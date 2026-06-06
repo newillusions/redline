@@ -2,7 +2,7 @@
 
 **Status:** Draft for Claude Code build handoff
 **Scope:** Internal-use desktop tool; near-zero-cost stack; architecture kept open for possible future commercialization
-**Last updated:** 2026-06-06 (all §12 decisions a–k resolved; consultant/reviewer focus locked; markup model + audit/identity (§6), measurement/scale schema (§7), review workflow promoted to core M2 (§13), sidecar format (§18), Tool Set / `.btx` import (§19), and Sets definition (§9) all specified; large-file perf flagged as an early M1 spike)
+**Last updated:** 2026-06-06 (all §12 decisions a–k resolved; consultant/reviewer focus locked; markup model + audit/identity (§6), measurement/scale schema (§7), review workflow promoted to core M2 (§13), sidecar format (§18), Tool Set / `.btx` import (§19), and Sets definition (§9) all specified; M1 performance acceptance criteria nailed down (§20))
 
 ---
 
@@ -175,7 +175,7 @@ Open multiple PDFs and navigate them as one ordered **Set** (a plan issue / draw
 
 ## 11. Key risks & mitigations
 
-- **Large-file performance (DEEP-DIVE REQUIRED — explore early, before building on top)** → Large drawing sets are in scope **from the outset**, so the memory + rendering strategy must be proven early in the dev process, not deferred. Approach: tiled render + bounded tile cache + streaming (never fully load 100s-MB files into memory). Treat as a **dedicated M1 spike**: on the largest *real* plan sets, measure peak memory, tile-render latency at each zoom level, and cache-eviction behavior — and prove the budget holds — *before* layering markup/takeoff on top. Make-or-break gate. (Tracked as a KB task assigned to redline.)
+- **Large-file performance (DEEP-DIVE REQUIRED — explore early, before building on top)** → Large drawing sets are in scope **from the outset**, so the memory + rendering strategy must be proven early in the dev process, not deferred. Approach: tiled render + bounded tile cache + streaming (never fully load 100s-MB files into memory). Treat as a **dedicated M1 spike**: on the largest *real* plan sets, measure peak memory, tile-render latency at each zoom level, and cache-eviction behavior — and prove the budget holds — *before* layering markup/takeoff on top. Make-or-break gate. (Tracked as a KB task assigned to redline; concrete acceptance criteria in §20.)
 - **Redaction correctness** → never ship a drawn "black box"; rasterize fallback is the v1 safe floor; real redaction only via mature engine
 - **Annotation round-trip fidelity** → serialize to standard PDF annotations; verify in Bluebeam/Acrobat
 - **Compare alignment accuracy** → start manual; validate on real plan revisions
@@ -203,7 +203,7 @@ All v1 open decisions are now locked. (Date noted so later changes stay visible.
 
 ## 13. Suggested build order (milestones)
 
-- **M1** — Tauri + Svelte shell incl. 3-column dockable layout (§17); PDFium tiled render; open/pan/zoom a large PDF smoothly
+- **M1** — Tauri + Svelte shell incl. 3-column dockable layout (§17); PDFium tiled render; open/pan/zoom a large PDF smoothly — **acceptance criteria in §20 (make-or-break gate)**
 - **M2 (the core — reviewers' primary surface)** — Markup overlay + core annotation types + comments/notes + save to PDF annotations; **review workflow: status (Accepted/Rejected/Completed) + the Markups/Comments list panel with sort/filter (§17)** — first-class, not an add-on, because reviewers are the primary audience (§12 i); Tool Chest / Tool Sets + stamps (static + dynamic) build directly on the markup model; **`.btx` / stamp importer** (reuses the annotation parser)
 - **M3** — Takeoff & measurement (review-grade, §7): scale calibration, measurement types, rollups; **Markup List export (XLSX/CSV — the reviewer's primary deliverable) + measurement summary export**
 - **M4** — Sets navigation + local versioning hooks; page manipulation, layers/hyperlinks, in-doc text search + OCR; folder/library full-text index (Tantivy) — the low-cost doc-management wins (§14)
@@ -420,3 +420,44 @@ A **tool** = a markup type + saved properties + placement mode, optionally with 
 - **Unmappable types/attributes** → never silently dropped: import as the closest generic annotation (preserving `<Raw>` in `source` for fidelity) **or** skip with an entry in an **import report**.
 
 **Output:** a native Tool Set (§19.1) + an **import report** (mapped / fell-back / skipped, per item) so a reviewer sees exactly what came across. Validate the importer early against a library of real-world `.btx` files + stamps (measurement tools, custom columns, embedded images) — this is a parser project, not from-scratch reverse engineering (§6, §11).
+
+## 20. M1 performance acceptance (make-or-break gate)
+
+The M1 spike (KB task assigned to redline) must hit these **before** M2 (markup) work begins. Failing the headline gate (C2) **escalates with mitigation — never silently proceeds** (§11, §13).
+
+**Floor machine** (all targets measured here — worst-case reviewer hardware): **16 GB RAM, 4-core SSD laptop, integrated GPU**, on **both Windows 11 and macOS (Apple Silicon)**. The ≤ 2 GB memory budget is the binding constraint at this floor.
+
+**Corpus** (real Emittiv plan sets, user-provided):
+
+| Corpus | Profile |
+|---|---|
+| C1 typical | ~80–150 MB, ~100 sheets, vector |
+| **C2 large (headline gate)** | **~300 MB, 200+ sheets, vector-heavy** |
+| C3 stress | 500 MB+ — graceful degradation, no crash/OOM |
+| C4 dense single sheet | one huge large-format vector sheet |
+| C5 scanned | raster-heavy scanned set (different memory profile) |
+
+**Thresholds** (floor machine, C2 unless noted; **Pass = required to leave M1**):
+
+| Metric | Pass | Stretch |
+|---|---|---|
+| Cold open → first sheet visible | ≤ 3 s | ≤ 1.5 s |
+| Open → fully interactive (pan/zoom) | ≤ 5 s | ≤ 2 s |
+| Pan frame time, any zoom | ≤ 33 ms (30 fps) sustained | ≤ 16 ms (60 fps) |
+| Zoom → placeholder shown | ≤ 16 ms (immediate) | — |
+| Zoom → sharp tiles settled | ≤ 250 ms | ≤ 120 ms |
+| Jump to arbitrary sheet → sharp | ≤ 600 ms | ≤ 300 ms |
+| Single tile rasterize | ≤ 60 ms | ≤ 30 ms |
+| Peak RSS, active use (C2) | ≤ 2.0 GB, **bounded** | ≤ 1.2 GB |
+| Peak RSS (C3, 500 MB+) | ≤ 2.5 GB, no OOM | — |
+| Memory after ~1 hr churn (pan/zoom/page over 100+ sheets) | within **+15 %** of steady baseline; **no monotonic growth (no leak)** | flat |
+| Crash / OOM (C2 & C3) | none | none |
+
+**Invariants — must hold, beyond the timings:**
+1. **Memory does not scale linearly with file size** — C2-vs-C3 peak RSS *similar* (not ~1.6×). This is the proof that streaming actually works, not just that the floor machine has spare RAM.
+2. **Tiles sharp at every zoom** — rendered at zoom × DPR, never upscaled; visual check at extreme zoom (§5).
+3. **Vector geometry extraction for snapping** works on C4 (the dense sheet) without Form-XObject paths collapsing to ~(0,0) — `pdfium-render` *transformed* path-segment iteration (§5).
+
+**Method:** instrument frame-time + RSS sampling; a scripted harness drives pan / zoom / page-jump and logs metrics; results land in a committed benchmark report (`bench/`). Run on the floor machine on **both** OSes.
+
+**Go / no-go:** all **Pass** on C1 + C2 (both OSes) → proceed to M2. C2 fails → **stop and escalate** with mitigation options (LOD / vector-tile rendering, alternate render lib, raise the hardware floor, or scope cut) before layering markup/takeoff on top.
