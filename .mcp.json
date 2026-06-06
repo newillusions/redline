@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "kb-surreal": {
+      "command": "bash",
+      "args": ["-c", "~/.claude/scripts/mcp-with-creds.sh npx -y @kb-agent/mcp-server@latest"],
+      "env": {
+        "SURREALDB_URL_FROM": "SURREAL_KB_URL",
+        "SURREALDB_USER_FROM": "SURREAL_KB_USER",
+        "SURREALDB_PASS_FROM": "SURREAL_KB_PASS",
+        "SURREALDB_NS_FROM": "SURREAL_KB_NS",
+        "SURREALDB_DB_FROM": "SURREAL_KB_DB",
+        "KB_HUB_URL_FROM": "KB_HUB_URL",
+        "KB_HUB_USER_FROM": "KB_HUB_USER",
+        "KB_HUB_PASS_FROM": "KB_HUB_PASS",
+        "KB_INSTANCE_NAME": "redline"
+      }
+    }
+  }
+}
