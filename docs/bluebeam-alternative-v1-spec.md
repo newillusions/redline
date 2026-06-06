@@ -2,7 +2,7 @@
 
 **Status:** Draft for Claude Code build handoff
 **Scope:** Internal-use desktop tool; near-zero-cost stack; architecture kept open for possible future commercialization
-**Last updated:** 2026-06-06 (all §12 decisions resolved; consultant/reviewer focus locked; markup model + audit/identity (§6), measurement/scale schema (§7), review workflow promoted to core M2 (§13), and the sidecar format (§18) all specified; large-file perf flagged as an early M1 spike)
+**Last updated:** 2026-06-06 (all §12 decisions a–k resolved; consultant/reviewer focus locked; markup model + audit/identity (§6), measurement/scale schema (§7), review workflow promoted to core M2 (§13), sidecar format (§18), Tool Set / `.btx` import (§19), and Sets definition (§9) all specified; large-file perf flagged as an early M1 spike)
 
 ---
 
@@ -161,7 +161,11 @@ Validate the importer early against a library of real-world `.btx` files and sta
 
 ## 9. Sets & document handling (v1)
 
-Open multiple PDFs; combine and navigate as an ordered **Set** (page labels, thumbnails, bookmarks). Local file save. Storage is local-first, but design **version hooks now**: retain the last N revisions (configurable, default ~10) in a per-file revision store, markups versioned with the document snapshot (decision (e), §12), so Compare lands without a storage retrofit.
+Open multiple PDFs and navigate them as one ordered **Set** (a plan issue / drawing set); a single multi-page PDF is just a one-member Set. The Set adds ordering, sheet/page labels, thumbnails, and cross-document bookmarks + search (§14); it does **not** own markups — each member PDF keeps its own `.redline/` sidecar (§18). Local file save. Storage is local-first, but design **version hooks now**: retain the last N revisions (configurable, default ~10) in a per-file revision store, markups versioned with the document snapshot (decision (e), §12), so Compare lands without a storage retrofit.
+
+**Set definition (`<setname>.redlineset.json`):** an ordered list of members, each referenced by **relative path** (so moving/copying the folder keeps the Set valid) with a `fingerprint` to flag a member changed underneath it, plus per-member `page_labels`. Each member carries a **stable `member_id`** so the deferred slip-sheet feature (§14) can replace a sheet's file behind a stable slot without breaking bookmarks/links. Set-level bookmarks target `{ member_id, page }`. Full schema in §18 (sits alongside the per-file sidecar).
+
+**Sheet/page labels (decision (k), §12):** v1 reads PDF `/PageLabels` where present, falls back to page index, and lets the user edit / bulk-assign labels manually. Auto-extracting labels from title blocks via OCR-region templates is **post-v1** (§14).
 
 ## 10. Compare & overlay (Phase 1.1 — fast follow)
 
@@ -195,6 +199,7 @@ All v1 open decisions are now locked. (Date noted so later changes stay visible.
 - **(i) Primary audience & priority:** consultants/reviewers, not contractors — **markup / comments / review-QA is the core**; takeoff/measurement is first-class but supporting. (§1, §2, §7)
 - **(j) Scale persistence:** the **sidecar is the source of truth** for per-page scales (with a document-default fallback + apply-to-range/all); on save we **also embed the standard PDF `/Measure` viewport** per page so measurements reproduce in other tools. (§7)
 - **Scanned-plan snapping:** v1 = OCR-for-search + calibrated manual placement only. **Raster corner/edge-detection snapping is post-v1** (§11, §14) — same limit as Bluebeam, accepted.
+- **(k) Sets & sheet labels:** a Set is an ordered multi-PDF unit defined in `<setname>.redlineset.json` (members by relative path + stable `member_id`; each member keeps its own `.redline/`). v1 sheet labels = PDF `/PageLabels` + manual edit; **title-block OCR auto-labelling is post-v1** (§9, §14, §18).
 
 ## 13. Suggested build order (milestones)
 
@@ -230,6 +235,7 @@ Gap review against Bluebeam Revu, split by cost. These augment the milestones ab
 - **Batch processing (confirmed, later)** — apply ops (flatten/headers/Bates/redact) across many files; mostly a queue + loop around `docops`, so straightforward once single-file ops exist.
 - **Snapshot / region copy** — minor convenience; later.
 - **Raster edge/corner-detection snapping** — give scanned/raster plans some snap targets via line/edge detection (Hough/OpenCV-style). Post-v1; v1 scanned-plan story is OCR-for-search + calibrated manual placement (§11). Pairs naturally with Visual Search (shared image-processing stack).
+- **Title-block OCR auto-labelling** — auto-extract sheet number/title by OCR'ing a definable title-block region (Bluebeam Auto-Mark equivalent) to populate Set page labels. Post-v1; v1 uses PDF `/PageLabels` + manual entry (§9). Depends on OCR + a region-template UI.
 
 ## 15. Cross-cutting requirements
 
@@ -322,7 +328,26 @@ Why this shape (engineering choices — flag if you disagree): the audit log is 
 
 **Sync-readiness (post-v1):** the append-only log + id-keyed state records merge cleanly across sources (desktop + future field app); the `user_id` registry survives renames; nothing assumes a single writer — the async sync layer (§2) layers on by adding only a conflict policy, no format change.
 
-**Sets:** a Set (§9) spanning multiple PDFs is a separate small definition (`<setname>.redlineset.json` — ordered member list + page-label config); each member PDF keeps its own `.redline/` folder. (v1 detail — confirm when we spec Sets.)
+**Sets (`<setname>.redlineset.json`):** a Set (§9) spanning multiple PDFs is a separate definition; each member PDF keeps its own `.redline/` folder (the Set owns only ordering / labels / bookmarks, never markups).
+
+```json
+{
+  "schema_version": 1,
+  "kind": "redline.set",
+  "id": "set_…",
+  "name": "Acme Tower — IFC Issue 2026-06",
+  "created_by": "u_…", "created_at": "…", "updated_at": "…",
+  "members": [                              // array order = Set order
+    { "member_id": "m_…",                   // stable slot id — survives a future slip-sheet swap (§14)
+      "path": "sheets/A-101.pdf",           // relative to this file — portable if the folder moves
+      "fingerprint": "sha256:…",            // detect an externally changed/replaced member
+      "label_source": "pdf_pagelabels",     // pdf_pagelabels | manual  (title-block OCR auto-label is post-v1, §14)
+      "page_labels": [ { "page": 0, "label": "A-101", "title": "Ground Floor Plan" } ] }
+  ],
+  "bookmarks": [ { "label": "Level 3", "target": { "member_id": "m_…", "page": 0 } } ]
+}
+```
+Members are referenced by relative path; cross-Set search (§14) and unified sheet navigation resolve results to `member_id` + page. Written atomically (temp + `rename`) like the other sidecar state.
 
 ## 19. Tool Set format & `.btx` import
 
