@@ -29,3 +29,14 @@ Thumbs.db
 # Test/scratch PDFs (large)
 /test-fixtures/*.pdf
 /scratch
+
+# Benchmark corpus — large real PDFs copied from the server, NEVER commit
+/bench/corpus/
+
+# PDFium prebuilt binary — downloaded, not committed
+/src-tauri/resources/libpdfium.dylib
+/src-tauri/resources/libpdfium.so
+/src-tauri/resources/pdfium.dll
+
+# Benchmark rendered output (PNG proofs)
+/bench/results/*.png

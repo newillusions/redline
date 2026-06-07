@@ -427,15 +427,15 @@ The M1 spike (KB task assigned to redline) must hit these **before** M2 (markup)
 
 **Floor machine** (all targets measured here — worst-case reviewer hardware): **16 GB RAM, 4-core SSD laptop, integrated GPU**, on **both Windows 11 and macOS (Apple Silicon)**. The ≤ 2 GB memory budget is the binding constraint at this floor.
 
-**Corpus** (real Emittiv plan sets, user-provided):
+**Corpus** (real Emittiv plan sets, user-provided). **All five are REQUIRED v1 use cases** — none is optional. C2 is the *headline* gate, but C4 (dense single large-format sheet) and C5 (very large scanned set) are real reviewer workflows that must also pass their per-tier targets (below):
 
-| Corpus | Profile |
-|---|---|
-| C1 typical | ~80–150 MB, ~100 sheets, vector |
-| **C2 large (headline gate)** | **~300 MB, 200+ sheets, vector-heavy** |
-| C3 stress | 500 MB+ — graceful degradation, no crash/OOM |
-| C4 dense single sheet | one huge large-format vector sheet |
-| C5 scanned | raster-heavy scanned set (different memory profile) |
+| Corpus | Profile | Status |
+|---|---|---|
+| C1 typical | ~80–150 MB, ~100 sheets, vector | required |
+| **C2 large (headline gate)** | **~300 MB, 200+ sheets, vector-heavy** | **required (headline)** |
+| C3 stress | 500 MB+ — graceful degradation, no crash/OOM | required |
+| **C4 dense single sheet** | one huge large-format (A0) vector sheet, thousands of objects | **required** |
+| **C5 scanned** | raster-heavy scanned set, may exceed 2 GB on disk | **required** |
 
 **Thresholds** (floor machine, C2 unless noted; **Pass = required to leave M1**):
 
@@ -453,6 +453,19 @@ The M1 spike (KB task assigned to redline) must hit these **before** M2 (markup)
 | Memory after ~1 hr churn (pan/zoom/page over 100+ sheets) | within **+15 %** of steady baseline; **no monotonic growth (no leak)** | flat |
 | Crash / OOM (C2 & C3) | none | none |
 
+**Per-tier targets for C4 and C5 (both REQUIRED):**
+
+| Metric | C4 dense A0 | C5 scanned (>2 GB on disk) |
+|---|---|---|
+| Single tile rasterize (steady state, page cached) | ≤ 60 ms | ≤ 60 ms |
+| First tile of a page (incl. one-time page load) | ≤ 1.5 s acceptable for a pathological dense A0; target ≤ 600 ms | ≤ 600 ms (after ingest) |
+| Open / ingest (one-time) | ≤ 5 s | ≤ ~15 s incl. normalise step (Acrobat/Bluebeam "reduce size" class) |
+| Peak RSS, steady-state render | ≤ 2.0 GB, bounded | ≤ 2.0 GB, bounded |
+| Peak RSS during one-time ingest/normalise | transient spike allowed | transient spike allowed (lopdf normalise loads whole file; one-time) |
+| Render correctness | every tile renders; no full-page allocation per tile | every page renders (auto-normalise oversized files; never modify the original) |
+
+C4/C5 engineering notes (M1.5, implemented): C4 uses a per-(doc,page) **page-handle cache** so the dense-A0 page-load cost is paid once, not per tile (1.1 s/tile → ~10 ms/tile). C5 uses an **auto-normalise-on-open fallback**: files whose pages fail to load via both the streaming and mmap/`FPDF_LoadMemDocument64` paths (PDFium's internal 2 GiB object-offset limit) are transparently re-serialised with `lopdf` (compress object streams) into a working copy under the OS temp dir — the user's original is never touched.
+
 **Invariants — must hold, beyond the timings:**
 1. **Memory does not scale linearly with file size** — C2-vs-C3 peak RSS *similar* (not ~1.6×). This is the proof that streaming actually works, not just that the floor machine has spare RAM.
 2. **Tiles sharp at every zoom** — rendered at zoom × DPR, never upscaled; visual check at extreme zoom (§5).
@@ -460,4 +473,4 @@ The M1 spike (KB task assigned to redline) must hit these **before** M2 (markup)
 
 **Method:** instrument frame-time + RSS sampling; a scripted harness drives pan / zoom / page-jump and logs metrics; results land in a committed benchmark report (`bench/`). Run on the floor machine on **both** OSes.
 
-**Go / no-go:** all **Pass** on C1 + C2 (both OSes) → proceed to M2. C2 fails → **stop and escalate** with mitigation options (LOD / vector-tile rendering, alternate render lib, raise the hardware floor, or scope cut) before layering markup/takeoff on top.
+**Go / no-go:** all **Pass** on C1 + C2 **and** C4 + C5 per-tier targets (both OSes) → proceed to M2. C2 fails → **stop and escalate** with mitigation options (LOD / vector-tile rendering, alternate render lib, raise the hardware floor, or scope cut) before layering markup/takeoff on top. C4 or C5 failing is also blocking — both are required reviewer workflows, not optional tiers.

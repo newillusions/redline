@@ -1,0 +1,97 @@
+[package]
+name = "redline"
+version = "0.1.0"
+description = "Redline — AEC PDF markup, takeoff, and document management"
+authors = ["Emittiv L.L.C-FZ"]
+license = ""
+repository = ""
+edition = "2021"
+rust-version = "1.80"
+# The crate has multiple binaries (the app `redline` + the `bench` harness). Tauri's
+# dev/build runs a bare `cargo run`, which is ambiguous with >1 bin — pin the default.
+default-run = "redline"
+
+[lib]
+name = "redline_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Headless §20 performance benchmark harness. Drives the render core directly
+# (no Tauri/webview) over the bench corpus and measures open/tile/page-jump
+# latency + peak RSS. Run: PDFIUM_DYNAMIC_LIB_PATH=... cargo run --release --bin bench -- <corpus-dir>
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.2.0", features = [] }
+
+[dependencies]
+# --- Tauri core ---
+tauri = { version = "2.5.0", features = ["macos-private-api"] }
+tauri-plugin-dialog = "2.2.2"
+tauri-plugin-log = "2.0.0-rc"
+
+# --- Async runtime ---
+tokio = { version = "1", features = ["full"] }
+
+# --- Serialization ---
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# --- Logging ---
+log = "0.4"
+
+# --- Error handling ---
+thiserror = "2"
+anyhow = "1"
+
+# --- PDF rendering (display only) ---
+# pdfium-render 0.8.x per spec §3. Latest on crates.io is 0.9.1; pin to 0.8.x
+# series as spec-locked. Use the "thread_safe" feature for use across tokio threads.
+# PDFium binary: use pdfium-render's bundled auto-download via build.rs OR
+# point PDFIUM_DYNAMIC_LIB_PATH env var at a prebuilt libpdfium.
+pdfium-render = { version = "0.8.28", features = ["thread_safe", "image"] }
+
+# --- Low-level PDF ops ---
+lopdf = "0.36"
+
+# --- Memory-mapped file loading ---
+# Required for PDFs > 2 GiB: PDFium's streaming FPDF_LoadCustomDocument path uses
+# a signed 32-bit internal file offset (2 GiB cap), so a 2.1 GB scanned set fails
+# to load pages. mmap + FPDF_LoadMemDocument64 (64-bit clean) is the fix, without
+# reading the whole file into RSS. See render::open_document.
+memmap2 = "0.9.10"
+
+# --- Image handling (tile encoding → PNG/RGBA bytes to webview) ---
+image = { version = "0.25", features = ["png"] }
+
+# --- Unique IDs ---
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# --- Time ---
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- Spatial index for snap targets (geometry module) ---
+# rstar = r-tree for 2D snap-target lookups
+rstar = "0.12"
+
+# --- Future milestones (feature-gated to keep M1 build lean) ---
+# leptess = { version = "0.14", optional = true }   # OCR — M4
+# tantivy = { version = "0.22", optional = true }   # full-text search — M4
+
+[features]
+default = []
+# Uncomment when milestone work begins:
+# ocr = ["dep:leptess"]
+# search = ["dep:tantivy"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

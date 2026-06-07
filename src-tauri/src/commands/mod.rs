@@ -1,0 +1,8 @@
+//! Tauri IPC commands — the bridge between the Svelte webview and the Rust core.
+//!
+//! Pattern mirrors e-fees: one sub-module per domain, all commands registered in lib.rs
+//! via `tauri::generate_handler![]`.
+
+pub mod diag;
+pub mod document;
+pub mod render;
