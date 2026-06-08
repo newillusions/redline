@@ -10,7 +10,9 @@
 /// → the app shows its normal empty state and waits for the Open dialog.
 #[tauri::command]
 pub fn auto_open_path() -> Option<String> {
-    std::env::var("REDLINE_OPEN_PDF").ok().filter(|s| !s.is_empty())
+    std::env::var("REDLINE_OPEN_PDF")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Current process resident set size (RSS) in megabytes.
@@ -44,13 +46,7 @@ fn rss_mb() -> f64 {
     // `tasklist /FI "PID eq <pid>" /FO CSV /NH` → last CSV field is "1,234 K".
     let pid = std::process::id();
     let out = std::process::Command::new("tasklist")
-        .args([
-            "/FI",
-            &format!("PID eq {pid}"),
-            "/FO",
-            "CSV",
-            "/NH",
-        ])
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .output();
     match out {
         Ok(o) => {

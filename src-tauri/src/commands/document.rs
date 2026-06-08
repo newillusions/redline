@@ -22,7 +22,8 @@ pub async fn open_document(
     }
 
     let doc_id = new_doc_id();
-    let page_count = state.render
+    let page_count = state
+        .render
         .open_document(path.clone(), doc_id.clone())
         .await
         .map_err(|e| format!("{:#}", e))?;
@@ -36,9 +37,10 @@ pub async fn open_document(
 
 /// Close an open document and release its resources.
 #[tauri::command]
-pub async fn close_document(
-    state: State<'_, AppState>,
-    doc_id: String,
-) -> Result<(), String> {
-    state.render.close_document(doc_id).await.map_err(|e| format!("{:#}", e))
+pub async fn close_document(state: State<'_, AppState>, doc_id: String) -> Result<(), String> {
+    state
+        .render
+        .close_document(doc_id)
+        .await
+        .map_err(|e| format!("{:#}", e))
 }

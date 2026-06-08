@@ -119,8 +119,14 @@ mod tests {
     #[test]
     fn nearest_snap_within_tolerance() {
         let targets = vec![
-            SnapTarget { point: PdfPoint { x: 10.0, y: 20.0 }, kind: SnapKind::Endpoint },
-            SnapTarget { point: PdfPoint { x: 50.0, y: 60.0 }, kind: SnapKind::Midpoint },
+            SnapTarget {
+                point: PdfPoint { x: 10.0, y: 20.0 },
+                kind: SnapKind::Endpoint,
+            },
+            SnapTarget {
+                point: PdfPoint { x: 50.0, y: 60.0 },
+                kind: SnapKind::Midpoint,
+            },
         ];
         let geom = PageGeometry {
             page_index: 0,
@@ -134,9 +140,10 @@ mod tests {
 
     #[test]
     fn nearest_snap_outside_tolerance() {
-        let targets = vec![
-            SnapTarget { point: PdfPoint { x: 10.0, y: 20.0 }, kind: SnapKind::Endpoint },
-        ];
+        let targets = vec![SnapTarget {
+            point: PdfPoint { x: 10.0, y: 20.0 },
+            kind: SnapKind::Endpoint,
+        }];
         let geom = PageGeometry {
             page_index: 0,
             snap_index: RTree::bulk_load(targets),

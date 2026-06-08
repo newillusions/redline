@@ -127,7 +127,9 @@ fn bench_tier(engine: &mut RenderEngine, tier: &str, path: &Path) -> Option<Tier
     let mut tile_ms: Vec<f64> = Vec::new();
     let sample_pages: Vec<u32> = {
         let n = pages.min(6);
-        (0..n).map(|i| (i * pages / n.max(1)).min(pages - 1)).collect()
+        (0..n)
+            .map(|i| (i * pages / n.max(1)).min(pages - 1))
+            .collect()
     };
     for &pg in &sample_pages {
         let (cols, rows) = tile_grid(engine, &doc_id, pg, scale);
@@ -169,7 +171,9 @@ fn bench_tier(engine: &mut RenderEngine, tier: &str, path: &Path) -> Option<Tier
     let mut jump_ms: Vec<f64> = Vec::new();
     let jump_targets: Vec<u32> = {
         let n = pages.min(10);
-        (0..n).map(|i| (i * pages / n.max(1)).min(pages - 1)).collect()
+        (0..n)
+            .map(|i| (i * pages / n.max(1)).min(pages - 1))
+            .collect()
     };
     for &pg in &jump_targets {
         let req = TileRequest {
@@ -200,7 +204,11 @@ fn bench_tier(engine: &mut RenderEngine, tier: &str, path: &Path) -> Option<Tier
         for pg in 0..churn_pages {
             let (cols, rows) = tile_grid(engine, &doc_id, pg, scale);
             // Render a diagonal sample of tiles to exercise different regions.
-            let picks = [(0u32, 0u32), (cols / 2, rows / 2), (cols.saturating_sub(1), rows.saturating_sub(1))];
+            let picks = [
+                (0u32, 0u32),
+                (cols / 2, rows / 2),
+                (cols.saturating_sub(1), rows.saturating_sub(1)),
+            ];
             for (tx, ty) in picks {
                 let req = TileRequest {
                     doc_id: doc_id.clone(),
@@ -240,7 +248,11 @@ fn bench_tier(engine: &mut RenderEngine, tier: &str, path: &Path) -> Option<Tier
     if !rss_samples.is_empty() {
         let first = rss_samples.first().copied().unwrap_or(0.0);
         let last = rss_samples.last().copied().unwrap_or(0.0);
-        let growth = if first > 0.0 { (last - first) / first * 100.0 } else { 0.0 };
+        let growth = if first > 0.0 {
+            (last - first) / first * 100.0
+        } else {
+            0.0
+        };
         notes.push_str(&format!("2nd-pass RSS Δ {growth:+.1}%; "));
     }
 
@@ -274,7 +286,10 @@ fn find_pdf(dir: &Path) -> Option<PathBuf> {
     let rd = std::fs::read_dir(dir).ok()?;
     for entry in rd.flatten() {
         let p = entry.path();
-        if p.extension().map(|e| e.eq_ignore_ascii_case("pdf")).unwrap_or(false) {
+        if p.extension()
+            .map(|e| e.eq_ignore_ascii_case("pdf"))
+            .unwrap_or(false)
+        {
             return Some(p);
         }
     }
@@ -337,7 +352,11 @@ fn main() {
     if args.get(1).map(|s| s == "--tier").unwrap_or(false) {
         let tier_id = args.get(2).expect("tier id");
         let corpus_dir = args.get(3).expect("corpus dir");
-        let subdir = TIERS.iter().find(|(t, _)| t == tier_id).map(|(_, d)| *d).expect("unknown tier");
+        let subdir = TIERS
+            .iter()
+            .find(|(t, _)| t == tier_id)
+            .map(|(_, d)| *d)
+            .expect("unknown tier");
         let mut engine = RenderEngine::new().unwrap_or_else(|e| {
             eprintln!("FATAL: PDFium init: {e:#}");
             std::process::exit(1);
@@ -347,6 +366,14 @@ fn main() {
             if let Ok(mb) = mb.parse::<usize>() {
                 engine = engine.with_cache_budget(mb * 1024 * 1024);
                 eprintln!("  (cache budget overridden to {mb} MB)");
+            }
+        }
+        // Optional page-LRU-cap override: REDLINE_MAX_PAGES=12. This is the dominant
+        // steady-RSS lever (held PDFium page state, not tiles) — see render::mod.rs.
+        if let Ok(n) = std::env::var("REDLINE_MAX_PAGES") {
+            if let Ok(n) = n.parse::<usize>() {
+                engine = engine.with_max_loaded_pages(n);
+                eprintln!("  (max loaded pages overridden to {n})");
             }
         }
         let dir = Path::new(corpus_dir).join(subdir);
@@ -411,7 +438,12 @@ fn render_report(results: &[TierResult]) -> String {
     s.push_str(&format!("Run: {now}\n\n"));
     s.push_str("Machine: Apple Silicon dev Mac (NOT the §20 floor machine). ");
     s.push_str("Tiles rendered at zoom×dpr = ");
-    s.push_str(&format!("{:.0}× ({}px CSS × {:.0} DPR).\n\n", ZOOM * DPR, TILE_CSS, DPR));
+    s.push_str(&format!(
+        "{:.0}× ({}px CSS × {:.0} DPR).\n\n",
+        ZOOM * DPR,
+        TILE_CSS,
+        DPR
+    ));
     s.push_str("Render strategy: M1.5 true tile-region matrix render (bitmap allocated at tile size, never full page). ");
     s.push_str("Page-handle cache (C4 dense-sheet fix). Auto-normalise on open for >2 GiB files PDFium can't load (C5).\n\n");
     s.push_str("**Each tier runs in its own subprocess** so RSS is isolated (no cross-tier allocator high-water carryover). ");
@@ -435,7 +467,10 @@ fn render_report(results: &[TierResult]) -> String {
     // Files list
     s.push_str("## Corpus files\n\n");
     for r in results {
-        s.push_str(&format!("- **{}**: `{}` — {:.0} MB, {} pages\n", r.tier, r.file, r.file_mb, r.pages));
+        s.push_str(&format!(
+            "- **{}**: `{}` — {:.0} MB, {} pages\n",
+            r.tier, r.file, r.file_mb, r.pages
+        ));
     }
     s.push('\n');
 

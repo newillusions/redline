@@ -431,7 +431,10 @@ impl RenderEngine {
             // keep the ORIGINAL path for display/identity
             OpenDoc::new(doc2, backing2, path, page_count2, self.max_loaded_pages),
         );
-        info!("Opened (normalised) document {} — {} pages", doc_id, page_count2);
+        info!(
+            "Opened (normalised) document {} — {} pages",
+            doc_id, page_count2
+        );
         Ok(page_count2)
     }
 
@@ -499,9 +502,16 @@ impl RenderEngine {
         }
         doc.compress();
 
-        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "doc".into());
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "doc".into());
         let mut out = std::env::temp_dir();
-        out.push(format!("redline-normalized-{}-{}.pdf", stem, std::process::id()));
+        out.push(format!(
+            "redline-normalized-{}-{}.pdf",
+            stem,
+            std::process::id()
+        ));
         doc.save(&out)
             .with_context(|| format!("lopdf failed to save normalised copy to {:?}", out))?;
         Ok(out)
@@ -629,60 +639,65 @@ impl RenderEngine {
             if tile_w == 0 || tile_h == 0 {
                 anyhow::bail!(
                     "Tile ({},{}) at zoom={} dpr={} is outside page bounds ({}×{} px)",
-                    req.tile_x, req.tile_y, req.zoom, req.dpr, full_w_px, full_h_px
+                    req.tile_x,
+                    req.tile_y,
+                    req.zoom,
+                    req.dpr,
+                    full_w_px,
+                    full_h_px
                 );
             }
 
-        // M1.5: TRUE tile-region render via transformation matrix.
-        //
-        // We allocate a bitmap of exactly tile_w × tile_h pixels (NEVER the full page)
-        // and use a custom PDF→device matrix so only the tile's slice of the page is
-        // rasterised into it. This keeps peak RSS bounded by tile size, independent of
-        // page dimensions — the §20 memory invariant. (Replaces the M1 full-page-render
-        // + crop_imm strategy, which allocated the entire page bitmap per tile.)
-        //
-        // How it composes with pdfium-render's PdfRenderConfig (verified against 0.8.37
-        // render_config.rs apply_to_page):
-        //   - set_fixed_size(tile_w, tile_h) ⇒ use_auto_scaling = false ⇒ the output
-        //     bitmap is allocated at exactly (tile_w, tile_h), and width/height scale
-        //     factors default to 1.0 (scale_width_factor/scale_height_factor = None).
-        //   - set_matrix(M) sets transformation_matrix; with form data disabled the final
-        //     device matrix = transformation_matrix.scale(1.0, 1.0) = M exactly.
-        //   - clip_rect defaults to (0,0,tile_w,tile_h) = the whole output bitmap.
-        //   - render is dispatched via FPDF_RenderPageBitmapWithMatrix.
-        //
-        // The matrix maps PDF user space (origin bottom-left, +y up) to device pixels
-        // (origin top-left, +y down) for THIS tile:
-        //   x_dev = s·x_pdf            − tile_origin_x      (a = s,  e = −tile_origin_x)
-        //   y_dev = −s·y_pdf + full_h_px − tile_origin_y    (d = −s, f = full_h_px − tile_origin_y)
-        // i.e. the full page is placed at device scale s, top-left at (0,0), then shifted
-        // up-left by the tile's pixel origin so the tile's slice lands in the bitmap.
-        let matrix = PdfMatrix::new(
-            scale,                                  // a: x scale
-            0.0,                                    // b
-            0.0,                                    // c
-            -scale,                                 // d: y scale (flip)
-            -(tile_origin_x as f32),                // e: x translate
-            full_h_px as f32 - tile_origin_y as f32, // f: y translate (flip origin)
-        );
+            // M1.5: TRUE tile-region render via transformation matrix.
+            //
+            // We allocate a bitmap of exactly tile_w × tile_h pixels (NEVER the full page)
+            // and use a custom PDF→device matrix so only the tile's slice of the page is
+            // rasterised into it. This keeps peak RSS bounded by tile size, independent of
+            // page dimensions — the §20 memory invariant. (Replaces the M1 full-page-render
+            // + crop_imm strategy, which allocated the entire page bitmap per tile.)
+            //
+            // How it composes with pdfium-render's PdfRenderConfig (verified against 0.8.37
+            // render_config.rs apply_to_page):
+            //   - set_fixed_size(tile_w, tile_h) ⇒ use_auto_scaling = false ⇒ the output
+            //     bitmap is allocated at exactly (tile_w, tile_h), and width/height scale
+            //     factors default to 1.0 (scale_width_factor/scale_height_factor = None).
+            //   - set_matrix(M) sets transformation_matrix; with form data disabled the final
+            //     device matrix = transformation_matrix.scale(1.0, 1.0) = M exactly.
+            //   - clip_rect defaults to (0,0,tile_w,tile_h) = the whole output bitmap.
+            //   - render is dispatched via FPDF_RenderPageBitmapWithMatrix.
+            //
+            // The matrix maps PDF user space (origin bottom-left, +y up) to device pixels
+            // (origin top-left, +y down) for THIS tile:
+            //   x_dev = s·x_pdf            − tile_origin_x      (a = s,  e = −tile_origin_x)
+            //   y_dev = −s·y_pdf + full_h_px − tile_origin_y    (d = −s, f = full_h_px − tile_origin_y)
+            // i.e. the full page is placed at device scale s, top-left at (0,0), then shifted
+            // up-left by the tile's pixel origin so the tile's slice lands in the bitmap.
+            let matrix = PdfMatrix::new(
+                scale,                                   // a: x scale
+                0.0,                                     // b
+                0.0,                                     // c
+                -scale,                                  // d: y scale (flip)
+                -(tile_origin_x as f32),                 // e: x translate
+                full_h_px as f32 - tile_origin_y as f32, // f: y translate (flip origin)
+            );
 
-        let render_config = PdfRenderConfig::new()
-            .set_fixed_size(tile_w as i32, tile_h as i32)
-            .render_form_data(false) // required: matrix path only applies when form data is off
-            .apply_matrix(matrix) // config starts at IDENTITY, so apply == set here
-            .context("failed to set tile transformation matrix")?;
+            let render_config = PdfRenderConfig::new()
+                .set_fixed_size(tile_w as i32, tile_h as i32)
+                .render_form_data(false) // required: matrix path only applies when form data is off
+                .apply_matrix(matrix) // config starts at IDENTITY, so apply == set here
+                .context("failed to set tile transformation matrix")?;
 
-        let bitmap = page
-            .render_with_config(&render_config)
-            .context("PDFium render_with_config (tile matrix) failed")?;
+            let bitmap = page
+                .render_with_config(&render_config)
+                .context("PDFium render_with_config (tile matrix) failed")?;
 
-        let img = bitmap.as_image();
-        let mut png_bytes: Vec<u8> = Vec::new();
-        img.write_to(
-            &mut std::io::Cursor::new(&mut png_bytes),
-            image::ImageFormat::Png,
-        )
-        .context("PNG encode failed")?;
+            let img = bitmap.as_image();
+            let mut png_bytes: Vec<u8> = Vec::new();
+            img.write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .context("PNG encode failed")?;
 
             let png_b64 = base64_encode(&png_bytes);
             (png_b64, tile_w, tile_h)
@@ -692,8 +707,15 @@ impl RenderEngine {
 
         debug!(
             "Rendered tile doc={} page={} ({},{}) {}×{}px zoom={} dpr={} in {}ms",
-            req.doc_id, req.page_index, req.tile_x, req.tile_y,
-            tile_w, tile_h, req.zoom, req.dpr, render_ms
+            req.doc_id,
+            req.page_index,
+            req.tile_x,
+            req.tile_y,
+            tile_w,
+            tile_h,
+            req.zoom,
+            req.dpr,
+            render_ms
         );
 
         // Insert into the byte-budgeted cache, then evict oldest tiles until the
@@ -835,7 +857,11 @@ impl RenderHandle {
                 // Command loop — runs until the sender is dropped (app shutdown).
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
-                        RenderCmd::OpenDocument { path, doc_id, reply } => {
+                        RenderCmd::OpenDocument {
+                            path,
+                            doc_id,
+                            reply,
+                        } => {
                             let _ = reply.send(engine.open_document(path, doc_id));
                         }
                         RenderCmd::CloseDocument { doc_id, reply } => {
@@ -845,7 +871,11 @@ impl RenderHandle {
                         RenderCmd::PageCount { doc_id, reply } => {
                             let _ = reply.send(engine.page_count(&doc_id));
                         }
-                        RenderCmd::PageSize { doc_id, page_index, reply } => {
+                        RenderCmd::PageSize {
+                            doc_id,
+                            page_index,
+                            reply,
+                        } => {
                             let _ = reply.send(engine.page_size(&doc_id, page_index));
                         }
                         RenderCmd::RenderTile { req, reply } => {
@@ -858,7 +888,9 @@ impl RenderHandle {
             })
             .expect("failed to spawn render thread");
 
-        Ok(Self { tx: std::sync::Arc::new(tx) })
+        Ok(Self {
+            tx: std::sync::Arc::new(tx),
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -868,37 +900,69 @@ impl RenderHandle {
 
     pub async fn open_document(&self, path: PathBuf, doc_id: String) -> Result<u32> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx.send(RenderCmd::OpenDocument { path, doc_id, reply: reply_tx })
+        self.tx
+            .send(RenderCmd::OpenDocument {
+                path,
+                doc_id,
+                reply: reply_tx,
+            })
             .map_err(|_| anyhow::anyhow!("render thread gone"))?;
-        reply_rx.await.map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
     }
 
     pub async fn close_document(&self, doc_id: String) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx.send(RenderCmd::CloseDocument { doc_id, reply: reply_tx })
+        self.tx
+            .send(RenderCmd::CloseDocument {
+                doc_id,
+                reply: reply_tx,
+            })
             .map_err(|_| anyhow::anyhow!("render thread gone"))?;
-        reply_rx.await.map_err(|_| anyhow::anyhow!("render thread dropped reply"))
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))
     }
 
     pub async fn page_count(&self, doc_id: String) -> Result<Option<u32>> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx.send(RenderCmd::PageCount { doc_id, reply: reply_tx })
+        self.tx
+            .send(RenderCmd::PageCount {
+                doc_id,
+                reply: reply_tx,
+            })
             .map_err(|_| anyhow::anyhow!("render thread gone"))?;
-        reply_rx.await.map_err(|_| anyhow::anyhow!("render thread dropped reply"))
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))
     }
 
     pub async fn page_size(&self, doc_id: String, page_index: u32) -> Result<PageSize> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx.send(RenderCmd::PageSize { doc_id, page_index, reply: reply_tx })
+        self.tx
+            .send(RenderCmd::PageSize {
+                doc_id,
+                page_index,
+                reply: reply_tx,
+            })
             .map_err(|_| anyhow::anyhow!("render thread gone"))?;
-        reply_rx.await.map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
     }
 
     pub async fn render_tile(&self, req: TileRequest) -> Result<RenderedTile> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx.send(RenderCmd::RenderTile { req, reply: reply_tx })
+        self.tx
+            .send(RenderCmd::RenderTile {
+                req,
+                reply: reply_tx,
+            })
             .map_err(|_| anyhow::anyhow!("render thread gone"))?;
-        reply_rx.await.map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
     }
 }
 
@@ -906,11 +970,21 @@ impl RenderHandle {
 fn send_init_error(cmd: RenderCmd, err: &anyhow::Error) {
     let msg = format!("PDFium init failed: {:#}", err);
     match cmd {
-        RenderCmd::OpenDocument { reply, .. } => { let _ = reply.send(Err(anyhow::anyhow!("{}", msg))); }
-        RenderCmd::CloseDocument { reply, .. } => { let _ = reply.send(()); }
-        RenderCmd::PageCount { reply, .. } => { let _ = reply.send(None); }
-        RenderCmd::PageSize { reply, .. } => { let _ = reply.send(Err(anyhow::anyhow!("{}", msg))); }
-        RenderCmd::RenderTile { reply, .. } => { let _ = reply.send(Err(anyhow::anyhow!("{}", msg))); }
+        RenderCmd::OpenDocument { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+        }
+        RenderCmd::CloseDocument { reply, .. } => {
+            let _ = reply.send(());
+        }
+        RenderCmd::PageCount { reply, .. } => {
+            let _ = reply.send(None);
+        }
+        RenderCmd::PageSize { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+        }
+        RenderCmd::RenderTile { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+        }
     }
 }
 
@@ -942,7 +1016,9 @@ fn base64_encode(data: &[u8]) -> String {
         let b0 = data[i] as usize;
         let b1 = data[i + 1] as usize;
         let b2 = data[i + 2] as usize;
-        let _ = write!(out, "{}{}{}{}",
+        let _ = write!(
+            out,
+            "{}{}{}{}",
             CHARS[b0 >> 2] as char,
             CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char,
             CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char,
@@ -955,7 +1031,9 @@ fn base64_encode(data: &[u8]) -> String {
         let _ = write!(out, "{}", CHARS[b0 >> 2] as char);
         if i + 1 < data.len() {
             let b1 = data[i + 1] as usize;
-            let _ = write!(out, "{}{}=",
+            let _ = write!(
+                out,
+                "{}{}=",
                 CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char,
                 CHARS[(b1 & 0xf) << 2] as char,
             );
@@ -1064,7 +1142,9 @@ mod tests {
         };
         // Tiny 8 MB budget so eviction is forced after a handful of tiles.
         let budget = 8 * 1024 * 1024;
-        let mut e = RenderEngine::new().expect("pdfium").with_cache_budget(budget);
+        let mut e = RenderEngine::new()
+            .expect("pdfium")
+            .with_cache_budget(budget);
         let pages = e.open_document(path, "t".into()).expect("open c1");
         // Render distinct tiles across many pages to accumulate cache pressure.
         let mut rendered = 0;
@@ -1091,7 +1171,10 @@ mod tests {
                 }
             }
         }
-        assert!(rendered > 30, "expected to render many tiles (got {rendered})");
+        assert!(
+            rendered > 30,
+            "expected to render many tiles (got {rendered})"
+        );
         // We pushed far more tile-bytes than the budget, so eviction must have run:
         // the live cache holds fewer tiles than we rendered.
         assert!(
@@ -1140,9 +1223,13 @@ mod tests {
         let mut e = RenderEngine::new().expect("pdfium");
         // The 2.1 GB file triggers the normalize-on-open fallback (PDFium 2 GiB
         // offset limit). It must end up renderable.
-        let pages = e.open_document(path, "t".into()).expect("open c5 (auto-normalize)");
+        let pages = e
+            .open_document(path, "t".into())
+            .expect("open c5 (auto-normalize)");
         assert!(pages > 100, "C5 should expose its pages after normalize");
-        let tile = e.render_tile(&one_tile(0)).expect("render c5 tile after normalize");
+        let tile = e
+            .render_tile(&one_tile(0))
+            .expect("render c5 tile after normalize");
         assert!(!tile.png_base64.is_empty(), "C5 page 0 must render");
     }
 }

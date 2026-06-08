@@ -1,0 +1,6 @@
+# Pin rustfmt to its default style so `cargo fmt` is stable across toolchain versions
+# and never re-blasts the tree (the M1 code predated any fmt run; normalised 2026-06-08).
+# These values ARE the rustfmt defaults — stated explicitly so the formatting contract
+# is visible and version-independent. The /sendit gate enforces `cargo fmt --check`.
+edition = "2021"
+max_width = 100
