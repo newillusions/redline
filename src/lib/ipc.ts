@@ -85,3 +85,109 @@ export async function getPageSize(
 export async function processRssMb(): Promise<number> {
   return invoke<number>("process_rss_mb");
 }
+
+// ---------------------------------------------------------------------------
+// Markup types (mirrors src-tauri/src/markup/mod.rs serde JSON shapes)
+// ---------------------------------------------------------------------------
+
+export interface PdfPoint {
+  x: number;
+  y: number;
+}
+
+export interface UserRef {
+  user_id: string;
+  display_name: string;
+}
+
+export type MarkupType =
+  | "Text"
+  | "Callout"
+  | "Cloud"
+  | "Rectangle"
+  | "Ellipse"
+  | "Polygon"
+  | "Line"
+  | "Polyline"
+  | "Arrow"
+  | "Highlight"
+  | "Ink"
+  | "Stamp"
+  | "StampDynamic"
+  | "MeasurementLength"
+  | "MeasurementPerimeter"
+  | "MeasurementArea"
+  | "MeasurementVolume"
+  | "MeasurementCount"
+  | "MeasurementAngle"
+  | "MeasurementRadius";
+
+export type MarkupGeometry =
+  | { Point: PdfPoint }
+  | { Rect: { min: PdfPoint; max: PdfPoint } }
+  | { Polyline: PdfPoint[] }
+  | { Ink: PdfPoint[][] };
+
+export interface Appearance {
+  color: string;
+  line_weight: number;
+  opacity: number;
+  fill: string | null;
+  line_style: "Solid" | "Dashed" | "Dotted";
+  font: { family: string; size_pt: number } | null;
+}
+
+export interface MarkupAudit {
+  created_by: UserRef;
+  created_at: string; // RFC3339
+  modified_by: UserRef;
+  modified_at: string;
+  revision: number;
+  origin: "Desktop" | "FieldApp";
+}
+
+export interface MarkupWorkflow {
+  status: "None" | "Accepted" | "Rejected" | "Completed";
+  assignee: UserRef | null;
+  thread: unknown[];
+}
+
+export interface Markup {
+  id: string;
+  markup_type: MarkupType;
+  page: number;
+  geometry: MarkupGeometry;
+  appearance: Appearance;
+  subject: string | null;
+  layer: string | null;
+  contents: string | null;
+  audit: MarkupAudit;
+  workflow: MarkupWorkflow;
+  measurement: unknown | null;
+}
+
+// ---------------------------------------------------------------------------
+// Markup + save commands
+// ---------------------------------------------------------------------------
+
+// addMarkup/listMarkups: consumed by the S2 markup-authoring UI; backend commands already live.
+export async function addMarkup(doc_id: string, markup: Markup): Promise<void> {
+  return invoke<void>("add_markup", { doc_id, markup });
+}
+
+export async function listMarkups(doc_id: string): Promise<Markup[]> {
+  return invoke<Markup[]>("list_markups", { doc_id });
+}
+
+/** Pull existing PDF annotations into the store (call once after open). */
+export async function loadMarkups(doc_id: string): Promise<Markup[]> {
+  return invoke<Markup[]>("load_markups", { doc_id });
+}
+
+export async function saveDocument(doc_id: string): Promise<void> {
+  return invoke<void>("save_document", { doc_id });
+}
+
+export async function saveDocumentAs(doc_id: string, new_path: string): Promise<void> {
+  return invoke<void>("save_document_as", { doc_id, new_path });
+}

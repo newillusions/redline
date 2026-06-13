@@ -49,6 +49,10 @@ Arguments combine: `/sendit fix --no-merge`.
 - Corpus-dependent PDFium tests (`REDLINE_BENCH_TESTS=1`, `--test-threads=1`) need the
   machine-local gitignored corpus and are **not** run by the gate — run those manually
   before shipping render-path changes. The gate runs the portable tests only.
+- The pipeline's internal review is a **single haiku smoke pass**, diff-only. For risky
+  diffs (render path, markup model/serde, geometry, takeoff math) run `/code-review`
+  (high effort) on the branch BEFORE invoking /sendit — treat the pipeline review as a
+  final gate, not the review.
 
 ## How It Works
 

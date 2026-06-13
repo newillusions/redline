@@ -18,6 +18,8 @@ use uuid::Uuid;
 
 use crate::geometry::PdfPoint;
 
+mod annotation;
+
 /// v1 markup types (spec §12 decision a — locked).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MarkupType {

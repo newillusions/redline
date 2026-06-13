@@ -31,16 +31,18 @@ pub mod storage;
 pub mod takeoff;
 pub mod text;
 
+use document::store::MarkupStore;
 use render::RenderHandle;
 
 /// Shared application state threaded through all Tauri commands.
 ///
 /// `RenderHandle` is Send + Sync (it wraps only an `Arc<SyncSender>`).
 /// The actual `RenderEngine` + PDFium live on a dedicated render thread
-/// and are never moved across thread boundaries — which is required because
+/// and are never moved across thread boundaries -- which is required because
 /// `Pdfium` is !Send + !Sync (PDFium uses thread-local C state).
 pub struct AppState {
     pub render: RenderHandle,
+    pub markups: MarkupStore,
 }
 
 /// Resolve the bundled PDFium library path and export it via `PDFIUM_DYNAMIC_LIB_PATH`
@@ -114,7 +116,10 @@ pub fn run() {
             // must run here, not before the builder.
             resolve_pdfium_path(app);
             let render = RenderHandle::spawn().expect("failed to start render thread");
-            app.manage(AppState { render });
+            app.manage(AppState {
+                render,
+                markups: MarkupStore::default(),
+            });
             info!("Redline started");
             Ok(())
         })
@@ -123,9 +128,14 @@ pub fn run() {
             commands::render::render_tile,
             commands::render::get_page_count,
             commands::render::get_page_size,
-            // Document commands (M1 shell)
+            // Document commands (M1 shell + M2 markup store + S1 save pipeline)
             commands::document::open_document,
             commands::document::close_document,
+            commands::document::add_markup,
+            commands::document::list_markups,
+            commands::document::load_markups,
+            commands::document::save_document,
+            commands::document::save_document_as,
             // Diagnostics (in-app §20 bench overlay)
             commands::diag::process_rss_mb,
             commands::diag::auto_open_path,

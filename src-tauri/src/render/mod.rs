@@ -1049,7 +1049,7 @@ fn base64_encode(data: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1091,7 +1091,15 @@ mod tests {
     // by requiring --test-threads=1.
     // -----------------------------------------------------------------------
 
-    fn corpus(rel: &str) -> Option<PathBuf> {
+    /// Resolve a corpus-relative path to an absolute `PathBuf`.
+    ///
+    /// Returns `None` (causing the caller to skip) when either:
+    /// - `PDFIUM_DYNAMIC_LIB_PATH` is not set (PDFium binary unavailable), or
+    /// - the file does not exist (corpus not checked out).
+    ///
+    /// `pub(crate)` so `document::save` corpus tests can reuse the same gating
+    /// without duplicating the discovery logic.
+    pub(crate) fn corpus(rel: &str) -> Option<PathBuf> {
         if std::env::var("PDFIUM_DYNAMIC_LIB_PATH").is_err() {
             return None;
         }
@@ -1108,7 +1116,7 @@ mod tests {
         }
     }
 
-    fn one_tile(page: u32) -> TileRequest {
+    pub(crate) fn one_tile(page: u32) -> TileRequest {
         TileRequest {
             doc_id: "t".into(),
             page_index: page,

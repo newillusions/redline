@@ -5,6 +5,8 @@ Cross-platform (Windows + macOS) desktop application for AEC PDF **markup, takeo
 
 The authoritative v1 technical specification lives at `docs/bluebeam-alternative-v1-spec.md`. Read it first.
 
+**Instance scope:** This file governs the redline project instance. The workspace orchestrator CLAUDE.md inherited from `/Volumes/base/dev/` describes the orchestrator's review-only role; its boundaries ("never edit project code", "never commit in project repos") apply to that instance, NOT to work in this repo.
+
 ## Tech Stack
 - **Shell:** Tauri 2.x (Rust core + OS webview)
 - **Frontend:** Svelte 5 + Vite (SPA mode) + TypeScript
@@ -24,21 +26,25 @@ The authoritative v1 technical specification lives at `docs/bluebeam-alternative
 ## Commands
 ```bash
 # Dev
-cargo tauri dev
+cargo tauri dev      # full app; resolves bundled PDFium, auto-opens $REDLINE_OPEN_PDF if set
 
 # Build (release bundle)
 cargo tauri build
 
-# Rust tests
-cargo test
+# Tests
+cargo test           # portable Rust tests (no PDFium/corpus required)
+REDLINE_BENCH_TESTS=1 cargo test --release -- --test-threads=1
+                     # PDFium + corpus tests - MUST run serial (PDFium global C state)
+npm test             # vitest (frontend)
+npm run check        # svelte-check
 
 # Lint / format
 cargo clippy --all-targets && cargo fmt
-# Frontend
-npm run dev   # vite (if run standalone)
-npm run check # svelte-check
+npm run lint && npm run format
 ```
-*(Filled in concretely once the M1 shell scaffold lands.)*
+Gotchas: `default-run = "redline"` is set (the headless `bench` bin otherwise breaks bare
+`cargo run`). The §20 corpus is machine-local and gitignored (`bench/corpus/`). Benchmark
+procedure: `bench/RUNBOOK-S20.md`.
 
 ## Build Order (milestones)
 M1 shell + tiled render (large-file perf is the make-or-break test — validate on 300 MB+ sets early) → M2 markup + Tool Sets + `.btx` importer → M3 takeoff → M4 Sets/versioning + page ops + search/OCR → M5 `docops` baseline → M6 (Phase 1.1) compare. Full detail in spec §13.
@@ -49,12 +55,16 @@ M1 shell + tiled render (large-file perf is the make-or-break test — validate 
 - Redaction v1 = rasterize-the-region safe floor; true vector redaction only via a mature engine behind the `docops` trait. Spec §8.
 - Markup model carries reserved workflow fields (status/assignee/thread) + stable IDs from day one, for the future field-tools mobile app + async sync. Spec §6.
 - Field tools deferred post-v1 as a standalone mobile/tablet app sharing the Rust core. Spec §2/§12.
+- M2 proceeded ahead of the definitive §20 floor-machine run (2026-06): the indicative §20 PASS on Apple Silicon stands in; the floor run (16 GB, Windows + macOS, `bench/RUNBOOK-S20.md`) remains the formal Go/No-Go and is still owed.
+- Annotations persist as standard PDF annotation objects per the spec §6 persistence map (M2) - interop with Bluebeam/Acrobat, no sidecar format.
+- Shipping flow is `/sendit` (background pipeline agent, Forgejo REST, squash-merge). Background pipeline agents need `mode: "bypassPermissions"` or they stall on Bash. See `.claude/skills/sendit/SKILL.md`.
 - (Add decisions here as made; log architectural ones via `kb_decision_create`.)
 
 ## Session Workflow
 1. `/lamp-on` — load KB context
 2. Work on current tasks (TDD — failing test first)
-3. `/lamp-off` — save context before ending
+3. Ship via `/sendit` (`--dry-run` first if unsure); deep-review risky diffs (render path, markup serde, geometry) with `/code-review` BEFORE shipping
+4. `/lamp-off` — save context before ending
 
 ## Workspace Standards
 Follows Emittiv workspace standards. See `/Volumes/base/dev/.claude/WORKSPACE_STANDARDS.md`.

@@ -16,6 +16,10 @@ pub struct DocumentInfo {
     pub page_count: u32,
 }
 
+pub mod annots;
+pub mod save;
+pub mod store;
+
 /// Generate a fresh doc_id.
 pub fn new_doc_id() -> String {
     Uuid::new_v4().to_string()

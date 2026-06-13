@@ -21,8 +21,8 @@
   import "$lib/styles.css";
   import { onMount } from "svelte";
   import Viewport from "./components/Viewport.svelte";
-  import { openDocument, closeDocument } from "$lib/ipc";
-  import { open } from "@tauri-apps/plugin-dialog";
+  import { openDocument, closeDocument, loadMarkups, saveDocument, saveDocumentAs } from "$lib/ipc";
+  import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
   import type { DocumentInfo } from "$lib/ipc";
 
@@ -30,6 +30,7 @@
   let currentDoc = $state<DocumentInfo | null>(null);
   let openError = $state<string | null>(null);
   let isOpening = $state(false);
+  let isSaving = $state(false);
 
   // --- Auto-open for the §20 GUI smoke / floor-machine runbook ---
   // If the backend reports REDLINE_OPEN_PDF (env var read in Rust), open it on
@@ -39,7 +40,11 @@
     try {
       const path = await invoke<string | null>("auto_open_path");
       if (path) {
-        currentDoc = await openDocument(path);
+        const doc = await openDocument(path);
+        currentDoc = doc;
+        loadMarkups(doc.doc_id).catch((e) => {
+          openError = `Load markups failed: ${e}`;
+        });
       }
     } catch (e) {
       openError = `auto-open failed: ${String(e)}`;
@@ -75,14 +80,58 @@
         currentDoc = null;
       }
 
-      currentDoc = await openDocument(selected as string);
+      const doc = await openDocument(selected as string);
+      currentDoc = doc;
+      loadMarkups(doc.doc_id).catch((e) => {
+        openError = `Load markups failed: ${e}`;
+      });
     } catch (e) {
       openError = String(e);
     } finally {
       isOpening = false;
     }
   }
+
+  // --- Save handlers ---
+  async function handleSave() {
+    if (!currentDoc || isSaving) return;
+    openError = null;
+    isSaving = true;
+    try {
+      await saveDocument(currentDoc.doc_id);
+    } catch (e) {
+      openError = `Save failed: ${e}`;
+    } finally {
+      isSaving = false;
+    }
+  }
+
+  async function handleSaveAs() {
+    if (!currentDoc || isSaving) return;
+    openError = null;
+    const dest = await saveDialog({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
+    if (!dest) return;
+    isSaving = true;
+    try {
+      await saveDocumentAs(currentDoc.doc_id, dest);
+      currentDoc = { ...currentDoc, path: dest };
+    } catch (e) {
+      openError = `Save As failed: ${e}`;
+    } finally {
+      isSaving = false;
+    }
+  }
+
+  // --- Keyboard shortcuts ---
+  function handleKeydown(e: KeyboardEvent) {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && !e.shiftKey) {
+      e.preventDefault();
+      handleSave();
+    }
+  }
 </script>
+
+<svelte:window onkeydown={handleKeydown} />
 
 <div class="app-shell">
   <!-- Toolbar -->
@@ -91,6 +140,12 @@
       <span class="app-name">Redline</span>
       <button class="btn-toolbar" onclick={handleOpenFile} disabled={isOpening}>
         {isOpening ? "Opening…" : "Open PDF"}
+      </button>
+      <button class="btn-toolbar" onclick={handleSave} disabled={!currentDoc || isSaving} title="Save (Cmd/Ctrl+S)">
+        {isSaving ? "Saving…" : "Save"}
+      </button>
+      <button class="btn-toolbar" onclick={handleSaveAs} disabled={!currentDoc || isSaving} title="Save As…">
+        Save As…
       </button>
       {#if currentDoc}
         <span class="doc-name">{currentDoc.path.split(/[\\/]/).at(-1)}</span>
