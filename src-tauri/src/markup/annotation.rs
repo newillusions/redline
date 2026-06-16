@@ -357,15 +357,29 @@ impl Markup {
         d.set("BS", Object::Dictionary(bs));
 
         // Font: FreeText /DA (interop) + lossless /RLFont* round-trip (spec §6).
-        // The /DA resource name is pinned to /Helv pending the G7 font picker; the exact
-        // family is preserved losslessly in /RLFontFamily.
+        //
+        // /DA uses the standard base-14 resource name (ISO 32000-1 §12.7.3.3) so external
+        // viewers (Acrobat, Bluebeam) render the intended typeface family. The exact family
+        // string is preserved losslessly in /RLFontFamily for redline-to-redline round-trips.
+        //
+        // Base-14 /DA resource name mapping (title-cased, per PDF spec convention):
+        //   Helv  = Helvetica / Arial
+        //   TiRo  = Times-Roman / Times New Roman
+        //   Cour  = Courier / Courier New
+        // Viewers recognise these without an explicit /DR entry for FreeText annotations
+        // (they are not AcroForm fields). If external-viewer rendering is still wrong after
+        // this change, add a /DR resource dict - track as G9 external-viewer-verification.
         if let Some(font) = &self.appearance.font {
             let rgb = hex_to_rgb(&self.appearance.color).unwrap_or([0.0, 0.0, 0.0]);
             d.set(
                 "DA",
                 Object::string_literal(format!(
-                    "/Helv {:.0} Tf {:.3} {:.3} {:.3} rg",
-                    font.size_pt, rgb[0], rgb[1], rgb[2]
+                    "/{} {:.0} Tf {:.3} {:.3} {:.3} rg",
+                    base14_da_name(&font.family),
+                    font.size_pt,
+                    rgb[0],
+                    rgb[1],
+                    rgb[2]
                 )),
             );
             d.set("RLFontFamily", Object::string_literal(font.family.clone()));
@@ -523,6 +537,25 @@ fn get_int(d: &Dictionary, key: &[u8]) -> Option<i64> {
 
 fn get_real(d: &Dictionary, key: &[u8]) -> Option<f64> {
     d.get(key).ok()?.as_f32().ok().map(|f| f as f64)
+}
+
+/// Map a font family name to the standard PDF base-14 /DA resource name (ISO 32000-1 §12.7.3.3).
+///
+/// Matching is case-insensitive on a normalised prefix so common aliases ("Arial" for
+/// Helvetica, "Times New Roman" for Times-Roman, "Courier New" for Courier) resolve
+/// correctly. Unknown families fall back to `Helv` (Helvetica), consistent with Acrobat's
+/// own default. The exact family string is always preserved in `/RLFontFamily` for lossless
+/// redline round-trips - this mapping affects only external-viewer rendering.
+fn base14_da_name(family: &str) -> &'static str {
+    let lower = family.to_lowercase();
+    if lower.starts_with("times") {
+        "TiRo"
+    } else if lower.starts_with("courier") {
+        "Cour"
+    } else {
+        // Helvetica, Arial, and all unrecognised families -> Helv.
+        "Helv"
+    }
 }
 
 #[cfg(test)]
@@ -758,6 +791,107 @@ mod tests {
         assert!(!d.has(b"Vertices"), "Callout uses /CL, not /Vertices");
         assert_roundtrip(&m);
     }
+
+    // --- G7.2: base14_da_name unit tests -------------------------------------------
+
+    #[test]
+    fn base14_da_name_helvetica_and_arial_map_to_helv() {
+        assert_eq!(base14_da_name("Helvetica"), "Helv");
+        assert_eq!(base14_da_name("Arial"), "Helv");
+        assert_eq!(base14_da_name("helvetica"), "Helv");
+        assert_eq!(base14_da_name("ARIAL"), "Helv");
+    }
+
+    #[test]
+    fn base14_da_name_times_variants_map_to_tiro() {
+        assert_eq!(base14_da_name("Times"), "TiRo");
+        assert_eq!(base14_da_name("Times New Roman"), "TiRo");
+        assert_eq!(base14_da_name("Times-Roman"), "TiRo");
+        assert_eq!(base14_da_name("times"), "TiRo");
+        assert_eq!(base14_da_name("TIMES NEW ROMAN"), "TiRo");
+    }
+
+    #[test]
+    fn base14_da_name_courier_variants_map_to_cour() {
+        assert_eq!(base14_da_name("Courier"), "Cour");
+        assert_eq!(base14_da_name("Courier New"), "Cour");
+        assert_eq!(base14_da_name("courier new"), "Cour");
+    }
+
+    #[test]
+    fn base14_da_name_unknown_falls_back_to_helv() {
+        assert_eq!(base14_da_name("Comic Sans"), "Helv");
+        assert_eq!(base14_da_name("Roboto"), "Helv");
+        assert_eq!(base14_da_name(""), "Helv");
+    }
+
+    // --- G7.2: /DA emits correct base-14 resource name ----------------------------
+
+    #[test]
+    fn freetext_times_font_da_contains_tiro() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 10.0, y: 20.0 },
+            max: PdfPoint { x: 160.0, y: 38.0 },
+        };
+        let mut m = fixture(g, MarkupType::Text);
+        m.appearance.font = Some(FontSpec {
+            family: "Times New Roman".into(),
+            size_pt: 11.0,
+        });
+        let d = m.to_annotation_dict();
+        let da = get_string(&d, b"DA").expect("/DA must be present");
+        assert!(da.contains("/TiRo"), "/DA should contain /TiRo, got: {da}");
+        assert!(
+            da.contains(" Tf"),
+            "/DA should contain Tf operator, got: {da}"
+        );
+        // Round-trip: family is preserved via /RLFontFamily, not inferred from /DA.
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn freetext_courier_font_da_contains_cour() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 10.0, y: 20.0 },
+            max: PdfPoint { x: 160.0, y: 38.0 },
+        };
+        let mut m = fixture(g, MarkupType::Text);
+        m.appearance.font = Some(FontSpec {
+            family: "Courier New".into(),
+            size_pt: 10.0,
+        });
+        let d = m.to_annotation_dict();
+        let da = get_string(&d, b"DA").expect("/DA must be present");
+        assert!(da.contains("/Cour"), "/DA should contain /Cour, got: {da}");
+        assert!(
+            da.contains(" Tf"),
+            "/DA should contain Tf operator, got: {da}"
+        );
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn freetext_helvetica_da_contains_helv() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 10.0, y: 20.0 },
+            max: PdfPoint { x: 160.0, y: 38.0 },
+        };
+        let mut m = fixture(g, MarkupType::Text);
+        m.appearance.font = Some(FontSpec {
+            family: "Helvetica".into(),
+            size_pt: 12.0,
+        });
+        let d = m.to_annotation_dict();
+        let da = get_string(&d, b"DA").expect("/DA must be present");
+        assert!(da.contains("/Helv"), "/DA should contain /Helv, got: {da}");
+        assert!(
+            da.contains(" Tf"),
+            "/DA should contain Tf operator, got: {da}"
+        );
+        assert_roundtrip(&m);
+    }
+
+    // --- end G7.2 tests ------------------------------------------------------------
 
     #[test]
     fn foreign_freetext_imports_as_text_without_cl_callout_with_cl() {

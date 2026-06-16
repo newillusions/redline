@@ -22,6 +22,7 @@
   import { onMount } from "svelte";
   import Viewport from "./components/Viewport.svelte";
   import ToolPalette from "./components/ToolPalette.svelte";
+  import PropertiesPanel from "./components/PropertiesPanel.svelte";
   import { openDocument, closeDocument, loadMarkups, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup } from "$lib/ipc";
   import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
@@ -221,8 +222,12 @@
     {#if !rightCollapsed}
       <aside class="panel panel-right">
         <div class="panel-header">Properties</div>
-        <div class="panel-body">
-          <p class="panel-hint muted">Tool Chest · Markups (M2)</p>
+        <div class="panel-body panel-body-flush">
+          {#if store}
+            <PropertiesPanel {store} />
+          {:else}
+            <p class="panel-hint muted">Select a markup to edit its properties.</p>
+          {/if}
         </div>
       </aside>
     {/if}

@@ -2,28 +2,29 @@
 
 ## Current Status
 
-**M2 / S2 (markup authoring + undo/redo) in flight on branch `feat/s2a-markup-overlay`.**
-S2a (overlay display) + S2 groups **G1–G6 are code-complete and reviewed**, plus **viewport
-zoom-snap controls** and the **first real GUI run (2026-06-15/16) which fixed 6 latent M1
-render-loop bugs** (see that section below). NOT yet pushed/merged. **170 frontend + 57 Rust
-tests green, clippy 0, `cargo fmt` clean, `npm run check` 0 errors** (2 a11y warnings: pre-existing
-viewport `<div>`, plus `autofocus` on the text editor — both expected/non-blocking).
+**S2a + G1–G6 + zoom-snap SHIPPED to `main`** (PR #3, squash `7f57758`, 2026-06-16). **G7
+(properties panel) is now code-complete on branch `feat/g7-properties-panel`** (off main),
+**NOT yet shipped**. **227 frontend + 64 Rust tests green, clippy 0, `cargo fmt` clean,
+`npm run check` 0 errors** (2 a11y warnings: pre-existing viewport `<div>` + text-editor
+`autofocus` — expected/non-blocking).
 
-Authoring works end-to-end: tool palette → draw on the overlay → commit through the Svelte
-store → async per-op mirror to the Rust backend → undoable → persists on Save. **The GUI now
-genuinely renders** (upright, correct scale, smooth zoom, seamless tiles — it never did before).
+Authoring works end-to-end: tool palette → draw on the overlay → select/move/resize/delete →
+**edit properties in the right panel** → commit through the Svelte store → async per-op mirror
+to Rust → undoable → persists on Save. **The GUI genuinely renders** (upright, correct scale,
+smooth zoom, seamless tiles).
 
 ## Last Session
 **Date**: 2026-06-16 (cont.)
-**Summary**: Shipped **viewport zoom-snap controls** (`87f355c`: Fit-Width/Fit-Height/100%,
-buttons + ⌘/Ctrl 1/2/0) then drove **G6 select/move/resize/delete** to completion across 5
-committed increments via the subagent-driven flow: **G6.1** pure selection geometry
-(`markup-select.ts`, `c88785d`), **G6.2** batch-undo transaction frames (`296cd2b`), **G6.3**
-select/shift/marquee + chrome (`4cbe947`), **G6.4+G6.5** move/rect-resize/delete + keyboard
-(`861e44b`). One hiccup: a `/reload-plugins` mid-run made the G6.4+G6.5 agent's writes land late
-and interleave with a manual takeover — resolved by verifying the final tree (no dup defs, 170
-green) before committing. Prior: 6 M1 GUI render-loop fixes + GUI harness + mtime cache
-(2026-06-15/16), G5 Text/Callout, S2a-T3 + G1–G4 (2026-06-14).
+**Summary**: (1) Shipped zoom-snap + **G6 select/move/resize/delete** (5 increments
+`c88785d..861e44b`). (2) **Shipped S2a+G1–G6 to main** via `/sendit` (PR #3, `7f57758`) — the
+sendit *background agent* couldn't run (sub-agents are denied Bash this session; bypassPermissions
+on a sub-agent does NOT override a session-level denial), so the **main instance ran the pipeline
+inline**. The haiku review pass returned a **false-positive BLOCK** on the IPC camelCase keys
+(they are the verified-correct Tauri v2 convention, fixed in `71949c4`, guarded by `ipc.test.ts`);
+overridden with evidence. (3) Built **G7 properties panel** off fresh `main` across 4 commits:
+**G7.1** pure patch/indeterminate helpers (`markup-properties.ts`, `1a3a1e8`), **G7.2** Rust `/DA`
+base-14 font mapping (`59ee2a5`), **G7.3** `PropertiesPanel.svelte` + App wiring (`8754d18`).
+Prior: 6 M1 GUI render-loop fixes + GUI harness + mtime cache, G5 Text/Callout, G1–G4.
 
 ## Plan / Spec (read these first)
 | Doc | Path |
@@ -41,6 +42,7 @@ green) before committing. Prior: 6 M1 GUI render-loop fixes + GUI harness + mtim
 - **G5 text + callout**: `markup-tools.ts` (`TEXT_TOOLS`/`isTextTool`/`textBoxGeometry`(Rect)/`calloutGeometry`(Polyline leader)/`DEFAULT_TEXT_FONT`; `buildMarkup` gained optional `contents`); `markup-render.ts` `text`+`callout` SvgShape kinds (font-scaled by zoom, `dominant-baseline="hanging"`); **`annotation.rs` serde**: Text/Callout→`/Subtype FreeText`, Callout leader→`/CL`, font→`/DA`+`/RLFontFamily`+`/RLFontSize` (read back lossless), foreign FreeText `/CL`?Callout:Text; Viewport inline screen-positioned `<textarea>` editor (Text=1 click, Callout=2 clicks; commit on blur+Cmd/Ctrl+Enter, Esc cancels, empty/whitespace=no-op; editor split into `editor`+`editorText` to avoid bind-teardown crash). ToolPalette: Text/Callout buttons.
 - **Zoom-snap** (`87f355c`): `viewport.ts` pure `fitWidthZoom`/`fitHeightZoom`/`ACTUAL_SIZE_ZOOM` (§5: page pts vs css px); Viewport `applySnapZoom()` (reuses the placeholder/debounced-render path) + bottom-right buttons + ⌘/Ctrl 1/2/0.
 - **G6 select / move / resize / delete** (plan `docs/superpowers/plans/2026-06-16-g6-select-move-resize-delete.md`): new pure `markup-select.ts` (`boundsOf`/`hitTest`/`marqueeHits`/`translateGeometry`/`scaleGeometryToBounds`/`handleAnchors`/`resizeBounds`, §5 y-up); `markup-commands.ts` frame-based History (`pushBatch`, `undo/redo`→`MirrorOp[]`) so a multi-select edit = ONE undo while mirroring N ops; store `applyBatch`/`deleteSelected`/`selectedMarkups`; `markup-render.ts` `selectionChrome`; `markup-tools.ts` `bumpAudit`. Viewport Select tool: click/shift/marquee select, drag-move (all selected), rect resize (single Rect, 8 handles), Delete/Backspace/Esc; `dragPreview`-aware `pageShapes`+`selectionBounds` keep shapes+chrome glued during the gesture. **Deferred to a G6.1 follow-up:** resize of non-rect geometries (Polyline/Ink/Callout are move-only) and multi-select resize. **Known minor:** undoing a multi-delete re-appends in reverse order (z-order among the restored set flips; content correct).
+- **G7 properties panel** *(on `feat/g7-properties-panel`, plan `docs/superpowers/plans/2026-06-16-g7-properties-panel.md`)*: pure `markup-properties.ts` (`patchAppearance`/`patchFields`/`commonValue`/`FONT_FAMILIES`/`FONT_SIZES`, `1a3a1e8`); `annotation.rs` `base14_da_name()` maps `/DA` to the base-14 font for the chosen family — Times*→`TiRo`, Courier*→`Cour`, else `Helv` (`59ee2a5`; family still lossless via `/RLFontFamily`; `/DR` not needed for FreeText, flagged as a G9 external-viewer check); `PropertiesPanel.svelte` + App right-panel wiring (`8754d18`): draft mode edits `draftAppearance` (no undo), selection mode commits via `applyBatch` → ONE undo across all selected, indeterminate (`data-indeterminate`/"Mixed") controls, font picker, contents/subject/layer (selection only); loads its own identity (Viewport untouched). **NOT yet `/code-review`'d** — batches with G8's `/RLGroup` serde before the next ship.
 
 ## M1 GUI render-loop fixes (first real GUI run — 2026-06-15/16)
 The GUI render path had never run end-to-end (vitest mocks `invoke`; the §20 bench is headless),
@@ -71,10 +73,11 @@ WKWebView. Driving needs a Playwright + mock-IPC harness (proposed, not built). 
 `pgrep -fl` the dev process — its command line carries the full env (creds) and dumps them.
 
 ## Next Steps (remaining S2 groups — author detail JIT, then subagent-driven execute)
-1. **G7 — Properties panel** *(next)* (right column): bind selection `Appearance`/`contents`/`subject`/`layer`; with no selection edit `draftAppearance`; reuse the **`bumpAudit` helper already shipped in G6** (`markup-tools.ts`). **Carries the font picker** — and with it the `/DA` family fix (G5 pins `/DA` to `/Helv`; the exact family already round-trips via `/RLFontFamily`).
-2. **G8 — Grouping** (cut-line): add `group_id: Option<Uuid>` to Rust `Markup` + serde + `/RLGroup` key + TS; group/ungroup commands; group-aware select/move. *Touches annotation serde — `/code-review` before ship.*
-3. **G9 — Ship**: full-app GUI smoke — now MUST include a visual render/zoom/pan/page-nav pass + **a select/move/resize/delete + zoom-snap pass** (the 6 M1 bugs prove headless isn't enough) + save round-trip in Acrobat/Bluebeam; update handover/roadmap, `/code-review`, `/sendit`.
-4. **G6.1 follow-up** (optional, any time): resize handles for non-rect geometry (Polyline/Ink/Callout vertex/segment resize) + multi-select resize; fix multi-delete-undo z-order.
+1. **G8 — Grouping** *(next)* (cut-line): add `group_id: Option<Uuid>` to Rust `Markup` + serde + `/RLGroup` key + TS; group/ungroup commands (batch `UpdateCmd` via `applyBatch`); group-aware select/move (selecting one selects the group). *Touches annotation serde — fold into the pre-ship `/code-review` alongside G7's `/DA`.*
+2. **G9 — Ship**: full-app GUI smoke — MUST include a visual render/zoom/pan/page-nav pass + **a select/move/resize/delete + properties-edit + zoom-snap pass** (the 6 M1 bugs prove headless isn't enough) + save round-trip in Acrobat/Bluebeam (verify the `/DA` font families render externally); `/code-review` the serde diff (G7 `/DA` + G8 `/RLGroup`); update handover/roadmap; `/sendit`.
+3. **G6.1 follow-up** (optional, any time): resize handles for non-rect geometry (Polyline/Ink/Callout vertex/segment resize) + multi-select resize; fix multi-delete-undo z-order.
+
+**Current branch:** `feat/g7-properties-panel` (G7 done, unshipped). Ship G7+G8 together at G9, or `/sendit` G7 now if you want it on main before G8.
 
 ## UI Backlog
 - ~~**Viewport zoom-snap controls**~~ **DONE 2026-06-16** *(req. user; `obs:1hjcevau4cpcisu9koy4`)*: Fit-Width / Fit-Height / 100% as bottom-right toolbar buttons + key-commands **⌘/Ctrl 1 / 2 / 0**. Pure fit math in `lib/viewport.ts` (`fitWidthZoom`/`fitHeightZoom`/`ACTUAL_SIZE_ZOOM`, §5 — page pts vs css px, never the raster); `applySnapZoom()` in `Viewport.svelte` reuses the placeholder + debounced sharp-render path. 11 new tests (5 unit + 6 interaction asserting the live zoom-indicator %). Cmd+0 now routes through `actualSize()`.
