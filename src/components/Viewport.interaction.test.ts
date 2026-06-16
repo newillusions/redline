@@ -1532,3 +1532,181 @@ describe("Viewport G6 move/resize/delete", () => {
     expect(store.markups[0].audit.modified_at).not.toBe(origModifiedAt);
   });
 });
+
+// ---------------------------------------------------------------------------
+// G8 grouping interaction tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Coordinate setup (same as G6 tests):
+ *   Rect A: PDF { min:(40,90), max:(110,160) }, screen centre (75,75)
+ *   Rect B: PDF { min:(120,30), max:(180,80) }, screen centre (150,145)
+ *   Rect C: PDF { min:(5,5), max:(20,15) }, screen centre (12,191) — small rect, loner
+ */
+
+describe("Viewport G8 grouping", () => {
+  let ipc: ReturnType<typeof fakeIpc>;
+  let store: MarkupStore;
+
+  const DEFAULT_APP = {
+    color: "#e02424", line_weight: 2, opacity: 1, fill: null, line_style: "Solid" as const, font: null,
+  };
+
+  function seedRect3(s: MarkupStore, id: string, minX: number, minY: number, maxX: number, maxY: number) {
+    s.markups.push(buildMarkup({
+      markupType: "Rectangle", page: 0,
+      geometry: { Rect: { min: { x: minX, y: minY }, max: { x: maxX, y: maxY } } },
+      appearance: DEFAULT_APP, identity: FAKE_IDENTITY, now: "2026-01-01T00:00:00Z", id,
+    }));
+  }
+
+  beforeEach(() => {
+    vi.mocked(ipcMocks.getPageSize).mockResolvedValue(FAKE_PAGE_SIZE);
+    vi.mocked(ipcMocks.renderTile).mockResolvedValue({
+      doc_id: "d1", page_index: 0, tile_x: 0, tile_y: 0,
+      width_px: 512, height_px: 512, zoom: 1, dpr: 1,
+      png_base64: "", render_ms: 1,
+    });
+    vi.mocked(ipcMocks.processRssMb).mockResolvedValue(0);
+    vi.mocked(ipcMocks.getUserIdentity).mockResolvedValue(FAKE_IDENTITY);
+
+    ipc = fakeIpc();
+    store = new MarkupStore("d1", ipc);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // -------------------------------------------------------------------------
+  // G8-1: Cmd+G groups selected markups (≥2) into one undo frame
+  // -------------------------------------------------------------------------
+  it("G8-1: Cmd+G groups 2 selected markups — both get same non-null group_id, loner stays null, one undo frame", async () => {
+    const { overlay } = await mountViewport(store);
+    seedRect3(store, "a", 40, 90, 110, 160);
+    seedRect3(store, "b", 120, 30, 180, 80);
+    seedRect3(store, "c", 5, 5, 20, 15);
+
+    store.activeTool = "select";
+    await tick();
+
+    // Select a and b via marquee (they are both within (5,5)-(195,195) drag but c is very small bottom-left)
+    // Easier: directly set selectedIds for a and b.
+    store.selectedIds = new Set(["a", "b"]);
+
+    // Dispatch Cmd+G.
+    fireEvent.keyDown(window, { key: "g", metaKey: true });
+    await tick();
+
+    const mA = store.markups.find((m) => m.id === "a")!;
+    const mB = store.markups.find((m) => m.id === "b")!;
+    const mC = store.markups.find((m) => m.id === "c")!;
+
+    expect(mA.group_id).not.toBeNull();
+    expect(mB.group_id).not.toBeNull();
+    expect(mA.group_id).toBe(mB.group_id);
+    expect(mC.group_id).toBeNull();
+
+    // One undo frame reverts both group_ids to null.
+    store.undo();
+    const mA2 = store.markups.find((m) => m.id === "a")!;
+    const mB2 = store.markups.find((m) => m.id === "b")!;
+    expect(mA2.group_id).toBeNull();
+    expect(mB2.group_id).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // G8-2: Group-aware select — clicking one group member selects both
+  // -------------------------------------------------------------------------
+  it("G8-2: clicking one member of a grouped pair selects both members", async () => {
+    const { overlay } = await mountViewport(store);
+    seedRect3(store, "a", 40, 90, 110, 160);   // screen centre (75,75)
+    seedRect3(store, "b", 120, 30, 180, 80);   // screen centre (150,145)
+
+    // Pre-group them directly (simulates state after Cmd+G).
+    const GID = "gggg0000-0000-0000-0000-000000000001";
+    store.markups[0] = { ...store.markups[0], group_id: GID };
+    store.markups[1] = { ...store.markups[1], group_id: GID };
+
+    store.activeTool = "select";
+    await tick();
+
+    // Click rect A at screen (75, 75).
+    ptr(overlay, "pointerdown", 75, 75);
+    ptr(overlay, "pointerup", 75, 75);
+    await tick();
+
+    // Both a and b should be selected.
+    expect(store.selectedIds.has("a")).toBe(true);
+    expect(store.selectedIds.has("b")).toBe(true);
+    expect(store.selectedIds.size).toBe(2);
+  });
+
+  // -------------------------------------------------------------------------
+  // G8-3: Group move glued — selecting via group click and moving translates both
+  // -------------------------------------------------------------------------
+  it("G8-3: move via group-aware select translates both markups by the same delta", async () => {
+    const { overlay } = await mountViewport(store);
+    seedRect3(store, "a", 40, 90, 110, 160);   // screen centre (75,75)
+    seedRect3(store, "b", 120, 30, 180, 80);   // screen centre (150,145)
+
+    const GID = "gggg0000-0000-0000-0000-000000000002";
+    store.markups[0] = { ...store.markups[0], group_id: GID };
+    store.markups[1] = { ...store.markups[1], group_id: GID };
+
+    store.activeTool = "select";
+    await tick();
+
+    // Click on A (selects both via group expand), then drag.
+    // Screen (75,75) -> PDF(75,125); screen (95,65) -> PDF(95,135). dx=+20, dy=+10.
+    ptr(overlay, "pointerdown", 75, 75);
+    ptr(overlay, "pointermove", 95, 65);
+    ptr(overlay, "pointerup", 95, 65);
+    await tick();
+
+    const mA = store.markups.find((m) => m.id === "a")!;
+    const mB = store.markups.find((m) => m.id === "b")!;
+
+    const rA = (mA.geometry as { Rect: { min: { x: number; y: number }; max: { x: number; y: number } } }).Rect;
+    const rB = (mB.geometry as { Rect: { min: { x: number; y: number }; max: { x: number; y: number } } }).Rect;
+
+    // Both translated by (+20, +10) PDF delta.
+    expect(rA.min.x).toBeCloseTo(60);   // 40+20
+    expect(rA.min.y).toBeCloseTo(100);  // 90+10
+    expect(rB.min.x).toBeCloseTo(140);  // 120+20
+    expect(rB.min.y).toBeCloseTo(40);   // 30+10
+  });
+
+  // -------------------------------------------------------------------------
+  // G8-4: Cmd+Shift+G ungroups — group_id back to null, one undo frame
+  // -------------------------------------------------------------------------
+  it("G8-4: Cmd+Shift+G ungroups selected markups — group_id set to null, one undo frame", async () => {
+    const { overlay } = await mountViewport(store);
+    seedRect3(store, "a", 40, 90, 110, 160);
+    seedRect3(store, "b", 120, 30, 180, 80);
+
+    const GID = "gggg0000-0000-0000-0000-000000000003";
+    store.markups[0] = { ...store.markups[0], group_id: GID };
+    store.markups[1] = { ...store.markups[1], group_id: GID };
+
+    store.activeTool = "select";
+    store.selectedIds = new Set(["a", "b"]);
+    await tick();
+
+    // Dispatch Cmd+Shift+G.
+    fireEvent.keyDown(window, { key: "G", metaKey: true, shiftKey: true });
+    await tick();
+
+    const mA = store.markups.find((m) => m.id === "a")!;
+    const mB = store.markups.find((m) => m.id === "b")!;
+    expect(mA.group_id).toBeNull();
+    expect(mB.group_id).toBeNull();
+
+    // One undo frame reverts both back to having the group_id.
+    store.undo();
+    const mA2 = store.markups.find((m) => m.id === "a")!;
+    const mB2 = store.markups.find((m) => m.id === "b")!;
+    expect(mA2.group_id).toBe(GID);
+    expect(mB2.group_id).toBe(GID);
+  });
+});

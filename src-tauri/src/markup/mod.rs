@@ -208,6 +208,11 @@ pub struct Markup {
     pub layer: Option<String>,
     /// Note text (→ `/Contents`).
     pub contents: Option<String>,
+    /// Flat group membership (G8). All markups sharing the same non-None `group_id`
+    /// move together as one unit. Serialised to `/RLGroup` in the annotation dict.
+    /// `#[serde(default)]` ensures pre-G8 JSON (no field) deserialises to `None`.
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
     pub audit: Audit,
     pub workflow: Workflow,
     /// Present iff `markup_type.is_measurement()`.
@@ -235,6 +240,7 @@ impl Markup {
             subject: None,
             layer: None,
             contents: None,
+            group_id: None,
             audit: Audit {
                 created_by: created_by.clone(),
                 created_at: now,
@@ -343,6 +349,55 @@ mod tests {
         let back: Markup = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(m, back);
     }
+
+    // --- G8: group_id field tests ---
+
+    #[test]
+    fn new_markup_has_no_group() {
+        let m = sample();
+        assert!(
+            m.group_id.is_none(),
+            "fresh markup must have group_id == None"
+        );
+    }
+
+    #[test]
+    fn serde_round_trip_preserves_group_id() {
+        let mut m = sample();
+        let gid = Uuid::new_v4();
+        m.group_id = Some(gid);
+
+        let json = serde_json::to_string(&m).expect("serialize");
+        let back: Markup = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back.group_id,
+            Some(gid),
+            "group_id must survive JSON round-trip"
+        );
+    }
+
+    #[test]
+    fn serde_default_group_id_when_absent() {
+        // Serialize a markup, remove the group_id key, then deserialize.
+        // This confirms #[serde(default)] maps the absent key to None.
+        let m = sample();
+        let json = serde_json::to_string(&m).expect("serialize");
+        // Strip the group_id key from the JSON object.
+        let stripped = if json.contains("\"group_id\":null,") {
+            json.replace("\"group_id\":null,", "")
+        } else if json.contains(",\"group_id\":null") {
+            json.replace(",\"group_id\":null", "")
+        } else {
+            json.replace("\"group_id\":null", "")
+        };
+        let back: Markup = serde_json::from_str(&stripped).expect("deserialize stripped");
+        assert!(
+            back.group_id.is_none(),
+            "absent group_id field must deserialize to None"
+        );
+    }
+
+    // --- end G8 tests ---
 
     #[test]
     fn measurement_markup_carries_payload() {

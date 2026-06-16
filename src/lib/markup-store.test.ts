@@ -7,7 +7,7 @@ function mk(id: string, contents: string | null = null): Markup {
     id, markup_type: "Rectangle", page: 0,
     geometry: { Rect: { min: { x: 0, y: 0 }, max: { x: 10, y: 10 } } },
     appearance: { color: "#f00", line_weight: 1, opacity: 1, fill: null, line_style: "Solid", font: null },
-    subject: null, layer: null, contents,
+    subject: null, layer: null, contents, group_id: null,
     audit: { created_by: { user_id: "u", display_name: "U" }, created_at: "", modified_by: { user_id: "u", display_name: "U" }, modified_at: "", revision: 0, origin: "Desktop" },
     workflow: { status: "None", assignee: null, thread: [] }, measurement: null,
   };

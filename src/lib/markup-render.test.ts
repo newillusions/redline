@@ -20,7 +20,7 @@ function mk(geometry: MarkupGeometry, markup_type: MarkupType, ap: Partial<Appea
       color: "#ff0000", line_weight: 2, opacity: 1, fill: null,
       line_style: "Solid", font: null, ...ap,
     },
-    subject: null, layer: null, contents: null,
+    subject: null, layer: null, contents: null, group_id: null,
     audit: {
       created_by: { user_id: "u", display_name: "U" }, created_at: "",
       modified_by: { user_id: "u", display_name: "U" }, modified_at: "",

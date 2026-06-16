@@ -8,6 +8,7 @@ import {
   FONT_SIZES,
   patchAppearance,
   patchFields,
+  patchGroup,
   commonValue,
 } from "./markup-properties";
 import type { Appearance, UserRef, Markup } from "./ipc";
@@ -48,6 +49,7 @@ function mkMarkup(id: string, overrides: Partial<Markup> = {}): Markup {
     subject: null,
     layer: null,
     contents: null,
+    group_id: null,
     audit: { ...BASE_AUDIT },
     workflow: { status: "None", assignee: null, thread: [] },
     measurement: null,
@@ -247,6 +249,36 @@ describe("patchFields", () => {
   it("returns a new object reference", () => {
     const result = patchFields(m, { contents: "y" }, OTHER, LATER);
     expect(result).not.toBe(m);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// patchGroup
+// ---------------------------------------------------------------------------
+describe("patchGroup", () => {
+  const m = mkMarkup("g1");
+
+  it("sets group_id to the provided value and bumps audit", () => {
+    const gid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const result = patchGroup(m, gid, OTHER, LATER);
+    expect(result.group_id).toBe(gid);
+    expect(result.audit.revision).toBe(BASE_AUDIT.revision + 1);
+    expect(result.audit.modified_by).toEqual(OTHER);
+    expect(result.audit.modified_at).toBe(LATER);
+  });
+
+  it("clears group_id to null when passed null", () => {
+    const grouped = mkMarkup("g2", { group_id: "some-group-id" });
+    const result = patchGroup(grouped, null, OTHER, LATER);
+    expect(result.group_id).toBeNull();
+    expect(result.audit.revision).toBe(BASE_AUDIT.revision + 1);
+  });
+
+  it("does not mutate the input markup", () => {
+    const snapshot = JSON.parse(JSON.stringify(m)) as Markup;
+    patchGroup(m, "new-group", OTHER, LATER);
+    expect(m.group_id).toBe(snapshot.group_id);
+    expect(m.audit.revision).toBe(snapshot.audit.revision);
   });
 });
 

@@ -161,6 +161,8 @@ export interface Markup {
   subject: string | null;
   layer: string | null;
   contents: string | null;
+  /** Flat group membership (G8). Markups sharing the same non-null group_id move together. */
+  group_id: string | null;
   audit: MarkupAudit;
   workflow: MarkupWorkflow;
   measurement: unknown | null;

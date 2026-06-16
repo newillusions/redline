@@ -50,6 +50,14 @@ export function patchFields(
 }
 
 /**
+ * Return a clone of `m` with `group_id` set to `groupId` and the audit trail bumped.
+ * Pass `null` to ungroup. Pure; no mutation of the input.
+ */
+export function patchGroup(m: Markup, groupId: string | null, by: UserRef, now: string): Markup {
+  return bumpAudit({ ...m, group_id: groupId }, by, now);
+}
+
+/**
  * Return the shared projected value across all `markups` when every element
  * projects the same value under strict equality (===), or `undefined` when the
  * list is empty or the values differ.

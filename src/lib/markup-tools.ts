@@ -121,6 +121,7 @@ export function buildMarkup(opts: {
     subject: null,
     layer: null,
     contents: opts.contents ?? null,
+    group_id: null,
     audit: {
       created_by: opts.identity,
       created_at: opts.now,

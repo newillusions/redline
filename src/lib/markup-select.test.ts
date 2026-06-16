@@ -12,6 +12,7 @@ import {
   isRectResizable,
   handleAnchors,
   resizeBounds,
+  expandSelectionToGroups,
   HANDLE_IDS,
 } from "./markup-select";
 import type { Bounds, HandleId } from "./markup-select";
@@ -30,7 +31,7 @@ const AUDIT = {
 const WORKFLOW = { status: "None" as const, assignee: null, thread: [] };
 
 function mkMarkup(id: string, geometry: Markup["geometry"]): Markup {
-  return { id, markup_type: "Rectangle", page: 1, geometry, appearance: AP, subject: null, layer: null, contents: null, audit: AUDIT, workflow: WORKFLOW, measurement: null };
+  return { id, markup_type: "Rectangle", page: 1, geometry, appearance: AP, subject: null, layer: null, contents: null, group_id: null, audit: AUDIT, workflow: WORKFLOW, measurement: null };
 }
 
 const rectMarkup = mkMarkup("r1", { Rect: { min: { x: 10, y: 20 }, max: { x: 60, y: 80 } } });
@@ -343,5 +344,52 @@ describe("resizeBounds", () => {
     // n handle controls maxY; drag below minY(0): clamps to minY + minPts = 0 + 10 = 10
     const r = resizeBounds(b, "n", { x: 0, y: -50 }, min);
     expect(r.maxY).toBe(min); // clamped: minY(0) + minPts(10)
+  });
+});
+
+// ---------------------------------------------------------------------------
+// expandSelectionToGroups
+// ---------------------------------------------------------------------------
+describe("expandSelectionToGroups", () => {
+  // 3-member group (gid "g1") + one loner.
+  const GID = "aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa";
+  const m1 = { ...mkMarkup("m1", { Rect: { min: { x: 0, y: 0 }, max: { x: 10, y: 10 } } }), group_id: GID };
+  const m2 = { ...mkMarkup("m2", { Rect: { min: { x: 20, y: 0 }, max: { x: 30, y: 10 } } }), group_id: GID };
+  const m3 = { ...mkMarkup("m3", { Rect: { min: { x: 40, y: 0 }, max: { x: 50, y: 10 } } }), group_id: GID };
+  const loner = mkMarkup("loner", { Rect: { min: { x: 100, y: 0 }, max: { x: 110, y: 10 } } });
+  const allMarkups = [m1, m2, m3, loner];
+
+  it("selecting one member of a 3-member group returns all 3 ids", () => {
+    const result = expandSelectionToGroups(allMarkups, new Set(["m1"]));
+    expect(result.has("m1")).toBe(true);
+    expect(result.has("m2")).toBe(true);
+    expect(result.has("m3")).toBe(true);
+    expect(result.size).toBe(3);
+  });
+
+  it("selecting an ungrouped markup returns just that id", () => {
+    const result = expandSelectionToGroups(allMarkups, new Set(["loner"]));
+    expect(result.has("loner")).toBe(true);
+    expect(result.size).toBe(1);
+  });
+
+  it("mixed selection (one grouped + one ungrouped) returns the full group plus the loner", () => {
+    const result = expandSelectionToGroups(allMarkups, new Set(["m2", "loner"]));
+    expect(result.has("m1")).toBe(true);
+    expect(result.has("m2")).toBe(true);
+    expect(result.has("m3")).toBe(true);
+    expect(result.has("loner")).toBe(true);
+    expect(result.size).toBe(4);
+  });
+
+  it("empty input returns an empty set", () => {
+    const result = expandSelectionToGroups(allMarkups, new Set());
+    expect(result.size).toBe(0);
+  });
+
+  it("does not mutate the passed-in set", () => {
+    const original = new Set(["m1"]);
+    expandSelectionToGroups(allMarkups, original);
+    expect(original.size).toBe(1); // unchanged
   });
 });

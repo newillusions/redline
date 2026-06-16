@@ -27,6 +27,41 @@ export type HandleId = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
 export const HANDLE_IDS: readonly HandleId[] = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
 
 // ---------------------------------------------------------------------------
+// expandSelectionToGroups
+// ---------------------------------------------------------------------------
+
+/**
+ * Given a set of selected markup ids, expand to include ALL markups that share
+ * a non-null `group_id` with any selected member. Markups with `group_id == null`
+ * contribute only themselves. Returns a new Set; never mutates `ids`.
+ */
+export function expandSelectionToGroups(markups: Markup[], ids: Set<string>): Set<string> {
+  if (ids.size === 0) return new Set();
+
+  // Collect group ids from the selected markups.
+  const groupIds = new Set<string>();
+  for (const m of markups) {
+    if (ids.has(m.id) && m.group_id !== null) {
+      groupIds.add(m.group_id);
+    }
+  }
+
+  if (groupIds.size === 0) {
+    // No groups involved — return a copy of the original set.
+    return new Set(ids);
+  }
+
+  // Expand: include original ids plus all markups sharing any of those group ids.
+  const expanded = new Set(ids);
+  for (const m of markups) {
+    if (m.group_id !== null && groupIds.has(m.group_id)) {
+      expanded.add(m.id);
+    }
+  }
+  return expanded;
+}
+
+// ---------------------------------------------------------------------------
 // boundsOf
 // ---------------------------------------------------------------------------
 

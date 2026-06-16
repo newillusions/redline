@@ -412,6 +412,9 @@ impl Markup {
         if let Some(layer) = &self.layer {
             d.set("RLLayer", Object::string_literal(layer.clone()));
         }
+        if let Some(gid) = self.group_id {
+            d.set("RLGroup", Object::string_literal(gid.to_string()));
+        }
         d
     }
 
@@ -510,6 +513,7 @@ impl Markup {
             subject: get_string(d, b"Subj"),
             layer: get_string(d, b"RLLayer"),
             contents: get_string(d, b"Contents"),
+            group_id: get_string(d, b"RLGroup").and_then(|s| uuid::Uuid::parse_str(&s).ok()),
             audit: Audit {
                 created_by,
                 created_at,
@@ -639,6 +643,7 @@ mod tests {
         assert_eq!(back.audit.created_at, m.audit.created_at);
         assert_eq!(back.audit.modified_at, m.audit.modified_at);
         assert_eq!(back.audit.origin, m.audit.origin);
+        assert_eq!(back.group_id, m.group_id, "group_id");
     }
 
     #[test]
@@ -915,4 +920,73 @@ mod tests {
             MarkupType::Callout
         );
     }
+
+    // --- G8: /RLGroup round-trip tests ---
+
+    #[test]
+    fn grouped_markup_rl_group_round_trips() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 10.0, y: 20.0 },
+            max: PdfPoint { x: 60.0, y: 70.0 },
+        };
+        let mut m = fixture(g, MarkupType::Rectangle);
+        let gid = uuid::Uuid::new_v4();
+        m.group_id = Some(gid);
+
+        let d = m.to_annotation_dict();
+
+        // /RLGroup must be present and equal to the UUID string.
+        let rl_group =
+            get_string(&d, b"RLGroup").expect("/RLGroup must be present for grouped markup");
+        assert_eq!(
+            rl_group,
+            gid.to_string(),
+            "/RLGroup must equal the group UUID"
+        );
+
+        // Full annotation round-trip via assert_roundtrip (now checks group_id).
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn ungrouped_markup_omits_rl_group() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 10.0, y: 20.0 },
+            max: PdfPoint { x: 60.0, y: 70.0 },
+        };
+        let m = fixture(g, MarkupType::Rectangle);
+        assert!(m.group_id.is_none(), "fixture must start ungrouped");
+
+        let d = m.to_annotation_dict();
+        assert!(
+            !d.has(b"RLGroup"),
+            "/RLGroup must be absent for ungrouped markup"
+        );
+
+        let back = Markup::from_annotation_dict(&d);
+        assert!(
+            back.group_id.is_none(),
+            "round-tripped ungrouped markup must have group_id == None"
+        );
+    }
+
+    #[test]
+    fn foreign_annotation_without_rl_group_is_ungrouped() {
+        // A bare foreign dict with only standard keys — no /RLGroup.
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("Square"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(5.0), real(6.0), real(15.0), real(26.0)]),
+        );
+        d.set("Contents", Object::string_literal("imported"));
+
+        let m = Markup::from_annotation_dict(&d);
+        assert!(
+            m.group_id.is_none(),
+            "foreign annotation without /RLGroup must import with group_id == None"
+        );
+    }
+
+    // --- end G8 tests ---
 }

@@ -40,6 +40,7 @@
   import {
     hitTest, marqueeHits, boundsOf, isRectResizable,
     handleAnchors, resizeBounds, translateGeometry, scaleGeometryToBounds,
+    expandSelectionToGroups,
     type Bounds, type HandleId,
   } from "$lib/markup-select";
   import {
@@ -48,6 +49,7 @@
     isMultiClickComplete, type MultiClickTool,
     isTextTool, textBoxGeometry, calloutGeometry, DEFAULT_TEXT_FONT,
   } from "$lib/markup-tools";
+  import { patchGroup } from "$lib/markup-properties";
 
   // ---------------------------------------------------------------------------
   // Props
@@ -478,6 +480,29 @@
       store.deleteSelected();
       return;
     }
+    // Cmd/Ctrl+G: group selected markups (≥2, select tool, identity loaded).
+    if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key === "g" && isSelectTool() && identity) {
+      e.preventDefault();
+      const targets = store.selectedMarkups;
+      if (targets.length >= 2) {
+        const gid = crypto.randomUUID();
+        const now = new Date().toISOString();
+        const pairs = targets.map((m) => ({ before: m, after: patchGroup(m, gid, identity!, now) }));
+        store.applyBatch(pairs);
+      }
+      return;
+    }
+    // Cmd/Ctrl+Shift+G: ungroup selected markups that belong to a group.
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "g" || e.key === "G") && isSelectTool() && identity) {
+      e.preventDefault();
+      const targets = store.selectedMarkups.filter((m) => m.group_id !== null);
+      if (targets.length > 0) {
+        const now = new Date().toISOString();
+        const pairs = targets.map((m) => ({ before: m, after: patchGroup(m, null, identity!, now) }));
+        store.applyBatch(pairs);
+      }
+      return;
+    }
     if (e.key === "Enter") {
       finishMultiClick();
     }
@@ -774,13 +799,19 @@
       const hit = hitTest(pageMarkups, p, SELECT_GRAB_PX / zoom);
       if (hit !== null) {
         if (e.shiftKey) {
-          // Shift-click toggles membership; no move.
+          // Shift-click toggles the whole group; no move.
+          const grp = expandSelectionToGroups(store.markups, new Set([hit]));
           const next = new Set(store.selectedIds);
-          if (next.has(hit)) next.delete(hit); else next.add(hit);
+          if (next.has(hit)) {
+            for (const id of grp) next.delete(id);
+          } else {
+            for (const id of grp) next.add(id);
+          }
           store.selectedIds = next;
         } else {
-          // Select (if not already) then start a move of the whole selection.
-          if (!store.selectedIds.has(hit)) store.selectedIds = new Set([hit]);
+          // Select the hit markup's whole group (if not already), then start a move.
+          const grp = expandSelectionToGroups(store.markups, new Set([hit]));
+          if (!store.selectedIds.has(hit)) store.selectedIds = grp;
           gesture = "move";
           moveStartPdf = p;
           moveOrigins = store.selectedMarkups.filter((m) => m.page === pageIndex);
