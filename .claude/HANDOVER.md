@@ -2,29 +2,45 @@
 
 ## Current Status
 
-**S2a + G1–G6 + zoom-snap SHIPPED to `main`** (PR #3, squash `7f57758`, 2026-06-16). **G7
-(properties panel) is now code-complete on branch `feat/g7-properties-panel`** (off main),
-**NOT yet shipped**. **227 frontend + 64 Rust tests green, clippy 0, `cargo fmt` clean,
-`npm run check` 0 errors** (2 a11y warnings: pre-existing viewport `<div>` + text-editor
-`autofocus` — expected/non-blocking).
+**S2 markup-authoring milestone is FUNCTIONALLY COMPLETE — G1–G9 done.** Merge train on `main`:
+`7f57758` (S2a+G1–G6+zoom-snap, PR #3) → `b29d0d9` (G7 properties panel, PR #4) →
+`cf6e2f7` (G8 grouping, PR #5) → **G9 ship gate** (`feat/g9-ship`, shipping). **239 frontend +
+71 Rust tests green, clippy 0, `cargo fmt` clean, `npm run check` 0 errors** (2 expected a11y
+warnings). **One human step remains: open the saved PDF in Acrobat/Bluebeam (see below).**
+
+**G9 caught + fixed a real latent bug** (`as_f32`→`as_float`, see Key Gotchas): lopdf serialises
+integer-valued reals (`12.0`, `3.0`, integer coordinates) without a decimal point, so they reload
+as `Object::Integer` and `as_f32()` dropped them — silently losing font size, line weight, opacity,
+colour channels, **and geometry coordinates** on a real file save→reopen. Fixed at all 5 read sites
+in `markup/annotation.rs`; guarded by a new save-round-trip test. The dict-level tests missed it
+(they never hit lopdf text serialisation); the old file tests only asserted `id()`.
 
 Authoring works end-to-end: tool palette → draw on the overlay → select/move/resize/delete →
-**edit properties in the right panel** → commit through the Svelte store → async per-op mirror
-to Rust → undoable → persists on Save. **The GUI genuinely renders** (upright, correct scale,
-smooth zoom, seamless tiles).
+**edit properties in the right panel** → **group/ungroup (Cmd/Ctrl+G · Cmd/Ctrl+Shift+G)** →
+commit through the Svelte store → async per-op mirror to Rust → undoable → persists on Save.
+**The GUI genuinely renders** (upright, correct scale, smooth zoom, seamless tiles — re-verified
+this session via the Playwright `gui:harness`: render/zoom-to-172%/pan/page-switch all clean).
+
+### G9 — remaining human step (the one thing I can't run)
+Open **`/tmp/redline-g9-sample.pdf`** (regenerate any time:
+`cd src-tauri && cargo test g9_emit_sample -- --ignored --nocapture`) in **Acrobat AND Bluebeam**
+and confirm: (a) the Times-fonted text note renders in the right typeface (the `/DA` base-14 mapping),
+(b) the grouped rectangle+ellipse and the note all appear, (c) no error about the private `/RLGroup`
+key (foreign viewers must ignore it gracefully). Byte-level evidence is already automated (the
+round-trip test re-parses the saved PDF and asserts `/DA …/TiRo… Tf` + `/RLGroup` objects are
+present); this step is the visual confirmation only.
 
 ## Last Session
 **Date**: 2026-06-16 (cont.)
-**Summary**: (1) Shipped zoom-snap + **G6 select/move/resize/delete** (5 increments
-`c88785d..861e44b`). (2) **Shipped S2a+G1–G6 to main** via `/sendit` (PR #3, `7f57758`) — the
-sendit *background agent* couldn't run (sub-agents are denied Bash this session; bypassPermissions
-on a sub-agent does NOT override a session-level denial), so the **main instance ran the pipeline
-inline**. The haiku review pass returned a **false-positive BLOCK** on the IPC camelCase keys
-(they are the verified-correct Tauri v2 convention, fixed in `71949c4`, guarded by `ipc.test.ts`);
-overridden with evidence. (3) Built **G7 properties panel** off fresh `main` across 4 commits:
-**G7.1** pure patch/indeterminate helpers (`markup-properties.ts`, `1a3a1e8`), **G7.2** Rust `/DA`
-base-14 font mapping (`59ee2a5`), **G7.3** `PropertiesPanel.svelte` + App wiring (`8754d18`).
-Prior: 6 M1 GUI render-loop fixes + GUI harness + mtime cache, G5 Text/Callout, G1–G4.
+**Summary**: (1) **Shipped G7 properties panel to main** via inline `/sendit` (PR #4, `b29d0d9`) —
+`/code-review` high APPROVE on the `/DA` serde diff first, gate green, squash-merged.
+(2) Built + **shipped G8 grouping to main** (PR #5, `cf6e2f7`): authored plan
+`docs/superpowers/plans/2026-06-16-g8-grouping.md`, dispatched a sonnet implementer subagent
+(TDD T1–T7), then **re-verified the diff + full gate inline** before shipping. G8 = flat
+`group_id: Option<Uuid>` + `/RLGroup` serde + pure `patchGroup`/`expandSelectionToGroups` +
+Viewport group-aware select & `Cmd/Ctrl+G`/`Cmd/Ctrl+Shift+G`. (3) Both ships ran **inline** —
+the `/sendit` *background agent* is still Bash-denied this session (`agent_feedback:sol37b2up0sqwsz9no58`).
+Prior session: S2a+G1–G6+zoom-snap (PR #3), 6 M1 GUI render-loop fixes, GUI harness, mtime cache.
 
 ## Plan / Spec (read these first)
 | Doc | Path |
@@ -72,12 +88,22 @@ headless timing missed all six. (2) Observability: I can SEE the live app via
 WKWebView. Driving needs a Playwright + mock-IPC harness (proposed, not built). (3) Do NOT
 `pgrep -fl` the dev process — its command line carries the full env (creds) and dumps them.
 
-## Next Steps (remaining S2 groups — author detail JIT, then subagent-driven execute)
-1. **G8 — Grouping** *(next)* (cut-line): add `group_id: Option<Uuid>` to Rust `Markup` + serde + `/RLGroup` key + TS; group/ungroup commands (batch `UpdateCmd` via `applyBatch`); group-aware select/move (selecting one selects the group). *Touches annotation serde — fold into the pre-ship `/code-review` alongside G7's `/DA`.*
-2. **G9 — Ship**: full-app GUI smoke — MUST include a visual render/zoom/pan/page-nav pass + **a select/move/resize/delete + properties-edit + zoom-snap pass** (the 6 M1 bugs prove headless isn't enough) + save round-trip in Acrobat/Bluebeam (verify the `/DA` font families render externally); `/code-review` the serde diff (G7 `/DA` + G8 `/RLGroup`); update handover/roadmap; `/sendit`.
-3. **G6.1 follow-up** (optional, any time): resize handles for non-rect geometry (Polyline/Ink/Callout vertex/segment resize) + multi-select resize; fix multi-delete-undo z-order.
+## Next Steps (S2 complete → M3 next)
+1. **Acrobat/Bluebeam visual check** *(human, blocking the "done" claim only — code already shipped)*:
+   see "G9 — remaining human step" above. If a foreign viewer mis-renders the `/DA` font, the
+   fallback is a `/DR` resource dict for FreeText (flagged in `annotation.rs` G7 comment).
+2. **M3 — Takeoff** *(next milestone per build order)*: calibration, measurement, quantity calc
+   in f64 user space (spec §7). The `Measurement` payload + measurement `MarkupType`s already exist
+   in the model (reserved from day one); M3 builds the calibration UI + measurement tools + quantity
+   table on top. Author the M3 plan JIT, then subagent-driven execute (the method that worked for S2).
+3. **G6.1 follow-up** (optional, any time): resize handles for non-rect geometry (Polyline/Ink/Callout
+   vertex/segment resize) + multi-select resize; fix multi-delete-undo z-order.
+4. **§20 definitive floor-machine run** (16 GB, Windows + macOS) — still OWED, the formal M1 Go/No-Go
+   (Track B, blocked on hardware). Windows build/bundle still unverified on real hardware.
 
-**Current branch:** `feat/g7-properties-panel` (G7 done, unshipped). Ship G7+G8 together at G9, or `/sendit` G7 now if you want it on main before G8.
+**Current branch:** `feat/g9-ship` (shipping). After merge, `main` carries all of S2 (G1–G9).
+The untracked stray `docs/superpowers/plans/2026-06-13-s2a-markup-overlay-display.md` remains
+deliberately out of every ship.
 
 ## UI Backlog
 - ~~**Viewport zoom-snap controls**~~ **DONE 2026-06-16** *(req. user; `obs:1hjcevau4cpcisu9koy4`)*: Fit-Width / Fit-Height / 100% as bottom-right toolbar buttons + key-commands **⌘/Ctrl 1 / 2 / 0**. Pure fit math in `lib/viewport.ts` (`fitWidthZoom`/`fitHeightZoom`/`ACTUAL_SIZE_ZOOM`, §5 — page pts vs css px, never the raster); `applySnapZoom()` in `Viewport.svelte` reuses the placeholder + debounced sharp-render path. 11 new tests (5 unit + 6 interaction asserting the live zoom-indicator %). Cmd+0 now routes through `actualSize()`.
@@ -99,6 +125,11 @@ Subagent-driven development at **group granularity**: author the group's detaile
 - Tests run via `npm run test` (vitest, mixed node + jsdom envs); Rust tests still `--test-threads=1`.
 - Type guards (`isDrawTool`/`isMultiClickTool`/`isInkTool`) narrow `ToolKind`→`MarkupType` so no unsafe casts; `as MultiClickTool` only appears post-guard.
 - §5 precision invariant: overlay maps PDF user space → screen every render (never reads raster); the glued-on-zoom interaction test guards against drift.
+- **lopdf reals: read with `as_float()`, NEVER `as_f32()`.** An integer-valued `Object::Real`
+  (`12.0`, `3.0`, integer coords) serialises without a decimal point and reloads as `Object::Integer`;
+  `as_f32()` is Real-only and silently drops it. Bit geometry/font/weight/colour on file save→reopen
+  until G9 (`obs` "Redline lopdf integer-valued Real lost..."). Dict-level round-trip tests do NOT
+  catch this — only a real `save_with_markups`→`load_markups_from` file cycle does.
 - PDFium 2 GiB limit, global C state (serial tests), `RenderEngine` drop order, page-handle LRU — unchanged from M1.
 - §20 definitive floor-machine run (16 GB, Windows + macOS) still OWED (Track B, blocked on hardware).
 

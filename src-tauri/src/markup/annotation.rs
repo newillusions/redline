@@ -55,7 +55,7 @@ fn get_name(d: &Dictionary, key: &[u8]) -> Option<String> {
 fn get_reals(d: &Dictionary, key: &[u8]) -> Option<Vec<f64>> {
     let arr = d.get(key).ok()?.as_array().ok()?;
     arr.iter()
-        .map(|o| o.as_f32().ok().map(|f| f as f64))
+        .map(|o| o.as_float().ok().map(|f| f as f64))
         .collect()
 }
 
@@ -247,7 +247,7 @@ fn geometry_from_dict(d: &Dictionary) -> MarkupGeometry {
                         .map(|s| {
                             let r: Vec<f64> = s
                                 .iter()
-                                .filter_map(|o| o.as_f32().ok().map(|f| f as f64))
+                                .filter_map(|o| o.as_float().ok().map(|f| f as f64))
                                 .collect();
                             points_from_reals(&r)
                         })
@@ -480,7 +480,7 @@ impl Markup {
             .ok()
             .and_then(|o| o.as_dict().ok())
             .and_then(|bs| bs.get(b"W").ok())
-            .and_then(|w| w.as_f32().ok())
+            .and_then(|w| w.as_float().ok())
             .map(|f| f as f64)
             .unwrap_or(1.0);
         let line_style = get_name(d, b"RLLineStyle")
@@ -489,7 +489,7 @@ impl Markup {
         let opacity = d
             .get(b"CA")
             .ok()
-            .and_then(|o| o.as_f32().ok())
+            .and_then(|o| o.as_float().ok())
             .map(|f| f as f64)
             .unwrap_or(1.0);
 
@@ -540,7 +540,7 @@ fn get_int(d: &Dictionary, key: &[u8]) -> Option<i64> {
 }
 
 fn get_real(d: &Dictionary, key: &[u8]) -> Option<f64> {
-    d.get(key).ok()?.as_f32().ok().map(|f| f as f64)
+    d.get(key).ok()?.as_float().ok().map(|f| f as f64)
 }
 
 /// Map a font family name to the standard PDF base-14 /DA resource name (ISO 32000-1 §12.7.3.3).
