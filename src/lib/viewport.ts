@@ -65,6 +65,34 @@ export function pdfUserSpaceToScreen(
 export const TILE_SIZE_CSS = 512;
 
 /**
+ * Wheel deltaY → multiplicative zoom factor. Proportional (exp) and symmetric, clamped per
+ * event so a fast flick can't jump to the zoom limit in a few events. Shared by
+ * Viewport.onWheel and the glued-on-zoom tests so neither hard-codes the curve.
+ */
+export function wheelZoomFactor(deltaY: number): number {
+  return Math.min(2, Math.max(0.5, Math.exp(-deltaY * 0.0015)));
+}
+
+/** Zoom-snap presets — 1:1 (actual size / 100%). */
+export const ACTUAL_SIZE_ZOOM = 1.0;
+
+/**
+ * Zoom level at which the page WIDTH exactly fills the viewport width.
+ * Pure §5 math (PDF points vs css px) — never reads the raster. Falls back to actual
+ * size when the page size is not yet known, so callers can't divide by zero.
+ */
+export function fitWidthZoom(pageWidthPts: number, canvasWidthCss: number): number {
+  if (pageWidthPts <= 0) return ACTUAL_SIZE_ZOOM;
+  return canvasWidthCss / pageWidthPts;
+}
+
+/** Zoom level at which the page HEIGHT exactly fills the viewport height (see fitWidthZoom). */
+export function fitHeightZoom(pageHeightPts: number, canvasHeightCss: number): number {
+  if (pageHeightPts <= 0) return ACTUAL_SIZE_ZOOM;
+  return canvasHeightCss / pageHeightPts;
+}
+
+/**
  * Compute which tiles are visible in the current viewport.
  * Returns an array of (tile_x, tile_y) pairs that intersect the visible area.
  */

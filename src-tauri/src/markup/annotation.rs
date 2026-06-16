@@ -10,18 +10,19 @@
 //!     render the annotation while redline reloads it losslessly.
 //!
 //! Scope of this slice: the §6 envelope + geometry + the universal appearance bits
-//! (colour / opacity / weight / fill / line-style). NOT yet mapped here (they live in
-//! the sidecar via serde, or land in a later slice): font, the measurement payload,
-//! comment thread/replies, and assignee. PDF reals are f32 (lopdf), so geometry in the
-//! annotation is the interop copy — the canonical f64 geometry stays in the app model /
-//! sidecar (spec §5/§6).
+//! (colour / opacity / weight / fill / line-style) + font (for FreeText annotations:
+//! written to `/DA` for interop and `/RLFontFamily`+`/RLFontSize` for lossless round-trip).
+//! NOT yet mapped here (they live in the sidecar via serde, or land in a later slice):
+//! the measurement payload, comment thread/replies, and assignee. PDF reals are f32
+//! (lopdf), so geometry in the annotation is the interop copy — the canonical f64
+//! geometry stays in the app model / sidecar (spec §5/§6).
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use lopdf::{Dictionary, Object};
 
 use super::{
-    Appearance, Audit, LineStyle, Markup, MarkupGeometry, MarkupStatus, MarkupType, Origin,
-    UserRef, Workflow,
+    Appearance, Audit, FontSpec, LineStyle, Markup, MarkupGeometry, MarkupStatus, MarkupType,
+    Origin, UserRef, Workflow,
 };
 use crate::geometry::PdfPoint;
 
@@ -77,8 +78,8 @@ fn type_from_tag(tag: &str) -> Option<MarkupType> {
 /// PDF standard `/Subtype` for interop rendering.
 fn pdf_subtype(t: MarkupType) -> &'static str {
     match t {
-        MarkupType::Text | MarkupType::MeasurementCount => "Text",
-        MarkupType::Callout => "FreeText",
+        MarkupType::MeasurementCount => "Text",
+        MarkupType::Text | MarkupType::Callout => "FreeText",
         MarkupType::Cloud
         | MarkupType::Polygon
         | MarkupType::MeasurementPerimeter
@@ -230,6 +231,7 @@ fn geometry_from_dict(d: &Dictionary) -> MarkupGeometry {
         }
         Some("poly") => {
             let r = get_reals(d, b"Vertices")
+                .or_else(|| get_reals(d, b"CL"))
                 .or_else(|| get_reals(d, b"L"))
                 .unwrap_or_default();
             MarkupGeometry::Polyline(points_from_reals(&r))
@@ -258,7 +260,10 @@ fn geometry_from_dict(d: &Dictionary) -> MarkupGeometry {
         _ => {
             if let Some(r) = get_reals(d, b"InkList") {
                 MarkupGeometry::Polyline(points_from_reals(&r))
-            } else if let Some(r) = get_reals(d, b"Vertices").or_else(|| get_reals(d, b"L")) {
+            } else if let Some(r) = get_reals(d, b"Vertices")
+                .or_else(|| get_reals(d, b"CL"))
+                .or_else(|| get_reals(d, b"L"))
+            {
                 MarkupGeometry::Polyline(points_from_reals(&r))
             } else {
                 let r = get_reals(d, b"Rect").unwrap_or_else(|| vec![0.0, 0.0, 0.0, 0.0]);
@@ -293,6 +298,8 @@ impl Markup {
             MarkupGeometry::Polyline(pts) => {
                 if matches!(pdf_subtype(t), "Line") && pts.len() >= 2 {
                     d.set("L", flatten(&pts[..2]));
+                } else if matches!(t, MarkupType::Callout) {
+                    d.set("CL", flatten(pts)); // callout leader line (spec §19.2)
                 } else {
                     d.set("Vertices", flatten(pts));
                 }
@@ -349,6 +356,22 @@ impl Markup {
         );
         d.set("BS", Object::Dictionary(bs));
 
+        // Font: FreeText /DA (interop) + lossless /RLFont* round-trip (spec §6).
+        // The /DA resource name is pinned to /Helv pending the G7 font picker; the exact
+        // family is preserved losslessly in /RLFontFamily.
+        if let Some(font) = &self.appearance.font {
+            let rgb = hex_to_rgb(&self.appearance.color).unwrap_or([0.0, 0.0, 0.0]);
+            d.set(
+                "DA",
+                Object::string_literal(format!(
+                    "/Helv {:.0} Tf {:.3} {:.3} {:.3} rg",
+                    font.size_pt, rgb[0], rgb[1], rgb[2]
+                )),
+            );
+            d.set("RLFontFamily", Object::string_literal(font.family.clone()));
+            d.set("RLFontSize", real(font.size_pt));
+        }
+
         // Private /RL* keys for lossless redline round-trip.
         d.set("RLType", name(&type_tag(t)));
         d.set("RLGeom", name(geom_tag(&self.geometry)));
@@ -381,8 +404,8 @@ impl Markup {
     /// Parse a markup from a PDF annotation dictionary. Prefers the `/RL*` private keys
     /// (lossless for redline-authored annotations); for foreign annotations it does a
     /// best-effort import from the standard keys (new id, type inferred from `/Subtype`).
-    /// Note: font, measurement payload, thread, and assignee are not carried in the
-    /// annotation — they come from the sidecar.
+    /// Note: the measurement payload, comment thread, and assignee are not carried in the
+    /// annotation (later slices). Font IS carried, via `/RLFontFamily`+`/RLFontSize`.
     pub fn from_annotation_dict(d: &Dictionary) -> Markup {
         let markup_type = get_name(d, b"RLType")
             .and_then(|t| type_from_tag(&t))
@@ -394,7 +417,11 @@ impl Markup {
                 Some("PolyLine") => Some(MarkupType::Polyline),
                 Some("Highlight") => Some(MarkupType::Highlight),
                 Some("Ink") => Some(MarkupType::Ink),
-                Some("FreeText") => Some(MarkupType::Callout),
+                Some("FreeText") => Some(if d.has(b"CL") {
+                    MarkupType::Callout
+                } else {
+                    MarkupType::Text
+                }),
                 Some("Stamp") => Some(MarkupType::Stamp),
                 _ => Some(MarkupType::Text),
             })
@@ -460,7 +487,11 @@ impl Markup {
                 opacity,
                 fill,
                 line_style,
-                font: None,
+                font: get_real(d, b"RLFontSize").map(|size_pt| FontSpec {
+                    family: get_string(d, b"RLFontFamily")
+                        .unwrap_or_else(|| "Helvetica".to_string()),
+                    size_pt,
+                }),
             },
             subject: get_string(d, b"Subj"),
             layer: get_string(d, b"RLLayer"),
@@ -488,6 +519,10 @@ impl Markup {
 
 fn get_int(d: &Dictionary, key: &[u8]) -> Option<i64> {
     d.get(key).ok()?.as_i64().ok()
+}
+
+fn get_real(d: &Dictionary, key: &[u8]) -> Option<f64> {
+    d.get(key).ok()?.as_f32().ok().map(|f| f as f64)
 }
 
 #[cfg(test)]
@@ -563,6 +598,7 @@ mod tests {
         assert_eq!(back.appearance.line_style, m.appearance.line_style);
         assert!((back.appearance.opacity - m.appearance.opacity).abs() < 0.01);
         assert!((back.appearance.line_weight - m.appearance.line_weight).abs() < 0.01);
+        assert_eq!(back.appearance.font, m.appearance.font, "font");
         assert_eq!(back.workflow.status, m.workflow.status);
         assert_eq!(back.audit.revision, m.audit.revision);
         assert_eq!(back.audit.created_by, m.audit.created_by);
@@ -622,7 +658,7 @@ mod tests {
     #[test]
     fn point_markup_round_trips() {
         let g = MarkupGeometry::Point(PdfPoint { x: 42.0, y: 99.0 });
-        assert_roundtrip(&fixture(g, MarkupType::Text));
+        assert_roundtrip(&fixture(g, MarkupType::MeasurementCount));
     }
 
     #[test]
@@ -686,5 +722,63 @@ mod tests {
             }
             other => panic!("expected Rect, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn freetext_with_font_round_trips_and_emits_da() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 10.0, y: 20.0 },
+            max: PdfPoint { x: 160.0, y: 38.0 },
+        };
+        let mut m = fixture(g, MarkupType::Text);
+        m.appearance.font = Some(FontSpec {
+            family: "Helvetica".into(),
+            size_pt: 12.0,
+        });
+        let d = m.to_annotation_dict();
+        assert_eq!(get_name(&d, b"Subtype").as_deref(), Some("FreeText"));
+        assert!(d.has(b"DA"), "FreeText with a font must emit /DA");
+        assert_roundtrip(&m); // assert_roundtrip now also checks font
+    }
+
+    #[test]
+    fn callout_emits_cl_leader_and_round_trips() {
+        let g = MarkupGeometry::Polyline(vec![
+            PdfPoint { x: 0.0, y: 0.0 },
+            PdfPoint { x: 50.0, y: 60.0 },
+        ]);
+        let mut m = fixture(g, MarkupType::Callout);
+        m.appearance.font = Some(FontSpec {
+            family: "Helvetica".into(),
+            size_pt: 14.0,
+        });
+        let d = m.to_annotation_dict();
+        assert_eq!(get_name(&d, b"Subtype").as_deref(), Some("FreeText"));
+        assert!(d.has(b"CL"), "Callout must emit /CL leader");
+        assert!(!d.has(b"Vertices"), "Callout uses /CL, not /Vertices");
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn foreign_freetext_imports_as_text_without_cl_callout_with_cl() {
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("FreeText"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(5.0), real(6.0), real(100.0), real(26.0)]),
+        );
+        d.set("Contents", Object::string_literal("foreign text"));
+        assert_eq!(
+            Markup::from_annotation_dict(&d).markup_type,
+            MarkupType::Text
+        );
+        d.set(
+            "CL",
+            Object::Array(vec![real(0.0), real(0.0), real(5.0), real(6.0)]),
+        );
+        assert_eq!(
+            Markup::from_annotation_dict(&d).markup_type,
+            MarkupType::Callout
+        );
     }
 }

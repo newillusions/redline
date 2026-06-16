@@ -4,6 +4,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::SystemTime;
+
+use uuid::Uuid;
 
 use crate::markup::Markup;
 
@@ -15,13 +18,51 @@ pub struct DocEntry {
     pub saving: bool,
 }
 
+/// Keyed by path: returns the parsed annotation set for a file that hasn't changed since the
+/// last `load_markups` (mtime match), avoiding the full lopdf parse on reopen.
+#[derive(Debug, Default)]
+struct MtimeCache(HashMap<PathBuf, (SystemTime, Vec<Markup>)>);
+
+impl MtimeCache {
+    /// Cached markups if the file's current mtime matches what was recorded; else None
+    /// (changed / unreadable / never cached).
+    fn get(&self, path: &PathBuf) -> Option<Vec<Markup>> {
+        let (cached_mtime, markups) = self.0.get(path)?;
+        let current_mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+        if current_mtime == *cached_mtime {
+            Some(markups.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Record a successful parse + the file's current mtime. Skipped if mtime is unreadable.
+    fn set(&mut self, path: PathBuf, markups: Vec<Markup>) {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return;
+        };
+        let Ok(mtime) = meta.modified() else {
+            return;
+        };
+        self.0.insert(path, (mtime, markups));
+    }
+
+    /// Evict the entry for `path` (called after a save changes the file's content + mtime).
+    fn invalidate(&mut self, path: &PathBuf) {
+        self.0.remove(path);
+    }
+}
+
 /// Thread-safe store shared via Tauri `AppState`.
 #[derive(Debug, Default)]
-pub struct MarkupStore(Mutex<HashMap<String, DocEntry>>);
+pub struct MarkupStore {
+    docs: Mutex<HashMap<String, DocEntry>>,
+    cache: Mutex<MtimeCache>,
+}
 
 impl MarkupStore {
     pub fn register(&self, doc_id: &str, path: PathBuf) {
-        self.0.lock().unwrap().insert(
+        self.docs.lock().unwrap().insert(
             doc_id.to_string(),
             DocEntry {
                 path,
@@ -33,16 +74,20 @@ impl MarkupStore {
     }
 
     pub fn remove(&self, doc_id: &str) {
-        self.0.lock().unwrap().remove(doc_id);
+        self.docs.lock().unwrap().remove(doc_id);
     }
 
     /// Path registered for this doc, if open.
     pub fn path(&self, doc_id: &str) -> Option<PathBuf> {
-        self.0.lock().unwrap().get(doc_id).map(|e| e.path.clone())
+        self.docs
+            .lock()
+            .unwrap()
+            .get(doc_id)
+            .map(|e| e.path.clone())
     }
 
     pub fn set_path(&self, doc_id: &str, path: PathBuf) -> Result<(), String> {
-        let mut g = self.0.lock().unwrap();
+        let mut g = self.docs.lock().unwrap();
         let e = g
             .get_mut(doc_id)
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
@@ -52,7 +97,7 @@ impl MarkupStore {
 
     /// True if the PDF's existing annotations have been loaded into the store.
     pub fn is_loaded(&self, doc_id: &str) -> bool {
-        self.0
+        self.docs
             .lock()
             .unwrap()
             .get(doc_id)
@@ -62,7 +107,7 @@ impl MarkupStore {
 
     /// Add one markup. Errors on unknown doc or duplicate id.
     pub fn add(&self, doc_id: &str, m: Markup) -> Result<(), String> {
-        let mut g = self.0.lock().unwrap();
+        let mut g = self.docs.lock().unwrap();
         let e = g
             .get_mut(doc_id)
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
@@ -73,11 +118,44 @@ impl MarkupStore {
         Ok(())
     }
 
+    /// Replace a markup by id. Errors on unknown doc or absent id.
+    ///
+    /// This is a verbatim swap, not a `Markup::touch()`. The frontend store is the
+    /// in-session source of truth and bumps audit fields (revision / modified_*) before
+    /// sending the updated markup (spec §6; decision:vic6slsasg6njkf7haka).
+    pub fn update(&self, doc_id: &str, m: Markup) -> Result<(), String> {
+        let mut g = self.docs.lock().unwrap();
+        let e = g
+            .get_mut(doc_id)
+            .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+        let slot = e
+            .markups
+            .iter_mut()
+            .find(|x| x.id() == m.id())
+            .ok_or_else(|| format!("unknown markup id {}", m.id()))?;
+        *slot = m;
+        Ok(())
+    }
+
+    /// Remove a markup by id. Errors on unknown doc or absent id.
+    pub fn delete(&self, doc_id: &str, id: Uuid) -> Result<(), String> {
+        let mut g = self.docs.lock().unwrap();
+        let e = g
+            .get_mut(doc_id)
+            .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+        let before = e.markups.len();
+        e.markups.retain(|x| x.id() != id);
+        if e.markups.len() == before {
+            return Err(format!("unknown markup id {id}"));
+        }
+        Ok(())
+    }
+
     /// Merge markups loaded from the PDF beneath any unsaved in-memory ones
     /// (the store wins on id collision) and mark the doc as loaded.
     /// Returns the merged set.
     pub fn seed_loaded(&self, doc_id: &str, loaded: Vec<Markup>) -> Result<Vec<Markup>, String> {
-        let mut g = self.0.lock().unwrap();
+        let mut g = self.docs.lock().unwrap();
         let e = g
             .get_mut(doc_id)
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
@@ -95,7 +173,7 @@ impl MarkupStore {
 
     /// Mark a save in flight. Errors if one is already running for this doc.
     pub fn begin_save(&self, doc_id: &str) -> Result<(), String> {
-        let mut g = self.0.lock().unwrap();
+        let mut g = self.docs.lock().unwrap();
         let e = g
             .get_mut(doc_id)
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
@@ -108,17 +186,35 @@ impl MarkupStore {
 
     /// Clear the in-flight flag (no-op for unknown doc - the entry may have been removed).
     pub fn end_save(&self, doc_id: &str) {
-        if let Some(e) = self.0.lock().unwrap().get_mut(doc_id) {
+        if let Some(e) = self.docs.lock().unwrap().get_mut(doc_id) {
             e.saving = false;
         }
     }
 
     /// Snapshot of the current markups (cloned; store stays locked only briefly).
     pub fn list(&self, doc_id: &str) -> Result<Vec<Markup>, String> {
-        let g = self.0.lock().unwrap();
+        let g = self.docs.lock().unwrap();
         g.get(doc_id)
             .map(|e| e.markups.clone())
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))
+    }
+
+    // --- mtime cache (skip the lopdf re-parse when reopening an unchanged file) ---
+
+    /// Cached parse result for `path` if its mtime is unchanged since the last load; else
+    /// `None` (caller must run the lopdf parse, then call [`Self::cache_loaded`]).
+    pub fn check_mtime_cache(&self, path: &PathBuf) -> Option<Vec<Markup>> {
+        self.cache.lock().unwrap().get(path)
+    }
+
+    /// Record a freshly-parsed annotation set so the next reopen of the unchanged file is instant.
+    pub fn cache_loaded(&self, path: PathBuf, markups: Vec<Markup>) {
+        self.cache.lock().unwrap().set(path, markups);
+    }
+
+    /// Drop the cached entry for `path` (call after a save changes the file).
+    pub fn invalidate_cache(&self, path: &PathBuf) {
+        self.cache.lock().unwrap().invalidate(path);
     }
 }
 
@@ -261,5 +357,106 @@ mod tests {
         let s = MarkupStore::default();
         // Must not panic - the entry may have been removed mid-save.
         s.end_save("nope");
+    }
+
+    #[test]
+    fn update_replaces_markup_by_id() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"));
+        let m = markup();
+        let id = m.id();
+        s.add("d1", m.clone()).unwrap();
+
+        let mut edited = m;
+        edited.contents = Some("edited".into());
+        s.update("d1", edited).unwrap();
+
+        let got = s.list("d1").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id(), id, "id preserved");
+        assert_eq!(got[0].contents.as_deref(), Some("edited"));
+    }
+
+    #[test]
+    fn update_unknown_id_errors() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"));
+        // markup() not added -> its id is absent
+        assert!(s.update("d1", markup()).is_err());
+        // unknown doc also errors
+        assert!(s.update("nope", markup()).is_err());
+    }
+
+    #[test]
+    fn delete_removes_by_id() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"));
+        let m = markup();
+        let id = m.id();
+        s.add("d1", m).unwrap();
+        s.delete("d1", id).unwrap();
+        assert_eq!(s.list("d1").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn delete_unknown_id_or_doc_errors() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"));
+        assert!(s.delete("d1", uuid::Uuid::new_v4()).is_err());
+        assert!(s.delete("nope", uuid::Uuid::new_v4()).is_err());
+    }
+
+    // --- mtime cache ---
+
+    fn temp_pdf() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("redline-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.pdf");
+        std::fs::write(&p, b"v1").unwrap();
+        p
+    }
+
+    #[test]
+    fn mtime_cache_cold_miss_returns_none() {
+        let s = MarkupStore::default();
+        assert!(s.check_mtime_cache(&temp_pdf()).is_none());
+    }
+
+    #[test]
+    fn mtime_cache_warm_hit_returns_cached() {
+        let s = MarkupStore::default();
+        let p = temp_pdf();
+        s.cache_loaded(p.clone(), vec![markup()]);
+        let got = s.check_mtime_cache(&p).expect("hit");
+        assert_eq!(got.len(), 1);
+        std::fs::remove_dir_all(p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn mtime_cache_miss_after_invalidate() {
+        let s = MarkupStore::default();
+        let p = temp_pdf();
+        s.cache_loaded(p.clone(), vec![markup()]);
+        assert!(s.check_mtime_cache(&p).is_some());
+        s.invalidate_cache(&p);
+        assert!(s.check_mtime_cache(&p).is_none());
+        std::fs::remove_dir_all(p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn mtime_cache_miss_after_file_modified() {
+        let s = MarkupStore::default();
+        let p = temp_pdf();
+        s.cache_loaded(p.clone(), vec![markup()]);
+        assert!(s.check_mtime_cache(&p).is_some());
+        // Bump the file's mtime deterministically (no sleep).
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.set_modified(SystemTime::now() + std::time::Duration::from_secs(30))
+            .unwrap();
+        assert!(
+            s.check_mtime_cache(&p).is_none(),
+            "changed mtime must invalidate the cache"
+        );
+        std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 }

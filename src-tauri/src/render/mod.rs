@@ -604,7 +604,12 @@ impl RenderEngine {
         let t0 = Instant::now();
 
         let scale = req.zoom * req.dpr;
-        let tile_px = (req.tile_size_css as f32 * scale) as u32;
+        // A tile covers TILE_SIZE_CSS CSS px of the on-screen page, rasterised at device
+        // resolution (× dpr) so it stays sharp. NOT × scale: the zoom factor is already in
+        // the PDF→device matrix below, so multiplying the bitmap size by zoom too would
+        // double-count it (the page renders ~zoom× too large on screen). The frontend draws
+        // each tile back at its CSS footprint (img pixels ÷ dpr).
+        let tile_px = (req.tile_size_css as f32 * req.dpr) as u32;
 
         // The whole PDFium-borrowing render runs inside this block so the mutable
         // borrow of `self.documents` (via `doc`/`page`) ends before we touch
@@ -666,19 +671,22 @@ impl RenderEngine {
             //   - clip_rect defaults to (0,0,tile_w,tile_h) = the whole output bitmap.
             //   - render is dispatched via FPDF_RenderPageBitmapWithMatrix.
             //
-            // The matrix maps PDF user space (origin bottom-left, +y up) to device pixels
-            // (origin top-left, +y down) for THIS tile:
-            //   x_dev = s·x_pdf            − tile_origin_x      (a = s,  e = −tile_origin_x)
-            //   y_dev = −s·y_pdf + full_h_px − tile_origin_y    (d = −s, f = full_h_px − tile_origin_y)
-            // i.e. the full page is placed at device scale s, top-left at (0,0), then shifted
-            // up-left by the tile's pixel origin so the tile's slice lands in the bitmap.
+            // pdfium-render's matrix path (apply_matrix → FPDF_RenderPageBitmapWithMatrix)
+            // ALREADY applies the PDF y-up → device y-down flip itself, so our matrix must
+            // NOT flip y again (a -scale `d` double-flips → the page renders upside-down;
+            // verified visually 2026-06-15). The matrix is therefore a plain scale + tile
+            // translate:
+            //   x_dev = s·x_pdf − tile_origin_x   (a = s,  e = −tile_origin_x)
+            //   y_dev = s·y_pdf − tile_origin_y   (d = s,  f = −tile_origin_y)
+            // i.e. the full page is placed at device scale s, then shifted up-left by the
+            // tile's pixel origin so the tile's slice lands in the bitmap.
             let matrix = PdfMatrix::new(
-                scale,                                   // a: x scale
-                0.0,                                     // b
-                0.0,                                     // c
-                -scale,                                  // d: y scale (flip)
-                -(tile_origin_x as f32),                 // e: x translate
-                full_h_px as f32 - tile_origin_y as f32, // f: y translate (flip origin)
+                scale,                   // a: x scale
+                0.0,                     // b
+                0.0,                     // c
+                scale,                   // d: y scale (no explicit flip — see note above)
+                -(tile_origin_x as f32), // e: x translate
+                -(tile_origin_y as f32), // f: y translate
             );
 
             let render_config = PdfRenderConfig::new()

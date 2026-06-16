@@ -21,13 +21,16 @@
   import "$lib/styles.css";
   import { onMount } from "svelte";
   import Viewport from "./components/Viewport.svelte";
-  import { openDocument, closeDocument, loadMarkups, saveDocument, saveDocumentAs } from "$lib/ipc";
+  import ToolPalette from "./components/ToolPalette.svelte";
+  import { openDocument, closeDocument, loadMarkups, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup } from "$lib/ipc";
   import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
   import type { DocumentInfo } from "$lib/ipc";
+  import { MarkupStore } from "$lib/markup-store.svelte";
 
   // --- App state ---
   let currentDoc = $state<DocumentInfo | null>(null);
+  let store = $state<MarkupStore | null>(null);
   let openError = $state<string | null>(null);
   let isOpening = $state(false);
   let isSaving = $state(false);
@@ -41,10 +44,11 @@
       const path = await invoke<string | null>("auto_open_path");
       if (path) {
         const doc = await openDocument(path);
+        store = new MarkupStore(doc.doc_id, { add: addMarkup, update: updateMarkup, remove: deleteMarkup });
         currentDoc = doc;
-        loadMarkups(doc.doc_id).catch((e) => {
-          openError = `Load markups failed: ${e}`;
-        });
+        loadMarkups(doc.doc_id)
+          .then((m) => { store?.seed(m); })
+          .catch((e) => { openError = `Load markups failed: ${e}`; });
       }
     } catch (e) {
       openError = `auto-open failed: ${String(e)}`;
@@ -81,10 +85,11 @@
       }
 
       const doc = await openDocument(selected as string);
+      store = new MarkupStore(doc.doc_id, { add: addMarkup, update: updateMarkup, remove: deleteMarkup });
       currentDoc = doc;
-      loadMarkups(doc.doc_id).catch((e) => {
-        openError = `Load markups failed: ${e}`;
-      });
+      loadMarkups(doc.doc_id)
+        .then((m) => { store?.seed(m); })
+        .catch((e) => { openError = `Load markups failed: ${e}`; });
     } catch (e) {
       openError = String(e);
     } finally {
@@ -98,9 +103,10 @@
     openError = null;
     isSaving = true;
     try {
+      await store?.flush();
       await saveDocument(currentDoc.doc_id);
     } catch (e) {
-      openError = `Save failed: ${e}`;
+      openError = `Save failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
       isSaving = false;
     }
@@ -113,10 +119,11 @@
     if (!dest) return;
     isSaving = true;
     try {
+      await store?.flush();
       await saveDocumentAs(currentDoc.doc_id, dest);
       currentDoc = { ...currentDoc, path: dest };
     } catch (e) {
-      openError = `Save As failed: ${e}`;
+      openError = `Save As failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
       isSaving = false;
     }
@@ -171,6 +178,10 @@
     </div>
   </header>
 
+  {#if store}
+    <ToolPalette {store} />
+  {/if}
+
   {#if openError}
     <div class="error-banner">{openError}</div>
   {/if}
@@ -194,8 +205,8 @@
 
     <!-- Centre viewport -->
     <main class="viewport-container">
-      {#if currentDoc}
-        <Viewport docInfo={currentDoc} />
+      {#if currentDoc && store}
+        <Viewport docInfo={currentDoc} {store} />
       {:else}
         <div class="empty-state">
           <p>Open a PDF to begin</p>

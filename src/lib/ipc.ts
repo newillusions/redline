@@ -55,7 +55,7 @@ export async function openDocument(path: string): Promise<DocumentInfo> {
 }
 
 export async function closeDocument(doc_id: string): Promise<void> {
-  return invoke<void>("close_document", { doc_id });
+  return invoke<void>("close_document", { docId: doc_id });
 }
 
 // ---------------------------------------------------------------------------
@@ -67,14 +67,14 @@ export async function renderTile(req: TileRequest): Promise<RenderedTile> {
 }
 
 export async function getPageCount(doc_id: string): Promise<number> {
-  return invoke<number>("get_page_count", { doc_id });
+  return invoke<number>("get_page_count", { docId: doc_id });
 }
 
 export async function getPageSize(
   doc_id: string,
   page_index: number
 ): Promise<PageSize> {
-  return invoke<PageSize>("get_page_size", { doc_id, page_index });
+  return invoke<PageSize>("get_page_size", { docId: doc_id, pageIndex: page_index });
 }
 
 // ---------------------------------------------------------------------------
@@ -172,22 +172,35 @@ export interface Markup {
 
 // addMarkup/listMarkups: consumed by the S2 markup-authoring UI; backend commands already live.
 export async function addMarkup(doc_id: string, markup: Markup): Promise<void> {
-  return invoke<void>("add_markup", { doc_id, markup });
+  return invoke<void>("add_markup", { docId: doc_id, markup });
 }
 
 export async function listMarkups(doc_id: string): Promise<Markup[]> {
-  return invoke<Markup[]>("list_markups", { doc_id });
+  return invoke<Markup[]>("list_markups", { docId: doc_id });
 }
 
 /** Pull existing PDF annotations into the store (call once after open). */
 export async function loadMarkups(doc_id: string): Promise<Markup[]> {
-  return invoke<Markup[]>("load_markups", { doc_id });
+  return invoke<Markup[]>("load_markups", { docId: doc_id });
 }
 
 export async function saveDocument(doc_id: string): Promise<void> {
-  return invoke<void>("save_document", { doc_id });
+  return invoke<void>("save_document", { docId: doc_id });
 }
 
 export async function saveDocumentAs(doc_id: string, new_path: string): Promise<void> {
-  return invoke<void>("save_document_as", { doc_id, new_path });
+  return invoke<void>("save_document_as", { docId: doc_id, newPath: new_path });
+}
+
+export async function updateMarkup(doc_id: string, markup: Markup): Promise<void> {
+  return invoke<void>("update_markup", { docId: doc_id, markup });
+}
+
+export async function deleteMarkup(doc_id: string, markup_id: string): Promise<void> {
+  return invoke<void>("delete_markup", { docId: doc_id, markupId: markup_id });
+}
+
+/** Persisted app user identity (generated on first run). */
+export async function getUserIdentity(): Promise<UserRef> {
+  return invoke<UserRef>("get_user_identity");
 }

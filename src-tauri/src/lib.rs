@@ -19,6 +19,7 @@ use tauri::Manager;
 mod commands;
 pub mod document;
 pub mod geometry;
+mod identity;
 pub mod render;
 
 // Stub modules — spec §4 scaffolded, implemented in future milestones
@@ -136,6 +137,9 @@ pub fn run() {
             commands::document::load_markups,
             commands::document::save_document,
             commands::document::save_document_as,
+            commands::document::update_markup,
+            commands::document::delete_markup,
+            commands::document::get_user_identity,
             // Diagnostics (in-app §20 bench overlay)
             commands::diag::process_rss_mb,
             commands::diag::auto_open_path,

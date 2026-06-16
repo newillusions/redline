@@ -1,7 +1,7 @@
 //! Tauri commands for document open/close (spec §4).
 
 use std::path::PathBuf;
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::document::save::{load_markups_from, save_with_markups};
 use crate::document::{new_doc_id, DocumentInfo};
@@ -62,6 +62,37 @@ pub async fn add_markup(
     state.markups.add(&doc_id, markup)
 }
 
+/// Replace an existing markup (move/resize/edit). Errors if the id is absent.
+#[tauri::command]
+pub async fn update_markup(
+    state: State<'_, AppState>,
+    doc_id: String,
+    markup: Markup,
+) -> Result<(), String> {
+    state.markups.update(&doc_id, markup)
+}
+
+/// Delete a markup by id (string UUID from the frontend).
+#[tauri::command]
+pub async fn delete_markup(
+    state: State<'_, AppState>,
+    doc_id: String,
+    markup_id: String,
+) -> Result<(), String> {
+    let id = uuid::Uuid::parse_str(&markup_id).map_err(|e| format!("bad markup id: {e}"))?;
+    state.markups.delete(&doc_id, id)
+}
+
+/// Return the persisted app user identity, generating it on first run.
+#[tauri::command]
+pub fn get_user_identity(app: tauri::AppHandle) -> Result<crate::identity::Identity, String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("config dir: {e}"))?;
+    crate::identity::load_or_create(&dir)
+}
+
 /// List the open document's in-memory markups.
 #[tauri::command]
 pub async fn list_markups(
@@ -82,10 +113,21 @@ pub async fn load_markups(
         .markups
         .path(&doc_id)
         .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
-    let loaded = tokio::task::spawn_blocking(move || load_markups_from(&path))
+
+    // Fast path: return the cached parse if the file is unchanged since the last load —
+    // skips the ~tens-of-seconds lopdf parse on reopen of a large, unmodified file.
+    if let Some(cached) = state.markups.check_mtime_cache(&path) {
+        return state.markups.seed_loaded(&doc_id, cached);
+    }
+
+    // Slow path: full lopdf parse (blocking; tens of seconds on large files).
+    let path_for_parse = path.clone();
+    let loaded = tokio::task::spawn_blocking(move || load_markups_from(&path_for_parse))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("{e:#}"))?;
+    // Populate the cache so the next reopen of this unmodified file returns immediately.
+    state.markups.cache_loaded(path, loaded.clone());
     state.markups.seed_loaded(&doc_id, loaded)
 }
 
@@ -180,6 +222,9 @@ async fn save_inner(
         .open_document(dest.clone(), doc_id.to_string())
         .await
         .map_err(|e| format!("reopen after save: {e:#}"))?;
+    // The save changed the file's content + mtime: drop the stale cache entry so the next
+    // load_markups re-parses rather than returning the pre-save snapshot.
+    state.markups.invalidate_cache(&dest);
     if new_path.is_some() {
         state.markups.set_path(doc_id, dest)?;
     }
