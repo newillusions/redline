@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'v*']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: rust-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
+
+      - name: Install PDFium system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libssl-dev pkg-config
+
+      - name: Run Rust tests
+        # Run from repo root: bare `cargo test` finds all 90 lib tests via the
+        # workspace member (src-tauri). --workspace with -p redline_lib is the
+        # explicit form but bare `cargo test` resolves correctly from root.
+        run: cargo test
+        env:
+          # Portable tests only — no PDFium binary or bench corpus needed
+          RUST_LOG: warn
+
+  test-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+        env:
+          npm_config_cache: ~/.npm
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Svelte type check
+        run: npm run check
