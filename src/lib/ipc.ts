@@ -378,3 +378,45 @@ export async function searchDocument(
     wholeWord,
   });
 }
+
+// ---------------------------------------------------------------------------
+// Version snapshot types + commands (M4 S2, spec §15/§18)
+// ---------------------------------------------------------------------------
+
+/** A persisted version snapshot record (mirrors Rust VersionRecord in sidecar/meta.rs). */
+export interface VersionRecord {
+  id: string;
+  created_at: string; // RFC3339
+  label: string | null;
+  filename: string;
+}
+
+/**
+ * Save a version snapshot of the open document before overwriting.
+ * Call this before `saveDocument` to capture the pre-save state.
+ */
+export async function snapshotVersion(
+  doc_id: string,
+  label: string | null
+): Promise<VersionRecord> {
+  return invoke<VersionRecord>("snapshot_version", { docId: doc_id, label });
+}
+
+/** List version records for the open document, newest first. */
+export async function listDocumentVersions(doc_id: string): Promise<VersionRecord[]> {
+  return invoke<VersionRecord[]>("list_document_versions", { docId: doc_id });
+}
+
+/**
+ * Restore a version snapshot back over the live PDF.
+ * The render engine is reloaded automatically so tiles refresh.
+ */
+export async function restoreDocumentVersion(
+  doc_id: string,
+  version_id: string
+): Promise<void> {
+  return invoke<void>("restore_document_version", {
+    docId: doc_id,
+    versionId: version_id,
+  });
+}

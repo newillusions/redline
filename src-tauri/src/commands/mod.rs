@@ -8,3 +8,4 @@ pub mod document;
 pub mod render;
 pub mod takeoff;
 pub mod text;
+pub mod versioning;

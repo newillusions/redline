@@ -204,3 +204,72 @@ describe("text search ipc wrappers (Tauri v2 camelCase keys)", () => {
     expect(result).toEqual(hits);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Versioning IPC wrappers (M4 S2)
+// ---------------------------------------------------------------------------
+
+describe("versioning ipc wrappers (Tauri v2 camelCase keys)", () => {
+  const mockInvokeVer = vi.mocked(invoke);
+
+  beforeEach(() => {
+    mockInvokeVer.mockReset();
+    mockInvokeVer.mockResolvedValue(undefined as never);
+  });
+
+  it("snapshotVersion → docId / label (with label)", async () => {
+    mockInvokeVer.mockResolvedValue({
+      id: "s1",
+      created_at: "2026-06-25T12:00:00Z",
+      label: "pre-issue",
+      filename: "0000001__2026-06-25T12-00-00Z__s1.pdf",
+    } as never);
+    await ipc.snapshotVersion("d1", "pre-issue");
+    expect(mockInvokeVer).toHaveBeenCalledWith("snapshot_version", {
+      docId: "d1",
+      label: "pre-issue",
+    });
+  });
+
+  it("snapshotVersion → docId / label (null label)", async () => {
+    mockInvokeVer.mockResolvedValue({
+      id: "s2",
+      created_at: "2026-06-25T12:00:00Z",
+      label: null,
+      filename: "0000002__2026-06-25T12-00-00Z__s2.pdf",
+    } as never);
+    await ipc.snapshotVersion("d1", null);
+    expect(mockInvokeVer).toHaveBeenCalledWith("snapshot_version", {
+      docId: "d1",
+      label: null,
+    });
+  });
+
+  it("listDocumentVersions → docId", async () => {
+    mockInvokeVer.mockResolvedValue([] as never);
+    await ipc.listDocumentVersions("d1");
+    expect(mockInvokeVer).toHaveBeenCalledWith("list_document_versions", { docId: "d1" });
+  });
+
+  it("restoreDocumentVersion → docId / versionId", async () => {
+    await ipc.restoreDocumentVersion("d1", "ver1");
+    expect(mockInvokeVer).toHaveBeenCalledWith("restore_document_version", {
+      docId: "d1",
+      versionId: "ver1",
+    });
+  });
+
+  it("listDocumentVersions returns array of VersionRecord", async () => {
+    const records: ipc.VersionRecord[] = [
+      {
+        id: "v1",
+        created_at: "2026-06-25T12:00:00Z",
+        label: "snapshot A",
+        filename: "0000001__2026-06-25T12-00-00Z__v1.pdf",
+      },
+    ];
+    mockInvokeVer.mockResolvedValue(records as never);
+    const result = await ipc.listDocumentVersions("d1");
+    expect(result).toEqual(records);
+  });
+});

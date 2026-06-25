@@ -8,20 +8,39 @@ use serde::{Deserialize, Serialize};
 
 use crate::takeoff::ScaleRecord;
 
-/// Persisted sidecar metadata (subset of spec §18 — M3 adds scales only).
+/// A single persisted version record inside `meta.json` (spec §18).
+/// Defined here (alongside SidecarMeta) to avoid a circular dep with the storage module.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VersionRecord {
+    /// Short random identifier — used as the restore key.
+    pub id: String,
+    /// ISO-8601 UTC timestamp at the moment the snapshot was taken.
+    pub created_at: String,
+    /// Optional human-readable label ("pre-issue", "client v2", …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Snapshot filename (basename only — the history dir is implicit).
+    pub filename: String,
+}
+
+/// Persisted sidecar metadata (subset of spec §18 — M3 adds scales; M4 S2 adds versions).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SidecarMeta {
     pub schema_version: u32,
     #[serde(default)]
     pub scales: Vec<ScaleRecord>,
+    /// Monotonically increasing counter for the NEXT version sequence number.
+    /// Stored explicitly so pruning never causes a seq reuse.
+    #[serde(default)]
+    pub next_version_seq: u64,
+    /// Version snapshot records, oldest-first. Added in M4 S2.
+    #[serde(default)]
+    pub versions: Vec<VersionRecord>,
 }
 
 /// Return the sidecar directory path for the given PDF path: `<file>.redline/`.
 pub fn sidecar_dir(pdf_path: &Path) -> PathBuf {
-    let stem = pdf_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let stem = pdf_path.file_name().unwrap_or_default().to_string_lossy();
     let dir = pdf_path.parent().unwrap_or(Path::new("."));
     dir.join(format!("{stem}.redline"))
 }
@@ -30,7 +49,12 @@ pub fn sidecar_dir(pdf_path: &Path) -> PathBuf {
 pub fn load_meta(pdf_path: &Path) -> io::Result<SidecarMeta> {
     let path = sidecar_dir(pdf_path).join("meta.json");
     if !path.exists() {
-        return Ok(SidecarMeta { schema_version: 1, scales: vec![] });
+        return Ok(SidecarMeta {
+            schema_version: 1,
+            scales: vec![],
+            next_version_seq: 0,
+            versions: vec![],
+        });
     }
     let s = std::fs::read_to_string(&path)?;
     serde_json::from_str(&s).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -68,7 +92,12 @@ mod tests {
     fn round_trip_with_scales() {
         let dir = tempdir().unwrap();
         let pdf = dir.path().join("plans.pdf");
-        let mut meta = SidecarMeta { schema_version: 1, scales: vec![] };
+        let mut meta = SidecarMeta {
+            schema_version: 1,
+            scales: vec![],
+            next_version_seq: 0,
+            versions: vec![],
+        };
         meta.scales.push(crate::takeoff::ScaleRecord::new(
             ScaleTarget::DocumentDefault,
             ScaleMethod::Preset,
