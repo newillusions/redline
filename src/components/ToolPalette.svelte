@@ -15,6 +15,10 @@
     { kind: "Ink", label: "✎", title: "Ink (Freehand)" },
     { kind: "Text", label: "A", title: "Text" },
     { kind: "Callout", label: "💬", title: "Callout" },
+    { kind: "calibrate", label: "⚖", title: "Calibrate Scale (two-click)" },
+    { kind: "MeasurementLength", label: "↔", title: "Measure Length" },
+    { kind: "MeasurementArea", label: "⬛", title: "Measure Area" },
+    { kind: "MeasurementCount", label: "⊕", title: "Count" },
   ];
 </script>
 <div class="tool-strip" role="toolbar" aria-label="Markup tools">

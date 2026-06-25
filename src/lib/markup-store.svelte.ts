@@ -16,7 +16,12 @@ export interface MarkupIpc {
 
 export type ToolKind =
   | "hand" | "select" | "Rectangle" | "Ellipse" | "Line" | "Arrow" | "Highlight"
-  | "Polyline" | "Polygon" | "Cloud" | "Ink" | "Text" | "Callout";
+  | "Polyline" | "Polygon" | "Cloud" | "Ink" | "Text" | "Callout"
+  // M3 measurement tools:
+  | "calibrate"
+  | "MeasurementLength"
+  | "MeasurementArea"
+  | "MeasurementCount";
 
 const DEFAULT_APPEARANCE: Appearance = {
   color: "#e02424", line_weight: 2, opacity: 1, fill: null, line_style: "Solid", font: null,

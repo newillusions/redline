@@ -186,6 +186,9 @@ pub struct Measurement {
     pub computed_quantity: f64,
     /// Depth for volume measurements.
     pub depth: Option<f64>,
+    /// For MeasurementCount: the integer count value (raw_measure = count_value as f64).
+    #[serde(default)]
+    pub count_value: Option<u32>,
     /// Estimating custom columns (spec §7).
     pub custom_columns: BTreeMap<String, String>,
 }
@@ -420,6 +423,7 @@ mod tests {
             unit: "sf".to_string(),
             computed_quantity: 5000.0,
             depth: None,
+            count_value: None,
             custom_columns: cols,
         });
 

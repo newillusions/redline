@@ -165,7 +165,7 @@ export interface Markup {
   group_id: string | null;
   audit: MarkupAudit;
   workflow: MarkupWorkflow;
-  measurement: unknown | null;
+  measurement: MeasurementPayload | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,4 +205,79 @@ export async function deleteMarkup(doc_id: string, markup_id: string): Promise<v
 /** Persisted app user identity (generated on first run). */
 export async function getUserIdentity(): Promise<UserRef> {
   return invoke<UserRef>("get_user_identity");
+}
+
+// ---------------------------------------------------------------------------
+// Takeoff / scale types (mirrors Rust src-tauri/src/takeoff/scale.rs)
+// ---------------------------------------------------------------------------
+
+export type ScaleTarget =
+  | { kind: "Page"; page: number }
+  | { kind: "DocumentDefault" };
+
+export type ScaleMethod = "TwoPoint" | "Preset";
+
+export interface ScaleRecord {
+  id: string;
+  applies_to: ScaleTarget;
+  method: ScaleMethod;
+  /** Real-world units per PDF point (multiply raw_measure by this). */
+  ratio: number;
+  unit: string;
+  label: string;
+  precision: number;
+}
+
+export interface MeasurementPayload {
+  scale_ref: string | null;
+  raw_measure: number;
+  unit: string;
+  computed_quantity: number;
+  depth: number | null;
+  count_value: number | null;
+  custom_columns: Record<string, string>;
+}
+
+export type ExportFormat = "Xlsx" | "Csv";
+
+// ---------------------------------------------------------------------------
+// Takeoff IPC wrappers
+// ---------------------------------------------------------------------------
+
+/** Add (or replace) a calibration scale for the document. Returns the created record. */
+export async function addScale(
+  doc_id: string,
+  appliesToPage: number | null,
+  ratio: number,
+  unit: string,
+  label: string,
+  precision: number
+): Promise<ScaleRecord> {
+  return invoke<ScaleRecord>("add_scale", {
+    docId: doc_id,
+    appliesToPage,
+    ratio,
+    unit,
+    label,
+    precision,
+  });
+}
+
+/** List all scale records for the document. */
+export async function listScales(doc_id: string): Promise<ScaleRecord[]> {
+  return invoke<ScaleRecord[]>("list_scales", { docId: doc_id });
+}
+
+/** Delete a scale by id. Returns true if found. */
+export async function deleteScale(doc_id: string, scale_id: string): Promise<boolean> {
+  return invoke<boolean>("delete_scale", { docId: doc_id, scaleId: scale_id });
+}
+
+/** Export the markup list to XLSX or CSV. `path` is the absolute output file path. */
+export async function exportMarkupList(
+  doc_id: string,
+  path: string,
+  format: ExportFormat
+): Promise<void> {
+  return invoke<void>("export_markup_list", { docId: doc_id, path, format });
 }

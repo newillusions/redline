@@ -23,15 +23,18 @@
   import Viewport from "./components/Viewport.svelte";
   import ToolPalette from "./components/ToolPalette.svelte";
   import PropertiesPanel from "./components/PropertiesPanel.svelte";
-  import { openDocument, closeDocument, loadMarkups, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup } from "$lib/ipc";
+  import MeasurementPanel from "./components/MeasurementPanel.svelte";
+  import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup } from "$lib/ipc";
   import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
   import type { DocumentInfo } from "$lib/ipc";
   import { MarkupStore } from "$lib/markup-store.svelte";
+  import { TakeoffStore } from "$lib/takeoff-store.svelte";
 
   // --- App state ---
   let currentDoc = $state<DocumentInfo | null>(null);
   let store = $state<MarkupStore | null>(null);
+  let takeoffStore = $state<TakeoffStore | null>(null);
   let openError = $state<string | null>(null);
   let isOpening = $state(false);
   let isSaving = $state(false);
@@ -46,10 +49,14 @@
       if (path) {
         const doc = await openDocument(path);
         store = new MarkupStore(doc.doc_id, { add: addMarkup, update: updateMarkup, remove: deleteMarkup });
+        takeoffStore = new TakeoffStore();
         currentDoc = doc;
         loadMarkups(doc.doc_id)
           .then((m) => { store?.seed(m); })
           .catch((e) => { openError = `Load markups failed: ${e}`; });
+        listScales(doc.doc_id)
+          .then((scales) => { takeoffStore?.seedScales(scales); })
+          .catch(() => {}); // scales are non-critical; fail silently
       }
     } catch (e) {
       openError = `auto-open failed: ${String(e)}`;
@@ -87,10 +94,14 @@
 
       const doc = await openDocument(selected as string);
       store = new MarkupStore(doc.doc_id, { add: addMarkup, update: updateMarkup, remove: deleteMarkup });
+      takeoffStore = new TakeoffStore();
       currentDoc = doc;
       loadMarkups(doc.doc_id)
         .then((m) => { store?.seed(m); })
         .catch((e) => { openError = `Load markups failed: ${e}`; });
+      listScales(doc.doc_id)
+        .then((scales) => { takeoffStore?.seedScales(scales); })
+        .catch(() => {}); // scales are non-critical; fail silently
     } catch (e) {
       openError = String(e);
     } finally {
@@ -206,8 +217,8 @@
 
     <!-- Centre viewport -->
     <main class="viewport-container">
-      {#if currentDoc && store}
-        <Viewport docInfo={currentDoc} {store} />
+      {#if currentDoc && store && takeoffStore}
+        <Viewport docInfo={currentDoc} {store} {takeoffStore} />
       {:else}
         <div class="empty-state">
           <p>Open a PDF to begin</p>
@@ -233,12 +244,22 @@
     {/if}
   </div>
 
-  <!-- Bottom panel — Markups/Comments list (spec §17) -->
+  <!-- Bottom panel — Markups / Measurement quantities (spec §17) -->
   {#if !bottomCollapsed}
     <div class="bottom-panel">
-      <div class="panel-header">Markups / Comments</div>
-      <div class="panel-body">
-        <p class="panel-hint muted">Markup list with status/filter (M2)</p>
+      <div class="panel-header">
+        {#if currentDoc && store && takeoffStore}
+          Takeoff — Quantities
+        {:else}
+          Markups / Comments
+        {/if}
+      </div>
+      <div class="panel-body panel-body-flush">
+        {#if currentDoc && store && takeoffStore}
+          <MeasurementPanel {store} {takeoffStore} docId={currentDoc.doc_id} />
+        {:else}
+          <p class="panel-hint muted">Open a PDF to see measurements.</p>
+        {/if}
       </div>
     </div>
   {/if}

@@ -20,6 +20,7 @@ import { fireEvent } from "@testing-library/svelte";
 import { tick } from "svelte";
 import Viewport from "./Viewport.svelte";
 import { MarkupStore } from "$lib/markup-store.svelte";
+import { TakeoffStore } from "$lib/takeoff-store.svelte";
 import { wheelZoomFactor } from "$lib/viewport";
 import { buildMarkup } from "$lib/markup-tools";
 
@@ -54,6 +55,14 @@ vi.mock("$lib/ipc", () => ({
   saveDocumentAs: vi.fn(),
   updateMarkup: vi.fn(),
   deleteMarkup: vi.fn(),
+  // M3 takeoff IPC
+  addScale: vi.fn(async () => ({
+    id: "scale-1", applies_to: { kind: "DocumentDefault" }, method: "TwoPoint",
+    ratio: 0.001, unit: "m", label: "1:1000", precision: 2,
+  })),
+  listScales: vi.fn(async () => []),
+  deleteScale: vi.fn(async () => true),
+  exportMarkupList: vi.fn(async () => {}),
 }));
 
 // Import the module AFTER vi.mock so we get the mocked version.
@@ -116,13 +125,14 @@ function ptr(target: Element, type: string, x: number, y: number) {
 }
 
 /** Mount Viewport and wait for onMount IPC calls to complete. */
-async function mountViewport(store: MarkupStore) {
+async function mountViewport(store: MarkupStore, takeoffStore?: TakeoffStore) {
   const triggerResize = stubResizeObserver();
 
   // setPointerCapture is called by the overlay on pointerdown capture.
   Element.prototype.setPointerCapture = vi.fn();
 
-  const { container } = render(Viewport, { props: { docInfo: FAKE_DOC, store } });
+  const props = takeoffStore ? { docInfo: FAKE_DOC, store, takeoffStore } : { docInfo: FAKE_DOC, store };
+  const { container } = render(Viewport, { props });
 
   // Wait for getUserIdentity (the last onMount async call) to have been invoked.
   await waitFor(() => {
@@ -1675,6 +1685,59 @@ describe("Viewport G8 grouping", () => {
     expect(rA.min.y).toBeCloseTo(100);  // 90+10
     expect(rB.min.x).toBeCloseTo(140);  // 120+20
     expect(rB.min.y).toBeCloseTo(40);   // 30+10
+  });
+
+  // -------------------------------------------------------------------------
+  // M3-1: calibrate tool — two clicks advance calibrationState
+  // -------------------------------------------------------------------------
+  it("M3-1: calibrate tool — two pointer-down clicks advance calibration state to waiting_p2", async () => {
+    const takeoffStore = new TakeoffStore();
+    takeoffStore.startCalibration({ page: 0, appliesToPage: null });
+    const { overlay } = await mountViewport(store, takeoffStore);
+    store.activeTool = "calibrate";
+    await tick();
+
+    // First click on the overlay: calibration state should advance to waiting_p1 -> waiting_p2
+    ptr(overlay, "pointerdown", 20, 20);
+    await tick();
+    // After p1 click the calibrationState step should be waiting_p2
+    expect(takeoffStore.calibrationState?.step).toBe("waiting_p2");
+  });
+
+  // -------------------------------------------------------------------------
+  // M3-2: MeasurementLength tool creates a markup with measurement payload
+  // -------------------------------------------------------------------------
+  it("M3-2: MeasurementLength drag-draw creates a MeasurementLength markup", async () => {
+    const takeoffStore = new TakeoffStore();
+    const { overlay } = await mountViewport(store, takeoffStore);
+    store.activeTool = "MeasurementLength";
+    await tick();
+
+    ptr(overlay, "pointerdown", 50, 50);
+    await tick();
+    ptr(overlay, "pointermove", 100, 50);
+    await tick();
+    ptr(overlay, "pointerup", 100, 50);
+    await tick();
+
+    expect(store.markups).toHaveLength(1);
+    expect(store.markups[0].markup_type).toBe("MeasurementLength");
+  });
+
+  // -------------------------------------------------------------------------
+  // M3-3: MeasurementCount single click creates a Count markup
+  // -------------------------------------------------------------------------
+  it("M3-3: MeasurementCount single click places a count markup", async () => {
+    const takeoffStore = new TakeoffStore();
+    const { overlay } = await mountViewport(store, takeoffStore);
+    store.activeTool = "MeasurementCount";
+    await tick();
+
+    fireEvent.click(overlay, { clientX: 50, clientY: 50, bubbles: true });
+    await tick();
+
+    expect(store.markups).toHaveLength(1);
+    expect(store.markups[0].markup_type).toBe("MeasurementCount");
   });
 
   // -------------------------------------------------------------------------

@@ -50,11 +50,19 @@
     isTextTool, textBoxGeometry, calloutGeometry, DEFAULT_TEXT_FONT,
   } from "$lib/markup-tools";
   import { patchGroup } from "$lib/markup-properties";
+  import { TakeoffStore } from "$lib/takeoff-store.svelte";
+  import { measureLength, measureArea } from "$lib/measurement-tools";
+  import { addScale, type MeasurementPayload } from "$lib/ipc";
+  import CalibrationDialog from "./CalibrationDialog.svelte";
 
   // ---------------------------------------------------------------------------
   // Props
   // ---------------------------------------------------------------------------
-  const { docInfo, store }: { docInfo: DocumentInfo; store: MarkupStore } = $props();
+  const {
+    docInfo,
+    store,
+    takeoffStore = new TakeoffStore(),
+  }: { docInfo: DocumentInfo; store: MarkupStore; takeoffStore?: TakeoffStore } = $props();
 
   // ---------------------------------------------------------------------------
   // State
@@ -160,13 +168,19 @@
   let dragPreview = $state<Markup[] | null>(null);
 
   /** True when any creation tool is active (all tools except hand/select). */
-  const isCreateTool = (t = store.activeTool) => isDrawTool(t) || isMultiClickTool(t) || isInkTool(t) || isTextTool(t);
+  const isCreateTool = (t = store.activeTool) =>
+    isDrawTool(t) || isMultiClickTool(t) || isInkTool(t) || isTextTool(t) ||
+    t === "calibrate" || t === "MeasurementLength" || t === "MeasurementArea" || t === "MeasurementCount";
 
   /** True when the select tool is active. */
   const isSelectTool = (t = store.activeTool): boolean => t === "select";
 
   /** Overlay captures pointer events for create tools OR select tool. */
   const overlayActive = $derived(isCreateTool() || isSelectTool());
+
+  // --- Calibration dialog state ---
+  let showCalibDialog = $state(false);
+  let calibDialogDist = $state(0);
 
   // ---------------------------------------------------------------------------
   // Derived
@@ -504,12 +518,44 @@
       return;
     }
     if (e.key === "Enter") {
-      finishMultiClick();
+      // MeasurementArea finish via Enter.
+      if (store.activeTool === "MeasurementArea" && identity && mcVerts.length >= 3) {
+        const raw = measureArea(mcVerts);
+        const scale = takeoffStore.activeScale;
+        const meas: MeasurementPayload = {
+          scale_ref: scale?.id ?? null,
+          raw_measure: raw,
+          unit: scale?.unit ?? "pt²",
+          computed_quantity: scale ? raw * scale.ratio * scale.ratio : 0,
+          depth: null,
+          count_value: null,
+          custom_columns: {},
+        };
+        const m = buildMarkup({
+          markupType: "MeasurementArea",
+          page: pageIndex,
+          geometry: polylineGeometry(mcVerts),
+          appearance: store.draftAppearance,
+          identity,
+          now: new Date().toISOString(),
+          id: crypto.randomUUID(),
+        });
+        m.measurement = meas;
+        store.create(m);
+        resetMultiClick();
+      } else {
+        finishMultiClick();
+      }
     }
     if (e.key === "Escape") {
       resetMultiClick();
       cancelDraw();
       store.selectedIds = new Set();
+      // Cancel in-progress calibration.
+      if (takeoffStore.calibrationState) {
+        takeoffStore.cancelCalibration();
+        showCalibDialog = false;
+      }
     }
   }
 
@@ -829,10 +875,36 @@
       return;
     }
 
+    // --- CALIBRATE tool branch ---
+    if (tool === "calibrate") {
+      const p = localPdf(e);
+      if (!p) return;
+      const step = takeoffStore.calibrationState?.step;
+      if (!step) {
+        // First pointer-down: start calibration if not yet started.
+        takeoffStore.startCalibration({ page: pageIndex, appliesToPage: pageIndex });
+        takeoffStore.calibrationClickP1(p);
+      } else if (step === "waiting_p1") {
+        takeoffStore.calibrationClickP1(p);
+      } else if (step === "waiting_p2") {
+        const result = takeoffStore.calibrationClickP2(p);
+        if (result) {
+          calibDialogDist = result.pixelDist;
+          showCalibDialog = true;
+        }
+      }
+      e.stopPropagation();
+      e.preventDefault();
+      return;
+    }
+
+    // --- MEASUREMENT COUNT tool branch (single click, handled via onOverlayClick) ---
+    if (tool === "MeasurementCount") return;
+
     // --- CREATE tool branch ---
     if (!isCreateTool(tool) || !identity) return;
     // Multi-click tools handle gestures via click/dblclick, not pointer capture.
-    if (isMultiClickTool(tool)) return;
+    if (isMultiClickTool(tool) || tool === "MeasurementArea") return;
     const p = localPdf(e);
     if (!p) return;
     (e.target as Element).setPointerCapture(e.pointerId);
@@ -1004,6 +1076,40 @@
       return;
     }
 
+    // --- MeasurementLength: drag-draw with measurement payload ---
+    if (tool === "MeasurementLength") {
+      if (!drawing || !drawStartPdf || !identity) { drawing = false; drawStartPdf = null; return; }
+      const p = localPdf(e);
+      drawing = false;
+      const start = drawStartPdf;
+      drawStartPdf = null;
+      if (!p || (p.x === start.x && p.y === start.y)) return;
+      const pts = [start, p];
+      const raw = measureLength(pts);
+      const scale = takeoffStore.activeScale;
+      const meas: MeasurementPayload = {
+        scale_ref: scale?.id ?? null,
+        raw_measure: raw,
+        unit: scale?.unit ?? "pt",
+        computed_quantity: scale ? raw * scale.ratio : 0,
+        depth: null,
+        count_value: null,
+        custom_columns: {},
+      };
+      const m = buildMarkup({
+        markupType: "MeasurementLength",
+        page: pageIndex,
+        geometry: { Polyline: pts },
+        appearance: store.draftAppearance,
+        identity,
+        now: new Date().toISOString(),
+        id: crypto.randomUUID(),
+      });
+      m.measurement = meas;
+      store.create(m);
+      return;
+    }
+
     if (!drawing || !drawStartPdf || !identity || !isDrawTool(tool)) {
       drawing = false;
       drawStartPdf = null;
@@ -1029,8 +1135,58 @@
   function onOverlayClick(e: MouseEvent) {
     // Selection is handled by pointer events, not click.
     if (isSelectTool()) return;
-    // Text/Callout tool: open the inline editor on click.
     const tool = store.activeTool;
+
+    // MeasurementCount: single click places a count point.
+    if (tool === "MeasurementCount" && identity) {
+      const p = localPdfFromMouse(e);
+      if (!p) return;
+      const scale = takeoffStore.activeScale;
+      const meas: MeasurementPayload = {
+        scale_ref: scale?.id ?? null,
+        raw_measure: 1,
+        unit: scale?.unit ?? "ea",
+        computed_quantity: 1,
+        depth: null,
+        count_value: 1,
+        custom_columns: {},
+      };
+      const m = buildMarkup({
+        markupType: "MeasurementCount",
+        page: pageIndex,
+        geometry: { Point: p },
+        appearance: store.draftAppearance,
+        identity,
+        now: new Date().toISOString(),
+        id: crypto.randomUUID(),
+      });
+      m.measurement = meas;
+      store.create(m);
+      return;
+    }
+
+    // MeasurementArea: multi-click polygon (same as Polygon but with measurement payload).
+    if (tool === "MeasurementArea" && identity) {
+      const p = localPdfFromMouse(e);
+      if (!p) return;
+      mcVerts = [...mcVerts, p];
+      // Update rubber-band preview.
+      const vertsForPreview = mcCursor ? [...mcVerts, mcCursor] : mcVerts;
+      if (vertsForPreview.length >= 2) {
+        previewMarkup = buildMarkup({
+          markupType: "MeasurementArea",
+          page: pageIndex,
+          geometry: polylineGeometry(vertsForPreview),
+          appearance: store.draftAppearance,
+          identity,
+          now: new Date().toISOString(),
+          id: "preview",
+        });
+      }
+      return;
+    }
+
+    // Text/Callout tool: open the inline editor on click.
     if (isTextTool(tool) && identity) {
       const p = localPdfFromMouse(e);
       if (!p) return;
@@ -1077,25 +1233,58 @@
   function onOverlayDblClick() {
     // No dblclick action under select tool.
     if (isSelectTool()) return;
+    const tool = store.activeTool;
     // The browser fires click→click→dblclick, so the dblclick's two constituent
     // clicks each appended a vertex at ~the same point; drop the duplicate before
     // finishing.
     if (mcVerts.length > 0) mcVerts = mcVerts.slice(0, -1);
+
+    // MeasurementArea: finish polygon and add measurement payload.
+    if (tool === "MeasurementArea" && identity && mcVerts.length >= 3) {
+      const raw = measureArea(mcVerts);
+      const scale = takeoffStore.activeScale;
+      const meas: MeasurementPayload = {
+        scale_ref: scale?.id ?? null,
+        raw_measure: raw,
+        unit: scale?.unit ?? "pt²",
+        computed_quantity: scale ? raw * scale.ratio * scale.ratio : 0,
+        depth: null,
+        count_value: null,
+        custom_columns: {},
+      };
+      const m = buildMarkup({
+        markupType: "MeasurementArea",
+        page: pageIndex,
+        geometry: polylineGeometry(mcVerts),
+        appearance: store.draftAppearance,
+        identity,
+        now: new Date().toISOString(),
+        id: crypto.randomUUID(),
+      });
+      m.measurement = meas;
+      store.create(m);
+      resetMultiClick();
+      return;
+    }
+
     finishMultiClick();
   }
 
   function onOverlayMouseMove(e: MouseEvent) {
     if (isSelectTool()) return;
-    if (!isMultiClickTool(store.activeTool) || mcVerts.length === 0 || !identity) return;
+    const tool = store.activeTool;
+    const isAreaTool = tool === "MeasurementArea";
+    if (!isMultiClickTool(tool) && !isAreaTool) return;
+    if (mcVerts.length === 0 || !identity) return;
     const p = localPdfFromMouse(e);
     if (!p) return;
     mcCursor = p;
     // Rubber-band: show current verts + live cursor.
-    const tool = store.activeTool as MultiClickTool;
     const vertsForPreview = [...mcVerts, p];
     if (vertsForPreview.length >= 2) {
       previewMarkup = buildMarkup({
-        markupType: tool,
+        // MeasurementArea uses "MeasurementArea" as the markupType for the preview.
+        markupType: isAreaTool ? "MeasurementArea" : (tool as MultiClickTool),
         page: pageIndex,
         geometry: polylineGeometry(vertsForPreview),
         appearance: store.draftAppearance,
@@ -1254,6 +1443,30 @@
       />
     {/if}
   </svg>
+
+  <!-- Calibration dialog: shown after user clicks two points with the calibrate tool. -->
+  {#if showCalibDialog}
+    <CalibrationDialog
+      pixelDist={calibDialogDist}
+      onConfirm={async (result) => {
+        showCalibDialog = false;
+        takeoffStore.cancelCalibration();
+        // Persist the new scale via IPC and add it to the store.
+        try {
+          const rec = await addScale(docInfo.doc_id, null, result.ratio, result.unit, result.label, result.precision);
+          takeoffStore.addScale(rec);
+        } catch (e) {
+          console.error("addScale failed:", e);
+        }
+        store.activeTool = "hand";
+      }}
+      onCancel={() => {
+        showCalibDialog = false;
+        takeoffStore.cancelCalibration();
+        store.activeTool = "hand";
+      }}
+    />
+  {/if}
 
   <!-- Inline text editor (Text/Callout). Positioned over the overlay at the click point. -->
   {#if editor}

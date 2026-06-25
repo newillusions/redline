@@ -76,4 +76,18 @@ describe("ToolPalette", () => {
     expect(store.activeTool).toBe("hand");
     expect(screen.getByTitle("Pan (Hand)")).toHaveAttribute("aria-pressed", "true");
   });
+
+  it("calibrate tool button is present and activatable", async () => {
+    const user = userEvent.setup();
+    render(ToolPalette, { props: { store } });
+    const btn = screen.getByTitle("Calibrate Scale (two-click)");
+    expect(btn).toBeTruthy();
+    await user.click(btn);
+    expect(store.activeTool).toBe("calibrate");
+  });
+
+  it("MeasurementLength tool button is present", () => {
+    render(ToolPalette, { props: { store } });
+    expect(screen.getByTitle("Measure Length")).toBeTruthy();
+  });
 });

@@ -71,6 +71,10 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 # --- Time ---
 chrono = { version = "0.4", features = ["serde"] }
 
+# --- XLSX + CSV export (Markup List export, spec §7) ---
+rust_xlsxwriter = "0.95.0"
+csv = "1.4.0"
+
 # --- Spatial index for snap targets (geometry module) ---
 # rstar = r-tree for 2D snap-target lookups
 rstar = "0.12"

@@ -21,6 +21,7 @@ pub mod document;
 pub mod geometry;
 mod identity;
 pub mod render;
+pub mod sidecar;
 
 // Stub modules — spec §4 scaffolded, implemented in future milestones
 pub mod compare;
@@ -32,8 +33,11 @@ pub mod storage;
 pub mod takeoff;
 pub mod text;
 
+use std::sync::Mutex;
+
 use document::store::MarkupStore;
 use render::RenderHandle;
+use takeoff::ScaleStore;
 
 /// Shared application state threaded through all Tauri commands.
 ///
@@ -44,6 +48,7 @@ use render::RenderHandle;
 pub struct AppState {
     pub render: RenderHandle,
     pub markups: MarkupStore,
+    pub scales: Mutex<ScaleStore>,
 }
 
 /// Resolve the bundled PDFium library path and export it via `PDFIUM_DYNAMIC_LIB_PATH`
@@ -120,6 +125,7 @@ pub fn run() {
             app.manage(AppState {
                 render,
                 markups: MarkupStore::default(),
+                scales: Mutex::new(ScaleStore::default()),
             });
             info!("Redline started");
             Ok(())
@@ -143,6 +149,11 @@ pub fn run() {
             // Diagnostics (in-app §20 bench overlay)
             commands::diag::process_rss_mb,
             commands::diag::auto_open_path,
+            // Takeoff commands (M3)
+            commands::takeoff::add_scale,
+            commands::takeoff::list_scales,
+            commands::takeoff::delete_scale,
+            commands::takeoff::export_markup_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running redline");
