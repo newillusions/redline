@@ -1,0 +1,24 @@
+FROM rust:1.89-slim
+
+# Tauri 2 system deps required even for cargo test --lib (tauri-build links against webkit/GTK).
+# libayatana-appindicator3-dev omitted (Ubuntu-only; tray-icon feature not enabled).
+RUN apt-get update -qq && apt-get install -y -qq \
+  pkg-config \
+  libssl-dev \
+  libwebkit2gtk-4.1-dev \
+  build-essential \
+  wget \
+  file \
+  libxdo-dev \
+  librsvg2-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+# --chown=root:root normalises file ownership so the Docker layer cache is shared
+# between builds on different machines (Mac dev vs Linux CI runner).
+COPY --chown=root:root Cargo.toml Cargo.lock ./
+COPY --chown=root:root src-tauri src-tauri
+
+ENV CARGO_TARGET_DIR=/target
+
+RUN cargo test --lib -p redline

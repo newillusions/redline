@@ -12,54 +12,32 @@ concurrency:
 
 jobs:
   test-rust:
-    # ubuntu-latest is the only runner label confirmed available for this repo
-    # (test-frontend uses it and passes; the rust-1.89 label is not registered here
-    # and failed to schedule in ~2s). The runner container is root, so no sudo, and
-    # external setup actions (dtolnay/rust-toolchain, actions/cache) do not resolve -
-    # install everything with plain run-steps, matching the mindmulch CI pattern.
+    # Routes the heavy Tauri+PDFium compile to the remote Docker daemon (10.0.23.137)
+    # via DOCKER_HOST. BuildKit cache mounts in the Dockerfile persist apt and cargo
+    # caches between runs on that daemon, making subsequent CI runs fast.
+    # The first run is slow (full apt + cargo compile); subsequent runs skip both.
     runs-on: ubuntu-latest
+    env:
+      DOCKER_HOST: tcp://10.0.23.137:2375
     steps:
-      - name: Install build prerequisites + Tauri/PDFium system deps
-        # The redline crate links the Tauri 2 webview (webkit2gtk 4.1) on Linux, so
-        # even `cargo test` must compile against the GTK/webkit system libs.
-        # Package list per https://v2.tauri.app/start/prerequisites/. No sudo: root.
+      - uses: actions/checkout@v4
+
+      - name: Install Docker CLI
         run: |
           apt-get update -qq
-          apt-get install -y -qq \
-            git curl ca-certificates \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            wget \
-            file \
-            libxdo-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            pkg-config
+          apt-get install -y -qq docker.io > /dev/null 2>&1
+          echo "Docker CLI version: $(docker --version)"
+          echo "DOCKER_HOST: $DOCKER_HOST"
+          docker info --format 'Remote daemon: {{.ServerVersion}} OS={{.OperatingSystem}}'
 
-      - name: Checkout
+      - name: Build and run tests
         run: |
-          git init -q && git remote add origin https://forge.mms.name/${GITHUB_REPOSITORY}.git
-          git fetch -q --depth 1 origin ${GITHUB_SHA} && git checkout -q FETCH_HEAD
-
-      - name: Install Rust toolchain (rustup)
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Run Rust tests
-        # `cargo test --lib` runs all 148 lib tests while skipping the `bench` and
-        # `main` binary targets and doc-tests (zero tests in those) - that roughly
-        # halves the compile/link load so the build fits the runner. Source cargo env
-        # explicitly in case $GITHUB_PATH propagation is not honored by the runner.
-        # Single codegen unit + thin LTO off keeps peak linker memory down.
-        run: |
-          . "$HOME/.cargo/env"
-          cargo test --lib -p redline
-        env:
-          RUST_LOG: warn
-          CARGO_NET_RETRY: "5"
-          CARGO_PROFILE_TEST_DEBUG: "0"
+          docker build \
+            --network=host \
+            --progress=plain \
+            -t redline-test \
+            -f .forgejo/Dockerfile.test-rust \
+            .
 
   test-frontend:
     runs-on: ubuntu-latest
