@@ -281,3 +281,65 @@ export async function exportMarkupList(
 ): Promise<void> {
   return invoke<void>("export_markup_list", { docId: doc_id, path, format });
 }
+
+// ---------------------------------------------------------------------------
+// Page operation commands (M4 S1)
+// ---------------------------------------------------------------------------
+
+export interface RotatePageArgs {
+  doc_id: string;
+  page_idx: number;
+  degrees: number;
+}
+
+export interface DeletePageArgs {
+  doc_id: string;
+  page_idx: number;
+}
+
+export interface ReorderPagesArgs {
+  doc_id: string;
+  new_order: number[];
+}
+
+export interface InsertBlankPageArgs {
+  doc_id: string;
+  at: number;
+  width: number;
+  height: number;
+}
+
+/** Rotate a page by `degrees` (multiple of 90, incremental). 0-based page index. */
+export async function rotatePage(args: RotatePageArgs): Promise<void> {
+  return invoke<void>("rotate_page", {
+    docId: args.doc_id,
+    pageIdx: args.page_idx,
+    degrees: args.degrees,
+  });
+}
+
+/** Delete a page (0-based index). Errors if the document has only one page. */
+export async function deletePage(args: DeletePageArgs): Promise<void> {
+  return invoke<void>("delete_page", {
+    docId: args.doc_id,
+    pageIdx: args.page_idx,
+  });
+}
+
+/** Reorder pages. `new_order` is a permutation of `0..pageCount` (0-based). */
+export async function reorderPages(args: ReorderPagesArgs): Promise<void> {
+  return invoke<void>("reorder_pages", {
+    docId: args.doc_id,
+    newOrder: args.new_order,
+  });
+}
+
+/** Insert a blank page at position `at` (0-based). `at == pageCount` appends. */
+export async function insertBlankPage(args: InsertBlankPageArgs): Promise<void> {
+  return invoke<void>("insert_blank_page", {
+    docId: args.doc_id,
+    at: args.at,
+    width: args.width,
+    height: args.height,
+  });
+}

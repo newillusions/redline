@@ -70,6 +70,45 @@ pub async fn delete_scale(
     Ok(removed)
 }
 
+/// List the scales applicable to a page for the preset picker: a page-specific
+/// scale (if any) plus the document default. Lets the user pick a saved scale
+/// without re-drawing a calibration line (M4 S1, M3-deferred). Page-specific first.
+#[tauri::command]
+pub async fn list_applicable_scales(
+    state: State<'_, AppState>,
+    doc_id: String,
+    page_idx: u32,
+) -> Result<Vec<ScaleRecord>, String> {
+    let store = state.scales.lock().unwrap();
+    let all = store.list(&doc_id);
+    Ok(crate::takeoff::applicable_scales(all, page_idx)
+        .into_iter()
+        .cloned()
+        .collect())
+}
+
+/// Embed a standard PDF /Measure viewport dictionary (spec §12.7) for a page,
+/// using a saved scale, so Acrobat/Bluebeam can read the calibration. Writes the
+/// PDF on disk (atomic temp+rename) and reloads the render engine (M4 S1).
+#[tauri::command]
+pub async fn write_page_measure(
+    state: State<'_, AppState>,
+    doc_id: String,
+    page_idx: u32,
+    scale_id: String,
+) -> Result<(), String> {
+    let scale = {
+        let store = state.scales.lock().unwrap();
+        crate::takeoff::find_scale(store.list(&doc_id), &scale_id)
+            .ok_or_else(|| format!("scale {scale_id} not found for doc {doc_id}"))?
+            .clone()
+    };
+    crate::commands::document::apply_page_edit(&state, &doc_id, move |doc| {
+        crate::takeoff::write_measure_dict(doc, page_idx, &scale)
+    })
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // Export command
 // ---------------------------------------------------------------------------

@@ -146,6 +146,11 @@ pub fn run() {
             commands::document::update_markup,
             commands::document::delete_markup,
             commands::document::get_user_identity,
+            // Page operation commands (M4 S1)
+            commands::document::rotate_page,
+            commands::document::delete_page,
+            commands::document::reorder_pages,
+            commands::document::insert_blank_page,
             // Diagnostics (in-app §20 bench overlay)
             commands::diag::process_rss_mb,
             commands::diag::auto_open_path,
@@ -154,6 +159,9 @@ pub fn run() {
             commands::takeoff::list_scales,
             commands::takeoff::delete_scale,
             commands::takeoff::export_markup_list,
+            // Takeoff commands (M4 S1 — preset picker + /Measure write)
+            commands::takeoff::list_applicable_scales,
+            commands::takeoff::write_page_measure,
         ])
         .run(tauri::generate_context!())
         .expect("error while running redline");

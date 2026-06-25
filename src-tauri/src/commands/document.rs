@@ -1,8 +1,10 @@
 //! Tauri commands for document open/close (spec §4).
 
+use anyhow::Context as _;
 use std::path::PathBuf;
 use tauri::{Manager, State};
 
+use crate::document::page_ops;
 use crate::document::save::{load_markups_from, save_with_markups};
 use crate::document::{new_doc_id, DocumentInfo};
 use crate::markup::Markup;
@@ -229,4 +231,143 @@ async fn save_inner(
         state.markups.set_path(doc_id, dest)?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Page operation commands (M4 S1)
+//
+// All page ops follow the same pattern:
+// 1. Load the PDF via lopdf (spawn_blocking).
+// 2. Apply the page operation.
+// 3. Save atomically (temp file + rename over original).
+// 4. Close + reopen the render doc so tiles refresh.
+// 5. Invalidate the markup cache.
+// ---------------------------------------------------------------------------
+
+/// Apply a document edit (closure) to the PDF on disk, then reload the render engine.
+/// Shared implementation for the page ops (rotate/delete/reorder/insert) and for any
+/// other lopdf-level edit that must restructure the file and refresh tiles (e.g. the
+/// takeoff /Measure dict write). Markups are re-written so they survive the edit.
+pub(crate) async fn apply_page_edit(
+    state: &State<'_, AppState>,
+    doc_id: &str,
+    op: impl FnOnce(&mut lopdf::Document) -> anyhow::Result<()> + Send + 'static,
+) -> Result<(), String> {
+    let src = state
+        .markups
+        .path(doc_id)
+        .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+
+    // Load-before-op: ensure the markup store is seeded so save doesn't drop existing
+    // redline annotations that haven't been loaded into memory yet.
+    if !state.markups.is_loaded(doc_id) {
+        let p = src.clone();
+        let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?;
+        state.markups.seed_loaded(doc_id, loaded)?;
+    }
+    let markups = state.markups.list(doc_id)?;
+
+    // Apply the op + save in a blocking task.
+    let src2 = src.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let mut doc =
+            lopdf::Document::load(&src2).with_context(|| format!("load {}", src2.display()))?;
+        op(&mut doc)?;
+        // Write markups back so they survive the page restructuring.
+        crate::document::annots::write_markups(&mut doc, &markups)?;
+        // Atomic write: temp + rename.
+        let dir = src2.parent().context("no parent dir")?;
+        let tmp = dir.join(format!(
+            ".redline-tmp-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let result = (|| -> anyhow::Result<()> {
+            let f = doc
+                .save(&tmp)
+                .with_context(|| format!("write {}", tmp.display()))?;
+            f.sync_all().context("fsync temp")?;
+            std::fs::rename(&tmp, &src2).context("atomic rename")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))?;
+
+    // Reload the render engine so new page geometry is reflected in tile renders.
+    state
+        .render
+        .close_document(doc_id.to_string())
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    state
+        .render
+        .open_document(src.clone(), doc_id.to_string())
+        .await
+        .map_err(|e| format!("reopen after page op: {e:#}"))?;
+    state.markups.invalidate_cache(&src);
+    Ok(())
+}
+
+/// Rotate a page by `degrees` (multiple of 90, incremental/cumulative).
+#[tauri::command]
+pub async fn rotate_page(
+    state: State<'_, AppState>,
+    doc_id: String,
+    page_idx: u32,
+    degrees: i32,
+) -> Result<(), String> {
+    apply_page_edit(&state, &doc_id, move |doc| {
+        page_ops::rotate_page(doc, page_idx, degrees)
+    })
+    .await
+}
+
+/// Delete a page (0-based index). Errors if the document has only one page.
+#[tauri::command]
+pub async fn delete_page(
+    state: State<'_, AppState>,
+    doc_id: String,
+    page_idx: u32,
+) -> Result<(), String> {
+    apply_page_edit(&state, &doc_id, move |doc| {
+        page_ops::delete_page(doc, page_idx)
+    })
+    .await
+}
+
+/// Reorder pages. `new_order` is a permutation of `0..page_count` (0-based).
+#[tauri::command]
+pub async fn reorder_pages(
+    state: State<'_, AppState>,
+    doc_id: String,
+    new_order: Vec<u32>,
+) -> Result<(), String> {
+    apply_page_edit(&state, &doc_id, move |doc| {
+        page_ops::reorder_pages(doc, new_order)
+    })
+    .await
+}
+
+/// Insert a blank page at position `at` (0-based; `at == page_count` appends).
+#[tauri::command]
+pub async fn insert_blank_page(
+    state: State<'_, AppState>,
+    doc_id: String,
+    at: u32,
+    width: f32,
+    height: f32,
+) -> Result<(), String> {
+    apply_page_edit(&state, &doc_id, move |doc| {
+        page_ops::insert_blank_page(doc, at, width, height)
+    })
+    .await
 }

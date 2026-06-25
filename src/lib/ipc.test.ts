@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import * as ipc from "./ipc";
 import type { Markup, TileRequest } from "./ipc";
+import type { RotatePageArgs, DeletePageArgs, ReorderPagesArgs, InsertBlankPageArgs } from "./ipc";
 
 /**
  * Guards the Tauri v2 invoke argument-naming convention: JS passes **camelCase**
@@ -75,5 +76,81 @@ describe("ipc invoke argument keys (Tauri v2 camelCase)", () => {
     const req = { doc_id: "d1", page_index: 0 } as unknown as TileRequest;
     await ipc.renderTile(req);
     expect(mockInvoke).toHaveBeenCalledWith("render_tile", { req });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Page operation IPC wrappers (M4 S1)
+// ---------------------------------------------------------------------------
+
+describe("page operation ipc wrappers (Tauri v2 camelCase keys)", () => {
+  const mockInvoke = vi.mocked(invoke);
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue(undefined as never);
+  });
+
+  it("rotatePage → docId / pageIdx / degrees", async () => {
+    const args: RotatePageArgs = { doc_id: "d1", page_idx: 2, degrees: 90 };
+    await ipc.rotatePage(args);
+    expect(mockInvoke).toHaveBeenCalledWith("rotate_page", {
+      docId: "d1",
+      pageIdx: 2,
+      degrees: 90,
+    });
+  });
+
+  it("deletePage → docId / pageIdx", async () => {
+    const args: DeletePageArgs = { doc_id: "d1", page_idx: 3 };
+    await ipc.deletePage(args);
+    expect(mockInvoke).toHaveBeenCalledWith("delete_page", {
+      docId: "d1",
+      pageIdx: 3,
+    });
+  });
+
+  it("reorderPages → docId / newOrder", async () => {
+    const args: ReorderPagesArgs = { doc_id: "d1", new_order: [2, 0, 1] };
+    await ipc.reorderPages(args);
+    expect(mockInvoke).toHaveBeenCalledWith("reorder_pages", {
+      docId: "d1",
+      newOrder: [2, 0, 1],
+    });
+  });
+
+  it("insertBlankPage → docId / at / width / height", async () => {
+    const args: InsertBlankPageArgs = { doc_id: "d1", at: 1, width: 612, height: 792 };
+    await ipc.insertBlankPage(args);
+    expect(mockInvoke).toHaveBeenCalledWith("insert_blank_page", {
+      docId: "d1",
+      at: 1,
+      width: 612,
+      height: 792,
+    });
+  });
+
+  it("rotatePage returns void on success", async () => {
+    const args: RotatePageArgs = { doc_id: "d1", page_idx: 0, degrees: 180 };
+    const result = await ipc.rotatePage(args);
+    expect(result).toBeUndefined();
+  });
+
+  it("deletePage returns void on success", async () => {
+    const args: DeletePageArgs = { doc_id: "d1", page_idx: 0 };
+    const result = await ipc.deletePage(args);
+    expect(result).toBeUndefined();
+  });
+
+  it("reorderPages returns void on success", async () => {
+    const args: ReorderPagesArgs = { doc_id: "d1", new_order: [1, 0] };
+    const result = await ipc.reorderPages(args);
+    expect(result).toBeUndefined();
+  });
+
+  it("insertBlankPage returns void on success", async () => {
+    const args: InsertBlankPageArgs = { doc_id: "d1", at: 0, width: 595, height: 842 };
+    const result = await ipc.insertBlankPage(args);
+    expect(result).toBeUndefined();
   });
 });

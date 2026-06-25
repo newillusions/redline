@@ -17,6 +17,7 @@ pub struct DocumentInfo {
 }
 
 pub mod annots;
+pub mod page_ops;
 pub mod save;
 pub mod store;
 
