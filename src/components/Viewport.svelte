@@ -52,7 +52,8 @@
   import { patchGroup } from "$lib/markup-properties";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
   import { measureLength, measureArea } from "$lib/measurement-tools";
-  import { addScale, type MeasurementPayload } from "$lib/ipc";
+  import { addScale, type MeasurementPayload, type SearchHit } from "$lib/ipc";
+  import { pdfUserSpaceToScreen } from "$lib/viewport";
   import CalibrationDialog from "./CalibrationDialog.svelte";
 
   // ---------------------------------------------------------------------------
@@ -62,7 +63,17 @@
     docInfo,
     store,
     takeoffStore = new TakeoffStore(),
-  }: { docInfo: DocumentInfo; store: MarkupStore; takeoffStore?: TakeoffStore } = $props();
+    searchHits = [],
+    activeSearchHitIdx = null,
+  }: {
+    docInfo: DocumentInfo;
+    store: MarkupStore;
+    takeoffStore?: TakeoffStore;
+    /** Search hits from SearchPanel.  Viewport renders highlight rects on the current page. */
+    searchHits?: SearchHit[];
+    /** Index into searchHits that is currently focused (rendered with a stronger highlight). */
+    activeSearchHitIdx?: number | null;
+  } = $props();
 
   // ---------------------------------------------------------------------------
   // State
@@ -249,6 +260,28 @@
   // Screen-space chrome for the selection overlay.
   const chrome = $derived<SelectionChrome | null>(
     selectionBounds ? selectionChrome(selectionBounds, viewState, showHandles) : null,
+  );
+
+  // Search hit highlight rects for the current page in screen space.
+  // Uses the same §5 pdfUserSpaceToScreen transform as markups so highlights
+  // stay pixel-accurate at any zoom level.
+  const pageSearchHits = $derived(
+    searchHits
+      .map((h, idx) => ({ hit: h, idx }))
+      .filter(({ hit }) => hit.page === pageIndex)
+      .map(({ hit, idx }) => {
+        const [left, bottom, right, top] = hit.rect;
+        const tl = pdfUserSpaceToScreen(left, top, viewState);
+        const br = pdfUserSpaceToScreen(right, bottom, viewState);
+        return {
+          idx,
+          x: tl.x,
+          y: tl.y,
+          width: Math.max(1, br.x - tl.x),
+          height: Math.max(1, br.y - tl.y),
+          active: idx === activeSearchHitIdx,
+        };
+      })
   );
 
   // ---------------------------------------------------------------------------
@@ -1442,6 +1475,19 @@
         pointer-events="none"
       />
     {/if}
+
+    <!-- Search hit highlights (M4 S3). Semi-transparent rects over matched text.
+         Active hit uses a stronger fill for the "you are here" indicator. -->
+    {#each pageSearchHits as r (r.idx)}
+      <rect
+        class="search-hit"
+        class:search-hit-active={r.active}
+        x={r.x} y={r.y}
+        width={r.width} height={r.height}
+        pointer-events="none"
+        aria-hidden="true"
+      />
+    {/each}
   </svg>
 
   <!-- Calibration dialog: shown after user clicks two points with the calibrate tool. -->
@@ -1607,6 +1653,19 @@
     stroke-width: 1px;
     stroke-dasharray: 4, 2;
     opacity: 0.7;
+  }
+
+  /* Search hit highlights (M4 S3). Semi-transparent yellow fill, no stroke. */
+  :global(.markup-overlay .search-hit) {
+    fill: #facc15; /* yellow-400 equivalent */
+    fill-opacity: 0.35;
+    stroke: none;
+  }
+
+  /* Active (focused) search hit: stronger highlight. */
+  :global(.markup-overlay .search-hit-active) {
+    fill: #f97316; /* orange-500 equivalent */
+    fill-opacity: 0.45;
   }
 
   /* Inline text editor (Text/Callout tool). */

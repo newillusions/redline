@@ -7,3 +7,4 @@ pub mod diag;
 pub mod document;
 pub mod render;
 pub mod takeoff;
+pub mod text;

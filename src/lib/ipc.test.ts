@@ -154,3 +154,53 @@ describe("page operation ipc wrappers (Tauri v2 camelCase keys)", () => {
     expect(result).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Text search IPC wrappers (M4 S3)
+// ---------------------------------------------------------------------------
+
+describe("text search ipc wrappers (Tauri v2 camelCase keys)", () => {
+  const mockInvoke = vi.mocked(invoke);
+
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue([] as never);
+  });
+
+  it("searchDocument → docId / query / caseSensitive / wholeWord (defaults false)", async () => {
+    await ipc.searchDocument("d1", "hello");
+    expect(mockInvoke).toHaveBeenCalledWith("search_document", {
+      docId: "d1",
+      query: "hello",
+      caseSensitive: false,
+      wholeWord: false,
+    });
+  });
+
+  it("searchDocument passes caseSensitive=true when set", async () => {
+    await ipc.searchDocument("d1", "Hello", true);
+    expect(mockInvoke).toHaveBeenCalledWith("search_document", {
+      docId: "d1",
+      query: "Hello",
+      caseSensitive: true,
+      wholeWord: false,
+    });
+  });
+
+  it("searchDocument passes wholeWord=true when set", async () => {
+    await ipc.searchDocument("d1", "the", false, true);
+    expect(mockInvoke).toHaveBeenCalledWith("search_document", {
+      docId: "d1",
+      query: "the",
+      caseSensitive: false,
+      wholeWord: true,
+    });
+  });
+
+  it("searchDocument returns the hit array from invoke", async () => {
+    const hits: ipc.SearchHit[] = [{ page: 2, rect: [1, 2, 3, 4], snippet: "foo" }];
+    mockInvoke.mockResolvedValue(hits as never);
+    const result = await ipc.searchDocument("d1", "foo");
+    expect(result).toEqual(hits);
+  });
+});

@@ -343,3 +343,38 @@ export async function insertBlankPage(args: InsertBlankPageArgs): Promise<void> 
     height: args.height,
   });
 }
+
+// ---------------------------------------------------------------------------
+// Text search types + commands (M4 S3)
+// ---------------------------------------------------------------------------
+
+/**
+ * A single text-search hit on one page.
+ * `rect` is [left, bottom, right, top] in PDF user-space points (y-up, same
+ * coordinate system as markups / §5 invariant).
+ */
+export interface SearchHit {
+  page: number;
+  /** [left, bottom, right, top] in PDF user-space points. */
+  rect: [number, number, number, number];
+  snippet: string;
+}
+
+/**
+ * Search for all occurrences of `query` across every page of an open document.
+ * Returns hits ordered by page then occurrence, or an empty array on no match.
+ * Returns a rejected promise if `docId` is unknown or PDFium fails.
+ */
+export async function searchDocument(
+  docId: string,
+  query: string,
+  caseSensitive = false,
+  wholeWord = false
+): Promise<SearchHit[]> {
+  return invoke<SearchHit[]>("search_document", {
+    docId,
+    query,
+    caseSensitive,
+    wholeWord,
+  });
+}

@@ -162,6 +162,8 @@ pub fn run() {
             // Takeoff commands (M4 S1 — preset picker + /Measure write)
             commands::takeoff::list_applicable_scales,
             commands::takeoff::write_page_measure,
+            // Text search commands (M4 S3)
+            commands::text::search_document,
         ])
         .run(tauri::generate_context!())
         .expect("error while running redline");
