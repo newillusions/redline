@@ -6,6 +6,7 @@
 pub mod diag;
 pub mod document;
 pub mod render;
+pub mod search;
 pub mod takeoff;
 pub mod text;
 pub mod versioning;

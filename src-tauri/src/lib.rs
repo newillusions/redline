@@ -49,6 +49,9 @@ pub struct AppState {
     pub render: RenderHandle,
     pub markups: MarkupStore,
     pub scales: Mutex<ScaleStore>,
+    /// Active folder full-text search index (M4 S4). `None` until the
+    /// `open_folder_index` command is called.
+    pub folder_index: Mutex<Option<search::FolderIndex>>,
 }
 
 /// Resolve the bundled PDFium library path and export it via `PDFIUM_DYNAMIC_LIB_PATH`
@@ -126,6 +129,7 @@ pub fn run() {
                 render,
                 markups: MarkupStore::default(),
                 scales: Mutex::new(ScaleStore::default()),
+                folder_index: Mutex::new(None),
             });
             info!("Redline started");
             Ok(())
@@ -168,6 +172,10 @@ pub fn run() {
             commands::versioning::snapshot_version,
             commands::versioning::list_document_versions,
             commands::versioning::restore_document_version,
+            // Folder full-text search commands (M4 S4)
+            commands::search::open_folder_index,
+            commands::search::search_folder,
+            commands::search::folder_index_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running redline");

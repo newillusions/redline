@@ -79,15 +79,17 @@ csv = "1.4.0"
 # rstar = r-tree for 2D snap-target lookups
 rstar = "0.12"
 
+# --- Full-text search (M4 S4) ---
+tantivy = "0.22"
+notify = "6"
+
 # --- Future milestones (feature-gated to keep M1 build lean) ---
 # leptess = { version = "0.14", optional = true }   # OCR — M4
-# tantivy = { version = "0.22", optional = true }   # full-text search — M4
 
 [features]
 default = []
 # Uncomment when milestone work begins:
 # ocr = ["dep:leptess"]
-# search = ["dep:tantivy"]
 
 [dev-dependencies]
 tempfile = "3"

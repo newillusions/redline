@@ -1,17 +1,19 @@
 // @vitest-environment jsdom
 /**
- * SearchPanel tests (M4 S3).
+ * SearchPanel tests (M4 S3 + M4 S4).
  *
  * - Mounts the real SearchPanel.svelte with controlled props.
- * - Mocks $lib/ipc so searchDocument calls are captured, not executed.
- * - Covers: initial render, search submission, result list, clear, options,
+ * - Mocks $lib/ipc so search calls are captured, not executed.
+ * - S3 covers: initial render, search submission, result list, clear, options,
  *   result click invokes onJump, Escape clears, no-results state.
+ * - S4 covers: folder mode tab, folder search call, cross-file results,
+ *   folder result click invokes onFolderJump.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/svelte";
 import { tick } from "svelte";
 import SearchPanel from "./SearchPanel.svelte";
-import type { SearchHit } from "$lib/ipc";
+import type { SearchHit, FolderSearchHit } from "$lib/ipc";
 
 // ---------------------------------------------------------------------------
 // Mock $lib/ipc
@@ -22,8 +24,17 @@ const FIXTURE_HITS: SearchHit[] = [
   { page: 1, rect: [5, 40, 60, 55], snippet: "hello again" },
 ];
 
+const FIXTURE_FOLDER_HITS: FolderSearchHit[] = [
+  { file_path: "/docs/plan.pdf", page_number: 3, snippet: "concrete <b>foundation</b>", source: "lopdf" },
+  { file_path: "/docs/spec.pdf", page_number: 7, snippet: "steel <b>foundation</b> detail", source: "lopdf" },
+];
+
 const mockSearchDocument = vi.fn<
   (docId: string, query: string, caseSensitive: boolean, wholeWord: boolean) => Promise<SearchHit[]>
+>();
+
+const mockSearchFolder = vi.fn<
+  (query: string, limit?: number) => Promise<FolderSearchHit[]>
 >();
 
 vi.mock("$lib/ipc", () => ({
@@ -33,6 +44,8 @@ vi.mock("$lib/ipc", () => ({
     caseSensitive: boolean,
     wholeWord: boolean
   ) => mockSearchDocument(docId, query, caseSensitive, wholeWord),
+  searchFolder: (query: string, limit?: number) =>
+    mockSearchFolder(query, limit),
   // other ipc stubs required by potential transitive imports
   getPageSize: vi.fn(),
   renderTile: vi.fn(),
@@ -57,6 +70,20 @@ function mountPanel({
   });
 }
 
+function mountPanelWithFolder({
+  docId = "doc-1",
+  pageCount = 5,
+  folderPath = "/docs",
+  onHits = vi.fn(),
+  onJump = vi.fn(),
+  onFolderHits = vi.fn(),
+  onFolderJump = vi.fn(),
+} = {}) {
+  return render(SearchPanel, {
+    props: { docId, pageCount, folderPath, onHits, onJump, onFolderHits, onFolderJump },
+  });
+}
+
 async function typeQuery(input: HTMLElement, value: string) {
   await fireEvent.input(input, { target: { value } });
   // Svelte bind:value uses the change event in some environments; cover both.
@@ -72,6 +99,7 @@ describe("SearchPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockSearchDocument.mockResolvedValue(FIXTURE_HITS);
+    mockSearchFolder.mockResolvedValue(FIXTURE_FOLDER_HITS);
   });
 
   it("renders the query input and Find button", () => {
@@ -241,5 +269,112 @@ describe("SearchPanel", () => {
     // Page 0 → "p.1", page 1 → "p.2"
     expect(screen.getByText("p.1")).toBeTruthy();
     expect(screen.getByText("p.2")).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Folder search mode (M4 S4)
+// ---------------------------------------------------------------------------
+
+describe("SearchPanel folder search mode", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSearchDocument.mockResolvedValue(FIXTURE_HITS);
+    mockSearchFolder.mockResolvedValue(FIXTURE_FOLDER_HITS);
+  });
+
+  it("does not show mode tabs when folderPath is not provided", () => {
+    mountPanel();
+    expect(screen.queryByRole("tab")).toBeNull();
+  });
+
+  it("shows Doc and Folder tabs when folderPath is provided", () => {
+    mountPanelWithFolder();
+    expect(screen.getByRole("tab", { name: /doc/i })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: /folder/i })).toBeTruthy();
+  });
+
+  it("clicking Folder tab switches to folder mode (placeholder shows 'folder')", async () => {
+    mountPanelWithFolder();
+    await fireEvent.click(screen.getByRole("tab", { name: /folder/i }));
+    await tick();
+    const input = screen.getByRole("searchbox") as HTMLInputElement;
+    expect(input.placeholder.toLowerCase()).toContain("folder");
+  });
+
+  it("folder mode calls searchFolder (not searchDocument)", async () => {
+    const onFolderHits = vi.fn();
+    mountPanelWithFolder({ onFolderHits });
+
+    await fireEvent.click(screen.getByRole("tab", { name: /folder/i }));
+    await tick();
+
+    const input = screen.getByRole("searchbox");
+    await typeQuery(input, "foundation");
+    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
+    await tick();
+    await tick();
+
+    expect(mockSearchFolder).toHaveBeenCalledOnce();
+    expect(mockSearchDocument).not.toHaveBeenCalled();
+    expect(onFolderHits).toHaveBeenCalledWith(FIXTURE_FOLDER_HITS);
+  });
+
+  it("folder results show file name and page number", async () => {
+    mountPanelWithFolder();
+
+    await fireEvent.click(screen.getByRole("tab", { name: /folder/i }));
+    await tick();
+
+    const input = screen.getByRole("searchbox");
+    await typeQuery(input, "foundation");
+    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
+    await tick();
+    await tick();
+
+    // File names (basename of path)
+    expect(screen.getByText("plan.pdf")).toBeTruthy();
+    expect(screen.getByText("spec.pdf")).toBeTruthy();
+    // 1-based page numbers from FIXTURE_FOLDER_HITS
+    expect(screen.getByText("p.3")).toBeTruthy();
+    expect(screen.getByText("p.7")).toBeTruthy();
+  });
+
+  it("clicking folder result calls onFolderJump with filePath and pageNumber", async () => {
+    const onFolderJump = vi.fn();
+    mountPanelWithFolder({ onFolderJump });
+
+    await fireEvent.click(screen.getByRole("tab", { name: /folder/i }));
+    await tick();
+
+    const input = screen.getByRole("searchbox");
+    await typeQuery(input, "foundation");
+    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
+    await tick();
+    await tick();
+
+    // Click the first result row (plan.pdf, page 3)
+    const firstResult = screen.getByText("plan.pdf").closest("li")!;
+    await fireEvent.click(firstResult);
+    await tick();
+
+    expect(onFolderJump).toHaveBeenCalledWith("/docs/plan.pdf", 3);
+  });
+
+  it("folder mode shows cross-file summary", async () => {
+    mountPanelWithFolder();
+
+    await fireEvent.click(screen.getByRole("tab", { name: /folder/i }));
+    await tick();
+
+    const input = screen.getByRole("searchbox");
+    await typeQuery(input, "foundation");
+    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
+    await tick();
+    await tick();
+
+    // FIXTURE_FOLDER_HITS has 2 results across 2 files
+    expect(screen.getByText(/2 result/i)).toBeTruthy();
+    expect(screen.getByText(/2 file/i)).toBeTruthy();
   });
 });

@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import * as ipc from "./ipc";
 import type { Markup, TileRequest } from "./ipc";
 import type { RotatePageArgs, DeletePageArgs, ReorderPagesArgs, InsertBlankPageArgs } from "./ipc";
+import type { FolderSearchHit, IndexStatus } from "./ipc";
 
 /**
  * Guards the Tauri v2 invoke argument-naming convention: JS passes **camelCase**
@@ -271,5 +272,78 @@ describe("versioning ipc wrappers (Tauri v2 camelCase keys)", () => {
     mockInvokeVer.mockResolvedValue(records as never);
     const result = await ipc.listDocumentVersions("d1");
     expect(result).toEqual(records);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Folder full-text search IPC wrappers (M4 S4)
+// ---------------------------------------------------------------------------
+
+describe("folder search ipc wrappers (Tauri v2 camelCase keys)", () => {
+  const mockInvokeFolderSearch = vi.mocked(invoke);
+
+  const IDLE_STATUS: IndexStatus = {
+    folder_path: "/docs",
+    indexed_files: 0,
+    indexed_pages: 0,
+    state: { kind: "Idle" },
+  };
+
+  beforeEach(() => {
+    mockInvokeFolderSearch.mockReset();
+    mockInvokeFolderSearch.mockResolvedValue(undefined as never);
+  });
+
+  it("openFolderIndex → folderPath (camelCase)", async () => {
+    mockInvokeFolderSearch.mockResolvedValue(IDLE_STATUS as never);
+    await ipc.openFolderIndex("/docs");
+    expect(mockInvokeFolderSearch).toHaveBeenCalledWith("open_folder_index", {
+      folderPath: "/docs",
+    });
+  });
+
+  it("openFolderIndex returns IndexStatus", async () => {
+    mockInvokeFolderSearch.mockResolvedValue(IDLE_STATUS as never);
+    const result = await ipc.openFolderIndex("/docs");
+    expect(result).toEqual(IDLE_STATUS);
+  });
+
+  it("searchFolder → query / limit (explicit)", async () => {
+    mockInvokeFolderSearch.mockResolvedValue([] as never);
+    await ipc.searchFolder("concrete", 10);
+    expect(mockInvokeFolderSearch).toHaveBeenCalledWith("search_folder", {
+      query: "concrete",
+      limit: 10,
+    });
+  });
+
+  it("searchFolder uses default limit 50 when omitted", async () => {
+    mockInvokeFolderSearch.mockResolvedValue([] as never);
+    await ipc.searchFolder("concrete");
+    expect(mockInvokeFolderSearch).toHaveBeenCalledWith("search_folder", {
+      query: "concrete",
+      limit: 50,
+    });
+  });
+
+  it("searchFolder returns FolderSearchHit array", async () => {
+    const hits: FolderSearchHit[] = [
+      {
+        file_path: "a.pdf",
+        page_number: 1,
+        snippet: "foo <b>bar</b> baz",
+        source: "lopdf",
+      },
+    ];
+    mockInvokeFolderSearch.mockResolvedValue(hits as never);
+    const result = await ipc.searchFolder("bar");
+    expect(result).toEqual(hits);
+  });
+
+  it("getFolderIndexStatus → no args", async () => {
+    mockInvokeFolderSearch.mockResolvedValue(IDLE_STATUS as never);
+    const result = await ipc.getFolderIndexStatus();
+    expect(mockInvokeFolderSearch).toHaveBeenCalledWith("folder_index_status");
+    expect(result).toEqual(IDLE_STATUS);
   });
 });
