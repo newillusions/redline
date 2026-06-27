@@ -24,7 +24,7 @@
   import ToolPalette from "./components/ToolPalette.svelte";
   import PropertiesPanel from "./components/PropertiesPanel.svelte";
   import MeasurementPanel from "./components/MeasurementPanel.svelte";
-  import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup } from "$lib/ipc";
+  import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup, flattenDocument } from "$lib/ipc";
   import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
   import type { DocumentInfo } from "$lib/ipc";
@@ -38,6 +38,7 @@
   let openError = $state<string | null>(null);
   let isOpening = $state(false);
   let isSaving = $state(false);
+  let isFlattening = $state(false);
 
   // --- Auto-open for the §20 GUI smoke / floor-machine runbook ---
   // If the backend reports REDLINE_OPEN_PDF (env var read in Rust), open it on
@@ -141,6 +142,22 @@
     }
   }
 
+  // --- DocOps handlers (M5) ---
+  async function handleFlatten() {
+    if (!currentDoc || isFlattening) return;
+    openError = null;
+    isFlattening = true;
+    try {
+      // Flush any unsaved in-memory markups first so the flatten sees current annotations.
+      await store?.flush();
+      await flattenDocument(currentDoc.doc_id);
+    } catch (e) {
+      openError = `Flatten failed: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      isFlattening = false;
+    }
+  }
+
   // --- Keyboard shortcuts ---
   function handleKeydown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && !e.shiftKey) {
@@ -165,6 +182,14 @@
       </button>
       <button class="btn-toolbar" onclick={handleSaveAs} disabled={!currentDoc || isSaving} title="Save As…">
         Save As…
+      </button>
+      <button
+        class="btn-toolbar btn-docops"
+        onclick={handleFlatten}
+        disabled={!currentDoc || isFlattening || isSaving}
+        title="Flatten — bake annotation appearances into page content (irreversible)"
+      >
+        {isFlattening ? "Flattening…" : "Flatten"}
       </button>
       {#if currentDoc}
         <span class="doc-name">{currentDoc.path.split(/[\\/]/).at(-1)}</span>
@@ -324,6 +349,14 @@
   .btn-toolbar:hover:not(:disabled) { background: var(--color-bg-hover); }
   .btn-toolbar:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn-toolbar.btn-icon { padding: var(--space-1) var(--space-2); }
+  /* DocOps buttons use a muted warning tint to signal an irreversible operation. */
+  .btn-toolbar.btn-docops {
+    border-color: var(--color-warning, #b45309);
+    color: var(--color-warning, #b45309);
+  }
+  .btn-toolbar.btn-docops:hover:not(:disabled) {
+    background: var(--color-warning-surface, #fffbeb);
+  }
 
   .btn-primary {
     background: var(--color-primary);

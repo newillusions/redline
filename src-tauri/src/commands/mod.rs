@@ -4,6 +4,7 @@
 //! via `tauri::generate_handler![]`.
 
 pub mod diag;
+pub mod docops;
 pub mod document;
 pub mod render;
 pub mod search;

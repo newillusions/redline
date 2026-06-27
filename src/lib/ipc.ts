@@ -489,3 +489,22 @@ export async function searchFolder(
 export async function getFolderIndexStatus(): Promise<IndexStatus> {
   return invoke<IndexStatus>("folder_index_status");
 }
+
+// ---------------------------------------------------------------------------
+// DocOps commands (M5 — flatten / optimize / redact, spec §8)
+// ---------------------------------------------------------------------------
+
+/**
+ * Flatten all annotation appearance streams in the open document into page
+ * content.  After completion the annotations are baked into the page and are
+ * no longer selectable/editable via Redline or any PDF viewer.
+ *
+ * The Tauri backend atomically rewrites the file and reloads the render engine,
+ * so the viewport updates automatically after this call returns.
+ *
+ * Returns a rejected promise on backend error (unknown doc_id, lopdf parse
+ * failure, or atomic-save failure).
+ */
+export async function flattenDocument(docId: string): Promise<void> {
+  return invoke<void>("flatten_document", { docId });
+}

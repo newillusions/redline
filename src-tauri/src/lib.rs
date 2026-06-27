@@ -176,6 +176,8 @@ pub fn run() {
             commands::search::open_folder_index,
             commands::search::search_folder,
             commands::search::folder_index_status,
+            // DocOps commands (M5)
+            commands::docops::flatten_document,
         ])
         .run(tauri::generate_context!())
         .expect("error while running redline");
