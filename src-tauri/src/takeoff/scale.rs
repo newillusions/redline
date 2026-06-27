@@ -97,7 +97,10 @@ impl ScaleStore {
         let list = self.inner.get(doc_id)?;
         list.iter()
             .find(|r| matches!(r.applies_to, ScaleTarget::Page { page: p } if p == page))
-            .or_else(|| list.iter().find(|r| matches!(r.applies_to, ScaleTarget::DocumentDefault)))
+            .or_else(|| {
+                list.iter()
+                    .find(|r| matches!(r.applies_to, ScaleTarget::DocumentDefault))
+            })
     }
 }
 
@@ -106,7 +109,14 @@ mod tests {
     use super::*;
 
     fn make_scale(applies_to: ScaleTarget, ratio: f64) -> ScaleRecord {
-        ScaleRecord::new(applies_to, ScaleMethod::Preset, ratio, "m".into(), "1:100".into(), 2)
+        ScaleRecord::new(
+            applies_to,
+            ScaleMethod::Preset,
+            ratio,
+            "m".into(),
+            "1:100".into(),
+            2,
+        )
     }
 
     #[test]

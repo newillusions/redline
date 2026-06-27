@@ -27,7 +27,14 @@ pub async fn add_scale(
         Some(p) => ScaleTarget::Page { page: p },
         None => ScaleTarget::DocumentDefault,
     };
-    let rec = ScaleRecord::new(applies_to.clone(), ScaleMethod::TwoPoint, ratio, unit, label, precision);
+    let rec = ScaleRecord::new(
+        applies_to.clone(),
+        ScaleMethod::TwoPoint,
+        ratio,
+        unit,
+        label,
+        precision,
+    );
 
     // Persist to sidecar
     let pdf_path = state.markups.path(&doc_id).ok_or("unknown doc")?;
@@ -151,28 +158,37 @@ fn export_xlsx(
     let ws = wb.add_worksheet();
 
     let header_fmt = Format::new().set_bold();
-    let headers = ["#", "Type", "Page", "Subject", "Author", "Date", "Contents", "Layer", "Quantity", "Unit", "Status"];
+    let headers = [
+        "#", "Type", "Page", "Subject", "Author", "Date", "Contents", "Layer", "Quantity", "Unit",
+        "Status",
+    ];
     for (col, h) in headers.iter().enumerate() {
         ws.write_string_with_format(0, col as u16, *h, &header_fmt)?;
     }
 
     for (row_idx, m) in markups.iter().enumerate() {
         let row = (row_idx + 1) as u32;
-        let (qty, unit) = m.measurement.as_ref()
+        let (qty, unit) = m
+            .measurement
+            .as_ref()
             .map(|meas| (format!("{:.2}", meas.computed_quantity), meas.unit.clone()))
             .unwrap_or_default();
 
         ws.write_number(row, 0, (row_idx + 1) as f64)?;
-        ws.write_string(row, 1, &format!("{:?}", m.markup_type))?;
+        ws.write_string(row, 1, format!("{:?}", m.markup_type))?;
         ws.write_number(row, 2, (m.page + 1) as f64)?; // 1-based for users
         ws.write_string(row, 3, m.subject.as_deref().unwrap_or(""))?;
         ws.write_string(row, 4, &m.audit.created_by.display_name)?;
-        ws.write_string(row, 5, &m.audit.created_at.format("%Y-%m-%d %H:%M").to_string())?;
+        ws.write_string(
+            row,
+            5,
+            m.audit.created_at.format("%Y-%m-%d %H:%M").to_string(),
+        )?;
         ws.write_string(row, 6, m.contents.as_deref().unwrap_or(""))?;
         ws.write_string(row, 7, m.layer.as_deref().unwrap_or(""))?;
         ws.write_string(row, 8, &qty)?;
         ws.write_string(row, 9, &unit)?;
-        ws.write_string(row, 10, &format!("{:?}", m.workflow.status))?;
+        ws.write_string(row, 10, format!("{:?}", m.workflow.status))?;
     }
 
     wb.save(path)?;
@@ -188,9 +204,14 @@ fn export_csv(
     path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut wtr = csv::Writer::from_path(path)?;
-    wtr.write_record(["#", "Type", "Page", "Subject", "Author", "Date", "Contents", "Layer", "Quantity", "Unit", "Status"])?;
+    wtr.write_record([
+        "#", "Type", "Page", "Subject", "Author", "Date", "Contents", "Layer", "Quantity", "Unit",
+        "Status",
+    ])?;
     for (i, m) in markups.iter().enumerate() {
-        let (qty, unit) = m.measurement.as_ref()
+        let (qty, unit) = m
+            .measurement
+            .as_ref()
             .map(|meas| (format!("{:.2}", meas.computed_quantity), meas.unit.clone()))
             .unwrap_or_default();
         wtr.write_record([
@@ -217,15 +238,21 @@ mod tests {
     use tempfile::tempdir;
 
     fn sample_markup(typ: crate::markup::MarkupType) -> crate::markup::Markup {
-        use crate::markup::{Appearance, MarkupGeometry, UserRef};
         use crate::geometry::PdfPoint;
+        use crate::markup::{Appearance, MarkupGeometry, UserRef};
         use uuid::Uuid;
         crate::markup::Markup::new(
             typ,
             0,
-            MarkupGeometry::Rect { min: PdfPoint { x: 0.0, y: 0.0 }, max: PdfPoint { x: 10.0, y: 10.0 } },
+            MarkupGeometry::Rect {
+                min: PdfPoint { x: 0.0, y: 0.0 },
+                max: PdfPoint { x: 10.0, y: 10.0 },
+            },
             Appearance::default(),
-            UserRef { user_id: Uuid::new_v4(), display_name: "Tester".into() },
+            UserRef {
+                user_id: Uuid::new_v4(),
+                display_name: "Tester".into(),
+            },
         )
     }
 
@@ -236,7 +263,10 @@ mod tests {
         let markups = vec![sample_markup(crate::markup::MarkupType::Rectangle)];
         export_csv(&markups, &out).unwrap();
         let content = std::fs::read_to_string(&out).unwrap();
-        assert!(content.contains("Rectangle"), "expected markup type in CSV: {content}");
+        assert!(
+            content.contains("Rectangle"),
+            "expected markup type in CSV: {content}"
+        );
         assert!(content.contains("Tester"), "expected author in CSV");
     }
 
@@ -247,7 +277,10 @@ mod tests {
         let markups = vec![sample_markup(crate::markup::MarkupType::MeasurementLength)];
         export_xlsx(&markups, &out).unwrap();
         assert!(out.exists(), "xlsx file should be created");
-        assert!(out.metadata().unwrap().len() > 1000, "xlsx should be non-trivial size");
+        assert!(
+            out.metadata().unwrap().len() > 1000,
+            "xlsx should be non-trivial size"
+        );
     }
 
     #[test]
@@ -268,7 +301,10 @@ mod tests {
         });
         export_csv(&[m], &out).unwrap();
         let content = std::fs::read_to_string(&out).unwrap();
-        assert!(content.contains("5.00"), "expected quantity 5.00 in CSV: {content}");
+        assert!(
+            content.contains("5.00"),
+            "expected quantity 5.00 in CSV: {content}"
+        );
         assert!(content.contains(",m,"), "expected unit m in CSV");
     }
 }
