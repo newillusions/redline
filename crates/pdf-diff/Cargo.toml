@@ -1,0 +1,26 @@
+[package]
+name = "pdf-diff"
+version = "0.1.0"
+edition = "2021"
+description = "Headless two-tier PDF fidelity diff (pixel + text-layer). Tauri-free; consumable by cad-export-api (Linux/axum) and redline M6."
+license = "MIT OR Apache-2.0"
+repository = "git@ssh.forge.mms.name:emittiv/redline.git"
+
+# HARD REQUIREMENT: NO Tauri, NO GUI, NO webview dependencies.
+# This crate is designed to be consumed by cad-export-api on Linux/axum
+# with zero desktop coupling. Any Tauri dep here breaks that contract.
+
+[dependencies]
+# Pin to exact version used in src-tauri to share a single PDFium dylib.
+pdfium-render = { version = "0.8.28", features = ["thread_safe", "image"] }
+image         = { version = "0.25", features = ["png"] }
+anyhow        = "1"
+log           = "0.4"
+memmap2       = "0.9.10"
+lopdf         = "0.36"
+serde         = { version = "1.0", features = ["derive"] }
+serde_json    = "1.0"
+
+[dev-dependencies]
+tempfile    = "3"
+env_logger  = "0.11"

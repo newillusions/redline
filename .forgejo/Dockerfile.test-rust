@@ -18,7 +18,17 @@ WORKDIR /workspace
 # between builds on different machines (Mac dev vs Linux CI runner).
 COPY --chown=root:root Cargo.toml Cargo.lock ./
 COPY --chown=root:root src-tauri src-tauri
+# pdf-diff is a workspace crate and a direct dependency of redline.
+# Without this COPY the src-tauri compilation fails immediately
+# because cargo cannot resolve the path dep ../crates/pdf-diff.
+COPY --chown=root:root crates crates
 
 ENV CARGO_TARGET_DIR=/target
 
-RUN cargo test --lib -p redline
+# Run both workspace crates.
+# PDFIUM_DYNAMIC_LIB_PATH is deliberately unset: PDFium-dependent tests in
+# src-tauri skip gracefully via early-return when the env var is absent
+# (matching the render::tests::corpus() helper pattern).
+# pdf-diff tests are all pure-Rust (pixel math + serde) and run unconditionally;
+# the single engine_new test handles Ok/Err without panic.
+RUN cargo test --lib -p redline && cargo test --lib -p pdf-diff

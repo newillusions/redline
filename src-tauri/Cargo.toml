@@ -1,6 +1,6 @@
 [package]
 name = "redline"
-version = "0.1.0"
+version = "0.2.0"
 description = "Redline — AEC PDF markup, takeoff, and document management"
 authors = ["Emittiv L.L.C-FZ"]
 license = ""
@@ -44,6 +44,9 @@ log = "0.4"
 # --- Error handling ---
 thiserror = "2"
 anyhow = "1"
+
+# --- Headless two-tier PDF diff (M6 compare module, shared with cad-export-api) ---
+pdf-diff = { path = "../crates/pdf-diff" }
 
 # --- PDF rendering (display only) ---
 # pdfium-render 0.8.x per spec §3. Latest on crates.io is 0.9.1; pin to 0.8.x

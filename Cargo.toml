@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "src-tauri",
+    "crates/pdf-diff",
 ]
 
 [workspace.package]

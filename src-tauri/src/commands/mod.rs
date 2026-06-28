@@ -3,6 +3,7 @@
 //! Pattern mirrors e-fees: one sub-module per domain, all commands registered in lib.rs
 //! via `tauri::generate_handler![]`.
 
+pub mod compare;
 pub mod diag;
 pub mod docops;
 pub mod document;
