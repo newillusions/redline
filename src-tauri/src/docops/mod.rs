@@ -25,13 +25,20 @@
 //!   are preserved; new top-level compositing is not added).
 //! - Annotations without an appearance stream (e.g. pure popup notes) are kept in place.
 //!
-//! # Optimize / Redact (stubs)
+//! # Optimize (v1 — lopdf)
 //!
-//! Both are left as passthrough stubs for M5. Planned implementations:
-//! - `optimize`: compress streams, remove unused objects, optionally linearise.
-//! - `redact`: rasterize the region at high DPI, overlay as an Image XObject, remove the
-//!   annotation. True vector redaction requires a mature engine (MuPDF / Apryse) behind
-//!   the trait — spec §8.
+//! `optimize_in_place(doc, level)` / `LopdfDocOps::optimize(bytes, level)`:
+//! - Level 0: no-op passthrough.
+//! - Level 1: prune unreferenced objects (`Document::prune_objects`).
+//! - Level 2+: prune + compress all compressable streams with Deflate (`Document::compress`).
+//!
+//! Deep image downsampling is out of scope for the v1 baseline (spec §8).
+//!
+//! # Redact (stub)
+//!
+//! Left as a passthrough stub. Planned v1 implementation:
+//! - Rasterize the region at high DPI, overlay as an Image XObject, remove the annotation.
+//! - True vector redaction requires a mature engine (MuPDF / Apryse) behind the trait — spec §8.
 
 use anyhow::{Context, Result};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
@@ -86,10 +93,17 @@ impl DocOps for LopdfDocOps {
         Ok(out)
     }
 
-    fn optimize(&self, pdf_bytes: &[u8], _level: u8) -> Result<Vec<u8>> {
-        // M5 stub: passthrough.
-        // Real implementation: linearise, recompress streams, remove unused objects.
-        Ok(pdf_bytes.to_vec())
+    fn optimize(&self, pdf_bytes: &[u8], level: u8) -> Result<Vec<u8>> {
+        if level == 0 {
+            return Ok(pdf_bytes.to_vec());
+        }
+        use std::io::Cursor;
+        let mut doc =
+            Document::load_from(Cursor::new(pdf_bytes)).context("load PDF for optimize")?;
+        optimize_in_place(&mut doc, level)?;
+        let mut out: Vec<u8> = Vec::new();
+        doc.save_to(&mut out).context("save optimized PDF")?;
+        Ok(out)
     }
 
     fn redact(&self, pdf_bytes: &[u8], _regions: &[RedactRegion]) -> Result<Vec<u8>> {
@@ -97,6 +111,36 @@ impl DocOps for LopdfDocOps {
         // Real implementation: rasterize each region, overlay as Image XObject, clear /Annots.
         Ok(pdf_bytes.to_vec())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Core optimize logic (pub so commands::docops can call it directly)
+// ---------------------------------------------------------------------------
+
+/// Optimize a PDF document in place.
+///
+/// | Level | Effect |
+/// |-------|--------|
+/// | 0     | No-op (passthrough). |
+/// | 1     | Prune unreferenced objects only (lossless). |
+/// | 2+    | Prune **and** compress all compressable streams with Deflate. |
+///
+/// "Deep image downsampling" is out of scope for the v1 baseline (spec §8).
+///
+/// Called by both:
+/// - `LopdfDocOps::optimize` (bytes round-trip, for the trait / library use)
+/// - `commands::docops::optimize_document` (in-place, via `apply_page_edit`)
+pub fn optimize_in_place(doc: &mut Document, level: u8) -> Result<()> {
+    if level == 0 {
+        return Ok(());
+    }
+    // Level 1+: remove objects unreachable from the document root.
+    doc.prune_objects();
+    if level >= 2 {
+        // Level 2+: Deflate-compress all compressable streams.
+        doc.compress();
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +519,18 @@ mod tests {
     // Test helpers
     // -----------------------------------------------------------------------
 
+    /// A content-stream payload large enough to benefit from Deflate compression.
+    ///
+    /// `Stream::compress()` only applies compression when the compressed output is at
+    /// least 19 bytes smaller than the input, so tiny streams like `b"BT ET"` are left
+    /// uncompressed.  Use this constant in tests that need to exercise level-2 compression.
+    fn compressible_stream_content() -> Vec<u8> {
+        // Repeated PDF content operators: highly compressible, well above the 19-byte
+        // savings threshold required by lopdf's Stream::compress().
+        let line = b"0.8 g 50 50 200 200 re f 0.2 g 100 100 100 100 re f\n";
+        line.iter().cycle().take(line.len() * 20).cloned().collect()
+    }
+
     /// Build a minimal single-page document with no annotations.
     fn bare_page_doc() -> (Document, ObjectId) {
         let mut doc = Document::with_version("1.7");
@@ -816,16 +872,19 @@ mod tests {
         );
     }
 
+    /// Level-1 optimize produces a valid, loadable PDF (not necessarily byte-identical —
+    /// the save/load cycle may reformat the xref table).
     #[test]
-    fn trait_optimize_passthrough() {
+    fn trait_optimize_level1_produces_valid_pdf() {
         let (mut doc, _, _) = doc_with_ap_annotation();
         let mut bytes: Vec<u8> = Vec::new();
         doc.save_to(&mut bytes).unwrap();
 
         let ops = LopdfDocOps;
         let out = ops.optimize(&bytes, 1).unwrap();
-        // Stub: output is identical to input.
-        assert_eq!(out, bytes);
+        // Output must be parseable and structurally correct.
+        let out_doc = Document::load_from(std::io::Cursor::new(&out)).unwrap();
+        assert_eq!(out_doc.get_pages().len(), 1, "page count must be preserved");
     }
 
     #[test]
@@ -837,5 +896,231 @@ mod tests {
         let ops = LopdfDocOps;
         let out = ops.redact(&bytes, &[]).unwrap();
         assert_eq!(out, bytes);
+    }
+
+    // -----------------------------------------------------------------------
+    // optimize_in_place — level 0 (no-op)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn optimize_in_place_level0_is_noop() {
+        let (mut doc, page_id) = bare_page_doc();
+        // Capture object count before.
+        let before = doc.objects.len();
+        optimize_in_place(&mut doc, 0).unwrap();
+        // Nothing removed or added.
+        assert_eq!(doc.objects.len(), before);
+        // Page dict intact.
+        doc.get_dictionary(page_id).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // optimize_in_place — level 1 (prune only)
+    // -----------------------------------------------------------------------
+
+    /// An object that is added to the document but not referenced from any
+    /// page, annotation, or catalog entry is an "orphan".  Level-1 optimize
+    /// must remove it.
+    #[test]
+    fn optimize_in_place_level1_removes_orphan_object() {
+        let (mut doc, _page_id) = bare_page_doc();
+
+        // Add an object that is intentionally unreferenced (orphan).
+        let orphan_id = doc.add_object(Object::String(
+            b"orphan-string-unused".to_vec(),
+            lopdf::StringFormat::Literal,
+        ));
+        assert!(
+            doc.objects.contains_key(&orphan_id),
+            "orphan must exist before optimize"
+        );
+
+        optimize_in_place(&mut doc, 1).unwrap();
+
+        assert!(
+            !doc.objects.contains_key(&orphan_id),
+            "level-1 optimize must remove unreferenced (orphan) object"
+        );
+    }
+
+    #[test]
+    fn optimize_in_place_level1_preserves_referenced_objects() {
+        let (mut doc, page_id) = bare_page_doc();
+        // The page object itself is referenced from the Pages tree → must survive.
+        let before_count = doc.objects.len();
+        optimize_in_place(&mut doc, 1).unwrap();
+        // A bare page doc has no unreferenced objects — count must not decrease.
+        assert_eq!(
+            doc.objects.len(),
+            before_count,
+            "level-1 optimize must not remove referenced objects"
+        );
+        // Page dict still accessible.
+        doc.get_dictionary(page_id).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // optimize_in_place — level 2 (prune + compress)
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal single-page doc whose content stream is large enough to
+    /// satisfy lopdf's compression threshold (compressed + 19 < original).
+    fn bare_page_doc_large_stream() -> (Document, ObjectId) {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        // Use a large, highly-compressible content payload.
+        let content = compressible_stream_content();
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content));
+        let page_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![
+                Object::Integer(0), Object::Integer(0),
+                Object::Integer(612), Object::Integer(792),
+            ],
+            "Contents" => content_id,
+            "Resources" => Object::Dictionary(dictionary! {}),
+        }));
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1_i64,
+            }),
+        );
+        let catalog_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        }));
+        doc.trailer.set("Root", catalog_id);
+        (doc, page_id)
+    }
+
+    #[test]
+    fn optimize_in_place_level2_compresses_uncompressed_streams() {
+        let (mut doc, _) = bare_page_doc_large_stream();
+
+        // Verify no stream is compressed before optimization.
+        let pre_compressed = doc.objects.values().any(|o| {
+            if let Object::Stream(s) = o {
+                s.is_compressed()
+            } else {
+                false
+            }
+        });
+        assert!(
+            !pre_compressed,
+            "doc must have no compressed streams before optimize"
+        );
+
+        optimize_in_place(&mut doc, 2).unwrap();
+
+        // After level-2 optimize at least one stream must be compressed.
+        let post_compressed = doc.objects.values().any(|o| {
+            if let Object::Stream(s) = o {
+                s.is_compressed()
+            } else {
+                false
+            }
+        });
+        assert!(
+            post_compressed,
+            "level-2 optimize must compress at least one stream"
+        );
+    }
+
+    #[test]
+    fn optimize_in_place_level2_also_prunes_orphans() {
+        // Use the large-stream variant so compression is also exercised.
+        let (mut doc, _) = bare_page_doc_large_stream();
+        let orphan_id = doc.add_object(Object::String(
+            b"also-orphan".to_vec(),
+            lopdf::StringFormat::Literal,
+        ));
+        optimize_in_place(&mut doc, 2).unwrap();
+        assert!(
+            !doc.objects.contains_key(&orphan_id),
+            "level-2 optimize must prune orphans as well as compressing"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // LopdfDocOps trait — optimize bytes round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn trait_optimize_level0_is_passthrough() {
+        let (mut doc, _, _) = doc_with_ap_annotation();
+        let mut bytes: Vec<u8> = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        let ops = LopdfDocOps;
+        let out = ops.optimize(&bytes, 0).unwrap();
+        assert_eq!(out, bytes, "level-0 optimize must be a strict passthrough");
+    }
+
+    #[test]
+    fn trait_optimize_level1_removes_orphan_via_bytes() {
+        let (mut doc, _) = bare_page_doc();
+        let orphan_id = doc.add_object(Object::String(
+            b"byte-orphan".to_vec(),
+            lopdf::StringFormat::Literal,
+        ));
+        let mut bytes: Vec<u8> = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        let ops = LopdfDocOps;
+        let out_bytes = ops.optimize(&bytes, 1).unwrap();
+
+        // Load the output and check the orphan is gone.
+        let out_doc = Document::load_from(std::io::Cursor::new(&out_bytes)).unwrap();
+        assert!(
+            out_doc.get_object(orphan_id).is_err(),
+            "level-1 optimize (bytes) must remove orphan object from output PDF"
+        );
+    }
+
+    #[test]
+    fn trait_optimize_level2_produces_valid_pdf_with_compressed_streams() {
+        // Use a doc with a large enough content stream to cross lopdf's compression threshold.
+        let (mut doc, _) = bare_page_doc_large_stream();
+        let mut bytes: Vec<u8> = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        let ops = LopdfDocOps;
+        let out_bytes = ops.optimize(&bytes, 2).unwrap();
+
+        // Output must be parseable.
+        let out_doc = Document::load_from(std::io::Cursor::new(&out_bytes)).unwrap();
+
+        // At least one stream must carry a Filter entry (i.e. be compressed).
+        let has_filter = out_doc.objects.values().any(|o| {
+            if let Object::Stream(s) = o {
+                s.is_compressed()
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_filter,
+            "level-2 optimize (bytes) must produce a PDF with at least one compressed stream"
+        );
+    }
+
+    #[test]
+    fn trait_optimize_preserves_page_count() {
+        let (mut doc, _) = bare_page_doc_large_stream();
+        let mut bytes: Vec<u8> = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        let ops = LopdfDocOps;
+        let out_bytes = ops.optimize(&bytes, 2).unwrap();
+        let out_doc = Document::load_from(std::io::Cursor::new(&out_bytes)).unwrap();
+        assert_eq!(
+            out_doc.get_pages().len(),
+            1,
+            "optimize must preserve page count"
+        );
     }
 }

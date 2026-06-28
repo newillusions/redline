@@ -508,3 +508,27 @@ export async function getFolderIndexStatus(): Promise<IndexStatus> {
 export async function flattenDocument(docId: string): Promise<void> {
   return invoke<void>("flatten_document", { docId });
 }
+
+/**
+ * Optimize the open document by pruning unreferenced objects and (at level 2)
+ * Deflate-compressing all compressable streams.
+ *
+ * Level semantics:
+ *   0 — no-op passthrough
+ *   1 — prune unused objects only (lossless, fastest)
+ *   2 — prune + compress streams (default for the UI "Optimize" action)
+ *
+ * Deep image downsampling is out of scope for the v1 baseline (spec §8).
+ *
+ * The Tauri backend atomically rewrites the file and reloads the render engine,
+ * so the viewport updates automatically after this call returns.
+ *
+ * Returns a rejected promise on backend error (unknown doc_id, lopdf parse
+ * failure, or atomic-save failure).
+ */
+export async function optimizeDocument(
+  docId: string,
+  level: number = 2,
+): Promise<void> {
+  return invoke<void>("optimize_document", { docId, level });
+}

@@ -24,7 +24,7 @@
   import ToolPalette from "./components/ToolPalette.svelte";
   import PropertiesPanel from "./components/PropertiesPanel.svelte";
   import MeasurementPanel from "./components/MeasurementPanel.svelte";
-  import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup, flattenDocument } from "$lib/ipc";
+  import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument } from "$lib/ipc";
   import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
   import type { DocumentInfo } from "$lib/ipc";
@@ -39,6 +39,7 @@
   let isOpening = $state(false);
   let isSaving = $state(false);
   let isFlattening = $state(false);
+  let isOptimizing = $state(false);
 
   // --- Auto-open for the §20 GUI smoke / floor-machine runbook ---
   // If the backend reports REDLINE_OPEN_PDF (env var read in Rust), open it on
@@ -158,6 +159,21 @@
     }
   }
 
+  async function handleOptimize() {
+    if (!currentDoc || isOptimizing) return;
+    openError = null;
+    isOptimizing = true;
+    try {
+      // Flush pending markups so the optimizer operates on the current annotation state.
+      await store?.flush();
+      await optimizeDocument(currentDoc.doc_id);
+    } catch (e) {
+      openError = `Optimize failed: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      isOptimizing = false;
+    }
+  }
+
   // --- Keyboard shortcuts ---
   function handleKeydown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && !e.shiftKey) {
@@ -190,6 +206,14 @@
         title="Flatten — bake annotation appearances into page content (irreversible)"
       >
         {isFlattening ? "Flattening…" : "Flatten"}
+      </button>
+      <button
+        class="btn-toolbar btn-docops"
+        onclick={handleOptimize}
+        disabled={!currentDoc || isOptimizing || isSaving}
+        title="Optimize — remove unused objects and compress streams to reduce file size"
+      >
+        {isOptimizing ? "Optimizing…" : "Optimize"}
       </button>
       {#if currentDoc}
         <span class="doc-name">{currentDoc.path.split(/[\\/]/).at(-1)}</span>
