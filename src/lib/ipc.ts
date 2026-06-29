@@ -571,3 +571,74 @@ export async function redactDocument(
 ): Promise<void> {
   return invoke<void>("redact_document", { docId, regions, applyAnnots });
 }
+
+// ---------------------------------------------------------------------------
+// Compare commands (M6 Phase 1.1 — two-tier diff, spec §10)
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of a two-tier page comparison between two PDF files.
+ *
+ * Mirrors `compare::PageDiffResult` in Rust — keep field names in sync.
+ * Fields use the original snake_case because Tauri deserialises the Rust
+ * struct with serde defaults (no rename attribute on the result struct).
+ */
+export interface PageDiffResult {
+  // Tier 1: text-layer
+  /** `true` when the full character sequence is identical on both pages. */
+  text_char_match: boolean;
+  /** Number of character position deltas (only meaningful when `text_char_match` is true). */
+  text_delta_count: number;
+  /** RMS of character position deltas in PDF points. */
+  text_rms_delta_pts: number;
+
+  // Tier 2: pixel
+  /** `true` when zero pixels differ beyond tolerance. */
+  pixel_passed: boolean;
+  /** Percentage of pixels changed (0-100). */
+  changed_pct: number;
+  /** Maximum per-channel delta seen anywhere (0-255). */
+  max_pixel_delta: number;
+  /**
+   * PNG-encoded diff image as a base64 string.
+   * Changed pixels are red; unchanged pixels are 50% grey.
+   * Use as `<img src="data:image/png;base64,{diff_png_b64}">`.
+   */
+  diff_png_b64: string;
+
+  // Meta
+  /** DPI used for the pixel render. */
+  render_dpi: number;
+}
+
+/**
+ * Compare one page from each of two PDF files using the two-tier diff algorithm.
+ *
+ * Tier 1: text-layer diff (character sequence + position deltas).
+ * Tier 2: pixel diff at the given DPI — returns a color-overlay PNG as base64
+ *   (changed pixels = red, unchanged = 50% grey; spec §10 "color-channel overlay").
+ *
+ * @param pathA         Absolute path to the "old" PDF.
+ * @param pathB         Absolute path to the "new" PDF.
+ * @param pageA         0-based page index in `pathA`.
+ * @param pageB         0-based page index in `pathB`.
+ * @param dpi           Render DPI for pixel diff (default 150 in backend).
+ * @param pixelTolerance Per-channel delta counted as "same" (default 5 in backend).
+ */
+export async function comparePages(
+  pathA: string,
+  pathB: string,
+  pageA: number,
+  pageB: number,
+  dpi?: number,
+  pixelTolerance?: number,
+): Promise<PageDiffResult> {
+  return invoke<PageDiffResult>("compare_pages", {
+    pathA,
+    pathB,
+    pageA,
+    pageB,
+    dpi,
+    pixelTolerance,
+  });
+}

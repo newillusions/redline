@@ -347,3 +347,56 @@ describe("folder search ipc wrappers (Tauri v2 camelCase keys)", () => {
     expect(result).toEqual(IDLE_STATUS);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Compare IPC wrappers (M6 Phase 1.1)
+// ---------------------------------------------------------------------------
+
+describe("compare ipc wrappers (Tauri v2 camelCase keys)", () => {
+  const mockInvokeCompare = vi.mocked(invoke);
+
+  const SAMPLE_RESULT: import("./ipc").PageDiffResult = {
+    text_char_match: true,
+    text_delta_count: 0,
+    text_rms_delta_pts: 0.0,
+    pixel_passed: false,
+    changed_pct: 3.14,
+    max_pixel_delta: 42,
+    diff_png_b64: "iVBORw0KGgo=",
+    render_dpi: 150.0,
+  };
+
+  beforeEach(() => {
+    mockInvokeCompare.mockReset();
+    mockInvokeCompare.mockResolvedValue(SAMPLE_RESULT as never);
+  });
+
+  it("comparePages → pathA / pathB / pageA / pageB (camelCase, required args)", async () => {
+    await ipc.comparePages("/a.pdf", "/b.pdf", 0, 1);
+    expect(mockInvokeCompare).toHaveBeenCalledWith("compare_pages", {
+      pathA: "/a.pdf",
+      pathB: "/b.pdf",
+      pageA: 0,
+      pageB: 1,
+      dpi: undefined,
+      pixelTolerance: undefined,
+    });
+  });
+
+  it("comparePages → optional dpi and pixelTolerance forwarded as-is", async () => {
+    await ipc.comparePages("/a.pdf", "/b.pdf", 2, 3, 300.0, 10);
+    expect(mockInvokeCompare).toHaveBeenCalledWith("compare_pages", {
+      pathA: "/a.pdf",
+      pathB: "/b.pdf",
+      pageA: 2,
+      pageB: 3,
+      dpi: 300.0,
+      pixelTolerance: 10,
+    });
+  });
+
+  it("comparePages returns PageDiffResult", async () => {
+    const result = await ipc.comparePages("/a.pdf", "/b.pdf", 0, 0);
+    expect(result).toEqual(SAMPLE_RESULT);
+  });
+});
