@@ -34,6 +34,7 @@
     fitHeightZoom,
     ACTUAL_SIZE_ZOOM,
     type ViewportState,
+    type ViewportSnapshot,
   } from "$lib/viewport";
   import { markupToSvg, selectionChrome, type SvgShape, type SelectionChrome } from "$lib/markup-render";
   import { MarkupStore } from "$lib/markup-store.svelte";
@@ -65,6 +66,8 @@
     takeoffStore = new TakeoffStore(),
     searchHits = [],
     activeSearchHitIdx = null,
+    initialState = undefined,
+    onviewportchange = undefined,
   }: {
     docInfo: DocumentInfo;
     store: MarkupStore;
@@ -73,6 +76,17 @@
     searchHits?: SearchHit[];
     /** Index into searchHits that is currently focused (rendered with a stronger highlight). */
     activeSearchHitIdx?: number | null;
+    /**
+     * Viewport state to restore on mount (zoom, pageIndex, scrollX, scrollY).
+     * Used by tab switching to preserve per-document view position.
+     */
+    initialState?: ViewportSnapshot;
+    /**
+     * Called whenever zoom, pageIndex, scrollX, or scrollY changes.
+     * App.svelte saves this into the tab's viewportSnapshot so it can be
+     * restored when the user switches back to this tab.
+     */
+    onviewportchange?: (s: ViewportSnapshot) => void;
   } = $props();
 
   // ---------------------------------------------------------------------------
@@ -81,10 +95,16 @@
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let containerEl = $state<HTMLDivElement | null>(null);
 
-  let zoom      = $state(1.0);
-  let scrollX   = $state(0);
-  let scrollY   = $state(0);
-  let pageIndex = $state(0);
+  // Initialised from initialState when the tab is switched back to, so zoom/page/scroll
+  // are restored. Default to 1/0/0/0 when opening fresh.
+  let zoom      = $state(initialState?.zoom      ?? 1.0);
+  let scrollX   = $state(initialState?.scrollX   ?? 0);
+  let scrollY   = $state(initialState?.scrollY   ?? 0);
+  let pageIndex = $state(initialState?.pageIndex ?? 0);
+
+  // Guard against loadPageSize() resetting scroll to 0 on the very first load
+  // when an initialState scroll position should be preserved.
+  let _firstPageLoad = true;
 
   let pageWidthPts  = $state(0);
   let pageHeightPts = $state(0);
@@ -210,6 +230,12 @@
     pageHeightPts,
   });
 
+  // Notify App.svelte whenever the user changes zoom/page/scroll so the
+  // per-tab snapshot stays current for tab switching.
+  $effect(() => {
+    onviewportchange?.({ zoom, pageIndex, scrollX, scrollY });
+  });
+
   // Markups on the current page, mapped to screen-space SVG descriptors.
   // Reactive to viewState (zoom/pan/resize) AND pageIndex AND store.markups,
   // so the overlay stays glued to the page with no manual redraw.
@@ -293,9 +319,14 @@
       const ps = await getPageSize(docInfo.doc_id, pageIndex);
       pageWidthPts  = ps.width_pts;
       pageHeightPts = ps.height_pts;
-      // Reset scroll on page change
-      scrollX = 0;
-      scrollY = 0;
+      // Reset scroll on page change — but preserve initialState.scrollX/Y on the
+      // very first load so tab-switching restores the scroll position correctly.
+      if (_firstPageLoad) {
+        _firstPageLoad = false;
+      } else {
+        scrollX = 0;
+        scrollY = 0;
+      }
       requestTiles();
     } catch (e) {
       console.error("getPageSize failed:", e);

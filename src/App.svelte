@@ -5,6 +5,8 @@
    * Layout:
    *   ┌──────────────────────────────────────────────┐
    *   │  Toolbar (top, full width)                   │
+   *   ├──────────────────────────────────────────────┤
+   *   │  Tab bar (multi-doc tabs, feat/tabbed-multi-file) │
    *   ├─────────────┬──────────────────┬─────────────┤
    *   │  Left panel │  Viewport (PDF)  │ Right panel │
    *   │  (collapsible)│               │ (collapsible)│
@@ -13,8 +15,10 @@
    *   │  (collapsible)                                │
    *   └──────────────────────────────────────────────┘
    *
-   * M1: static layout + real PDF viewport. Full drag-rearrange (dockview-core)
-   * lands in M2 once the layout proves stable.
+   * Multi-doc: each open PDF lives in a DocTab (MarkupStore + TakeoffStore +
+   * ViewportSnapshot). Only one Viewport is mounted at a time — switching tabs
+   * saves the current zoom/page/scroll into the tab's snapshot and restores it
+   * via the new initialState prop when the Viewport remounts for the new tab.
    *
    * Svelte 5 runes: $state / $derived / $effect throughout.
    */
@@ -25,6 +29,7 @@
   import PropertiesPanel from "./components/PropertiesPanel.svelte";
   import MeasurementPanel from "./components/MeasurementPanel.svelte";
   import ComparePanel from "./components/ComparePanel.svelte";
+  import TabBar from "./components/TabBar.svelte";
   import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument } from "$lib/ipc";
   import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
@@ -32,11 +37,18 @@
   import type { DocumentInfo } from "$lib/ipc";
   import { MarkupStore } from "$lib/markup-store.svelte";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
+  import { DocTabStore } from "$lib/doc-tabs.svelte";
+  import type { ViewportSnapshot } from "$lib/viewport";
 
-  // --- App state ---
-  let currentDoc = $state<DocumentInfo | null>(null);
-  let store = $state<MarkupStore | null>(null);
-  let takeoffStore = $state<TakeoffStore | null>(null);
+  // ---------------------------------------------------------------------------
+  // Multi-doc state
+  // ---------------------------------------------------------------------------
+  const tabStore = new DocTabStore();
+
+  /** Convenience alias for the currently active tab (null when no docs open). */
+  const activeTab = $derived(tabStore.activeTab);
+
+  // Per-operation busy flags (apply to the active tab's document).
   let openError = $state<string | null>(null);
   let isOpening = $state(false);
   let isSaving = $state(false);
@@ -49,28 +61,16 @@
   let comparePathA = $state("");
   let comparePathB = $state("");
 
-  // Cleanup handle for the Tauri drag-drop listener (Fix 4: file drop to open).
+  // Cleanup handle for the Tauri drag-drop listener.
   let _dropUnlisten: (() => void) | undefined;
 
-  // --- Auto-open for the §20 GUI smoke / floor-machine runbook ---
-  // If the backend reports REDLINE_OPEN_PDF (env var read in Rust), open it on
-  // startup without the file dialog. Lets `cargo tauri dev` launch straight into a
-  // corpus file for scripted/repeatable bench runs.
+  // ---------------------------------------------------------------------------
+  // Auto-open (§20 GUI smoke / floor-machine runbook)
+  // ---------------------------------------------------------------------------
   async function autoOpenIfRequested() {
     try {
       const path = await invoke<string | null>("auto_open_path");
-      if (path) {
-        const doc = await openDocument(path);
-        store = new MarkupStore(doc.doc_id, { add: addMarkup, update: updateMarkup, remove: deleteMarkup });
-        takeoffStore = new TakeoffStore();
-        currentDoc = doc;
-        loadMarkups(doc.doc_id)
-          .then((m) => { store?.seed(m); })
-          .catch((e) => { openError = `Load markups failed: ${e}`; });
-        listScales(doc.doc_id)
-          .then((scales) => { takeoffStore?.seedScales(scales); })
-          .catch(() => {}); // scales are non-critical; fail silently
-      }
+      if (path) await openFilePath(path);
     } catch (e) {
       openError = `auto-open failed: ${String(e)}`;
     }
@@ -78,8 +78,7 @@
 
   onMount(async () => {
     await autoOpenIfRequested();
-    // Fix 4: file drop opens a PDF exactly like File>Open.
-    // Ignore non-PDF drops and honour the single-document model (drop replaces current doc).
+    // File drop: open each dropped PDF into a new tab (same dedup logic as File>Open).
     _dropUnlisten = await getCurrentWebview().onDragDropEvent(async (event) => {
       if (event.payload.type !== "drop") return;
       const pdfs = (event.payload.paths as string[]).filter((p) =>
@@ -87,7 +86,10 @@
       );
       if (pdfs.length === 0) return;
       if (isOpening) return;
-      await openFilePath(pdfs[0]);
+      // Open each dropped PDF (first one focused, others added as background tabs).
+      for (const pdf of pdfs) {
+        await openFilePath(pdf);
+      }
     });
   });
 
@@ -98,30 +100,42 @@
   let rightCollapsed = $state(false);
   let bottomCollapsed = $state(true);
 
-  // --- Actions ---
+  // ---------------------------------------------------------------------------
+  // Open flow — dedup by path, new tab per file
+  // ---------------------------------------------------------------------------
 
   /**
-   * Core open logic shared by File>Open dialog and file-drop (Fix 4).
-   * Closes the current document first (single-document app), then opens the given path.
+   * Core open logic shared by File>Open dialog, file-drop, and auto-open.
+   * - If the path is already open, switch to its tab (dedup).
+   * - Otherwise open a new PDFium document, create a tab, and activate it.
    */
   async function openFilePath(path: string) {
+    // Dedup: if this path is already open, just switch to it.
+    const existing = tabStore.findByPath(path);
+    if (existing) {
+      tabStore.switchTab(existing.docId);
+      return;
+    }
+
     openError = null;
     isOpening = true;
     try {
-      if (currentDoc) {
-        await closeDocument(currentDoc.doc_id);
-        currentDoc = null;
-      }
-      const doc = await openDocument(path);
-      store = new MarkupStore(doc.doc_id, { add: addMarkup, update: updateMarkup, remove: deleteMarkup });
-      takeoffStore = new TakeoffStore();
-      currentDoc = doc;
+      const doc: DocumentInfo = await openDocument(path);
+      const store = new MarkupStore(doc.doc_id, {
+        add: addMarkup,
+        update: updateMarkup,
+        remove: deleteMarkup,
+      });
+      const ts = new TakeoffStore();
+      tabStore.addTab(doc, store, ts);
+
+      // Load markups and scales asynchronously (non-blocking).
       loadMarkups(doc.doc_id)
-        .then((m) => { store?.seed(m); })
+        .then((m) => { store.seed(m); })
         .catch((e) => { openError = `Load markups failed: ${e}`; });
       listScales(doc.doc_id)
-        .then((scales) => { takeoffStore?.seedScales(scales); })
-        .catch(() => {}); // scales are non-critical; fail silently
+        .then((scales) => { ts.seedScales(scales); })
+        .catch(() => {}); // scales are non-critical
     } catch (e) {
       openError = String(e);
     } finally {
@@ -134,20 +148,58 @@
     const selected = await open({
       title: "Open PDF",
       filters: [{ name: "PDF Documents", extensions: ["pdf"] }],
-      multiple: false,
+      multiple: true, // allow multi-select to open several tabs at once
     });
-    if (!selected || Array.isArray(selected)) return;
-    await openFilePath(selected as string);
+    if (!selected) return;
+    const paths = Array.isArray(selected) ? selected : [selected];
+    for (const p of paths) {
+      await openFilePath(p as string);
+    }
   }
 
-  // --- Save handlers ---
+  // ---------------------------------------------------------------------------
+  // Close flow — tab × button and Cmd/Ctrl+W
+  // ---------------------------------------------------------------------------
+
+  async function closeTab(docId: string) {
+    // closeTab removes the tab from the store and returns the next activeDocId.
+    tabStore.closeTab(docId);
+    // Release the PDFium document so resources are freed.
+    try {
+      await closeDocument(docId);
+    } catch {
+      // Non-fatal: the tab is already gone from the UI.
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Tab switching — save viewport snapshot before switching away
+  // ---------------------------------------------------------------------------
+
+  function handleTabClick(docId: string) {
+    // The active Viewport's onviewportchange fires on every state change,
+    // so the snapshot in tabStore is already current. Just switch.
+    tabStore.switchTab(docId);
+  }
+
+  /** Called by the active Viewport on every zoom/page/scroll change. */
+  function handleViewportChange(snapshot: ViewportSnapshot) {
+    if (tabStore.activeDocId) {
+      tabStore.saveViewportSnapshot(tabStore.activeDocId, snapshot);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Save handlers (operate on the active tab)
+  // ---------------------------------------------------------------------------
+
   async function handleSave() {
-    if (!currentDoc || isSaving) return;
+    if (!activeTab || isSaving) return;
     openError = null;
     isSaving = true;
     try {
-      await store?.flush();
-      await saveDocument(currentDoc.doc_id);
+      await activeTab.store.flush();
+      await saveDocument(activeTab.docId);
     } catch (e) {
       openError = `Save failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
@@ -156,15 +208,20 @@
   }
 
   async function handleSaveAs() {
-    if (!currentDoc || isSaving) return;
+    if (!activeTab || isSaving) return;
     openError = null;
     const dest = await saveDialog({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
     if (!dest) return;
     isSaving = true;
     try {
-      await store?.flush();
-      await saveDocumentAs(currentDoc.doc_id, dest);
-      currentDoc = { ...currentDoc, path: dest };
+      await activeTab.store.flush();
+      await saveDocumentAs(activeTab.docId, dest);
+      // Update the path in the active tab's doc record.
+      tabStore.tabs = tabStore.tabs.map((t) =>
+        t.docId === activeTab.docId
+          ? { ...t, doc: { ...t.doc, path: dest } }
+          : t,
+      );
     } catch (e) {
       openError = `Save As failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
@@ -172,15 +229,17 @@
     }
   }
 
-  // --- DocOps handlers (M5) ---
+  // ---------------------------------------------------------------------------
+  // DocOps handlers (M5) — operate on the active tab
+  // ---------------------------------------------------------------------------
+
   async function handleFlatten() {
-    if (!currentDoc || isFlattening) return;
+    if (!activeTab || isFlattening) return;
     openError = null;
     isFlattening = true;
     try {
-      // Flush any unsaved in-memory markups first so the flatten sees current annotations.
-      await store?.flush();
-      await flattenDocument(currentDoc.doc_id);
+      await activeTab.store.flush();
+      await flattenDocument(activeTab.docId);
     } catch (e) {
       openError = `Flatten failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
@@ -189,13 +248,12 @@
   }
 
   async function handleOptimize() {
-    if (!currentDoc || isOptimizing) return;
+    if (!activeTab || isOptimizing) return;
     openError = null;
     isOptimizing = true;
     try {
-      // Flush pending markups so the optimizer operates on the current annotation state.
-      await store?.flush();
-      await optimizeDocument(currentDoc.doc_id);
+      await activeTab.store.flush();
+      await optimizeDocument(activeTab.docId);
     } catch (e) {
       openError = `Optimize failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
@@ -204,15 +262,12 @@
   }
 
   async function handleRedact() {
-    if (!currentDoc || isRedacting) return;
+    if (!activeTab || isRedacting) return;
     openError = null;
     isRedacting = true;
     try {
-      // Flush any unsaved in-memory markups first (e.g. pending Redact annotations).
-      await store?.flush();
-      // Apply: (1) any explicit regions (none from the toolbar — caller passes [])
-      //        (2) all /Subtype /Redact annotations on every page.
-      await redactDocument(currentDoc.doc_id, [], true);
+      await activeTab.store.flush();
+      await redactDocument(activeTab.docId, [], true);
     } catch (e) {
       openError = `Redact failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
@@ -220,7 +275,10 @@
     }
   }
 
-  // --- Compare handlers (M6 Phase 1.1) ---
+  // ---------------------------------------------------------------------------
+  // Compare handlers (M6 Phase 1.1)
+  // ---------------------------------------------------------------------------
+
   async function handlePickCompareA() {
     const selected = await open({
       title: "Select old PDF (File A)",
@@ -239,11 +297,47 @@
     if (selected && !Array.isArray(selected)) comparePathB = selected as string;
   }
 
-  // --- Keyboard shortcuts ---
+  // ---------------------------------------------------------------------------
+  // Keyboard shortcuts
+  // ---------------------------------------------------------------------------
+
   function handleKeydown(e: KeyboardEvent) {
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && !e.shiftKey) {
+    const mod = e.metaKey || e.ctrlKey;
+
+    // Cmd/Ctrl+S — save active tab
+    if (mod && e.key.toLowerCase() === "s" && !e.shiftKey) {
       e.preventDefault();
       handleSave();
+      return;
+    }
+
+    // Cmd/Ctrl+W — close active tab
+    if (mod && e.key.toLowerCase() === "w") {
+      e.preventDefault();
+      if (activeTab) closeTab(activeTab.docId);
+      return;
+    }
+
+    // Ctrl+Tab — next tab
+    if (e.ctrlKey && e.key === "Tab" && !e.shiftKey) {
+      e.preventDefault();
+      if (tabStore.tabs.length > 1 && tabStore.activeDocId) {
+        const idx = tabStore.tabs.findIndex((t) => t.docId === tabStore.activeDocId);
+        const next = tabStore.tabs[(idx + 1) % tabStore.tabs.length];
+        tabStore.switchTab(next.docId);
+      }
+      return;
+    }
+
+    // Ctrl+Shift+Tab — previous tab
+    if (e.ctrlKey && e.key === "Tab" && e.shiftKey) {
+      e.preventDefault();
+      if (tabStore.tabs.length > 1 && tabStore.activeDocId) {
+        const idx = tabStore.tabs.findIndex((t) => t.docId === tabStore.activeDocId);
+        const prev = tabStore.tabs[(idx - 1 + tabStore.tabs.length) % tabStore.tabs.length];
+        tabStore.switchTab(prev.docId);
+      }
+      return;
     }
   }
 </script>
@@ -258,16 +352,16 @@
       <button class="btn-toolbar" onclick={handleOpenFile} disabled={isOpening}>
         {isOpening ? "Opening…" : "Open PDF"}
       </button>
-      <button class="btn-toolbar" onclick={handleSave} disabled={!currentDoc || isSaving} title="Save (Cmd/Ctrl+S)">
+      <button class="btn-toolbar" onclick={handleSave} disabled={!activeTab || isSaving} title="Save (Cmd/Ctrl+S)">
         {isSaving ? "Saving…" : "Save"}
       </button>
-      <button class="btn-toolbar" onclick={handleSaveAs} disabled={!currentDoc || isSaving} title="Save As…">
+      <button class="btn-toolbar" onclick={handleSaveAs} disabled={!activeTab || isSaving} title="Save As…">
         Save As…
       </button>
       <button
         class="btn-toolbar btn-docops"
         onclick={handleFlatten}
-        disabled={!currentDoc || isFlattening || isSaving}
+        disabled={!activeTab || isFlattening || isSaving}
         title="Flatten — bake annotation appearances into page content (irreversible)"
       >
         {isFlattening ? "Flattening…" : "Flatten"}
@@ -275,7 +369,7 @@
       <button
         class="btn-toolbar btn-docops"
         onclick={handleOptimize}
-        disabled={!currentDoc || isOptimizing || isSaving}
+        disabled={!activeTab || isOptimizing || isSaving}
         title="Optimize — remove unused objects and compress streams to reduce file size"
       >
         {isOptimizing ? "Optimizing…" : "Optimize"}
@@ -283,7 +377,7 @@
       <button
         class="btn-toolbar btn-docops"
         onclick={handleRedact}
-        disabled={!currentDoc || isRedacting || isSaving}
+        disabled={!activeTab || isRedacting || isSaving}
         title="Apply Redactions — permanently cover all Redact-marked regions with solid-black overlays (irreversible)"
       >
         {isRedacting ? "Redacting…" : "Apply Redactions"}
@@ -295,9 +389,8 @@
       >
         {compareVisible ? "Compare ▲" : "Compare"}
       </button>
-      {#if currentDoc}
-        <span class="doc-name">{currentDoc.path.split(/[\\/]/).at(-1)}</span>
-        <span class="doc-pages">{currentDoc.page_count} pages</span>
+      {#if activeTab}
+        <span class="doc-pages">{activeTab.doc.page_count} pages</span>
       {/if}
     </div>
     <div class="toolbar-right">
@@ -319,7 +412,15 @@
     </div>
   </header>
 
-  <!-- Compare panel — collapsible, below toolbar (M6 Phase 1.1, spec §10) -->
+  <!-- Tab bar (multi-doc) -->
+  <TabBar
+    tabs={tabStore.tabs}
+    activeDocId={tabStore.activeDocId}
+    ontabclick={handleTabClick}
+    ontabclose={closeTab}
+  />
+
+  <!-- Compare panel — collapsible, below tab bar (M6 Phase 1.1, spec §10) -->
   {#if compareVisible}
     <div class="compare-bar">
       <div class="compare-bar-pickers">
@@ -334,8 +435,8 @@
     </div>
   {/if}
 
-  {#if store}
-    <ToolPalette {store} />
+  {#if activeTab}
+    <ToolPalette store={activeTab.store} />
   {/if}
 
   {#if openError}
@@ -349,7 +450,7 @@
       <aside class="panel panel-left">
         <div class="panel-header">Navigator</div>
         <div class="panel-body">
-          {#if currentDoc}
+          {#if activeTab}
             <p class="panel-hint">Thumbnails · Bookmarks · Layers</p>
             <p class="panel-hint muted">(M4)</p>
           {:else}
@@ -359,10 +460,20 @@
       </aside>
     {/if}
 
-    <!-- Centre viewport -->
+    <!-- Centre viewport — only one Viewport mounted at a time -->
     <main class="viewport-container">
-      {#if currentDoc && store && takeoffStore}
-        <Viewport docInfo={currentDoc} {store} {takeoffStore} />
+      {#if activeTab}
+        <!-- Key forces Viewport to remount when switching tabs, so initialState
+             (zoom/page/scroll snapshot) takes effect fresh for each tab. -->
+        {#key activeTab.docId}
+          <Viewport
+            docInfo={activeTab.doc}
+            store={activeTab.store}
+            takeoffStore={activeTab.takeoffStore}
+            initialState={activeTab.viewportSnapshot}
+            onviewportchange={handleViewportChange}
+          />
+        {/key}
       {:else}
         <div class="empty-state">
           <p>Open a PDF to begin</p>
@@ -378,8 +489,8 @@
       <aside class="panel panel-right">
         <div class="panel-header">Properties</div>
         <div class="panel-body panel-body-flush">
-          {#if store}
-            <PropertiesPanel {store} />
+          {#if activeTab}
+            <PropertiesPanel store={activeTab.store} />
           {:else}
             <p class="panel-hint muted">Select a markup to edit its properties.</p>
           {/if}
@@ -392,15 +503,19 @@
   {#if !bottomCollapsed}
     <div class="bottom-panel">
       <div class="panel-header">
-        {#if currentDoc && store && takeoffStore}
+        {#if activeTab}
           Takeoff — Quantities
         {:else}
           Markups / Comments
         {/if}
       </div>
       <div class="panel-body panel-body-flush">
-        {#if currentDoc && store && takeoffStore}
-          <MeasurementPanel {store} {takeoffStore} docId={currentDoc.doc_id} />
+        {#if activeTab}
+          <MeasurementPanel
+            store={activeTab.store}
+            takeoffStore={activeTab.takeoffStore}
+            docId={activeTab.docId}
+          />
         {:else}
           <p class="panel-hint muted">Open a PDF to see measurements.</p>
         {/if}
@@ -441,14 +556,6 @@
     color: var(--color-primary);
     margin-right: var(--space-2);
   }
-  .doc-name {
-    font-size: var(--font-size-sm);
-    color: var(--color-text);
-    max-width: 300px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
   .doc-pages {
     font-size: var(--font-size-xs);
     color: var(--color-text-muted);
@@ -468,7 +575,6 @@
   .btn-toolbar:hover:not(:disabled) { background: var(--color-bg-hover); }
   .btn-toolbar:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn-toolbar.btn-icon { padding: var(--space-1) var(--space-2); }
-  /* DocOps buttons use a muted warning tint to signal an irreversible operation. */
   .btn-toolbar.btn-docops {
     border-color: var(--color-warning, #b45309);
     color: var(--color-warning, #b45309);
@@ -476,7 +582,6 @@
   .btn-toolbar.btn-docops:hover:not(:disabled) {
     background: var(--color-warning-surface, #fffbeb);
   }
-
   .btn-toolbar.btn-compare-toggle {
     border-color: var(--color-primary, #2563eb);
     color: var(--color-primary, #2563eb);
@@ -495,7 +600,6 @@
     max-height: 420px;
     overflow: hidden;
   }
-
   .compare-bar-pickers {
     display: flex;
     gap: var(--space-2, 6px);

@@ -12,6 +12,17 @@
  * Screen space:   origin top-left,    y increases downward, units = CSS pixels.
  */
 
+/**
+ * Snapshot of user-navigable viewport state saved per tab (feat/tabbed-multi-file).
+ * Restored as initialState when a tab is re-activated so zoom/page/scroll are preserved.
+ */
+export interface ViewportSnapshot {
+  zoom: number;
+  pageIndex: number;
+  scrollX: number;
+  scrollY: number;
+}
+
 export interface ViewportState {
   /** Width of the visible canvas area in CSS pixels. */
   canvasWidthCss: number;
