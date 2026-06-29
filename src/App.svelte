@@ -24,7 +24,7 @@
   import ToolPalette from "./components/ToolPalette.svelte";
   import PropertiesPanel from "./components/PropertiesPanel.svelte";
   import MeasurementPanel from "./components/MeasurementPanel.svelte";
-  import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument } from "$lib/ipc";
+  import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument } from "$lib/ipc";
   import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
   import type { DocumentInfo } from "$lib/ipc";
@@ -40,6 +40,7 @@
   let isSaving = $state(false);
   let isFlattening = $state(false);
   let isOptimizing = $state(false);
+  let isRedacting = $state(false);
 
   // --- Auto-open for the §20 GUI smoke / floor-machine runbook ---
   // If the backend reports REDLINE_OPEN_PDF (env var read in Rust), open it on
@@ -174,6 +175,23 @@
     }
   }
 
+  async function handleRedact() {
+    if (!currentDoc || isRedacting) return;
+    openError = null;
+    isRedacting = true;
+    try {
+      // Flush any unsaved in-memory markups first (e.g. pending Redact annotations).
+      await store?.flush();
+      // Apply: (1) any explicit regions (none from the toolbar — caller passes [])
+      //        (2) all /Subtype /Redact annotations on every page.
+      await redactDocument(currentDoc.doc_id, [], true);
+    } catch (e) {
+      openError = `Redact failed: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      isRedacting = false;
+    }
+  }
+
   // --- Keyboard shortcuts ---
   function handleKeydown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && !e.shiftKey) {
@@ -214,6 +232,14 @@
         title="Optimize — remove unused objects and compress streams to reduce file size"
       >
         {isOptimizing ? "Optimizing…" : "Optimize"}
+      </button>
+      <button
+        class="btn-toolbar btn-docops"
+        onclick={handleRedact}
+        disabled={!currentDoc || isRedacting || isSaving}
+        title="Apply Redactions — permanently cover all Redact-marked regions with solid-black overlays (irreversible)"
+      >
+        {isRedacting ? "Redacting…" : "Apply Redactions"}
       </button>
       {#if currentDoc}
         <span class="doc-name">{currentDoc.path.split(/[\\/]/).at(-1)}</span>

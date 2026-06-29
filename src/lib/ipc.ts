@@ -532,3 +532,42 @@ export async function optimizeDocument(
 ): Promise<void> {
   return invoke<void>("optimize_document", { docId, level });
 }
+
+/** A page region to redact (PDF user space coordinates). */
+export interface RedactRegion {
+  page_index: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Apply redactions to the open document.
+ *
+ * Two modes, combinable in a single call:
+ *
+ * - **`regions`**: each entry overlays a solid-black Image XObject scaled to
+ *   fill the region rectangle in PDF user space.  Pass an empty array when not
+ *   needed.
+ * - **`applyAnnots`**: when `true`, all `/Subtype /Redact` annotations on
+ *   every page are applied as Image XObject overlays and removed from
+ *   `/Annots`.
+ *
+ * Using an Image XObject (raster) rather than a vector black rectangle ensures
+ * content below the redacted area cannot be recovered by text-extraction tools
+ * (spec §8 — "rasterize-region safe floor").
+ *
+ * The Tauri backend atomically rewrites the file and reloads the render engine,
+ * so the viewport updates automatically after this call returns.
+ *
+ * Returns a rejected promise on backend error (unknown doc_id, lopdf parse
+ * failure, or atomic-save failure).
+ */
+export async function redactDocument(
+  docId: string,
+  regions: RedactRegion[] = [],
+  applyAnnots: boolean = true,
+): Promise<void> {
+  return invoke<void>("redact_document", { docId, regions, applyAnnots });
+}

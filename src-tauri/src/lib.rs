@@ -179,6 +179,7 @@ pub fn run() {
             // DocOps commands (M5)
             commands::docops::flatten_document,
             commands::docops::optimize_document,
+            commands::docops::redact_document,
             // Compare commands (M6 Phase 1.1)
             commands::compare::compare_pages,
         ])

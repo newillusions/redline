@@ -1,17 +1,18 @@
 //! DocOps Tauri commands — M5 baseline (spec §4, §8).
 //!
-//! Exposes `flatten_document` and `optimize_document`: lopdf-backed PDF surgery
-//! operations that reload the render engine and write the result atomically.
+//! Exposes `flatten_document`, `optimize_document`, and `redact_document`:
+//! lopdf-backed PDF surgery operations that reload the render engine and write
+//! the result atomically.
 //!
-//! Both commands reuse `apply_page_edit` from `commands::document` (the same
-//! load-op-save-reload pipeline used by all page ops) to keep the save
+//! All three commands reuse `apply_page_edit` from `commands::document` (the
+//! same load-op-save-reload pipeline used by all page ops) to keep the save
 //! contract consistent: markups are preserved, the file is written atomically,
 //! the render engine is reopened, and the markup cache is invalidated.
 
 use tauri::State;
 
 use crate::commands::document::apply_page_edit;
-use crate::docops::{flatten_annotations, optimize_in_place};
+use crate::docops::{flatten_annotations, optimize_in_place, redact_annotations, redact_regions, RedactRegion};
 use crate::AppState;
 
 /// Flatten all annotation appearance streams in the open document into page content.
@@ -32,6 +33,44 @@ pub async fn flatten_document(
     doc_id: String,
 ) -> Result<(), String> {
     apply_page_edit(&state, &doc_id, move |doc| flatten_annotations(doc)).await
+}
+
+/// Apply redactions to the open document.
+///
+/// Two modes, used together in the toolbar "Apply Redactions" flow:
+///
+/// 1. **`regions`** (explicit coordinates): each `RedactRegion` overlays a 1×1 solid-black
+///    DeviceGray Image XObject scaled to fill the region rectangle.  Pass an empty slice
+///    when this mode is not needed.
+/// 2. **`apply_annots`**: when `true`, scan every page for `/Subtype /Redact` annotations,
+///    apply the same Image XObject overlay for each one, and remove the consumed annotations
+///    from `/Annots`.
+///
+/// Both modes run in a single `apply_page_edit` pass so the file is written once.
+///
+/// After completion the render engine is reloaded so the viewport reflects the updated file.
+///
+/// # Errors
+///
+/// Returns an error string if the document is not open, the lopdf parse fails,
+/// or the atomic save/rename fails.
+#[tauri::command]
+pub async fn redact_document(
+    state: State<'_, AppState>,
+    doc_id: String,
+    regions: Vec<RedactRegion>,
+    apply_annots: bool,
+) -> Result<(), String> {
+    apply_page_edit(&state, &doc_id, move |doc| {
+        if !regions.is_empty() {
+            redact_regions(doc, &regions)?;
+        }
+        if apply_annots {
+            redact_annotations(doc)?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Optimize the open document (prune unused objects and/or compress streams).
