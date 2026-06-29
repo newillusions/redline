@@ -19,7 +19,7 @@
    * Svelte 5 runes: $state / $derived / $effect throughout.
    */
   import "$lib/styles.css";
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
   import Viewport from "./components/Viewport.svelte";
   import ToolPalette from "./components/ToolPalette.svelte";
   import PropertiesPanel from "./components/PropertiesPanel.svelte";
@@ -28,6 +28,7 @@
   import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument } from "$lib/ipc";
   import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
+  import { getCurrentWebview } from "@tauri-apps/api/webview";
   import type { DocumentInfo } from "$lib/ipc";
   import { MarkupStore } from "$lib/markup-store.svelte";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
@@ -47,6 +48,9 @@
   let compareVisible = $state(false);
   let comparePathA = $state("");
   let comparePathB = $state("");
+
+  // Cleanup handle for the Tauri drag-drop listener (Fix 4: file drop to open).
+  let _dropUnlisten: (() => void) | undefined;
 
   // --- Auto-open for the §20 GUI smoke / floor-machine runbook ---
   // If the backend reports REDLINE_OPEN_PDF (env var read in Rust), open it on
@@ -72,7 +76,22 @@
     }
   }
 
-  onMount(autoOpenIfRequested);
+  onMount(async () => {
+    await autoOpenIfRequested();
+    // Fix 4: file drop opens a PDF exactly like File>Open.
+    // Ignore non-PDF drops and honour the single-document model (drop replaces current doc).
+    _dropUnlisten = await getCurrentWebview().onDragDropEvent(async (event) => {
+      if (event.payload.type !== "drop") return;
+      const pdfs = (event.payload.paths as string[]).filter((p) =>
+        p.toLowerCase().endsWith(".pdf"),
+      );
+      if (pdfs.length === 0) return;
+      if (isOpening) return;
+      await openFilePath(pdfs[0]);
+    });
+  });
+
+  onDestroy(() => { _dropUnlisten?.(); });
 
   // Panel collapse state
   let leftCollapsed  = $state(false);
@@ -80,28 +99,20 @@
   let bottomCollapsed = $state(true);
 
   // --- Actions ---
-  async function handleOpenFile() {
+
+  /**
+   * Core open logic shared by File>Open dialog and file-drop (Fix 4).
+   * Closes the current document first (single-document app), then opens the given path.
+   */
+  async function openFilePath(path: string) {
     openError = null;
     isOpening = true;
     try {
-      const selected = await open({
-        title: "Open PDF",
-        filters: [{ name: "PDF Documents", extensions: ["pdf"] }],
-        multiple: false,
-      });
-
-      if (!selected || Array.isArray(selected)) {
-        isOpening = false;
-        return;
-      }
-
-      // Close existing doc first
       if (currentDoc) {
         await closeDocument(currentDoc.doc_id);
         currentDoc = null;
       }
-
-      const doc = await openDocument(selected as string);
+      const doc = await openDocument(path);
       store = new MarkupStore(doc.doc_id, { add: addMarkup, update: updateMarkup, remove: deleteMarkup });
       takeoffStore = new TakeoffStore();
       currentDoc = doc;
@@ -116,6 +127,17 @@
     } finally {
       isOpening = false;
     }
+  }
+
+  async function handleOpenFile() {
+    if (isOpening) return;
+    const selected = await open({
+      title: "Open PDF",
+      filters: [{ name: "PDF Documents", extensions: ["pdf"] }],
+      multiple: false,
+    });
+    if (!selected || Array.isArray(selected)) return;
+    await openFilePath(selected as string);
   }
 
   // --- Save handlers ---

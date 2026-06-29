@@ -638,12 +638,22 @@ describe("Viewport zoom-snap controls", () => {
     expect(zoomPercent(container)).toContain("50%");
   });
 
-  it("Z3: Cmd+0 snaps back to actual size (100%) after a fit", async () => {
+  it("Z3: Cmd+0 fits page width (same as Cmd+1, new mapping)", async () => {
+    const { container } = await mountViewport(store);
+    fireEvent.keyDown(window, { key: "2", metaKey: true }); // → 50% (fit-height)
+    await tick();
+    expect(zoomPercent(container)).toContain("50%");
+    fireEvent.keyDown(window, { key: "0", metaKey: true }); // → 200% (fit-width)
+    await tick();
+    expect(zoomPercent(container)).toContain("200%");
+  });
+
+  it("Z3b: Cmd+Shift+0 snaps to actual size (100%)", async () => {
     const { container } = await mountViewport(store);
     fireEvent.keyDown(window, { key: "1", metaKey: true }); // → 200%
     await tick();
     expect(zoomPercent(container)).toContain("200%");
-    fireEvent.keyDown(window, { key: "0", metaKey: true }); // → 100%
+    fireEvent.keyDown(window, { key: "0", metaKey: true, shiftKey: true }); // → 100%
     await tick();
     expect(zoomPercent(container)).toContain("100%");
   });

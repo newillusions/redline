@@ -14,7 +14,7 @@
    *
    * Svelte 5 runes throughout.
    */
-  import { onMount, onDestroy } from "svelte";
+  import { onMount, onDestroy, untrack } from "svelte";
   import {
     renderTile,
     getPageSize,
@@ -509,14 +509,24 @@
     if (e.key === "b" || e.key === "B") {
       benchOverlay = !benchOverlay;
     }
-    // Keyboard zoom (Cmd/Ctrl + = / -), anchored to the viewport centre, plus the
-    // zoom-snap presets: 1 = fit-width, 2 = fit-height, 0 = actual size (100%).
+    // Keyboard zoom (Cmd/Ctrl + = / -), anchored to the viewport centre, plus zoom-snap
+    // presets and page navigation. Guard all of these when the text editor is active
+    // so Arrow keys don't hijack navigation while the user is typing.
     if (e.metaKey || e.ctrlKey) {
+      if (editor) return; // let textarea handle Cmd/Ctrl inside the editor
       if (e.key === "=" || e.key === "+") { e.preventDefault(); applyZoom(zoom * 1.1, containerWidth / 2, containerHeight / 2); return; }
       if (e.key === "-" || e.key === "_") { e.preventDefault(); applyZoom(zoom / 1.1, containerWidth / 2, containerHeight / 2); return; }
+      // Fit-width: Cmd/Ctrl+1 (legacy) or Cmd/Ctrl+0
       if (e.key === "1") { e.preventDefault(); fitWidth(); return; }
+      if (!e.shiftKey && e.key === "0") { e.preventDefault(); fitWidth(); return; }
+      // Fit-height: Cmd/Ctrl+2 (legacy) or Cmd/Ctrl+9
       if (e.key === "2") { e.preventDefault(); fitHeight(); return; }
-      if (e.key === "0") { e.preventDefault(); actualSize(); return; }
+      if (e.key === "9") { e.preventDefault(); fitHeight(); return; }
+      // Actual size (100%): Cmd/Ctrl+Shift+0
+      if (e.shiftKey && (e.key === "0" || e.key === ")")) { e.preventDefault(); actualSize(); return; }
+      // Page navigation: Cmd/Ctrl+ArrowLeft / ArrowRight
+      if (e.key === "ArrowLeft")  { e.preventDefault(); prevPage(); return; }
+      if (e.key === "ArrowRight") { e.preventDefault(); nextPage(); return; }
     }
     // Don't fire multi-click Escape when the text editor is open — the textarea
     // handles it itself via its own onkeydown.
@@ -818,7 +828,13 @@
     const tool = store.activeTool; // reactive dependency
     resetMultiClick();
     cancelDraw();
-    cancelEditor();
+    // Commit any in-progress text/callout annotation before the tool switch so the
+    // user's work is not silently discarded. commitEditor() is a no-op when the editor
+    // is empty (it falls through to cancelEditor internally).
+    // untrack() prevents editor/identity/editorText from being registered as reactive
+    // dependencies of this $effect (they're read inside commitEditor). Without it, the
+    // effect re-runs when e.g. identity loads and would prematurely cancel a just-opened editor.
+    untrack(() => commitEditor());
     // Clear marquee + move/resize transient state on any tool switch.
     marquee = null;
     marqueeAdditive = false;
@@ -1392,6 +1408,18 @@
     ondblclick={onOverlayDblClick}
     onmousemove={onOverlayMouseMove}
   >
+    <defs>
+      <!--
+        Arrowhead marker for Arrow markup (Fix: arrow tool had no visible head).
+        markerUnits="strokeWidth" keeps the head proportional to line weight.
+        fill="context-stroke" inherits the referencing polyline's stroke color so the
+        arrowhead automatically matches the markup color and persists through save/reload.
+      -->
+      <marker id="redline-arrowhead" markerWidth="6" markerHeight="6"
+        refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path d="M0,0 L6,3 L0,6 Z" fill="context-stroke" />
+      </marker>
+    </defs>
     {#snippet shape(s: SvgShape)}
       {#if s.kind === "rect"}
         <rect
@@ -1410,6 +1438,13 @@
           stroke={s.stroke} stroke-width={s.strokeWidth}
           fill={s.fill} opacity={s.opacity}
           stroke-dasharray={s.dashArray ?? undefined} />
+      {:else if s.kind === "arrow"}
+        <polyline points={s.points}
+          stroke={s.stroke} stroke-width={s.strokeWidth}
+          fill="none" opacity={s.opacity}
+          stroke-dasharray={s.dashArray ?? undefined}
+          marker-end="url(#redline-arrowhead)"
+        />
       {:else if s.kind === "polyline"}
         <polyline points={s.points}
           stroke={s.stroke} stroke-width={s.strokeWidth}

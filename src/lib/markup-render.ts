@@ -22,6 +22,7 @@ export type SvgShape =
   | (SvgStyle & { kind: "rect"; x: number; y: number; width: number; height: number })
   | (SvgStyle & { kind: "polygon"; points: string })
   | (SvgStyle & { kind: "polyline"; points: string })
+  | (SvgStyle & { kind: "arrow"; points: string })
   | (SvgStyle & { kind: "cloud"; path: string })
   | (SvgStyle & { kind: "ink"; strokes: string[] })
   | (SvgStyle & { kind: "point"; x: number; y: number })
@@ -160,6 +161,10 @@ export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
   if ("Polyline" in g && m.markup_type === "Cloud") {
     const screen = g.Polyline.map((p) => pdfUserSpaceToScreen(p.x, p.y, v));
     return { ...style, kind: "cloud", path: cloudPath(screen, Math.max(4, 6 * v.zoom)) };
+  }
+  if ("Polyline" in g && m.markup_type === "Arrow") {
+    const points = pointsStr(g.Polyline, v);
+    return { ...style, kind: "arrow", points };
   }
   if ("Polyline" in g) {
     const points = pointsStr(g.Polyline, v);

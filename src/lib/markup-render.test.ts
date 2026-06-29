@@ -49,7 +49,7 @@ describe("markupToSvg geometry", () => {
     expect(markupToSvg(mk(pts, "Cloud"), VS).kind).toBe("cloud");
     expect(markupToSvg(mk(pts, "MeasurementArea"), VS).kind).toBe("polygon");
     expect(markupToSvg(mk(pts, "Line"), VS).kind).toBe("polyline");
-    expect(markupToSvg(mk(pts, "Arrow"), VS).kind).toBe("polyline");
+    expect(markupToSvg(mk(pts, "Arrow"), VS).kind).toBe("arrow");
     expect(markupToSvg(mk(pts, "Polyline"), VS).kind).toBe("polyline");
   });
 
@@ -189,6 +189,27 @@ describe("selectionChrome", () => {
     const se = c.handles.find((h) => h.id === "se")!;
     expect(se.x).toBeCloseTo(60);
     expect(se.y).toBeCloseTo(80);
+  });
+});
+
+describe("arrow rendering", () => {
+  it("Arrow markup returns kind arrow (not polyline), enabling arrowhead marker", () => {
+    const pts: MarkupGeometry = { Polyline: [{ x: 0, y: 0 }, { x: 50, y: 50 }] };
+    const s = markupToSvg(mk(pts, "Arrow"), VS);
+    expect(s.kind).toBe("arrow");
+  });
+  it("Arrow has the same screen-space point string as an equivalent Polyline", () => {
+    const pts: MarkupGeometry = { Polyline: [{ x: 0, y: 100 }, { x: 100, y: 100 }] };
+    const arrow = markupToSvg(mk(pts, "Arrow"), VS);
+    const line  = markupToSvg(mk(pts, "Line"),  VS);
+    // Arrow and Line share the same geometry; only the kind differs.
+    if (arrow.kind !== "arrow") throw new Error("expected arrow kind");
+    if (line.kind !== "polyline") throw new Error("expected polyline kind");
+    expect(arrow.points).toBe(line.points);
+  });
+  it("Line markup remains kind polyline (no arrowhead)", () => {
+    const pts: MarkupGeometry = { Polyline: [{ x: 0, y: 0 }, { x: 50, y: 50 }] };
+    expect(markupToSvg(mk(pts, "Line"), VS).kind).toBe("polyline");
   });
 });
 
