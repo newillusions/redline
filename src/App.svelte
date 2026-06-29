@@ -24,6 +24,7 @@
   import ToolPalette from "./components/ToolPalette.svelte";
   import PropertiesPanel from "./components/PropertiesPanel.svelte";
   import MeasurementPanel from "./components/MeasurementPanel.svelte";
+  import ComparePanel from "./components/ComparePanel.svelte";
   import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument } from "$lib/ipc";
   import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
@@ -41,6 +42,11 @@
   let isFlattening = $state(false);
   let isOptimizing = $state(false);
   let isRedacting = $state(false);
+
+  // --- Compare panel state (M6 Phase 1.1) ---
+  let compareVisible = $state(false);
+  let comparePathA = $state("");
+  let comparePathB = $state("");
 
   // --- Auto-open for the §20 GUI smoke / floor-machine runbook ---
   // If the backend reports REDLINE_OPEN_PDF (env var read in Rust), open it on
@@ -192,6 +198,25 @@
     }
   }
 
+  // --- Compare handlers (M6 Phase 1.1) ---
+  async function handlePickCompareA() {
+    const selected = await open({
+      title: "Select old PDF (File A)",
+      filters: [{ name: "PDF Documents", extensions: ["pdf"] }],
+      multiple: false,
+    });
+    if (selected && !Array.isArray(selected)) comparePathA = selected as string;
+  }
+
+  async function handlePickCompareB() {
+    const selected = await open({
+      title: "Select new PDF (File B)",
+      filters: [{ name: "PDF Documents", extensions: ["pdf"] }],
+      multiple: false,
+    });
+    if (selected && !Array.isArray(selected)) comparePathB = selected as string;
+  }
+
   // --- Keyboard shortcuts ---
   function handleKeydown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && !e.shiftKey) {
@@ -241,6 +266,13 @@
       >
         {isRedacting ? "Redacting…" : "Apply Redactions"}
       </button>
+      <button
+        class="btn-toolbar btn-compare-toggle"
+        onclick={() => (compareVisible = !compareVisible)}
+        title="Toggle compare panel — diff two PDF revisions (spec §10)"
+      >
+        {compareVisible ? "Compare ▲" : "Compare"}
+      </button>
       {#if currentDoc}
         <span class="doc-name">{currentDoc.path.split(/[\\/]/).at(-1)}</span>
         <span class="doc-pages">{currentDoc.page_count} pages</span>
@@ -264,6 +296,21 @@
       >▼</button>
     </div>
   </header>
+
+  <!-- Compare panel — collapsible, below toolbar (M6 Phase 1.1, spec §10) -->
+  {#if compareVisible}
+    <div class="compare-bar">
+      <div class="compare-bar-pickers">
+        <button class="btn-toolbar" onclick={handlePickCompareA}>
+          {comparePathA ? "A: " + comparePathA.split(/[\\/]/).at(-1) : "Pick File A (old)…"}
+        </button>
+        <button class="btn-toolbar" onclick={handlePickCompareB}>
+          {comparePathB ? "B: " + comparePathB.split(/[\\/]/).at(-1) : "Pick File B (new)…"}
+        </button>
+      </div>
+      <ComparePanel pathA={comparePathA} pathB={comparePathB} />
+    </div>
+  {/if}
 
   {#if store}
     <ToolPalette {store} />
@@ -406,6 +453,32 @@
   }
   .btn-toolbar.btn-docops:hover:not(:disabled) {
     background: var(--color-warning-surface, #fffbeb);
+  }
+
+  .btn-toolbar.btn-compare-toggle {
+    border-color: var(--color-primary, #2563eb);
+    color: var(--color-primary, #2563eb);
+  }
+  .btn-toolbar.btn-compare-toggle:hover {
+    background: var(--color-primary-surface, #eff6ff);
+  }
+
+  /* --- Compare bar (M6) --- */
+  .compare-bar {
+    flex-shrink: 0;
+    border-bottom: 1px solid var(--color-border, #e5e7eb);
+    background: var(--color-surface-raised, #f9fafb);
+    display: flex;
+    flex-direction: column;
+    max-height: 420px;
+    overflow: hidden;
+  }
+
+  .compare-bar-pickers {
+    display: flex;
+    gap: var(--space-2, 6px);
+    padding: var(--space-2, 6px) var(--space-3, 8px);
+    border-bottom: 1px solid var(--color-border, #e5e7eb);
   }
 
   .btn-primary {
