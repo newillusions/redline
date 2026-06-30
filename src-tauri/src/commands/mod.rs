@@ -7,6 +7,7 @@ pub mod compare;
 pub mod diag;
 pub mod docops;
 pub mod document;
+pub mod recent_docs;
 pub mod render;
 pub mod search;
 pub mod takeoff;

@@ -39,6 +39,9 @@
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
   import { DocTabStore } from "$lib/doc-tabs.svelte";
   import type { ViewportSnapshot } from "$lib/viewport";
+  import DocumentHistoryPanel from "./components/DocumentHistoryPanel.svelte";
+  import { loadRecentDocs, saveRecentDocs, upsertMru } from "$lib/recent-docs";
+  import type { RecentDoc } from "$lib/recent-docs";
 
   // ---------------------------------------------------------------------------
   // Multi-doc state
@@ -65,6 +68,24 @@
   let _dropUnlisten: (() => void) | undefined;
 
   // ---------------------------------------------------------------------------
+  // Recent-docs MRU list (Document History panel)
+  // ---------------------------------------------------------------------------
+  let recentDocs = $state<RecentDoc[]>([]);
+
+  /** Record a successful open in the MRU list and persist it. */
+  async function recordRecentDoc(doc: DocumentInfo) {
+    const entry: RecentDoc = {
+      path: doc.path,
+      file_name: doc.path.split(/[\\/]/).at(-1) ?? doc.path,
+      last_opened: new Date().toISOString(),
+      page_count: doc.page_count,
+    };
+    recentDocs = upsertMru(recentDocs, entry);
+    // Persist asynchronously — failure is non-fatal.
+    saveRecentDocs(recentDocs).catch(() => {});
+  }
+
+  // ---------------------------------------------------------------------------
   // Auto-open (§20 GUI smoke / floor-machine runbook)
   // ---------------------------------------------------------------------------
   async function autoOpenIfRequested() {
@@ -77,6 +98,9 @@
   }
 
   onMount(async () => {
+    // Load the MRU list from the backend (non-blocking; failure is non-fatal).
+    loadRecentDocs().then((docs) => { recentDocs = docs; }).catch(() => {});
+
     await autoOpenIfRequested();
     // File drop: open each dropped PDF into a new tab (same dedup logic as File>Open).
     _dropUnlisten = await getCurrentWebview().onDragDropEvent(async (event) => {
@@ -128,6 +152,9 @@
       });
       const ts = new TakeoffStore();
       tabStore.addTab(doc, store, ts);
+
+      // Record successful open in the MRU history.
+      void recordRecentDoc(doc);
 
       // Load markups and scales asynchronously (non-blocking).
       loadMarkups(doc.doc_id)
@@ -449,14 +476,27 @@
     <!-- Left panel -->
     {#if !leftCollapsed}
       <aside class="panel panel-left">
-        <div class="panel-header">Navigator</div>
-        <div class="panel-body">
-          {#if activeTab}
-            <p class="panel-hint">Thumbnails · Bookmarks · Layers</p>
-            <p class="panel-hint muted">(M4)</p>
-          {:else}
-            <p class="panel-hint muted">Open a PDF to begin.</p>
-          {/if}
+        <!-- Document History section (MRU list) -->
+        <div class="panel-section">
+          <div class="panel-header">Recent Documents</div>
+          <div class="panel-body panel-body-flush">
+            <DocumentHistoryPanel
+              recentDocs={recentDocs}
+              onOpen={openFilePath}
+            />
+          </div>
+        </div>
+        <!-- Navigator placeholder (M4 — thumbnails/bookmarks/layers) -->
+        <div class="panel-section panel-section--secondary">
+          <div class="panel-header">Navigator</div>
+          <div class="panel-body">
+            {#if activeTab}
+              <p class="panel-hint">Thumbnails · Bookmarks · Layers</p>
+              <p class="panel-hint muted">(M4)</p>
+            {:else}
+              <p class="panel-hint muted">Open a PDF to begin.</p>
+            {/if}
+          </div>
         </div>
       </aside>
     {/if}
@@ -671,6 +711,29 @@
     margin: 0 0 var(--space-2);
   }
   .panel-hint.muted { color: var(--color-text-muted); }
+
+  /* --- Left panel sections (history + navigator stacked) --- */
+  .panel-section {
+    display: flex;
+    flex-direction: column;
+    border-bottom: 1px solid var(--color-border);
+    flex-shrink: 0;
+  }
+  /* History panel gets more room; Navigator placeholder collapses to fit-content. */
+  .panel-section:first-child {
+    flex: 1;
+    overflow: hidden;
+    max-height: 55%;
+  }
+  .panel-section--secondary {
+    flex: 1;
+    overflow: hidden;
+  }
+  .panel-body-flush {
+    padding: 0;
+    overflow-y: auto;
+    flex: 1;
+  }
 
   /* --- Viewport container --- */
   .viewport-container {

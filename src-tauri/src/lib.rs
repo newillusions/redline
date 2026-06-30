@@ -182,6 +182,10 @@ pub fn run() {
             commands::docops::redact_document,
             // Compare commands (M6 Phase 1.1)
             commands::compare::compare_pages,
+            // Recent docs (MRU list, Document History panel)
+            commands::recent_docs::load_recent_docs,
+            commands::recent_docs::save_recent_docs,
+            commands::recent_docs::check_file_exists,
         ])
         .run(tauri::generate_context!())
         .expect("error while running redline");

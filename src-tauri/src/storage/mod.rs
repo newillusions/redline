@@ -7,6 +7,7 @@
 //! - Snapshot filenames: `<7-digit-seq>__<iso-utc>__<5-char-id>.pdf`
 //! - meta.json / markups.json: atomic write (temp file + rename).
 //! - Retained-N: default 10. Prune runs after every successful snapshot.
+pub mod recent_docs;
 pub mod versioning;
 
 pub use versioning::{history_dir, list_versions, restore_version, save_version_snapshot};
