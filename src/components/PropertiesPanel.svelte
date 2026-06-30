@@ -134,6 +134,13 @@
     return commonValue(selected, (m) => m.layer ?? "") ?? "";
   }
 
+  /** 1-based page display for the properties panel (read-only). */
+  function pageDisplay(): string {
+    const v = commonValue(selected, (m) => m.page);
+    if (v === undefined) return "Multiple";
+    return String((v as number) + 1);
+  }
+
   // ---------------------------------------------------------------------------
   // Event handlers
   // ---------------------------------------------------------------------------
@@ -442,6 +449,11 @@
           placeholder={layerValue() === "" && selected.length > 1 ? "Mixed" : ""}
         />
       </div>
+
+      <div class="prop-row">
+        <span class="prop-label">Page</span>
+        <span class="prop-value muted">{pageDisplay()}</span>
+      </div>
     </section>
   {/if}
 </div>
@@ -589,6 +601,11 @@
     font-size: var(--font-size-sm);
     resize: vertical;
     font-family: inherit;
+  }
+
+  .prop-value {
+    flex: 1;
+    font-size: var(--font-size-sm);
   }
 
   .muted {

@@ -127,8 +127,8 @@ describe("MeasurementPanel", () => {
     store.markups.push(makeMeasurementMarkup("c1", "MeasurementCount", 1, "ea", "s1", 1));
     store.markups.push(makeMeasurementMarkup("c2", "MeasurementCount", 1, "ea", "s1", 1));
     await tick();
-    // single (unassigned) subtotal row should show "2"
-    expect(screen.getByText("2")).toBeTruthy();
+    // The set subtotal row AND the per-page breakdown row both show "2" (total count and page count).
+    expect(screen.getAllByText("2").length).toBeGreaterThanOrEqual(1);
   });
 
   it("shows a separate subtotal row per count set", async () => {

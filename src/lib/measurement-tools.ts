@@ -43,6 +43,57 @@ export function countSubtotals(markups: Markup[]): CountSubtotal[] {
   return [...groups.values()];
 }
 
+/** One page's tally within a count set. */
+export interface CountPageBreakdown {
+  /** 0-based page index. */
+  page: number;
+  count: number;
+}
+
+/** Per-set count row with an additional per-page breakdown. */
+export interface CountSubtotalWithPages extends CountSubtotal {
+  /** Per-page count tallies, sorted ascending by page. */
+  byPage: CountPageBreakdown[];
+}
+
+/**
+ * Like `countSubtotals` but also breaks each set's total down by page.
+ * Returns one entry per set (including an "Unassigned" entry for markers with
+ * no set), with `byPage` sorted ascending. Pure — unit-tested in isolation.
+ */
+export function countSubtotalsByPage(markups: Markup[]): CountSubtotalWithPages[] {
+  const groups = new Map<string | null, CountSubtotalWithPages>();
+  for (const m of markups) {
+    if (m.markup_type !== "MeasurementCount") continue;
+    const cs = m.count_set ?? null;
+    const key = cs?.id ?? null;
+    let row = groups.get(key);
+    if (!row) {
+      row = {
+        setId: key,
+        name: cs?.name ?? "Unassigned",
+        color: cs?.color ?? m.appearance.color,
+        symbol: cs?.symbol ?? "Circle",
+        count: 0,
+        byPage: [],
+      };
+      groups.set(key, row);
+    }
+    const val = m.measurement?.count_value ?? 0;
+    row.count += val;
+    const existing = row.byPage.find((bp) => bp.page === m.page);
+    if (existing) {
+      existing.count += val;
+    } else {
+      row.byPage.push({ page: m.page, count: val });
+    }
+  }
+  for (const row of groups.values()) {
+    row.byPage.sort((a, b) => a.page - b.page);
+  }
+  return [...groups.values()];
+}
+
 /**
  * Sum of segment lengths along a polyline, in PDF points (raw_measure for length types).
  */

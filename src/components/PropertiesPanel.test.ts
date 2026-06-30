@@ -391,6 +391,54 @@ describe("single selection mode", () => {
 });
 
 // ---------------------------------------------------------------------------
+describe("page number display (selection mode only)", () => {
+  it("single selected markup shows 1-based page number", async () => {
+    const store = makeStore();
+    // page: 2 (0-based) → displayed as 3
+    const m = makeMarkup("m1", { page: 2 });
+    store.seed([m]);
+    store.selectedIds = new Set(["m1"]);
+
+    const { container } = await mountPanel(store);
+
+    // "Page" label text must be present in the Content section (selection mode only).
+    expect(container.textContent?.toLowerCase()).toContain("page");
+    // The 1-based value "3" must appear.
+    expect(container.textContent).toContain("3");
+  });
+
+  it("multi-selection same page shows that 1-based page", async () => {
+    const store = makeStore();
+    const m1 = makeMarkup("m1", { page: 1 });
+    const m2 = makeMarkup("m2", { page: 1 });
+    store.seed([m1, m2]);
+    store.selectedIds = new Set(["m1", "m2"]);
+
+    const { container } = await mountPanel(store);
+    // page 1 → displayed as 2
+    expect(container.textContent).toContain("2");
+  });
+
+  it("multi-selection spanning different pages shows 'Multiple'", async () => {
+    const store = makeStore();
+    const m1 = makeMarkup("m1", { page: 0 });
+    const m2 = makeMarkup("m2", { page: 1 });
+    store.seed([m1, m2]);
+    store.selectedIds = new Set(["m1", "m2"]);
+
+    const { getByText } = await mountPanel(store);
+    expect(getByText("Multiple")).toBeTruthy();
+  });
+
+  it("draft mode does not show a page row", async () => {
+    const store = makeStore();
+    const { container } = await mountPanel(store);
+    // No markup selected → draft mode → Content section hidden → no "Page" label.
+    expect(container.textContent?.toLowerCase()).not.toContain("page");
+  });
+});
+
+// ---------------------------------------------------------------------------
 describe("multi-selection (2 markups)", () => {
   it("color input is blank/indeterminate when colors differ", async () => {
     const store = makeStore();

@@ -110,6 +110,22 @@ describe("hitTest", () => {
     expect(hitTest([pointMarkup], { x: 100, y: 100 }, tol)).toBeNull();
   });
 
+  // Count markers use a bounding-box (Chebyshev) test — Euclidean distance misses
+  // the corners of non-circular symbols (Cross, Square, Diamond) which sit at
+  // ~1.4×tol from centre. A click at (±tol, ±tol) is AT the corner of the symbol
+  // bounding box and MUST register as a hit.
+  it("Point geometry (count marker): corner of symbol bounding box registers as hit", () => {
+    // pointMarkup is at (30, 40); tol = 5.
+    // Corner offset (5, 5) puts us at (35, 45) — Euclidean distance = 5*√2 ≈ 7.07 > 5,
+    // so this click MISSES the old circular test but MUST hit with the box test.
+    expect(hitTest([pointMarkup], { x: 35, y: 45 }, tol)).toBe("pt1");
+  });
+
+  it("Point geometry: miss when outside bounding box on one axis", () => {
+    // (30 + tol+1, 40) is just past the box edge in x — must miss.
+    expect(hitTest([pointMarkup], { x: 36, y: 40 }, tol)).toBeNull();
+  });
+
   it("topmost-wins: returns the LATER markup's id when two Rects overlap", () => {
     const a = mkMarkup("bottom", { Rect: { min: { x: 0, y: 0 }, max: { x: 50, y: 50 } } });
     const b = mkMarkup("top",    { Rect: { min: { x: 10, y: 10 }, max: { x: 40, y: 40 } } });

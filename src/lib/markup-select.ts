@@ -103,7 +103,11 @@ function _boundsOfPoints(pts: PdfPoint[]): Bounds {
  *
  * - Rect: hit when inside or within tolPts of the AABB.
  * - Polyline/Ink: hit when min distance to any segment <= tolPts.
- * - Point: hit when Euclidean distance to the point <= tolPts.
+ * - Point: hit when within the axis-aligned bounding box of size tolPts around
+ *   the point — Chebyshev (L∞) distance rather than Euclidean, so that clicks
+ *   anywhere inside the rendered symbol footprint register (including the
+ *   corners of non-circular symbols such as Cross, Square, and Diamond, which
+ *   extend to ~1.4 × tolPts from centre under a Euclidean measure).
  */
 export function hitTest(markups: Markup[], p: PdfPoint, tolPts: number): string | null {
   for (let i = markups.length - 1; i >= 0; i--) {
@@ -136,8 +140,9 @@ function _hits(m: Markup, p: PdfPoint, tol: number): boolean {
     }
     return false;
   }
-  // Point
-  return _dist(p, g.Point) <= tol;
+  // Point (count markers): bounding-box (Chebyshev) test so every pixel inside
+  // the rendered symbol footprint registers as a hit regardless of shape.
+  return Math.abs(p.x - g.Point.x) <= tol && Math.abs(p.y - g.Point.y) <= tol;
 }
 
 /** Minimum distance from point `p` to line segment `a`-`b`. */

@@ -15,7 +15,7 @@
   import type { TakeoffStore } from "$lib/takeoff-store.svelte";
   import type { Markup } from "$lib/ipc";
   import { exportMarkupList, type ExportFormat } from "$lib/ipc";
-  import { countSubtotals } from "$lib/measurement-tools";
+  import { countSubtotalsByPage } from "$lib/measurement-tools";
   import { countSymbolRender, COUNT_MARKER_RADIUS } from "$lib/markup-render";
   import { save as saveDialog } from "@tauri-apps/plugin-dialog";
   import CountSetPicker from "./CountSetPicker.svelte";
@@ -44,8 +44,9 @@
       .reduce((sum: number, m: Markup) => sum + (m.measurement?.computed_quantity ?? 0), 0)
   );
 
-  // Per-set count subtotals (spec §7): group MeasurementCount markups by their count set.
-  const countGroups = $derived(countSubtotals(measurements));
+  // Per-set count subtotals (spec §7): group MeasurementCount markups by their count set,
+  // with per-page breakdown for the quantities panel.
+  const countGroups = $derived(countSubtotalsByPage(measurements));
   const totalCount = $derived(countGroups.reduce((sum, g) => sum + g.count, 0));
 
   // 14px symbol swatch for the subtotal rows (reuses the live render geometry).
@@ -160,6 +161,15 @@
             <td>ea (count)</td>
             <td></td>
           </tr>
+          {#each g.byPage as bp (bp.page)}
+            <tr class="count-page-row">
+              <td></td>
+              <td class="page-label">Page {bp.page + 1}</td>
+              <td class="num-col">{bp.count}</td>
+              <td>ea</td>
+              <td></td>
+            </tr>
+          {/each}
         {/each}
         {#if countGroups.length > 1}
           <tr class="totals-row count-grand-total">
@@ -284,5 +294,17 @@
 
   .count-grand-total td {
     border-top: 2px solid var(--color-primary);
+  }
+
+  .count-page-row td {
+    background: var(--color-bg-canvas, var(--color-bg));
+    font-weight: 400;
+    font-size: var(--font-size-xs, 0.75rem);
+    color: var(--color-text-muted);
+    border-top: none;
+  }
+
+  .page-label {
+    padding-left: var(--space-6, 1.5rem);
   }
 </style>
