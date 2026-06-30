@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { dragDrawGeometry, buildMarkup, bumpAudit, RECT_TOOLS, isDrawTool, MULTI_CLICK_TOOLS, isMultiClickTool, isInkTool, polylineGeometry, inkGeometry, minVertices, isMultiClickComplete, TEXT_TOOLS, isTextTool, textBoxGeometry, calloutGeometry, DEFAULT_TEXT_FONT } from "./markup-tools";
+import { patchAppearance } from "./markup-properties";
 import type { Appearance, UserRef, PdfPoint } from "./ipc";
 
 const AP: Appearance = { color: "#e02424", line_weight: 2, opacity: 1, fill: null, line_style: "Solid", font: null };
@@ -177,5 +178,94 @@ describe("bumpAudit", () => {
     expect(bumped.audit.created_at).toBe("2026-01-01T00:00:00Z");
     expect(bumped).not.toBe(original);
     expect(original.audit.revision).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Appearance cloning — shared-reference correctness (regression: per-markup
+// appearance isolation bug where buildMarkup stored appearance BY REFERENCE so
+// mutating draftAppearance post-creation changed every existing markup).
+// ---------------------------------------------------------------------------
+
+describe("buildMarkup — appearance isolation", () => {
+  const BASE_GEOM = { Rect: { min: { x: 0, y: 0 }, max: { x: 10, y: 10 } } } as const;
+
+  it("mutating the source Appearance object after build does NOT change the markup", () => {
+    const draft: Appearance = {
+      color: "#e02424", line_weight: 2, opacity: 1,
+      fill: null, line_style: "Solid", font: null,
+    };
+    const m = buildMarkup({
+      markupType: "Rectangle", page: 0, geometry: BASE_GEOM,
+      appearance: draft, identity: USER, now: "t", id: "iso-1",
+    });
+
+    // Simulate what PropertiesPanel did before the fix: in-place mutation of draftAppearance
+    Object.assign(draft, { color: "#0000ff", line_weight: 5 });
+
+    expect(m.appearance.color).toBe("#e02424");
+    expect(m.appearance.line_weight).toBe(2);
+  });
+
+  it("nested font is a distinct object — mutating source font does NOT change markup", () => {
+    const font = { family: "Helvetica", size_pt: 12 };
+    const draft: Appearance = {
+      color: "#000000", line_weight: 1, opacity: 1,
+      fill: null, line_style: "Solid", font,
+    };
+    const m = buildMarkup({
+      markupType: "Text", page: 0, geometry: BASE_GEOM,
+      appearance: draft, identity: USER, now: "t", id: "iso-2",
+    });
+
+    expect(m.appearance.font).not.toBe(font); // must be a clone, not the same reference
+    expect(m.appearance.font).toEqual(font);  // same value
+
+    font.size_pt = 99;
+    expect(m.appearance.font!.size_pt).toBe(12); // markup unaffected
+  });
+
+  it("two markups built from the same draft appearance are independent", () => {
+    const draft: Appearance = {
+      color: "#e02424", line_weight: 2, opacity: 1,
+      fill: null, line_style: "Solid", font: null,
+    };
+    const m1 = buildMarkup({
+      markupType: "Rectangle", page: 0, geometry: BASE_GEOM,
+      appearance: draft, identity: USER, now: "t", id: "iso-3a",
+    });
+    const m2 = buildMarkup({
+      markupType: "Ellipse", page: 0, geometry: BASE_GEOM,
+      appearance: draft, identity: USER, now: "t", id: "iso-3b",
+    });
+
+    // Mutate draft (what PropertiesPanel did with Object.assign before the fix)
+    Object.assign(draft, { color: "#00ff00" });
+
+    expect(m1.appearance.color).toBe("#e02424"); // unchanged
+    expect(m2.appearance.color).toBe("#e02424"); // unchanged
+    // The two markups own their appearance objects independently
+    expect(m1.appearance).not.toBe(m2.appearance);
+  });
+
+  it("patchAppearance on one markup never leaks into another (patchAppearance is already immutable)", () => {
+    const draft: Appearance = {
+      color: "#e02424", line_weight: 2, opacity: 1,
+      fill: null, line_style: "Solid", font: null,
+    };
+    const m1 = buildMarkup({
+      markupType: "Rectangle", page: 0, geometry: BASE_GEOM,
+      appearance: draft, identity: USER, now: "t", id: "iso-4a",
+    });
+    const m2 = buildMarkup({
+      markupType: "Ellipse", page: 0, geometry: BASE_GEOM,
+      appearance: draft, identity: USER, now: "t", id: "iso-4b",
+    });
+
+    const m1patched = patchAppearance(m1, { color: "#0000ff" }, USER, "t2");
+
+    expect(m1patched.appearance.color).toBe("#0000ff");
+    expect(m2.appearance.color).toBe("#e02424"); // m2 is unaffected
+    expect(m1.appearance.color).toBe("#e02424"); // original m1 unaffected (patchAppearance is pure)
   });
 });

@@ -135,7 +135,14 @@ export function buildMarkup(opts: {
     markup_type: opts.markupType,
     page: opts.page,
     geometry: opts.geometry,
-    appearance: opts.appearance,
+    // Deep-clone appearance so each markup owns its own object. Without this,
+    // all markups created from the same draftAppearance share one reference and
+    // any in-place mutation (e.g. Object.assign on the store's draft) silently
+    // changes every existing markup's appearance.
+    appearance: {
+      ...opts.appearance,
+      font: opts.appearance.font ? { ...opts.appearance.font } : opts.appearance.font,
+    },
     subject: null,
     layer: null,
     contents: opts.contents ?? null,

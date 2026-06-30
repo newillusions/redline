@@ -28,7 +28,11 @@
 
   function commitAppearancePatch(patch: Parameters<typeof patchAppearance>[1]) {
     if (mode === "draft") {
-      Object.assign(store.draftAppearance, patch);
+      // Immutable replace (not Object.assign) so draftAppearance gets a new
+      // object reference. This satisfies Svelte 5 reactivity and, critically,
+      // avoids mutating a reference that existing markups still hold — belt-
+      // and-suspenders on top of buildMarkup's own clone.
+      store.draftAppearance = { ...store.draftAppearance, ...patch };
     } else {
       const now = new Date().toISOString();
       const pairs = selected.map((m) => ({
