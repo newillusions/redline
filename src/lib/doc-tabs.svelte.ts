@@ -122,6 +122,31 @@ export class DocTabStore {
   }
 
   /**
+   * Reorder tabs by moving the tab at `fromIndex` to `toIndex`.
+   *
+   * Both indices are clamped to valid bounds before use.
+   * Out-of-range `fromIndex` (before clamping to a valid source) is a no-op.
+   * Same effective position after clamping is also a no-op.
+   * `activeDocId` is preserved regardless of which tab moves.
+   */
+  moveTab(fromIndex: number, toIndex: number): void {
+    const len = this.tabs.length;
+    if (len < 2) return;
+
+    // fromIndex must refer to an existing tab; treat out-of-bounds as no-op.
+    if (fromIndex < 0 || fromIndex >= len) return;
+
+    // Clamp toIndex to valid range.
+    const clampedTo = Math.max(0, Math.min(toIndex, len - 1));
+    if (fromIndex === clampedTo) return;
+
+    const next = [...this.tabs];
+    const [tab] = next.splice(fromIndex, 1);
+    next.splice(clampedTo, 0, tab);
+    this.tabs = next;
+  }
+
+  /**
    * Save the viewport snapshot for a tab (called on every state change from
    * the active Viewport, so the snapshot is up to date when switching away).
    */

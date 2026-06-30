@@ -234,4 +234,96 @@ describe("DocTabStore", () => {
       expect(tab?.viewportSnapshot.pageIndex).toBe(2);
     });
   });
+
+  describe("moveTab", () => {
+    function makeThreeTabs() {
+      const ts = new DocTabStore();
+      const t1 = makeTab("doc1");
+      const t2 = makeTab("doc2");
+      const t3 = makeTab("doc3");
+      ts.addTab(t1.doc, t1.store, t1.takeoffStore);
+      ts.addTab(t2.doc, t2.store, t2.takeoffStore);
+      ts.addTab(t3.doc, t3.store, t3.takeoffStore);
+      return ts;
+    }
+
+    it("moves a tab forward (index 0 -> 2)", () => {
+      const ts = makeThreeTabs();
+      ts.moveTab(0, 2);
+      expect(ts.tabs.map((t) => t.docId)).toEqual(["doc2", "doc3", "doc1"]);
+    });
+
+    it("moves a tab backward (index 2 -> 0)", () => {
+      const ts = makeThreeTabs();
+      ts.moveTab(2, 0);
+      expect(ts.tabs.map((t) => t.docId)).toEqual(["doc3", "doc1", "doc2"]);
+    });
+
+    it("moves a tab to the first position (index 1 -> 0)", () => {
+      const ts = makeThreeTabs();
+      ts.moveTab(1, 0);
+      expect(ts.tabs.map((t) => t.docId)).toEqual(["doc2", "doc1", "doc3"]);
+    });
+
+    it("moves a tab to the last position (index 1 -> 2)", () => {
+      const ts = makeThreeTabs();
+      ts.moveTab(1, 2);
+      expect(ts.tabs.map((t) => t.docId)).toEqual(["doc1", "doc3", "doc2"]);
+    });
+
+    it("clamps toIndex above bounds to last index", () => {
+      const ts = makeThreeTabs();
+      ts.moveTab(0, 99);
+      expect(ts.tabs.map((t) => t.docId)).toEqual(["doc2", "doc3", "doc1"]);
+    });
+
+    it("clamps toIndex below zero to 0", () => {
+      const ts = makeThreeTabs();
+      ts.moveTab(2, -5);
+      expect(ts.tabs.map((t) => t.docId)).toEqual(["doc3", "doc1", "doc2"]);
+    });
+
+    it("same-position move is a no-op", () => {
+      const ts = makeThreeTabs();
+      const before = ts.tabs.map((t) => t.docId);
+      ts.moveTab(1, 1);
+      expect(ts.tabs.map((t) => t.docId)).toEqual(before);
+    });
+
+    it("single-tab store: moveTab is a no-op", () => {
+      const ts = new DocTabStore();
+      const t1 = makeTab("doc1");
+      ts.addTab(t1.doc, t1.store, t1.takeoffStore);
+      ts.moveTab(0, 0);
+      expect(ts.tabs.map((t) => t.docId)).toEqual(["doc1"]);
+    });
+
+    it("active tab stays active after moving it", () => {
+      const ts = makeThreeTabs();
+      ts.switchTab("doc1"); // activate first tab then move it
+      ts.moveTab(0, 2);
+      expect(ts.activeDocId).toBe("doc1");
+    });
+
+    it("active tab stays active when a different tab is moved", () => {
+      const ts = makeThreeTabs();
+      ts.switchTab("doc2");
+      ts.moveTab(0, 2); // move doc1, active is doc2
+      expect(ts.activeDocId).toBe("doc2");
+    });
+
+    it("clamps fromIndex above bounds: no-op (out of range source)", () => {
+      const ts = makeThreeTabs();
+      const before = ts.tabs.map((t) => t.docId);
+      ts.moveTab(99, 0);
+      expect(ts.tabs.map((t) => t.docId)).toEqual(before);
+    });
+
+    it("clamps fromIndex below zero: no-op (out of range source)", () => {
+      const ts = makeThreeTabs();
+      const before = ts.tabs.map((t) => t.docId);
+      ts.moveTab(-1, 2);
+      expect(ts.tabs.map((t) => t.docId)).toEqual(before);
+    });
+  });
 });

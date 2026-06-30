@@ -418,6 +418,7 @@
     activeDocId={tabStore.activeDocId}
     ontabclick={handleTabClick}
     ontabclose={closeTab}
+    onmoveTab={(from, to) => tabStore.moveTab(from, to)}
   />
 
   <!-- Compare panel — collapsible, below tab bar (M6 Phase 1.1, spec §10) -->
