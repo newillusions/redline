@@ -305,3 +305,84 @@ describe("MarkupStore count sets", () => {
     expect(s.activeCountSetId).toBe("a");
   });
 });
+
+describe("MarkupStore dirty tracking", () => {
+  it("is clean on construction", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    expect(s.dirty).toBe(false);
+  });
+
+  it("becomes dirty after create", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    s.create(mk("a"));
+    expect(s.dirty).toBe(true);
+  });
+
+  it("becomes dirty after update", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    const m = mk("a");
+    s.create(m);
+    s.clearDirty();
+    s.update(m, { ...m, contents: "changed" });
+    expect(s.dirty).toBe(true);
+  });
+
+  it("becomes dirty after delete", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    s.create(mk("a"));
+    s.clearDirty();
+    s.delete("a");
+    expect(s.dirty).toBe(true);
+  });
+
+  it("becomes dirty after undo", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    s.create(mk("a"));
+    s.clearDirty();
+    s.undo();
+    expect(s.dirty).toBe(true);
+  });
+
+  it("becomes dirty after redo", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    s.create(mk("a"));
+    s.undo();
+    s.clearDirty();
+    s.redo();
+    expect(s.dirty).toBe(true);
+  });
+
+  it("becomes dirty after applyBatch", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    const m = mk("a");
+    s.create(m);
+    s.clearDirty();
+    s.applyBatch([{ before: m, after: { ...m, contents: "x" } }]);
+    expect(s.dirty).toBe(true);
+  });
+
+  it("becomes dirty after deleteSelected", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    s.create(mk("a"));
+    s.selectedIds = new Set(["a"]);
+    s.clearDirty();
+    s.deleteSelected();
+    expect(s.dirty).toBe(true);
+  });
+
+  it("clearDirty resets to false", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    s.create(mk("a"));
+    expect(s.dirty).toBe(true);
+    s.clearDirty();
+    expect(s.dirty).toBe(false);
+  });
+
+  it("seed resets dirty to false", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    s.create(mk("a"));
+    expect(s.dirty).toBe(true);
+    s.seed([mk("b")]);
+    expect(s.dirty).toBe(false);
+  });
+});

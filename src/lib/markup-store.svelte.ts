@@ -52,6 +52,8 @@ export class MarkupStore implements MarkupSink {
   activeTool = $state<ToolKind>("hand");
   draftAppearance = $state<Appearance>({ ...DEFAULT_APPEARANCE });
   mirrorError = $state<string | null>(null);
+  /** True when markups have changed since the last save (or since the doc was opened). */
+  dirty = $state(false);
 
   // --- Count sets (spec §7): document-scoped category definitions for the Count tool. ---
   countSets = $state<CountSet[]>([]);
@@ -106,12 +108,16 @@ export class MarkupStore implements MarkupSink {
   }
   getById(id: string) { return this.markups.find((x) => x.id === id); }
 
+  /** Mark the document as clean (call after a successful save). */
+  clearDirty(): void { this.dirty = false; }
+
   // --- Loading (no undo entry, no mirror — the PDF already has these) ---
   seed(markups: Markup[]) {
     this.markups = markups;
     this.history = new History(this);
     this.queue = [];
     this.drainPromise = null;
+    this.dirty = false;
     // Restore the count sets the document was saved with (annotation = source of truth).
     // Keep the default set available so new counts always have a bucket; prefer a restored
     // set as the active one when the document already has counts.
@@ -125,14 +131,14 @@ export class MarkupStore implements MarkupSink {
   }
 
   // --- Mutations (undoable + mirrored) ---
-  create(m: Markup) { this.enqueue(this.history.push(new CreateCmd(m))); }
-  update(before: Markup, after: Markup) { this.enqueue(this.history.push(new UpdateCmd(before, after))); }
-  delete(id: string) { const m = this.getById(id); if (m) this.enqueue(this.history.push(new DeleteCmd(m))); }
+  create(m: Markup) { this.dirty = true; this.enqueue(this.history.push(new CreateCmd(m))); }
+  update(before: Markup, after: Markup) { this.dirty = true; this.enqueue(this.history.push(new UpdateCmd(before, after))); }
+  delete(id: string) { const m = this.getById(id); if (m) { this.dirty = true; this.enqueue(this.history.push(new DeleteCmd(m))); } }
 
   /** Undo the last frame (which may be 1 or N commands). Each op is enqueued in order. */
-  undo() { const ops = this.history.undo(); if (ops) ops.forEach((op) => this.enqueue(op)); }
+  undo() { const ops = this.history.undo(); if (ops) { this.dirty = true; ops.forEach((op) => this.enqueue(op)); } }
   /** Redo the last undone frame. Each op is enqueued in order. */
-  redo() { const ops = this.history.redo(); if (ops) ops.forEach((op) => this.enqueue(op)); }
+  redo() { const ops = this.history.redo(); if (ops) { this.dirty = true; ops.forEach((op) => this.enqueue(op)); } }
 
   get canUndo() { return this.history.canUndo; }
   get canRedo() { return this.history.canRedo; }
@@ -148,6 +154,7 @@ export class MarkupStore implements MarkupSink {
    */
   applyBatch(pairs: { before: Markup; after: Markup }[]): void {
     if (pairs.length === 0) return;
+    this.dirty = true;
     const cmds = pairs.map(({ before, after }) => new UpdateCmd(before, after));
     const ops = this.history.pushBatch(cmds);
     ops.forEach((op) => this.enqueue(op));
@@ -160,6 +167,7 @@ export class MarkupStore implements MarkupSink {
   deleteSelected(): void {
     const targets = this.selectedMarkups;
     if (targets.length === 0) return;
+    this.dirty = true;
     const cmds = targets.map((m) => new DeleteCmd(m));
     const ops = this.history.pushBatch(cmds);
     ops.forEach((op) => this.enqueue(op));

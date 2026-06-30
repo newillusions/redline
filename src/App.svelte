@@ -30,6 +30,7 @@
   import MeasurementPanel from "./components/MeasurementPanel.svelte";
   import ComparePanel from "./components/ComparePanel.svelte";
   import TabBar from "./components/TabBar.svelte";
+  import SavePromptDialog from "./components/SavePromptDialog.svelte";
   import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument } from "$lib/ipc";
   import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
@@ -58,6 +59,11 @@
   let isFlattening = $state(false);
   let isOptimizing = $state(false);
   let isRedacting = $state(false);
+
+  // --- Save-prompt dialog state ---
+  /** docId of the document awaiting save/discard/cancel decision; null when dialog is hidden. */
+  let savePromptDocId = $state<string | null>(null);
+  let savePromptFilename = $state("");
 
   // --- Compare panel state (M6 Phase 1.1) ---
   let compareVisible = $state(false);
@@ -188,15 +194,70 @@
   // Close flow — tab × button and Cmd/Ctrl+W
   // ---------------------------------------------------------------------------
 
-  async function closeTab(docId: string) {
-    // closeTab removes the tab from the store and returns the next activeDocId.
+  /**
+   * Low-level close: remove from store + release PDFium handle.
+   * Does NOT check dirty state. Gate at the callers that check dirty.
+   */
+  async function doCloseTab(docId: string) {
     tabStore.closeTab(docId);
-    // Release the PDFium document so resources are freed.
     try {
       await closeDocument(docId);
     } catch {
       // Non-fatal: the tab is already gone from the UI.
     }
+  }
+
+  /**
+   * Public close entry point (called by tab × button and Cmd/Ctrl+W).
+   * If the document has unsaved changes, show the save-prompt dialog.
+   * Otherwise close immediately.
+   */
+  async function closeTab(docId: string) {
+    const tab = tabStore.tabs.find((t) => t.docId === docId);
+    if (!tab) return;
+
+    if (tab.store.dirty) {
+      savePromptFilename = tab.doc.path.split(/[\\/]/).at(-1) ?? tab.doc.path;
+      savePromptDocId = docId;
+      return;
+    }
+
+    await doCloseTab(docId);
+  }
+
+  /** Save-prompt: user chose Save — save, clear dirty, then close. */
+  async function handleSavePromptSave() {
+    const docId = savePromptDocId;
+    savePromptDocId = null;
+    if (!docId) return;
+
+    const tab = tabStore.tabs.find((t) => t.docId === docId);
+    if (!tab) return;
+
+    isSaving = true;
+    openError = null;
+    try {
+      await tab.store.flush();
+      await saveDocument(docId);
+      tab.store.clearDirty();
+      await doCloseTab(docId);
+    } catch (e) {
+      openError = `Save failed: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      isSaving = false;
+    }
+  }
+
+  /** Save-prompt: user chose Don't Save — close immediately, discarding changes. */
+  async function handleSavePromptDiscard() {
+    const docId = savePromptDocId;
+    savePromptDocId = null;
+    if (docId) await doCloseTab(docId);
+  }
+
+  /** Save-prompt: user chose Cancel — keep the document open, dismiss dialog. */
+  function handleSavePromptCancel() {
+    savePromptDocId = null;
   }
 
   // ---------------------------------------------------------------------------
@@ -227,6 +288,7 @@
     try {
       await activeTab.store.flush();
       await saveDocument(activeTab.docId);
+      activeTab.store.clearDirty();
     } catch (e) {
       openError = `Save failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
@@ -243,6 +305,7 @@
     try {
       await activeTab.store.flush();
       await saveDocumentAs(activeTab.docId, dest);
+      activeTab.store.clearDirty();
       // Update the path in the active tab's doc record.
       tabStore.tabs = tabStore.tabs.map((t) =>
         t.docId === activeTab.docId
@@ -562,6 +625,16 @@
         {/if}
       </div>
     </div>
+  {/if}
+
+  <!-- Save-prompt dialog — shown when closing a document with unsaved changes -->
+  {#if savePromptDocId !== null}
+    <SavePromptDialog
+      filename={savePromptFilename}
+      onSave={handleSavePromptSave}
+      onDiscard={handleSavePromptDiscard}
+      onCancel={handleSavePromptCancel}
+    />
   {/if}
 </div>
 

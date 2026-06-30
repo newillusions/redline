@@ -104,6 +104,9 @@
   function handlePointerDown(e: PointerEvent, i: number) {
     // Primary button only (left-click / touch).
     if (e.pointerType === "mouse" && e.button !== 0) return;
+    // If the pointer-down originated on the close button, bail out immediately —
+    // do NOT set pointer capture so the button's native click event can fire.
+    if ((e.target as HTMLElement).closest(".tab-close")) return;
     dragSrcIndex = i;
     dropIndex = i;
     dragStartX = e.clientX;
