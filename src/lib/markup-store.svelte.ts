@@ -4,8 +4,27 @@
  * MirrorOp is drained through an ordered FIFO to the Rust store (the save buffer) via the
  * injected IPC. flush() awaits a full drain — App.svelte calls it before save_document.
  */
-import type { Markup, Appearance } from "./ipc";
+import type { Markup, Appearance, CountSet, CountSymbol } from "./ipc";
 import { History, CreateCmd, UpdateCmd, DeleteCmd, type MarkupSink, type MirrorOp } from "./markup-commands";
+
+/** Default colour rotation for newly-created count sets (distinct, legible hues). */
+export const COUNT_SET_PALETTE: readonly string[] = [
+  "#e02424", "#1d70b8", "#00875a", "#b8860b", "#7b2ff7", "#d63384", "#0aa2c0",
+];
+
+/**
+ * Reconstruct the document's count-set definitions from loaded markups: the unique set
+ * (by id) embedded on each MeasurementCount markup. The annotation is the source of truth,
+ * so re-opening a saved document restores exactly the sets it was saved with.
+ */
+export function reconstructCountSets(markups: Markup[]): CountSet[] {
+  const byId = new Map<string, CountSet>();
+  for (const m of markups) {
+    const cs = m.count_set;
+    if (cs && !byId.has(cs.id)) byId.set(cs.id, cs);
+  }
+  return [...byId.values()];
+}
 
 /** The IPC surface the store mirrors to (injected for testability). */
 export interface MarkupIpc {
@@ -34,11 +53,47 @@ export class MarkupStore implements MarkupSink {
   draftAppearance = $state<Appearance>({ ...DEFAULT_APPEARANCE });
   mirrorError = $state<string | null>(null);
 
+  // --- Count sets (spec §7): document-scoped category definitions for the Count tool. ---
+  countSets = $state<CountSet[]>([]);
+  /** Id of the set new count markers are assigned to (null → counts go unassigned). */
+  activeCountSetId = $state<string | null>(null);
+
   private history = new History(this);
   private queue: MirrorOp[] = [];
   private drainPromise: Promise<void> | null = null;
 
-  constructor(private readonly docId: string, private readonly ipc: MarkupIpc) {}
+  constructor(private readonly docId: string, private readonly ipc: MarkupIpc) {
+    // Seed one default set so the Count tool tallies into a named bucket out of the box.
+    const def = this.makeCountSet("Count 1", "Circle");
+    this.countSets = [def];
+    this.activeCountSetId = def.id;
+  }
+
+  // --- Count sets ---
+
+  /** The set new count markers are assigned to (or null when none is active). */
+  get activeCountSet(): CountSet | null {
+    return this.countSets.find((s) => s.id === this.activeCountSetId) ?? null;
+  }
+
+  /** Build a CountSet (id assigned here). Colour defaults to the next palette hue. */
+  makeCountSet(name: string, symbol: CountSymbol, color?: string): CountSet {
+    const hue = color ?? COUNT_SET_PALETTE[this.countSets.length % COUNT_SET_PALETTE.length];
+    return { id: crypto.randomUUID(), name, color: hue, symbol };
+  }
+
+  /** Create a new count set and make it active. Returns the created set. */
+  addCountSet(name: string, symbol: CountSymbol, color?: string): CountSet {
+    const set = this.makeCountSet(name, symbol, color);
+    this.countSets = [...this.countSets, set];
+    this.activeCountSetId = set.id;
+    return set;
+  }
+
+  /** Select the active count set by id (no-op if the id is unknown). */
+  setActiveCountSet(id: string): void {
+    if (this.countSets.some((s) => s.id === id)) this.activeCountSetId = id;
+  }
 
   // --- MarkupSink (used by History; never enqueues — the History caller does) ---
   insert(m: Markup) { this.markups.push(m); }
@@ -57,6 +112,16 @@ export class MarkupStore implements MarkupSink {
     this.history = new History(this);
     this.queue = [];
     this.drainPromise = null;
+    // Restore the count sets the document was saved with (annotation = source of truth).
+    // Keep the default set available so new counts always have a bucket; prefer a restored
+    // set as the active one when the document already has counts.
+    const restored = reconstructCountSets(markups);
+    if (restored.length > 0) {
+      const ids = new Set(restored.map((s) => s.id));
+      const extras = this.countSets.filter((s) => !ids.has(s.id));
+      this.countSets = [...restored, ...extras];
+      this.activeCountSetId = restored[0].id;
+    }
   }
 
   // --- Mutations (undoable + mirrored) ---

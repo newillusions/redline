@@ -1360,7 +1360,7 @@
     if (isSelectTool()) return;
     const tool = store.activeTool;
 
-    // MeasurementCount: single click places a count point.
+    // MeasurementCount: single click places a count point in the active count set.
     if (tool === "MeasurementCount" && identity) {
       const p = localPdfFromMouse(e);
       if (!p) return;
@@ -1374,14 +1374,21 @@
         count_value: 1,
         custom_columns: {},
       };
+      // The active set drives the marker colour (→ annotation /C) and symbol, so each
+      // category renders distinctly and tallies separately.
+      const set = store.activeCountSet;
+      const appearance = set
+        ? { ...store.draftAppearance, color: set.color }
+        : store.draftAppearance;
       const m = buildMarkup({
         markupType: "MeasurementCount",
         page: pageIndex,
         geometry: { Point: p },
-        appearance: store.draftAppearance,
+        appearance,
         identity,
         now: new Date().toISOString(),
         id: crypto.randomUUID(),
+        countSet: set,
       });
       m.measurement = meas;
       store.create(m);
@@ -1655,11 +1662,28 @@
             pointer-events="none" />
         {/each}
       {:else if s.kind === "point"}
-        <circle cx={s.x} cy={s.y} r="6"
-          stroke={s.stroke} stroke-width={s.strokeWidth}
-          fill={s.fill === "none" ? s.stroke : s.fill}
-          opacity={s.opacity}
-          pointer-events="none" />
+        {#if s.render.shape === "circle"}
+          <circle cx={s.render.cx} cy={s.render.cy} r={s.render.r}
+            stroke={s.stroke} stroke-width={s.strokeWidth}
+            fill={s.fill === "none" ? s.stroke : s.fill}
+            opacity={s.opacity}
+            pointer-events="none" />
+        {:else if s.render.shape === "polygon"}
+          <polygon points={s.render.points}
+            stroke={s.stroke} stroke-width={s.strokeWidth}
+            fill={s.fill === "none" ? s.stroke : s.fill}
+            opacity={s.opacity}
+            stroke-linejoin="round"
+            pointer-events="none" />
+        {:else if s.render.shape === "cross"}
+          {#each s.render.lines as ln, i (i)}
+            <line x1={ln.x1} y1={ln.y1} x2={ln.x2} y2={ln.y2}
+              stroke={s.stroke} stroke-width={s.strokeWidth}
+              stroke-linecap="round"
+              opacity={s.opacity}
+              pointer-events="none" />
+          {/each}
+        {/if}
       {:else if s.kind === "text"}
         <text x={s.x} y={s.y} fill={s.stroke} font-size={s.fontPx}
           dominant-baseline="hanging" opacity={s.opacity}

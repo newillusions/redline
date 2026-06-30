@@ -3,8 +3,56 @@ import {
   measureLength,
   measureArea,
   formatQuantity,
+  countSubtotals,
 } from "./measurement-tools";
-import type { ScaleRecord } from "./ipc";
+import type { CountSet, Markup, ScaleRecord } from "./ipc";
+
+function countMarkup(id: string, count: number, set: CountSet | null): Markup {
+  return {
+    id,
+    page: 0,
+    markup_type: "MeasurementCount",
+    geometry: { Point: { x: 0, y: 0 } },
+    appearance: { color: set?.color ?? "#e02424", line_weight: 2, opacity: 1, fill: null, line_style: "Solid", font: null },
+    subject: null, layer: null, contents: null, group_id: null,
+    audit: {
+      created_by: { user_id: "u", display_name: "U" }, created_at: "",
+      modified_by: { user_id: "u", display_name: "U" }, modified_at: "",
+      revision: 0, origin: "Desktop",
+    },
+    workflow: { status: "None", assignee: null, thread: [] },
+    measurement: { scale_ref: null, raw_measure: 1, unit: "ea", computed_quantity: 1, depth: null, count_value: count, custom_columns: {} },
+    count_set: set,
+  };
+}
+
+describe("countSubtotals", () => {
+  const A: CountSet = { id: "set-a", name: "Type-A", color: "#0066ff", symbol: "Triangle" };
+  const B: CountSet = { id: "set-b", name: "Type-B", color: "#00875a", symbol: "Square" };
+
+  it("groups count markups by set and sums count_value per set", () => {
+    const rows = countSubtotals([
+      countMarkup("1", 1, A),
+      countMarkup("2", 1, B),
+      countMarkup("3", 1, A),
+    ]);
+    expect(rows).toHaveLength(2);
+    const a = rows.find((r) => r.setId === "set-a")!;
+    expect(a).toMatchObject({ name: "Type-A", color: "#0066ff", symbol: "Triangle", count: 2 });
+    expect(rows.find((r) => r.setId === "set-b")!.count).toBe(1);
+  });
+
+  it("buckets count markups with no set under a single Unassigned group (setId null)", () => {
+    const rows = countSubtotals([countMarkup("1", 1, null), countMarkup("2", 1, null)]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ setId: null, name: "Unassigned", count: 2 });
+  });
+
+  it("ignores non-count measurement and non-measurement markups", () => {
+    const rect = { ...countMarkup("r", 1, A), markup_type: "Rectangle" as const };
+    expect(countSubtotals([rect])).toHaveLength(0);
+  });
+});
 
 function scale(ratio: number, unit = "m", precision = 2): ScaleRecord {
   return {

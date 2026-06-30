@@ -9,11 +9,13 @@ import { tick } from "svelte";
 import MeasurementPanel from "./MeasurementPanel.svelte";
 import { MarkupStore } from "$lib/markup-store.svelte";
 import { TakeoffStore } from "$lib/takeoff-store.svelte";
-import type { Markup } from "$lib/ipc";
+import type { CountSet, Markup } from "$lib/ipc";
 
 // Mock IPC modules — dialog and ipc calls are not needed in unit tests.
+// COUNT_SYMBOLS is a runtime value consumed by CountSetPicker, so it must be present.
 vi.mock("$lib/ipc", () => ({
   exportMarkupList: vi.fn(async () => {}),
+  COUNT_SYMBOLS: ["Circle", "Square", "Triangle", "Diamond", "Cross", "Star", "Hexagon"],
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   save: vi.fn(async () => null),
@@ -125,8 +127,24 @@ describe("MeasurementPanel", () => {
     store.markups.push(makeMeasurementMarkup("c1", "MeasurementCount", 1, "ea", "s1", 1));
     store.markups.push(makeMeasurementMarkup("c2", "MeasurementCount", 1, "ea", "s1", 1));
     await tick();
-    // count totals row should show "2"
+    // single (unassigned) subtotal row should show "2"
     expect(screen.getByText("2")).toBeTruthy();
+  });
+
+  it("shows a separate subtotal row per count set", async () => {
+    const setA: CountSet = { id: "set-a", name: "Type-A fixture", color: "#0066ff", symbol: "Triangle" };
+    const setB: CountSet = { id: "set-b", name: "Type-B fixture", color: "#00875a", symbol: "Square" };
+    const withSet = (id: string, set: CountSet) => ({
+      ...makeMeasurementMarkup(id, "MeasurementCount", 1, "ea", "s1", 1),
+      count_set: set,
+    });
+    render(MeasurementPanel, { props: { store, takeoffStore, docId: "d1" } });
+    store.markups.push(withSet("a1", setA), withSet("a2", setA), withSet("b1", setB));
+    await tick();
+    // Each set is named with its own subtotal; a grand total appears when >1 set.
+    expect(screen.getByText("Type-A fixture")).toBeTruthy();
+    expect(screen.getByText("Type-B fixture")).toBeTruthy();
+    expect(screen.getByText("All counts")).toBeTruthy();
   });
 
   it("displays no scale set when takeoffStore has no active scale", () => {

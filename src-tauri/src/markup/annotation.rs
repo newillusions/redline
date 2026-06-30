@@ -21,8 +21,8 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use lopdf::{Dictionary, Object};
 
 use super::{
-    Appearance, Audit, FontSpec, LineStyle, Markup, MarkupGeometry, MarkupStatus, MarkupType,
-    Origin, UserRef, Workflow,
+    Appearance, Audit, CountSet, CountSymbol, FontSpec, LineStyle, Markup, MarkupGeometry,
+    MarkupStatus, MarkupType, Origin, UserRef, Workflow,
 };
 use crate::geometry::PdfPoint;
 
@@ -128,6 +128,30 @@ fn line_style_tag(s: LineStyle) -> &'static str {
         LineStyle::Solid => "Solid",
         LineStyle::Dashed => "Dashed",
         LineStyle::Dotted => "Dotted",
+    }
+}
+
+fn count_symbol_tag(s: CountSymbol) -> &'static str {
+    match s {
+        CountSymbol::Circle => "Circle",
+        CountSymbol::Square => "Square",
+        CountSymbol::Triangle => "Triangle",
+        CountSymbol::Diamond => "Diamond",
+        CountSymbol::Cross => "Cross",
+        CountSymbol::Star => "Star",
+        CountSymbol::Hexagon => "Hexagon",
+    }
+}
+
+fn count_symbol_from_tag(s: &str) -> CountSymbol {
+    match s {
+        "Square" => CountSymbol::Square,
+        "Triangle" => CountSymbol::Triangle,
+        "Diamond" => CountSymbol::Diamond,
+        "Cross" => CountSymbol::Cross,
+        "Star" => CountSymbol::Star,
+        "Hexagon" => CountSymbol::Hexagon,
+        _ => CountSymbol::Circle,
     }
 }
 
@@ -415,6 +439,15 @@ impl Markup {
         if let Some(gid) = self.group_id {
             d.set("RLGroup", Object::string_literal(gid.to_string()));
         }
+
+        // Count set (spec §7): the set assignment + symbol via private /RLCountSet* keys.
+        // The set COLOUR is carried by the standard /C key (appearance.color == set.color),
+        // so external viewers render the marker in the set colour with no extra mapping.
+        if let Some(cs) = &self.count_set {
+            d.set("RLCountSetId", Object::string_literal(cs.id.to_string()));
+            d.set("RLCountSetName", Object::string_literal(cs.name.clone()));
+            d.set("RLCountSymbol", name(count_symbol_tag(cs.symbol)));
+        }
         d
     }
 
@@ -493,6 +526,16 @@ impl Markup {
             .map(|f| f as f64)
             .unwrap_or(1.0);
 
+        // Count set: reconstruct from /RLCountSet* keys; the colour comes from /C (== `color`).
+        let count_set = get_string(d, b"RLCountSetId")
+            .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+            .map(|set_id| CountSet {
+                id: set_id,
+                name: get_string(d, b"RLCountSetName").unwrap_or_default(),
+                color: color.clone(),
+                symbol: count_symbol_from_tag(&get_name(d, b"RLCountSymbol").unwrap_or_default()),
+            });
+
         Markup {
             id,
             markup_type,
@@ -531,6 +574,7 @@ impl Markup {
                 thread: Vec::new(),
             },
             measurement: None,
+            count_set,
         }
     }
 }
@@ -644,6 +688,7 @@ mod tests {
         assert_eq!(back.audit.modified_at, m.audit.modified_at);
         assert_eq!(back.audit.origin, m.audit.origin);
         assert_eq!(back.group_id, m.group_id, "group_id");
+        assert_eq!(back.count_set, m.count_set, "count_set");
     }
 
     #[test]
@@ -989,4 +1034,44 @@ mod tests {
     }
 
     // --- end G8 tests ---
+
+    // --- Count set round-trip ---
+
+    #[test]
+    fn count_markup_with_set_round_trips_via_annotation() {
+        use super::super::{CountSet, CountSymbol};
+        let g = MarkupGeometry::Point(PdfPoint { x: 42.0, y: 99.0 });
+        let mut m = fixture(g, MarkupType::MeasurementCount);
+        // The set colour must equal the annotation colour (/C carries the set colour);
+        // the fixture sets appearance.color = "#3366ff".
+        let cs = CountSet {
+            id: uuid::Uuid::new_v4(),
+            name: "Type-A fixture".into(),
+            color: "#3366ff".into(),
+            symbol: CountSymbol::Diamond,
+        };
+        m.count_set = Some(cs.clone());
+
+        let d = m.to_annotation_dict();
+        assert_eq!(
+            get_string(&d, b"RLCountSetId").as_deref(),
+            Some(cs.id.to_string().as_str()),
+            "/RLCountSetId must carry the set id"
+        );
+        assert_eq!(get_name(&d, b"RLCountSymbol").as_deref(), Some("Diamond"));
+        // Colour is carried by the standard /C key (not a private one).
+        assert!(d.has(b"C"), "set colour must be on standard /C");
+
+        assert_roundtrip(&m); // assert_roundtrip now also checks count_set
+    }
+
+    #[test]
+    fn count_markup_without_set_omits_keys() {
+        let g = MarkupGeometry::Point(PdfPoint { x: 1.0, y: 2.0 });
+        let m = fixture(g, MarkupType::MeasurementCount);
+        assert!(m.count_set.is_none(), "fixture starts with no count set");
+        let d = m.to_annotation_dict();
+        assert!(!d.has(b"RLCountSetId"), "no /RLCountSetId without a set");
+        assert!(Markup::from_annotation_dict(&d).count_set.is_none());
+    }
 }

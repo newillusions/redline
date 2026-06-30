@@ -3,7 +3,45 @@
  * in src-tauri/src/takeoff/math.rs — both must produce identical results.
  * No DOM, no Svelte, no clocks. Import and test directly.
  */
-import type { PdfPoint, ScaleRecord } from "./ipc";
+import type { PdfPoint, ScaleRecord, Markup, CountSymbol } from "./ipc";
+
+/** A per-set count subtotal row for the measurement panel. */
+export interface CountSubtotal {
+  /** Set id, or `null` for count markers with no set assignment. */
+  setId: string | null;
+  name: string;
+  color: string;
+  symbol: CountSymbol;
+  /** Summed count_value across this set's MeasurementCount markups. */
+  count: number;
+}
+
+/**
+ * Group MeasurementCount markups by their count set and sum count_value per group.
+ * Markers with no set fall into a single "Unassigned" group (setId null). Groups are
+ * returned in first-seen order so the panel is stable. Pure — unit-tested in isolation.
+ */
+export function countSubtotals(markups: Markup[]): CountSubtotal[] {
+  const groups = new Map<string | null, CountSubtotal>();
+  for (const m of markups) {
+    if (m.markup_type !== "MeasurementCount") continue;
+    const cs = m.count_set ?? null;
+    const key = cs?.id ?? null;
+    let row = groups.get(key);
+    if (!row) {
+      row = {
+        setId: key,
+        name: cs?.name ?? "Unassigned",
+        color: cs?.color ?? m.appearance.color,
+        symbol: cs?.symbol ?? "Circle",
+        count: 0,
+      };
+      groups.set(key, row);
+    }
+    row.count += m.measurement?.count_value ?? 0;
+  }
+  return [...groups.values()];
+}
 
 /**
  * Sum of segment lengths along a polyline, in PDF points (raw_measure for length types).

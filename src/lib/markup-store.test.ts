@@ -1,6 +1,19 @@
 import { describe, it, expect, vi } from "vitest";
-import { MarkupStore } from "./markup-store.svelte";
-import type { Markup } from "./ipc";
+import { MarkupStore, reconstructCountSets } from "./markup-store.svelte";
+import type { CountSet, Markup } from "./ipc";
+
+function countMk(id: string, set: CountSet | null): Markup {
+  return {
+    id, markup_type: "MeasurementCount", page: 0,
+    geometry: { Point: { x: 0, y: 0 } },
+    appearance: { color: set?.color ?? "#f00", line_weight: 1, opacity: 1, fill: null, line_style: "Solid", font: null },
+    subject: null, layer: null, contents: null, group_id: null,
+    audit: { created_by: { user_id: "u", display_name: "U" }, created_at: "", modified_by: { user_id: "u", display_name: "U" }, modified_at: "", revision: 0, origin: "Desktop" },
+    workflow: { status: "None", assignee: null, thread: [] },
+    measurement: { scale_ref: null, raw_measure: 1, unit: "ea", computed_quantity: 1, depth: null, count_value: 1, custom_columns: {} },
+    count_set: set,
+  };
+}
 
 function mk(id: string, contents: string | null = null): Markup {
   return {
@@ -248,5 +261,47 @@ describe("MarkupStore.deleteSelected", () => {
     await s.flush();
     expect(ipc.remove).not.toHaveBeenCalled();
     expect(s.markups).toHaveLength(1);
+  });
+});
+
+describe("MarkupStore count sets", () => {
+  it("seeds one default active count set on construction", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    expect(s.countSets).toHaveLength(1);
+    expect(s.activeCountSetId).toBe(s.countSets[0].id);
+    expect(s.activeCountSet?.symbol).toBe("Circle");
+  });
+
+  it("addCountSet appends a set and makes it active", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    const set = s.addCountSet("Type-B", "Square", "#00875a");
+    expect(s.countSets).toHaveLength(2);
+    expect(s.activeCountSetId).toBe(set.id);
+    expect(s.activeCountSet).toMatchObject({ name: "Type-B", color: "#00875a", symbol: "Square" });
+  });
+
+  it("setActiveCountSet selects a known set and ignores unknown ids", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    const first = s.countSets[0].id;
+    s.addCountSet("Type-B", "Square");
+    s.setActiveCountSet(first);
+    expect(s.activeCountSetId).toBe(first);
+    s.setActiveCountSet("nope");
+    expect(s.activeCountSetId).toBe(first);
+  });
+
+  it("reconstructCountSets returns the unique sets embedded on markups", () => {
+    const A: CountSet = { id: "a", name: "A", color: "#0066ff", symbol: "Triangle" };
+    const B: CountSet = { id: "b", name: "B", color: "#00875a", symbol: "Square" };
+    const sets = reconstructCountSets([countMk("1", A), countMk("2", B), countMk("3", A), countMk("4", null)]);
+    expect(sets.map((s) => s.id)).toEqual(["a", "b"]);
+  });
+
+  it("seed restores the document's count sets and activates one", () => {
+    const A: CountSet = { id: "a", name: "Type-A", color: "#0066ff", symbol: "Triangle" };
+    const s = new MarkupStore("doc1", fakeIpc());
+    s.seed([countMk("1", A)]);
+    expect(s.countSets.some((set) => set.id === "a")).toBe(true);
+    expect(s.activeCountSetId).toBe("a");
   });
 });

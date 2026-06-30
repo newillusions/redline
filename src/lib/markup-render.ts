@@ -5,7 +5,7 @@
  *
  * line_weight is in PDF points; it is scaled by zoom so a 2pt line looks 2pt at any zoom.
  */
-import type { Markup, MarkupType, PdfPoint } from "./ipc";
+import type { CountSymbol, Markup, MarkupType, PdfPoint } from "./ipc";
 import { pdfUserSpaceToScreen, type ViewportState } from "./viewport";
 import { type Bounds, type HandleId, HANDLE_IDS, handleAnchors } from "./markup-select";
 
@@ -34,9 +34,94 @@ export type SvgShape =
     })
   | (SvgStyle & { kind: "cloud"; path: string })
   | (SvgStyle & { kind: "ink"; strokes: string[] })
-  | (SvgStyle & { kind: "point"; x: number; y: number })
+  | (SvgStyle & {
+      kind: "point";
+      x: number;
+      y: number;
+      /** The count set's symbol (Circle when the marker has no set). */
+      symbol: CountSymbol;
+      /** Pre-computed screen-space symbol geometry — WKWebView-safe primitives only. */
+      render: PointSymbolRender;
+    })
   | (SvgStyle & { kind: "text"; x: number; y: number; text: string; fontPx: number })
   | (SvgStyle & { kind: "callout"; points: string; x: number; y: number; text: string; fontPx: number });
+
+/** Screen-space radius (CSS px) of a count marker — half its bounding box. */
+export const COUNT_MARKER_RADIUS = 6;
+
+/**
+ * Screen-space geometry for a count symbol, reduced to WKWebView-safe SVG primitives:
+ * a `circle`, a `polygon` (square / triangle / diamond / star / hexagon), or a `cross`
+ * (two `line`s). Viewport renders by switching on `shape` — no DOM/`context-stroke` tricks.
+ */
+export type PointSymbolRender =
+  | { shape: "circle"; cx: number; cy: number; r: number }
+  | { shape: "polygon"; points: string }
+  | { shape: "cross"; lines: { x1: number; y1: number; x2: number; y2: number }[] };
+
+function polygonPoints(pts: { x: number; y: number }[]): string {
+  return pts.map((p) => `${+p.x.toFixed(2)},${+p.y.toFixed(2)}`).join(" ");
+}
+
+/**
+ * Map a [`CountSymbol`] to concrete screen-space geometry centred at (x, y) with radius r.
+ * Pure + unit-tested (no DOM). Angles use screen space (y-DOWN); the "up" vertex is at
+ * angle -90° so triangles/stars/hexagons point up on screen.
+ */
+export function countSymbolRender(
+  symbol: CountSymbol,
+  x: number,
+  y: number,
+  r: number,
+): PointSymbolRender {
+  // Regular n-gon, first vertex at `start` radians, going clockwise on screen.
+  const ngon = (n: number, start: number, radius = r) =>
+    Array.from({ length: n }, (_, i) => {
+      const a = start + (i * 2 * Math.PI) / n;
+      return { x: x + radius * Math.cos(a), y: y + radius * Math.sin(a) };
+    });
+
+  switch (symbol) {
+    case "Square":
+      return {
+        shape: "polygon",
+        points: polygonPoints([
+          { x: x - r, y: y - r }, { x: x + r, y: y - r },
+          { x: x + r, y: y + r }, { x: x - r, y: y + r },
+        ]),
+      };
+    case "Triangle":
+      return { shape: "polygon", points: polygonPoints(ngon(3, -Math.PI / 2)) };
+    case "Diamond":
+      return {
+        shape: "polygon",
+        points: polygonPoints([
+          { x, y: y - r }, { x: x + r, y }, { x, y: y + r }, { x: x - r, y },
+        ]),
+      };
+    case "Hexagon":
+      return { shape: "polygon", points: polygonPoints(ngon(6, -Math.PI / 2)) };
+    case "Star": {
+      // 10 alternating outer/inner vertices, first (outer) point up.
+      const outer = ngon(5, -Math.PI / 2);
+      const inner = ngon(5, -Math.PI / 2 + Math.PI / 5, r * 0.4);
+      const pts: { x: number; y: number }[] = [];
+      for (let i = 0; i < 5; i++) { pts.push(outer[i], inner[i]); }
+      return { shape: "polygon", points: polygonPoints(pts) };
+    }
+    case "Cross":
+      return {
+        shape: "cross",
+        lines: [
+          { x1: x - r, y1: y - r, x2: x + r, y2: y + r },
+          { x1: x - r, y1: y + r, x2: x + r, y2: y - r },
+        ],
+      };
+    case "Circle":
+    default:
+      return { shape: "circle", cx: x, cy: y, r };
+  }
+}
 
 const CLOSED_TYPES: ReadonlySet<MarkupType> = new Set<MarkupType>([
   "Polygon", "Cloud", "MeasurementArea", "MeasurementPerimeter", "MeasurementVolume",
@@ -310,5 +395,13 @@ export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
     return { ...style, kind: "ink", strokes: g.Ink.map((stroke) => pointsStr(stroke, v)) };
   }
   const s = pdfUserSpaceToScreen(g.Point.x, g.Point.y, v);
-  return { ...style, kind: "point", x: s.x, y: s.y };
+  const symbol: CountSymbol = m.count_set?.symbol ?? "Circle";
+  return {
+    ...style,
+    kind: "point",
+    x: s.x,
+    y: s.y,
+    symbol,
+    render: countSymbolRender(symbol, s.x, s.y, COUNT_MARKER_RADIUS),
+  };
 }

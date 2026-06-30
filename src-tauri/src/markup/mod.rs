@@ -91,6 +91,41 @@ pub enum MarkupStatus {
     Completed,
 }
 
+/// Distinct count-marker shapes (takeoff Count sets). A small, fixed palette so a user
+/// can tell apart count categories at a glance (e.g. Type-A vs Type-B fixtures). Rendered
+/// in the set's colour by the frontend overlay (spec §7 count measurement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CountSymbol {
+    #[default]
+    Circle,
+    Square,
+    Triangle,
+    Diamond,
+    Cross,
+    Star,
+    Hexagon,
+}
+
+/// A Count "set" / category: a named bucket with its own colour + symbol so distinct item
+/// types are counted and tallied separately (spec §7). Document-scoped for v1 (definitions
+/// live in the markup store); each [`MarkupType::MeasurementCount`] markup references the set
+/// it belongs to via [`Markup::count_set`], and the full set is embedded on the PDF annotation
+/// (private `/RLCountSet*` keys + the standard `/C` colour) so it round-trips losslessly with
+/// the document — no sidecar. Modelled cleanly so it can later be promoted to a reusable
+/// `.btx`-style Tool Set (spec §6, follow-up).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CountSet {
+    /// Stable id (UUID), shared by every count markup in the set.
+    pub id: Uuid,
+    /// User-facing label (e.g. "Type-A fixture").
+    pub name: String,
+    /// Hex colour (`#rrggbb`) — also written to the annotation `/C` so external viewers
+    /// render the marker in the set colour.
+    pub color: String,
+    /// The marker shape drawn at each count point.
+    pub symbol: CountSymbol,
+}
+
 /// Stroke / fill line style (spec §6 appearance).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LineStyle {
@@ -220,6 +255,12 @@ pub struct Markup {
     pub workflow: Workflow,
     /// Present iff `markup_type.is_measurement()`.
     pub measurement: Option<Measurement>,
+    /// The Count set this markup belongs to (only meaningful for
+    /// [`MarkupType::MeasurementCount`]). The whole definition is embedded so the marker
+    /// renders in its set colour + symbol and the assignment round-trips through the PDF
+    /// annotation. `#[serde(default)]` keeps pre-count-set JSON deserialising to `None`.
+    #[serde(default)]
+    pub count_set: Option<CountSet>,
 }
 
 impl Markup {
@@ -254,6 +295,7 @@ impl Markup {
             },
             workflow: Workflow::default(),
             measurement: None,
+            count_set: None,
         }
     }
 
@@ -401,6 +443,84 @@ mod tests {
     }
 
     // --- end G8 tests ---
+
+    // --- Count sets ---
+
+    fn count_set() -> CountSet {
+        CountSet {
+            id: Uuid::new_v4(),
+            name: "Type-A fixture".to_string(),
+            color: "#0066ff".to_string(),
+            symbol: CountSymbol::Triangle,
+        }
+    }
+
+    #[test]
+    fn new_markup_has_no_count_set() {
+        assert!(
+            sample().count_set.is_none(),
+            "fresh markup must have count_set == None"
+        );
+    }
+
+    #[test]
+    fn count_markup_carries_set_and_round_trips() {
+        let cs = count_set();
+        let mut m = Markup::new(
+            MarkupType::MeasurementCount,
+            0,
+            MarkupGeometry::Point(PdfPoint { x: 12.0, y: 34.0 }),
+            Appearance {
+                color: cs.color.clone(),
+                ..Appearance::default()
+            },
+            user("Alice"),
+        )
+        .with_measurement(Measurement {
+            scale_ref: None,
+            raw_measure: 1.0,
+            unit: "ea".to_string(),
+            computed_quantity: 1.0,
+            depth: None,
+            count_value: Some(1),
+            custom_columns: BTreeMap::new(),
+        });
+        m.count_set = Some(cs.clone());
+
+        let json = serde_json::to_string(&m).expect("serialize");
+        let back: Markup = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.count_set, Some(cs));
+        assert_eq!(m, back);
+    }
+
+    #[test]
+    fn count_symbol_serializes_as_variant_name() {
+        // The enum is a unit enum: serde emits the bare variant name (used by the /RL tag).
+        assert_eq!(
+            serde_json::to_string(&CountSymbol::Hexagon).unwrap(),
+            "\"Hexagon\""
+        );
+        assert_eq!(CountSymbol::default(), CountSymbol::Circle);
+    }
+
+    #[test]
+    fn serde_default_count_set_when_absent() {
+        // Pre-count-set JSON (no count_set key) must deserialise to None.
+        let m = sample();
+        let json = serde_json::to_string(&m).expect("serialize");
+        let stripped = if json.contains("\"count_set\":null,") {
+            json.replace("\"count_set\":null,", "")
+        } else if json.contains(",\"count_set\":null") {
+            json.replace(",\"count_set\":null", "")
+        } else {
+            json.replace("\"count_set\":null", "")
+        };
+        let back: Markup = serde_json::from_str(&stripped).expect("deserialize stripped");
+        assert!(
+            back.count_set.is_none(),
+            "absent count_set field must deserialize to None"
+        );
+    }
 
     #[test]
     fn measurement_markup_carries_payload() {

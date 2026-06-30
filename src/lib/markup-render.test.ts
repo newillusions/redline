@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { markupToSvg, cloudPath, selectionChrome, type SvgShape } from "./markup-render";
-import type { Markup, MarkupType, Appearance, MarkupGeometry } from "./ipc";
+import { markupToSvg, cloudPath, selectionChrome, countSymbolRender, type SvgShape } from "./markup-render";
+import type { Markup, MarkupType, Appearance, MarkupGeometry, CountSet } from "./ipc";
 import type { ViewportState } from "./viewport";
 import { pdfUserSpaceToScreen } from "./viewport";
 import type { Bounds } from "./markup-select";
@@ -72,6 +72,63 @@ describe("markupToSvg geometry", () => {
     if (s.kind !== "point") throw new Error("kind");
     expect(s.x).toBeCloseTo(50);
     expect(s.y).toBeCloseTo(50);
+  });
+
+  it("defaults a count point with no set to the Circle symbol", () => {
+    const s = markupToSvg(mk({ Point: { x: 25, y: 75 } }, "MeasurementCount"), VS);
+    if (s.kind !== "point") throw new Error("kind");
+    expect(s.symbol).toBe("Circle");
+    expect(s.render.shape).toBe("circle");
+  });
+
+  it("renders a count point in its set's symbol", () => {
+    const set: CountSet = { id: "s1", name: "Type-A", color: "#0066ff", symbol: "Triangle" };
+    const m = { ...mk({ Point: { x: 25, y: 75 } }, "MeasurementCount"), count_set: set };
+    const s = markupToSvg(m, VS);
+    if (s.kind !== "point") throw new Error("kind");
+    expect(s.symbol).toBe("Triangle");
+    expect(s.render.shape).toBe("polygon");
+    if (s.render.shape !== "polygon") throw new Error("shape");
+    // A triangle is 3 vertices → 3 "x,y" tokens.
+    expect(s.render.points.trim().split(" ")).toHaveLength(3);
+  });
+});
+
+describe("countSymbolRender", () => {
+  it("circle is a circle primitive centred at (x,y)", () => {
+    const r = countSymbolRender("Circle", 10, 20, 6);
+    expect(r).toEqual({ shape: "circle", cx: 10, cy: 20, r: 6 });
+  });
+
+  it("square/diamond have 4 vertices, hexagon 6, star 10", () => {
+    const poly = (sym: "Square" | "Diamond" | "Hexagon" | "Star") => {
+      const r = countSymbolRender(sym, 0, 0, 6);
+      if (r.shape !== "polygon") throw new Error("polygon");
+      return r.points.trim().split(" ").length;
+    };
+    expect(poly("Square")).toBe(4);
+    expect(poly("Diamond")).toBe(4);
+    expect(poly("Hexagon")).toBe(6);
+    expect(poly("Star")).toBe(10);
+  });
+
+  it("cross is two crossing line segments through the centre box", () => {
+    const r = countSymbolRender("Cross", 0, 0, 6);
+    if (r.shape !== "cross") throw new Error("cross");
+    expect(r.lines).toHaveLength(2);
+    expect(r.lines[0]).toEqual({ x1: -6, y1: -6, x2: 6, y2: 6 });
+  });
+
+  it("symbol geometry stays within the radius bounding box", () => {
+    for (const sym of ["Triangle", "Hexagon", "Star", "Diamond"] as const) {
+      const r = countSymbolRender(sym, 100, 100, 6);
+      if (r.shape !== "polygon") throw new Error("polygon");
+      for (const tok of r.points.trim().split(" ")) {
+        const [px, py] = tok.split(",").map(Number);
+        expect(Math.abs(px - 100)).toBeLessThanOrEqual(6.01);
+        expect(Math.abs(py - 100)).toBeLessThanOrEqual(6.01);
+      }
+    }
   });
 });
 

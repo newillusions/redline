@@ -152,6 +152,35 @@ export interface MarkupWorkflow {
   thread: unknown[];
 }
 
+/** Distinct count-marker shapes for takeoff Count sets (mirrors Rust `CountSymbol`). */
+export type CountSymbol =
+  | "Circle"
+  | "Square"
+  | "Triangle"
+  | "Diamond"
+  | "Cross"
+  | "Star"
+  | "Hexagon";
+
+/** Ordered starter palette of count symbols (drives the set-picker shape chooser). */
+export const COUNT_SYMBOLS: readonly CountSymbol[] = [
+  "Circle", "Square", "Triangle", "Diamond", "Cross", "Star", "Hexagon",
+];
+
+/**
+ * A Count "set" / category (mirrors Rust `CountSet`): a named bucket with its own colour +
+ * symbol so distinct item types are counted and tallied separately (spec §7). Definitions are
+ * document-scoped (held in the markup store); the full set is embedded on each count markup so
+ * the assignment + colour + symbol round-trip through the PDF annotation — no sidecar.
+ */
+export interface CountSet {
+  id: string;
+  name: string;
+  /** Hex colour (`#rrggbb`); also carried by the annotation `/C`. */
+  color: string;
+  symbol: CountSymbol;
+}
+
 export interface Markup {
   id: string;
   markup_type: MarkupType;
@@ -166,6 +195,8 @@ export interface Markup {
   audit: MarkupAudit;
   workflow: MarkupWorkflow;
   measurement: MeasurementPayload | null;
+  /** Count set this marker belongs to (MeasurementCount only). Absent/null for everything else. */
+  count_set?: CountSet | null;
 }
 
 // ---------------------------------------------------------------------------

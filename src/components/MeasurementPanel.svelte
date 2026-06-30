@@ -15,7 +15,10 @@
   import type { TakeoffStore } from "$lib/takeoff-store.svelte";
   import type { Markup } from "$lib/ipc";
   import { exportMarkupList, type ExportFormat } from "$lib/ipc";
+  import { countSubtotals } from "$lib/measurement-tools";
+  import { countSymbolRender, COUNT_MARKER_RADIUS } from "$lib/markup-render";
   import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+  import CountSetPicker from "./CountSetPicker.svelte";
 
   const {
     store,
@@ -41,11 +44,15 @@
       .reduce((sum: number, m: Markup) => sum + (m.measurement?.computed_quantity ?? 0), 0)
   );
 
-  const totalCount = $derived(
-    measurements
-      .filter((m: Markup) => m.markup_type === "MeasurementCount")
-      .reduce((sum: number, m: Markup) => sum + (m.measurement?.count_value ?? 0), 0)
-  );
+  // Per-set count subtotals (spec §7): group MeasurementCount markups by their count set.
+  const countGroups = $derived(countSubtotals(measurements));
+  const totalCount = $derived(countGroups.reduce((sum, g) => sum + g.count, 0));
+
+  // 14px symbol swatch for the subtotal rows (reuses the live render geometry).
+  const SWATCH = 14;
+  function swatch(symbol: import("$lib/ipc").CountSymbol) {
+    return countSymbolRender(symbol, SWATCH / 2, SWATCH / 2, COUNT_MARKER_RADIUS);
+  }
 
   const scale = $derived(takeoffStore.activeScale);
   const scaleLabel = $derived(scale ? `${scale.label} (${scale.unit})` : "No scale set");
@@ -81,6 +88,8 @@
   {#if exportError}
     <div class="export-error">{exportError}</div>
   {/if}
+
+  <CountSetPicker {store} />
 
   {#if measurements.length === 0}
     <p class="empty-hint">No measurements yet. Use the calibrate + measurement tools to add some.</p>
@@ -127,12 +136,39 @@
           <td>{scale ? `${scale.unit}²` : "pt²"} (area)</td>
           <td></td>
         </tr>
-        <tr class="totals-row">
-          <td colspan="2"></td>
-          <td class="num-col">{totalCount}</td>
-          <td>ea (count)</td>
-          <td></td>
-        </tr>
+        {#each countGroups as g (g.setId ?? "__unassigned")}
+          {@const r = swatch(g.symbol)}
+          <tr class="totals-row count-subtotal">
+            <td colspan="2">
+              <span class="set-cell">
+                <svg width={SWATCH} height={SWATCH} viewBox={`0 0 ${SWATCH} ${SWATCH}`} aria-hidden="true">
+                  {#if r.shape === "circle"}
+                    <circle cx={r.cx} cy={r.cy} r={r.r} fill={g.color} />
+                  {:else if r.shape === "polygon"}
+                    <polygon points={r.points} fill={g.color} stroke-linejoin="round" />
+                  {:else if r.shape === "cross"}
+                    {#each r.lines as ln, i (i)}
+                      <line x1={ln.x1} y1={ln.y1} x2={ln.x2} y2={ln.y2}
+                        stroke={g.color} stroke-width="2" stroke-linecap="round" />
+                    {/each}
+                  {/if}
+                </svg>
+                {g.name}
+              </span>
+            </td>
+            <td class="num-col">{g.count}</td>
+            <td>ea (count)</td>
+            <td></td>
+          </tr>
+        {/each}
+        {#if countGroups.length > 1}
+          <tr class="totals-row count-grand-total">
+            <td colspan="2">All counts</td>
+            <td class="num-col">{totalCount}</td>
+            <td>ea (count)</td>
+            <td></td>
+          </tr>
+        {/if}
       </tfoot>
     </table>
   {/if}
@@ -233,5 +269,20 @@
     background: var(--color-bg-active);
     font-weight: 600;
     border-top: 2px solid var(--color-border);
+  }
+
+  .set-cell {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .set-cell svg {
+    display: block;
+    flex-shrink: 0;
+  }
+
+  .count-grand-total td {
+    border-top: 2px solid var(--color-primary);
   }
 </style>

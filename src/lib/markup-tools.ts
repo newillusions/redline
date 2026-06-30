@@ -4,7 +4,7 @@
  * passes `id` + `now` so this stays deterministic and unit-testable. Viewport.svelte does
  * the screen→PDF conversion (via the tested `screenToPdfUserSpace`) before calling these.
  */
-import type { Markup, MarkupType, MarkupGeometry, Appearance, UserRef, PdfPoint } from "./ipc";
+import type { Markup, MarkupType, MarkupGeometry, Appearance, UserRef, PdfPoint, CountSet } from "./ipc";
 import type { ToolKind } from "./markup-store.svelte";
 
 /** The drag-draw tools — a subset of MarkupType (so no cast is needed at the call site). */
@@ -129,6 +129,8 @@ export function buildMarkup(opts: {
   now: string;
   id: string;
   contents?: string | null;
+  /** Count set assignment (MeasurementCount only). Embedded so it round-trips via the PDF. */
+  countSet?: CountSet | null;
 }): Markup {
   return {
     id: opts.id,
@@ -157,6 +159,7 @@ export function buildMarkup(opts: {
     },
     workflow: { status: "None", assignee: null, thread: [] },
     measurement: null,
+    count_set: opts.countSet ? { ...opts.countSet } : null,
   };
 }
 
