@@ -587,6 +587,93 @@ describe("Viewport G4 multi-click tools", () => {
     expect(poly[0].x).toBeCloseTo(50);
     expect(poly[0].y).toBeCloseTo(150);
   });
+
+  // -------------------------------------------------------------------------
+  // T15: Shape elements carry pointer-events=none so they don't intercept multi-click gestures
+  // Root cause of Bug 2: existing markup shapes inherit pointer-events:auto from the
+  // overlay's .capture class; in WKWebView this can cause click events on filled shapes
+  // to not reach the overlay's onclick handler. Fix: explicit pointer-events="none" on shapes.
+  // -------------------------------------------------------------------------
+  it("T15: markup shape elements in the overlay have pointer-events=none so clicks always reach the overlay", async () => {
+    const DEFAULT_APP = {
+      color: "#e02424", line_weight: 2, opacity: 1, fill: "#e02424",
+      line_style: "Solid" as const, font: null,
+    };
+    // Seed many polygon markups covering the entire viewport area
+    for (let i = 0; i < 15; i++) {
+      store.markups.push(buildMarkup({
+        markupType: "Polygon",
+        page: 0,
+        geometry: { Polyline: [{ x: 0, y: 0 }, { x: 200, y: 0 }, { x: 100, y: 200 }] },
+        appearance: DEFAULT_APP,
+        identity: FAKE_IDENTITY,
+        now: "2026-01-01T00:00:00Z",
+        id: `seed-${i}`,
+      }));
+    }
+
+    const { container } = await mountViewport(store);
+    await tick();
+
+    // Every rendered shape in the overlay must have pointer-events="none".
+    // This ensures click gestures (e.g. multi-click Polygon tool) always reach the
+    // SVG overlay directly, never being intercepted by existing markup shapes.
+    const shapeEls = container.querySelectorAll(
+      "svg.markup-overlay rect, svg.markup-overlay polygon, svg.markup-overlay polyline, svg.markup-overlay path, svg.markup-overlay circle",
+    );
+    expect(shapeEls.length).toBeGreaterThan(0);
+    for (const el of shapeEls) {
+      expect(el.getAttribute("pointer-events")).toBe("none");
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // T16: Polygon coords stay correct when many seeded multipoint markups exist
+  // -------------------------------------------------------------------------
+  it("T16: polygon coords are correct with 20 seeded multipoint markups covering the viewport", async () => {
+    const DEFAULT_APP = {
+      color: "#e02424", line_weight: 2, opacity: 1, fill: "#e02424",
+      line_style: "Solid" as const, font: null,
+    };
+    for (let i = 0; i < 20; i++) {
+      store.markups.push(buildMarkup({
+        markupType: "Polygon",
+        page: 0,
+        geometry: { Polyline: [{ x: 0, y: 0 }, { x: 200, y: 0 }, { x: 100, y: 200 }] },
+        appearance: DEFAULT_APP,
+        identity: FAKE_IDENTITY,
+        now: "2026-01-01T00:00:00Z",
+        id: `seed-${i}`,
+      }));
+    }
+
+    const { overlay } = await mountViewport(store);
+    store.activeTool = "Polygon";
+    await tick();
+
+    // Three clicks at known positions; each must register the correct PDF coord.
+    //   click(50, 50)   -> PDF(50, 150)
+    //   click(100, 50)  -> PDF(100, 150)
+    //   click(100, 100) -> PDF(100, 100)
+    fireEvent.click(overlay, { clientX: 50, clientY: 50 });
+    fireEvent.click(overlay, { clientX: 100, clientY: 50 });
+    fireEvent.click(overlay, { clientX: 100, clientY: 100 });
+    fireEvent.keyDown(window, { key: "Enter" });
+    await tick();
+
+    expect(store.markups.length).toBe(21); // 20 seeded + 1 new
+    const newMarkup = store.markups[store.markups.length - 1];
+    expect(newMarkup.markup_type).toBe("Polygon");
+
+    const poly = (newMarkup.geometry as { Polyline: { x: number; y: number }[] }).Polyline;
+    expect(poly).toHaveLength(3);
+    expect(poly[0].x).toBeCloseTo(50);
+    expect(poly[0].y).toBeCloseTo(150);
+    expect(poly[1].x).toBeCloseTo(100);
+    expect(poly[1].y).toBeCloseTo(150);
+    expect(poly[2].x).toBeCloseTo(100);
+    expect(poly[2].y).toBeCloseTo(100);
+  });
 });
 
 // ---------------------------------------------------------------------------

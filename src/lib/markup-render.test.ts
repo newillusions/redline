@@ -198,18 +198,99 @@ describe("arrow rendering", () => {
     const s = markupToSvg(mk(pts, "Arrow"), VS);
     expect(s.kind).toBe("arrow");
   });
-  it("Arrow has the same screen-space point string as an equivalent Polyline", () => {
+  it("Arrow polyline start matches the equivalent Line start; endpoint is pulled back by head length", () => {
     const pts: MarkupGeometry = { Polyline: [{ x: 0, y: 100 }, { x: 100, y: 100 }] };
     const arrow = markupToSvg(mk(pts, "Arrow"), VS);
     const line  = markupToSvg(mk(pts, "Line"),  VS);
-    // Arrow and Line share the same geometry; only the kind differs.
     if (arrow.kind !== "arrow") throw new Error("expected arrow kind");
     if (line.kind !== "polyline") throw new Error("expected polyline kind");
-    expect(arrow.points).toBe(line.points);
+    // Both begin at the same screen-space first point.
+    const arrowPts = arrow.points.trim().split(/\s+/);
+    const linePts = line.points.trim().split(/\s+/);
+    expect(arrowPts[0]).toBe(linePts[0]);
+    // Arrow last point is pulled back so the line terminates at the arrowhead base.
+    const arrowLast = arrowPts[arrowPts.length - 1].split(",").map(Number);
+    const lineLast = linePts[linePts.length - 1].split(",").map(Number);
+    expect(arrowLast[0]).toBeLessThan(lineLast[0]);
   });
   it("Line markup remains kind polyline (no arrowhead)", () => {
     const pts: MarkupGeometry = { Polyline: [{ x: 0, y: 0 }, { x: 50, y: 50 }] };
     expect(markupToSvg(mk(pts, "Line"), VS).kind).toBe("polyline");
+  });
+});
+
+describe("arrow rendering - arrowhead geometry (WKWebView-safe explicit polygon)", () => {
+  // VS: zoom=2, pageHeight=100, scrollX=0, scrollY=0, line_weight=2 -> strokeWidth=4
+  // Horizontal arrow PDF(0,100)->(100,100) maps to screen (0,0)->(200,0)
+  // headLen = max(8, 4*4)=16; halfWidth = max(4, 4*2)=8; base.x = 200-16 = 184
+
+  it("Arrow shape carries an arrowHead polygon field with 3 points — not context-stroke marker", () => {
+    const pts: MarkupGeometry = { Polyline: [{ x: 0, y: 100 }, { x: 100, y: 100 }] };
+    const s = markupToSvg(mk(pts, "Arrow"), VS);
+    if (s.kind !== "arrow") throw new Error("expected arrow kind");
+    expect(s.arrowHead).toBeTruthy();
+    expect(s.arrowHead.trim().split(/\s+/)).toHaveLength(3);
+  });
+
+  it("Arrow head fill color is the markup stroke color — no context-stroke or context-fill", () => {
+    const pts: MarkupGeometry = { Polyline: [{ x: 0, y: 100 }, { x: 100, y: 100 }] };
+    const s = markupToSvg(mk(pts, "Arrow", { color: "#00ff00" }), VS);
+    if (s.kind !== "arrow") throw new Error("expected arrow kind");
+    // Viewport.svelte fills the arrowHead polygon with fill={s.stroke}
+    expect(s.stroke).toBe("#00ff00");
+    expect(s.stroke).not.toMatch(/^context-/);
+    expect(s.stroke).not.toBe("none");
+  });
+
+  it("Arrow head tip is placed at the screen-space last point of the underlying geometry", () => {
+    // PDF(100,100) at zoom 2, pageH=100: screen x=200, y=(100-100)*2=0 -> (200,0)
+    const pts: MarkupGeometry = { Polyline: [{ x: 0, y: 100 }, { x: 100, y: 100 }] };
+    const s = markupToSvg(mk(pts, "Arrow"), VS);
+    if (s.kind !== "arrow") throw new Error("expected arrow kind");
+    const [tipStr] = s.arrowHead.trim().split(/\s+/);
+    const [tipX, tipY] = tipStr.split(",").map(Number);
+    expect(tipX).toBeCloseTo(200, 0);
+    expect(tipY).toBeCloseTo(0, 0);
+  });
+
+  it("Arrow polyline is shortened so the line terminates at the arrowhead base (not through the tip)", () => {
+    const pts: MarkupGeometry = { Polyline: [{ x: 0, y: 100 }, { x: 100, y: 100 }] };
+    const s = markupToSvg(mk(pts, "Arrow"), VS);
+    if (s.kind !== "arrow") throw new Error("expected arrow kind");
+    const parts = s.points.trim().split(/\s+/);
+    const lastPt = parts[parts.length - 1].split(",").map(Number);
+    // Rendered line must end before tip x=200, pulled back by headLen=16 -> x~184
+    expect(lastPt[0]).toBeLessThan(200);
+    expect(lastPt[0]).toBeCloseTo(184, 0);
+    expect(lastPt[1]).toBeCloseTo(0, 0);
+  });
+});
+
+describe("ellipse rendering", () => {
+  // VS: zoom=2, pageHeight=100, scrollX=0, scrollY=0
+  // Rect { min: {x:10,y:20}, max: {x:60,y:70} } in screen space:
+  //   screen of (10,20): x=20, y=(100-20)*2=160
+  //   screen of (60,70): x=120, y=(100-70)*2=60
+  //   cx=(20+120)/2=70, cy=(160+60)/2=110, rx=(120-20)/2=50, ry=(160-60)/2=50
+
+  it("Ellipse markup yields kind:ellipse with cx/cy/rx/ry computed from rect bounds in screen space", () => {
+    const s = markupToSvg(mk({ Rect: { min: { x: 10, y: 20 }, max: { x: 60, y: 70 } } }, "Ellipse"), VS);
+    expect(s.kind).toBe("ellipse");
+    if (s.kind !== "ellipse") throw new Error("expected ellipse kind");
+    expect(s.cx).toBeCloseTo(70);
+    expect(s.cy).toBeCloseTo(110);
+    expect(s.rx).toBeCloseTo(50);
+    expect(s.ry).toBeCloseTo(50);
+  });
+
+  it("Rectangle markup still yields kind:rect after ellipse special-case (no regression)", () => {
+    const s = markupToSvg(mk({ Rect: { min: { x: 10, y: 20 }, max: { x: 60, y: 70 } } }, "Rectangle"), VS);
+    expect(s.kind).toBe("rect");
+  });
+
+  it("Highlight markup still yields kind:rect (no regression)", () => {
+    const s = markupToSvg(mk({ Rect: { min: { x: 10, y: 20 }, max: { x: 60, y: 70 } } }, "Highlight"), VS);
+    expect(s.kind).toBe("rect");
   });
 });
 

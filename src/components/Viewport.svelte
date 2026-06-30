@@ -1059,7 +1059,7 @@
     previewMarkup = buildMarkup({
       markupType: tool,
       page: pageIndex,
-      geometry: dragDrawGeometry(tool, drawStartPdf, p),
+      geometry: dragDrawGeometry(tool, drawStartPdf, p, { constrain: e.shiftKey }),
       appearance: store.draftAppearance,
       identity,
       now: new Date().toISOString(),
@@ -1203,7 +1203,7 @@
     store.create(buildMarkup({
       markupType: tool,
       page: pageIndex,
-      geometry: dragDrawGeometry(tool, start, p),
+      geometry: dragDrawGeometry(tool, start, p, { constrain: e.shiftKey }),
       appearance: store.draftAppearance,
       identity,
       now: new Date().toISOString(),
@@ -1439,68 +1439,95 @@
     ondblclick={onOverlayDblClick}
     onmousemove={onOverlayMouseMove}
   >
-    <defs>
-      <!--
-        Arrowhead marker for Arrow markup (Fix: arrow tool had no visible head).
-        markerUnits="strokeWidth" keeps the head proportional to line weight.
-        fill="context-stroke" inherits the referencing polyline's stroke color so the
-        arrowhead automatically matches the markup color and persists through save/reload.
-      -->
-      <marker id="redline-arrowhead" markerWidth="6" markerHeight="6"
-        refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
-        <path d="M0,0 L6,3 L0,6 Z" fill="context-stroke" />
-      </marker>
-    </defs>
     {#snippet shape(s: SvgShape)}
+      <!--
+        All shape elements carry pointer-events="none" so that click/pointer events
+        (e.g. multi-click polygon placement, select tool's own hit-testing) always
+        reach the SVG overlay directly. The select tool uses mathematical hit-testing
+        (hitTest) and does not need shape elements to receive events natively.
+        WKWebView (Tauri/macOS) does not reliably bubble events from filled SVG child
+        elements to a parent onclick handler — pointer-events:none avoids the issue.
+      -->
       {#if s.kind === "rect"}
         <rect
           x={s.x} y={s.y} width={s.width} height={s.height}
           stroke={s.stroke} stroke-width={s.strokeWidth}
           fill={s.fill} opacity={s.opacity}
           stroke-dasharray={s.dashArray ?? undefined}
+          pointer-events="none"
+        />
+      {:else if s.kind === "ellipse"}
+        <ellipse
+          cx={s.cx} cy={s.cy} rx={s.rx} ry={s.ry}
+          stroke={s.stroke} stroke-width={s.strokeWidth}
+          fill={s.fill} opacity={s.opacity}
+          stroke-dasharray={s.dashArray ?? undefined}
+          pointer-events="none"
         />
       {:else if s.kind === "polygon"}
         <polygon points={s.points}
           stroke={s.stroke} stroke-width={s.strokeWidth}
           fill={s.fill} opacity={s.opacity}
-          stroke-dasharray={s.dashArray ?? undefined} />
+          stroke-dasharray={s.dashArray ?? undefined}
+          pointer-events="none" />
       {:else if s.kind === "cloud"}
         <path d={s.path}
           stroke={s.stroke} stroke-width={s.strokeWidth}
           fill={s.fill} opacity={s.opacity}
-          stroke-dasharray={s.dashArray ?? undefined} />
+          stroke-dasharray={s.dashArray ?? undefined}
+          pointer-events="none" />
       {:else if s.kind === "arrow"}
+        <!--
+          Arrow: shortened shaft + explicit arrowhead triangle.
+          fill="context-stroke" on SVG markers is unsupported in macOS WKWebView, so
+          the arrowhead is rendered as a plain <polygon> filled with the markup color.
+          The polyline ends at the arrowhead base (not the tip) so the shaft does not
+          visually protrude through the head.
+        -->
         <polyline points={s.points}
           stroke={s.stroke} stroke-width={s.strokeWidth}
           fill="none" opacity={s.opacity}
           stroke-dasharray={s.dashArray ?? undefined}
-          marker-end="url(#redline-arrowhead)"
+          pointer-events="none"
         />
+        {#if s.arrowHead}
+          <polygon points={s.arrowHead}
+            fill={s.stroke} stroke="none"
+            opacity={s.opacity}
+            pointer-events="none"
+          />
+        {/if}
       {:else if s.kind === "polyline"}
         <polyline points={s.points}
           stroke={s.stroke} stroke-width={s.strokeWidth}
           fill="none" opacity={s.opacity}
-          stroke-dasharray={s.dashArray ?? undefined} />
+          stroke-dasharray={s.dashArray ?? undefined}
+          pointer-events="none" />
       {:else if s.kind === "ink"}
         {#each s.strokes as stroke, i (i)}
           <polyline points={stroke}
             stroke={s.stroke} stroke-width={s.strokeWidth}
             fill="none" opacity={s.opacity}
-            stroke-linecap="round" stroke-linejoin="round" />
+            stroke-linecap="round" stroke-linejoin="round"
+            pointer-events="none" />
         {/each}
       {:else if s.kind === "point"}
         <circle cx={s.x} cy={s.y} r="6"
           stroke={s.stroke} stroke-width={s.strokeWidth}
           fill={s.fill === "none" ? s.stroke : s.fill}
-          opacity={s.opacity} />
+          opacity={s.opacity}
+          pointer-events="none" />
       {:else if s.kind === "text"}
         <text x={s.x} y={s.y} fill={s.stroke} font-size={s.fontPx}
-          dominant-baseline="hanging" opacity={s.opacity}>{s.text}</text>
+          dominant-baseline="hanging" opacity={s.opacity}
+          pointer-events="none">{s.text}</text>
       {:else if s.kind === "callout"}
         <polyline points={s.points} stroke={s.stroke} stroke-width={s.strokeWidth}
-          fill="none" opacity={s.opacity} stroke-dasharray={s.dashArray ?? undefined} />
+          fill="none" opacity={s.opacity} stroke-dasharray={s.dashArray ?? undefined}
+          pointer-events="none" />
         <text x={s.x} y={s.y} fill={s.stroke} font-size={s.fontPx}
-          dominant-baseline="hanging" opacity={s.opacity}>{s.text}</text>
+          dominant-baseline="hanging" opacity={s.opacity}
+          pointer-events="none">{s.text}</text>
       {/if}
     {/snippet}
 

@@ -21,13 +21,31 @@ export function isDrawTool(t: ToolKind): t is DrawTool {
 /** Drag-draw tools whose geometry is an axis-aligned bounding Rect. */
 export const RECT_TOOLS: ReadonlySet<ToolKind> = new Set<ToolKind>(["Rectangle", "Ellipse", "Highlight"]);
 
-/** Build geometry for a drag-draw tool from two PDF-space points (press + release). */
-export function dragDrawGeometry(tool: ToolKind, a: PdfPoint, b: PdfPoint): MarkupGeometry {
+/**
+ * Build geometry for a drag-draw tool from two PDF-space points (press + release).
+ * When `opts.constrain` is true and the tool is a RECT_TOOL, the bounding rect is
+ * constrained to a square: both axes use the larger of |dx|, |dy|, preserving sign
+ * so the shape grows in the actual drag direction. Supports Shift-to-square/circle.
+ */
+export function dragDrawGeometry(
+  tool: ToolKind,
+  a: PdfPoint,
+  b: PdfPoint,
+  opts?: { constrain?: boolean },
+): MarkupGeometry {
   if (RECT_TOOLS.has(tool)) {
+    let bx = b.x, by = b.y;
+    if (opts?.constrain) {
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const size = Math.max(Math.abs(dx), Math.abs(dy));
+      bx = a.x + Math.sign(dx) * size;
+      by = a.y + Math.sign(dy) * size;
+    }
     return {
       Rect: {
-        min: { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y) },
-        max: { x: Math.max(a.x, b.x), y: Math.max(a.y, b.y) },
+        min: { x: Math.min(a.x, bx), y: Math.min(a.y, by) },
+        max: { x: Math.max(a.x, bx), y: Math.max(a.y, by) },
       },
     };
   }

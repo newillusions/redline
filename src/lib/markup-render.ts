@@ -20,9 +20,18 @@ interface SvgStyle {
 
 export type SvgShape =
   | (SvgStyle & { kind: "rect"; x: number; y: number; width: number; height: number })
+  | (SvgStyle & { kind: "ellipse"; cx: number; cy: number; rx: number; ry: number })
   | (SvgStyle & { kind: "polygon"; points: string })
   | (SvgStyle & { kind: "polyline"; points: string })
-  | (SvgStyle & { kind: "arrow"; points: string })
+  | (SvgStyle & {
+      kind: "arrow";
+      /** Shortened polyline — terminates at the arrowhead base, not through the tip. */
+      points: string;
+      /** Explicit arrowhead triangle (3-point polygon string). Filled with `stroke` color.
+       *  WKWebView does not support `fill="context-stroke"` on SVG markers, so the head
+       *  is computed in screen space and rendered as a plain `<polygon>`. */
+      arrowHead: string;
+    })
   | (SvgStyle & { kind: "cloud"; path: string })
   | (SvgStyle & { kind: "ink"; strokes: string[] })
   | (SvgStyle & { kind: "point"; x: number; y: number })
@@ -86,6 +95,63 @@ function pointsStr(pts: { x: number; y: number }[], v: ViewportState): string {
 }
 
 const DEFAULT_FONT_PT = 12;
+
+/**
+ * Compute an explicit arrowhead triangle for the end of an arrow polyline.
+ * WKWebView does not support `fill="context-stroke"` on SVG markers, so the head
+ * must be a standalone `<polygon>` filled with the actual stroke color.
+ *
+ * Returns:
+ *   shortPoints - polyline points string with the last segment shortened to the
+ *                 arrowhead base so the shaft does not run through the head.
+ *   arrowHead   - space-separated "x,y" polygon string for the filled triangle
+ *                 (tip, left barb, right barb in screen space).
+ */
+function arrowHeadData(
+  screenPts: { x: number; y: number }[],
+  strokeWidth: number,
+): { shortPoints: string; arrowHead: string } {
+  const fmt = (p: { x: number; y: number }) => `${+p.x.toFixed(3)},${+p.y.toFixed(3)}`;
+
+  if (screenPts.length < 2) {
+    return { shortPoints: screenPts.map(fmt).join(" "), arrowHead: "" };
+  }
+
+  const tip  = screenPts[screenPts.length - 1];
+  const prev = screenPts[screenPts.length - 2];
+  const dx   = tip.x - prev.x;
+  const dy   = tip.y - prev.y;
+  const len  = Math.hypot(dx, dy);
+
+  if (len < 0.001) {
+    return { shortPoints: screenPts.map(fmt).join(" "), arrowHead: "" };
+  }
+
+  // Unit forward (shaft direction) and left-perpendicular in screen space (y-down).
+  const ux = dx / len;
+  const uy = dy / len;
+  const nx = -uy;
+  const ny =  ux;
+
+  // Head dimensions proportional to stroke width, with a minimum so thin lines still
+  // have a visible head.
+  const headLen   = Math.max(8, strokeWidth * 4);
+  const halfWidth = Math.max(4, strokeWidth * 2);
+
+  // Triangle: tip at the true line endpoint, base pulled back along the shaft.
+  const base = { x: tip.x - headLen * ux, y: tip.y - headLen * uy };
+  const lb   = { x: base.x + halfWidth * nx, y: base.y + halfWidth * ny };
+  const rb   = { x: base.x - halfWidth * nx, y: base.y - halfWidth * ny };
+
+  const arrowHead = `${fmt(tip)} ${fmt(lb)} ${fmt(rb)}`;
+
+  // Shorten the rendered polyline: replace the last vertex with the arrowhead base
+  // so the shaft terminates cleanly at the back of the head.
+  const shortened = [...screenPts.slice(0, -1), base];
+  const shortPoints = shortened.map(fmt).join(" ");
+
+  return { shortPoints, arrowHead };
+}
 
 // ---------------------------------------------------------------------------
 // SelectionChrome — screen-space chrome for the selection overlay
@@ -151,6 +217,15 @@ export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
       x: anchor.x, y: anchor.y, text: m.contents ?? "", fontPx };
   }
 
+  if ("Rect" in g && m.markup_type === "Ellipse") {
+    const a = pdfUserSpaceToScreen(g.Rect.min.x, g.Rect.min.y, v);
+    const b = pdfUserSpaceToScreen(g.Rect.max.x, g.Rect.max.y, v);
+    const cx = (a.x + b.x) / 2;
+    const cy = (a.y + b.y) / 2;
+    const rx = Math.abs(b.x - a.x) / 2;
+    const ry = Math.abs(a.y - b.y) / 2;
+    return { ...style, kind: "ellipse", cx, cy, rx, ry };
+  }
   if ("Rect" in g) {
     const a = pdfUserSpaceToScreen(g.Rect.min.x, g.Rect.min.y, v);
     const b = pdfUserSpaceToScreen(g.Rect.max.x, g.Rect.max.y, v);
@@ -163,8 +238,9 @@ export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
     return { ...style, kind: "cloud", path: cloudPath(screen, Math.max(4, 6 * v.zoom)) };
   }
   if ("Polyline" in g && m.markup_type === "Arrow") {
-    const points = pointsStr(g.Polyline, v);
-    return { ...style, kind: "arrow", points };
+    const screen = g.Polyline.map((p) => pdfUserSpaceToScreen(p.x, p.y, v));
+    const { shortPoints, arrowHead } = arrowHeadData(screen, style.strokeWidth);
+    return { ...style, kind: "arrow", points: shortPoints, arrowHead };
   }
   if ("Polyline" in g) {
     const points = pointsStr(g.Polyline, v);

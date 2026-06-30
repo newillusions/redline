@@ -118,6 +118,48 @@ describe("text/callout helpers", () => {
   });
 });
 
+describe("dragDrawGeometry - shift constrain", () => {
+  it("constrain=true forces equal width and height using the larger magnitude", () => {
+    // dx=30, dy=50 -> size=50; constrained to (50,50) box
+    const g = dragDrawGeometry("Rectangle", { x: 0, y: 0 }, { x: 30, y: 50 }, { constrain: true }) as { Rect: { min: PdfPoint; max: PdfPoint } };
+    const w = g.Rect.max.x - g.Rect.min.x;
+    const h = g.Rect.max.y - g.Rect.min.y;
+    expect(w).toBeCloseTo(h);
+    expect(w).toBeCloseTo(50);
+  });
+
+  it("constrain=true all 4 drag quadrants yield equal width and height", () => {
+    // a={50,50}, each b gives dx=±30, dy=±40 -> size=40
+    const a: PdfPoint = { x: 50, y: 50 };
+    const cases: PdfPoint[] = [
+      { x: 80, y: 90 },  // right+up
+      { x: 20, y: 90 },  // left+up
+      { x: 80, y: 10 },  // right+down
+      { x: 20, y: 10 },  // left+down
+    ];
+    for (const b of cases) {
+      const g = dragDrawGeometry("Rectangle", a, b, { constrain: true }) as { Rect: { min: PdfPoint; max: PdfPoint } };
+      const w = g.Rect.max.x - g.Rect.min.x;
+      const h = g.Rect.max.y - g.Rect.min.y;
+      expect(w).toBeCloseTo(h, 5);
+      expect(w).toBeCloseTo(40, 5);
+    }
+  });
+
+  it("constrain=true also applies to Ellipse (RECT_TOOL)", () => {
+    const g = dragDrawGeometry("Ellipse", { x: 0, y: 0 }, { x: 30, y: 50 }, { constrain: true }) as { Rect: { min: PdfPoint; max: PdfPoint } };
+    const w = g.Rect.max.x - g.Rect.min.x;
+    const h = g.Rect.max.y - g.Rect.min.y;
+    expect(w).toBeCloseTo(h);
+  });
+
+  it("constrain absent or false does not alter geometry", () => {
+    const g = dragDrawGeometry("Rectangle", { x: 0, y: 0 }, { x: 30, y: 50 }) as { Rect: { min: PdfPoint; max: PdfPoint } };
+    expect(g.Rect.max.x - g.Rect.min.x).toBe(30);
+    expect(g.Rect.max.y - g.Rect.min.y).toBe(50);
+  });
+});
+
 describe("bumpAudit", () => {
   it("increments revision and updates modified_by/at, preserves created_by/at, does not mutate input", () => {
     const original = buildMarkup({
