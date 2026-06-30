@@ -89,6 +89,23 @@
     return v === null;
   }
 
+  // Box-border colour for Text/Callout. Falls back to the glyph colour when unset, so the
+  // swatch always shows the effective border; editing it writes a distinct outline_color.
+  function outlineColorValue(): string {
+    if (mode === "draft") return store.draftAppearance.outline_color ?? store.draftAppearance.color;
+    return commonValue(selected, (m) => m.appearance.outline_color ?? m.appearance.color) ?? "";
+  }
+
+  // Fill alpha, independent of overall opacity. Defaults to 1 (fully opaque fill) when unset.
+  function fillOpacityValue(): number {
+    if (mode === "draft") return store.draftAppearance.fill_opacity ?? 1;
+    return commonValue(selected, (m) => m.appearance.fill_opacity ?? 1) ?? 1;
+  }
+
+  function fillOpacityDisplay(): string {
+    return `${Math.round((fillOpacityValue() as number) * 100)}%`;
+  }
+
   function lineStyleValue(): string {
     if (mode === "draft") return store.draftAppearance.line_style;
     return commonValue(selected, (m) => m.appearance.line_style) ?? "";
@@ -149,6 +166,16 @@
       // restore a default fill color
       commitAppearancePatch({ fill: "#ffffff" });
     }
+  }
+
+  function onOutlineColorInput(e: Event) {
+    const v = (e.target as HTMLInputElement).value;
+    commitAppearancePatch({ outline_color: v });
+  }
+
+  function onFillOpacityInput(e: Event) {
+    const raw = parseFloat((e.target as HTMLInputElement).value);
+    if (!isNaN(raw)) commitAppearancePatch({ fill_opacity: raw });
   }
 
   function onLineStyleChange(e: Event) {
@@ -273,6 +300,41 @@
           />
           No fill
         </label>
+      </div>
+    </div>
+
+    <!-- Box outline (Text/Callout border colour — distinct from the text/glyph colour) -->
+    <div class="prop-row">
+      <label for="prop-outline" class="prop-label">Box outline</label>
+      <div class="prop-control color-row">
+        <div class="color-swatch" style="background: {outlineColorValue() || 'transparent'}"></div>
+        <input
+          id="prop-outline"
+          type="color"
+          data-field="outline_color"
+          data-indeterminate={outlineColorValue() === "" ? "true" : undefined}
+          value={outlineColorValue() || "#000000"}
+          oninput={onOutlineColorInput}
+        />
+      </div>
+    </div>
+
+    <!-- Fill transparency (box fill alpha, independent of overall opacity) -->
+    <div class="prop-row">
+      <label for="prop-fill-opacity" class="prop-label">Fill opacity</label>
+      <div class="prop-control opacity-row">
+        <input
+          id="prop-fill-opacity"
+          type="range"
+          data-field="fill_opacity"
+          min="0"
+          max="1"
+          step="0.05"
+          value={fillOpacityValue()}
+          oninput={onFillOpacityInput}
+          class="prop-range"
+        />
+        <span class="opacity-readout muted">{fillOpacityDisplay()}</span>
       </div>
     </div>
 

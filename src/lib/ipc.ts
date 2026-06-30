@@ -135,6 +135,18 @@ export interface Appearance {
   fill: string | null;
   line_style: "Solid" | "Dashed" | "Dotted";
   font: { family: string; size_pt: number } | null;
+  /**
+   * Box-border colour for text-bearing markups (Text / Callout), distinct from the glyph
+   * `color`. `null`/absent ⇒ the border falls back to `color`. Persists via `/RLOutlineColor`.
+   * Optional so pre-existing Appearance literals (and pre-outline JSON) stay valid.
+   */
+  outline_color?: string | null;
+  /**
+   * Fill alpha (0..1) for the box interior, applied INDEPENDENTLY of overall `opacity`, so a
+   * semi-transparent fill sits behind solid text + outline. `null`/absent ⇒ fully opaque fill.
+   * Persists via `/RLFillOpacity`.
+   */
+  fill_opacity?: number | null;
 }
 
 export interface MarkupAudit {

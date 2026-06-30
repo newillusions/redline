@@ -44,6 +44,7 @@ export type ToolKind =
 
 const DEFAULT_APPEARANCE: Appearance = {
   color: "#e02424", line_weight: 2, opacity: 1, fill: null, line_style: "Solid", font: null,
+  outline_color: null, fill_opacity: null,
 };
 
 export class MarkupStore implements MarkupSink {

@@ -1043,6 +1043,48 @@ describe("Viewport G5 text + callout", () => {
     expect(x1).toBeCloseTo(x0 * wheelZoomFactor(-100), 0);
     expect(fontSize1).toBeCloseTo(12 * wheelZoomFactor(-100), 1);
   });
+
+  // -------------------------------------------------------------------------
+  // T20: Persist-on-click-outside — a pointer-down on the canvas commits the editor
+  // -------------------------------------------------------------------------
+  it("T20: Text tool — typing then a pointer-down on the canvas outside commits the markup", async () => {
+    const { container, overlay } = await mountViewport(store);
+    store.activeTool = "Text";
+    await tick();
+
+    // Open the editor at (60, 80) and type — but do NOT blur.
+    fireEvent.click(overlay, { clientX: 60, clientY: 80 });
+    await tick();
+    const textarea = container.querySelector("textarea.text-editor") as HTMLTextAreaElement;
+    expect(textarea).not.toBeNull();
+    textarea.value = "outside-commit";
+    fireEvent.input(textarea);
+
+    // Pointer-down on the canvas well away from the editor — must commit (not discard).
+    ptr(overlay, "pointerdown", 160, 160);
+    await tick();
+
+    expect(store.markups.length).toBe(1);
+    expect(store.markups[0].markup_type).toBe("Text");
+    expect(store.markups[0].contents).toBe("outside-commit");
+  });
+
+  it("T20b: Text tool — pointer-down outside with empty editor commits nothing", async () => {
+    const { container, overlay } = await mountViewport(store);
+    store.activeTool = "Text";
+    await tick();
+
+    fireEvent.click(overlay, { clientX: 60, clientY: 80 });
+    await tick();
+    const textarea = container.querySelector("textarea.text-editor") as HTMLTextAreaElement;
+    expect(textarea).not.toBeNull(); // editor opened
+
+    // No text typed — pointer-down outside should cancel, not create an empty markup.
+    ptr(overlay, "pointerdown", 160, 160);
+    await tick();
+
+    expect(store.markups.length).toBe(0);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1099,6 +1141,20 @@ describe("Viewport G6 select", () => {
       identity: FAKE_IDENTITY,
       now: "2026-01-01T00:00:00Z",
       id,
+    }));
+  }
+
+  // Callout leader [target, anchor]. target PDF(50,150)=screen(50,50); anchor PDF(100,100)=screen(100,100).
+  function seedCallout(s: MarkupStore, id: string) {
+    s.markups.push(buildMarkup({
+      markupType: "Callout",
+      page: 0,
+      geometry: { Polyline: [{ x: 50, y: 150 }, { x: 100, y: 100 }] },
+      appearance: DEFAULT_APPEARANCE,
+      identity: FAKE_IDENTITY,
+      now: "2026-01-01T00:00:00Z",
+      id,
+      contents: "see note",
     }));
   }
 
@@ -1321,6 +1377,36 @@ describe("Viewport G6 select", () => {
 
     expect(store.selectedIds.size).toBe(0);
     expect(container.querySelector("svg.markup-overlay .selection-box")).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // S6: Callout target handle — dragging it moves ONLY the leader's target end.
+  // -------------------------------------------------------------------------
+  it("S6: dragging a selected Callout's target handle moves leader index 0 only", async () => {
+    const { overlay } = await mountViewport(store);
+    seedCallout(store, "call-a");
+    store.activeTool = "select";
+    await tick();
+
+    // Select the callout by clicking its leader near the anchor end, screen ~(100,100).
+    ptr(overlay, "pointerdown", 100, 100);
+    ptr(overlay, "pointerup", 100, 100);
+    await tick();
+    expect(store.selectedIds.has("call-a")).toBe(true);
+
+    // Drag the target handle from screen (50,50) → (20,20). PDF: (50,150) → (20,180).
+    ptr(overlay, "pointerdown", 50, 50);
+    ptr(overlay, "pointermove", 20, 20);
+    ptr(overlay, "pointerup", 20, 20);
+    await tick();
+
+    const poly = (store.markups[0].geometry as { Polyline: { x: number; y: number }[] }).Polyline;
+    expect(poly).toHaveLength(2);
+    // Index 0 (target) moved to PDF(20,180); index 1 (anchor) unchanged at (100,100).
+    expect(poly[0].x).toBeCloseTo(20);
+    expect(poly[0].y).toBeCloseTo(180);
+    expect(poly[1].x).toBeCloseTo(100);
+    expect(poly[1].y).toBeCloseTo(100);
   });
 });
 

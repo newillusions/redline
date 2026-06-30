@@ -43,8 +43,38 @@ export type SvgShape =
       /** Pre-computed screen-space symbol geometry — WKWebView-safe primitives only. */
       render: PointSymbolRender;
     })
-  | (SvgStyle & { kind: "text"; x: number; y: number; text: string; fontPx: number })
-  | (SvgStyle & { kind: "callout"; points: string; x: number; y: number; text: string; fontPx: number });
+  | (SvgStyle & {
+      kind: "text";
+      /** Box top-left in screen px — also the text origin (one unit: box + glyphs share this). */
+      x: number;
+      y: number;
+      /** Box size in screen px, derived from the SAME Rect geometry as the text. */
+      width: number;
+      height: number;
+      text: string;
+      fontPx: number;
+      /** Box border colour (`outline_color ?? color`) — distinct from the glyph `stroke`/colour. */
+      outline: string;
+      /** Box fill alpha, applied on top of `opacity` (`fill_opacity ?? 1`). */
+      fillOpacity: number;
+    })
+  | (SvgStyle & {
+      kind: "callout";
+      /** Leader polyline, shortened so the shaft stops at the arrowhead base. */
+      points: string;
+      /** Explicit arrowhead triangle at the leader's pointing (target) end; "" when degenerate. */
+      arrowHead: string;
+      /** Text-box top-left in screen px (the leader's anchor end) — box + glyphs share this. */
+      x: number;
+      y: number;
+      /** Synthesized text-box size in screen px. */
+      width: number;
+      height: number;
+      text: string;
+      fontPx: number;
+      outline: string;
+      fillOpacity: number;
+    });
 
 /** Screen-space radius (CSS px) of a count marker — half its bounding box. */
 export const COUNT_MARKER_RADIUS = 6;
@@ -197,6 +227,25 @@ function pointsStr(pts: { x: number; y: number }[], v: ViewportState): string {
 }
 
 const DEFAULT_FONT_PT = 12;
+
+/**
+ * Synthesized callout text-box size in PDF points (mirrors markup-tools DEFAULT_TEXT_BOX).
+ * The Callout geometry stores only the leader Polyline, so the text box is derived at render
+ * time from the leader's anchor end at this fixed size (single leader / fixed attachment — the
+ * configurable-box work is deferred).
+ */
+const CALLOUT_BOX_PT = { width: 144, height: 18 } as const;
+
+/** Highlighter wash alpha — a translucent marker pass over content, never an opaque fill. */
+const HIGHLIGHT_FILL_ALPHA = 0.35;
+
+/** Resolve a text-box's border colour + fill alpha from appearance (with sane fallbacks). */
+function boxStyle(m: Markup): { outline: string; fillOpacity: number } {
+  return {
+    outline: m.appearance.outline_color ?? m.appearance.color,
+    fillOpacity: m.appearance.fill_opacity ?? 1,
+  };
+}
 
 /**
  * Compute an explicit arrowhead triangle for the end of an arrow polyline.
@@ -352,14 +401,48 @@ export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
 
   const fontPx = (m.appearance.font?.size_pt ?? DEFAULT_FONT_PT) * v.zoom;
   if (m.markup_type === "Text" && "Rect" in g) {
+    // Box + glyphs are ONE unit: both derive from this single Rect geometry, so moving the
+    // markup translates them together (no orphaned/duplicate box).
     const tl = pdfUserSpaceToScreen(g.Rect.min.x, g.Rect.max.y, v); // PDF top-left (y-up)
-    return { ...style, kind: "text", x: tl.x, y: tl.y, text: m.contents ?? "", fontPx };
+    const br = pdfUserSpaceToScreen(g.Rect.max.x, g.Rect.min.y, v); // bottom-right
+    const { outline, fillOpacity } = boxStyle(m);
+    return {
+      ...style, kind: "text", x: tl.x, y: tl.y,
+      width: Math.abs(br.x - tl.x), height: Math.abs(br.y - tl.y),
+      text: m.contents ?? "", fontPx, outline, fillOpacity,
+    };
   }
   if (m.markup_type === "Callout" && "Polyline" in g) {
+    const screen = g.Polyline.map((p) => pdfUserSpaceToScreen(p.x, p.y, v));
+    // The leader POINTS at the target (index 0). arrowHeadData puts the head on the last
+    // point, so reverse a copy: the head lands on the target and the shaft stops at its base.
+    const { shortPoints, arrowHead } = arrowHeadData([...screen].reverse(), style.strokeWidth);
+    // The text box sits at the anchor (leader's last point); box + glyphs share this origin.
     const last = g.Polyline[g.Polyline.length - 1] ?? { x: 0, y: 0 };
     const anchor = pdfUserSpaceToScreen(last.x, last.y, v);
-    return { ...style, kind: "callout", points: pointsStr(g.Polyline, v),
-      x: anchor.x, y: anchor.y, text: m.contents ?? "", fontPx };
+    const { outline, fillOpacity } = boxStyle(m);
+    return {
+      ...style, kind: "callout", points: shortPoints, arrowHead,
+      x: anchor.x, y: anchor.y,
+      width: CALLOUT_BOX_PT.width * v.zoom, height: CALLOUT_BOX_PT.height * v.zoom,
+      text: m.contents ?? "", fontPx, outline, fillOpacity,
+    };
+  }
+
+  // Highlight: a translucent highlighter wash (colour fill, no border) — NOT a text box.
+  // Gated here so the text-box fill/outline treatment never applies to Highlight (it stays a
+  // RECT_TOOL but renders as a marker pass, per the highlighter convention).
+  if ("Rect" in g && m.markup_type === "Highlight") {
+    const a = pdfUserSpaceToScreen(g.Rect.min.x, g.Rect.min.y, v);
+    const b = pdfUserSpaceToScreen(g.Rect.max.x, g.Rect.max.y, v);
+    const x = Math.min(a.x, b.x);
+    const y = Math.min(a.y, b.y);
+    return {
+      ...style, kind: "rect",
+      fill: m.appearance.color, stroke: "none",
+      opacity: m.appearance.opacity * HIGHLIGHT_FILL_ALPHA,
+      x, y, width: Math.abs(b.x - a.x), height: Math.abs(a.y - b.y),
+    };
   }
 
   if ("Rect" in g && m.markup_type === "Ellipse") {

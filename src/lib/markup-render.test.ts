@@ -174,6 +174,32 @@ describe("text + callout rendering", () => {
     // top-left = screen of (min.x, max.y) — verify it matches the transform
     const tl = pdfUserSpaceToScreen(10, 40, VS);
     expect(s.x).toBeCloseTo(tl.x); expect(s.y).toBeCloseTo(tl.y);
+    // Box derives from the SAME Rect: width = (60-10)*zoom, height = (40-20)*zoom.
+    expect(s.width).toBeCloseTo(50 * VS.zoom);
+    expect(s.height).toBeCloseTo(20 * VS.zoom);
+    // Outline defaults to the glyph colour when outline_color is unset; fill alpha defaults to 1.
+    expect(s.outline).toBe("#ff0000");
+    expect(s.fillOpacity).toBe(1);
+  });
+  it("Text box + glyphs translate together as one unit when the Rect moves", () => {
+    const at = (dx: number, dy: number) =>
+      markupToSvg(mk({ Rect: { min: { x: 10 + dx, y: 20 + dy }, max: { x: 60 + dx, y: 40 + dy } } }, "Text"), VS);
+    const a = at(0, 0), b = at(15, 0);
+    if (a.kind !== "text" || b.kind !== "text") throw new Error("kind");
+    // Same Rect → box AND text share x/y, and both shift by the same screen delta.
+    expect(b.x - a.x).toBeCloseTo(15 * VS.zoom);
+    expect(b.y).toBeCloseTo(a.y);
+    expect(b.width).toBeCloseTo(a.width); // box size unchanged by translation
+  });
+  it("Text box uses outline_color + fill_opacity when set (distinct from the glyph colour)", () => {
+    const m = mk({ Rect: { min: { x: 0, y: 0 }, max: { x: 10, y: 10 } } }, "Text",
+      { color: "#111111", outline_color: "#00ff00", fill: "#abcdef", fill_opacity: 0.3 });
+    const s = markupToSvg(m, VS);
+    if (s.kind !== "text") throw new Error("kind");
+    expect(s.stroke).toBe("#111111");   // glyph colour (text fill)
+    expect(s.outline).toBe("#00ff00");  // box border — distinct from the glyph colour
+    expect(s.fill).toBe("#abcdef");     // box fill
+    expect(s.fillOpacity).toBe(0.3);    // independent of overall opacity
   });
   it("Text with null contents renders empty text, default 12pt", () => {
     const s = markupToSvg(mk({ Rect: { min: { x: 0, y: 0 }, max: { x: 10, y: 10 } } }, "Text"), VS);
@@ -189,6 +215,14 @@ describe("text + callout rendering", () => {
     expect(s.text).toBe("see note");
     const anchor = pdfUserSpaceToScreen(50, 60, VS);
     expect(s.x).toBeCloseTo(anchor.x); expect(s.y).toBeCloseTo(anchor.y);
+    // Arrowhead at the leader's pointing (target) end: an explicit 3-point polygon.
+    expect(s.arrowHead.split(" ").length).toBe(3);
+    // Synthesized text box at the anchor end has a positive size.
+    expect(s.width).toBeGreaterThan(0);
+    expect(s.height).toBeGreaterThan(0);
+    // Outline + fill alpha resolve with the same fallbacks as the Text box.
+    expect(s.outline).toBe("#ff0000");
+    expect(s.fillOpacity).toBe(1);
   });
 });
 
@@ -345,9 +379,16 @@ describe("ellipse rendering", () => {
     expect(s.kind).toBe("rect");
   });
 
-  it("Highlight markup still yields kind:rect (no regression)", () => {
-    const s = markupToSvg(mk({ Rect: { min: { x: 10, y: 20 }, max: { x: 60, y: 70 } } }, "Highlight"), VS);
-    expect(s.kind).toBe("rect");
+  it("Highlight renders as a translucent wash (colour fill, no border, no text-box outline)", () => {
+    const m = mk({ Rect: { min: { x: 10, y: 20 }, max: { x: 60, y: 70 } } }, "Highlight",
+      { color: "#ffe600", opacity: 1 });
+    const s = markupToSvg(m, VS);
+    expect(s.kind).toBe("rect"); // still a rect element (no regression in element type)
+    if (s.kind !== "rect") throw new Error("kind");
+    expect(s.fill).toBe("#ffe600");      // colour wash, not a solid grey/black box
+    expect(s.stroke).toBe("none");       // no border (it's a marker, not a text box)
+    expect(s.opacity).toBeLessThan(1);   // translucent
+    expect(s).not.toHaveProperty("outline"); // text-box outline treatment must NOT apply
   });
 });
 

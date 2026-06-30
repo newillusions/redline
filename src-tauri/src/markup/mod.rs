@@ -152,6 +152,18 @@ pub struct Appearance {
     pub fill: Option<String>,
     pub line_style: LineStyle,
     pub font: Option<FontSpec>,
+    /// Box-border colour for text-bearing markups (Text / Callout), distinct from the
+    /// glyph `color`. `None` ⇒ the border falls back to `color` (and matches the standard
+    /// FreeText `/C` semantics for foreign annotations). Persists via private `/RLOutlineColor`.
+    /// `#[serde(default)]` keeps pre-outline JSON (no field) deserialising to `None`.
+    #[serde(default)]
+    pub outline_color: Option<String>,
+    /// Fill alpha (`0.0..=1.0`) applied to the box interior INDEPENDENTLY of the overall
+    /// `opacity`, so a semi-transparent fill can sit behind solid text + a solid outline.
+    /// `None` ⇒ fully opaque fill (subject only to the overall `opacity`). Persists via the
+    /// private `/RLFillOpacity` key. `#[serde(default)]` keeps pre-field JSON deserialising.
+    #[serde(default)]
+    pub fill_opacity: Option<f64>,
 }
 
 impl Default for Appearance {
@@ -163,6 +175,8 @@ impl Default for Appearance {
             fill: None,
             line_style: LineStyle::Solid,
             font: None,
+            outline_color: None,
+            fill_opacity: None,
         }
     }
 }

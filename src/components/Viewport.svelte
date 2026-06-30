@@ -322,6 +322,25 @@
   /** Min point-count floor for vertex deletion (closed shapes keep ≥3, open keep ≥2). */
   const vertexFloor = (m: Markup): number => (isClosedMarkupType(m.markup_type) ? 3 : 2);
 
+  // The single selected Callout (leader Polyline). Excluded from singleMultipoint above (its
+  // leader is not a freely-editable path), but its TARGET end gets its own drag handle. Tracks
+  // the live dragPreview so the handle follows a target drag.
+  const selectedCallout = $derived.by<Markup | null>(() => {
+    const src = dragPreview ?? selectedOnPage;
+    if (src.length !== 1) return null;
+    const m = src[0];
+    return m.markup_type === "Callout" && "Polyline" in m.geometry ? m : null;
+  });
+
+  // Screen-space handle at the Callout leader's target (arrow-head) end, index 0. null when none.
+  const calloutTargetHandle = $derived.by<{ x: number; y: number } | null>(() => {
+    const m = selectedCallout;
+    if (!m || !("Polyline" in m.geometry)) return null;
+    const target = m.geometry.Polyline[0];
+    if (!target) return null;
+    return pdfUserSpaceToScreen(target.x, target.y, viewState);
+  });
+
   // Search hit highlight rects for the current page in screen space.
   // Uses the same §5 pdfUserSpaceToScreen transform as markups so highlights
   // stay pixel-accurate at any zoom level.
@@ -949,6 +968,12 @@
     return null;
   }
 
+  /** True when (sx, sy) is within HANDLE_GRAB_PX of the selected Callout's target handle. */
+  function atCalloutTarget(sx: number, sy: number): boolean {
+    const h = calloutTargetHandle;
+    return !!h && Math.abs(h.x - sx) <= HANDLE_GRAB_PX && Math.abs(h.y - sy) <= HANDLE_GRAB_PX;
+  }
+
   /** The segment index (if any) whose midpoint handle is within HANDLE_GRAB_PX of (sx, sy). */
   function midpointAtScreen(sx: number, sy: number): number | null {
     if (!vertexHandles) return null;
@@ -974,6 +999,13 @@
 
   function onOverlayPointerDown(e: PointerEvent) {
     const tool = store.activeTool;
+
+    // Persist-on-click-outside: a pointer-down anywhere on the canvas commits an open
+    // text/callout editor BEFORE this gesture is handled. The textarea's onblur also commits,
+    // but the Text-tool branch below resets editorText (and reassigns editor) first, so relying
+    // on blur alone dropped the typed text — only a tool-switch committed it previously.
+    // commitEditor() captures the text now; it is a no-op (cancel) when the editor is empty.
+    if (editor) commitEditor();
 
     // --- SELECT tool branch ---
     if (isSelectTool(tool)) {
@@ -1039,6 +1071,19 @@
           e.preventDefault();
           return;
         }
+      }
+
+      // 1c. Callout target handle: drag the leader's pointing (arrow-head) end (index 0) only.
+      //     Routes through the existing vertex gesture so pointermove/up move + commit point 0.
+      if (selectedCallout && atCalloutTarget(sx, sy)) {
+        gesture = "vertex";
+        vertexBefore = selectedCallout;
+        vertexWorking = selectedCallout;
+        vertexIndex = 0;
+        (e.target as Element).setPointerCapture(e.pointerId);
+        e.stopPropagation();
+        e.preventDefault();
+        return;
       }
 
       // 2. Hit-test markups on this page (topmost wins).
@@ -1685,6 +1730,14 @@
           {/each}
         {/if}
       {:else if s.kind === "text"}
+        <!-- Box + glyphs are ONE unit (both derive from the markup's Rect). The box renders
+             BEHIND the text so the fill control is visible; `outline` is the box border (distinct
+             from the glyph colour `stroke`); `fill-opacity` is independent of overall opacity. -->
+        <rect x={s.x} y={s.y} width={s.width} height={s.height}
+          fill={s.fill} fill-opacity={s.fillOpacity}
+          stroke={s.outline} stroke-width={s.strokeWidth}
+          stroke-dasharray={s.dashArray ?? undefined}
+          opacity={s.opacity} pointer-events="none" />
         <text x={s.x} y={s.y} fill={s.stroke} font-size={s.fontPx}
           dominant-baseline="hanging" opacity={s.opacity}
           pointer-events="none">{s.text}</text>
@@ -1692,6 +1745,17 @@
         <polyline points={s.points} stroke={s.stroke} stroke-width={s.strokeWidth}
           fill="none" opacity={s.opacity} stroke-dasharray={s.dashArray ?? undefined}
           pointer-events="none" />
+        {#if s.arrowHead}
+          <!-- Arrowhead at the leader's pointing (target) end. Explicit polygon (WKWebView has
+               no fill="context-stroke"), filled with the leader colour; shaft stops at its base. -->
+          <polygon points={s.arrowHead} fill={s.stroke} stroke="none"
+            opacity={s.opacity} pointer-events="none" />
+        {/if}
+        <rect x={s.x} y={s.y} width={s.width} height={s.height}
+          fill={s.fill} fill-opacity={s.fillOpacity}
+          stroke={s.outline} stroke-width={s.strokeWidth}
+          stroke-dasharray={s.dashArray ?? undefined}
+          opacity={s.opacity} pointer-events="none" />
         <text x={s.x} y={s.y} fill={s.stroke} font-size={s.fontPx}
           dominant-baseline="hanging" opacity={s.opacity}
           pointer-events="none">{s.text}</text>
@@ -1746,6 +1810,18 @@
           pointer-events="none"
         />
       {/each}
+    {/if}
+
+    <!-- Draggable target (arrow-head) handle for a selected Callout. Dragging it moves ONLY the
+         leader's pointing end (index 0); the text box + anchor stay put. pointer-events:none —
+         hit-testing is mathematical (atCalloutTarget), like every other overlay handle. -->
+    {#if calloutTargetHandle}
+      <rect
+        class="vertex-handle"
+        x={calloutTargetHandle.x - 4} y={calloutTargetHandle.y - 4}
+        width={8} height={8}
+        pointer-events="none"
+      />
     {/if}
 
     <!-- Marquee drag preview. -->

@@ -148,6 +148,42 @@ describe("draft mode (no selection)", () => {
     expect(store.draftAppearance.line_weight).toBe(5);
     expect(store.canUndo).toBe(false);
   });
+
+  it("changing box outline colour updates draftAppearance.outline_color (distinct from color)", async () => {
+    const store = makeStore();
+    const { container } = await mountPanel(store);
+
+    const outlineInput = container.querySelector(
+      "input[type='color'][data-field='outline_color']"
+    ) as HTMLInputElement;
+    expect(outlineInput).toBeTruthy();
+
+    fireEvent.input(outlineInput, { target: { value: "#0000ff" } });
+    await tick();
+
+    expect(store.draftAppearance.outline_color).toBe("#0000ff");
+    // The glyph colour is untouched — outline is a separate field.
+    expect(store.draftAppearance.color).not.toBe("#0000ff");
+    expect(store.canUndo).toBe(false);
+  });
+
+  it("changing fill opacity updates draftAppearance.fill_opacity independently of opacity", async () => {
+    const store = makeStore();
+    const { container } = await mountPanel(store);
+
+    const fillOpacityInput = container.querySelector(
+      "input[type='range'][data-field='fill_opacity']"
+    ) as HTMLInputElement;
+    expect(fillOpacityInput).toBeTruthy();
+
+    fireEvent.input(fillOpacityInput, { target: { value: "0.3" } });
+    await tick();
+
+    expect(store.draftAppearance.fill_opacity).toBeCloseTo(0.3);
+    // Overall opacity is a different control — unchanged.
+    expect(store.draftAppearance.opacity).toBe(1);
+    expect(store.canUndo).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

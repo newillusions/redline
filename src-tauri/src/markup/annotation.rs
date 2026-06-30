@@ -368,6 +368,15 @@ impl Markup {
                 d.set("IC", Object::Array(rgb.iter().map(|v| real(*v)).collect()));
             }
         }
+        // Text/Callout box border colour + fill alpha — redline-private, so foreign viewers
+        // are unaffected (they keep /C as the annotation colour). Stored as the literal hex
+        // string + a real, mirroring the /RL* private-key pattern (spec §6).
+        if let Some(outline) = &self.appearance.outline_color {
+            d.set("RLOutlineColor", Object::string_literal(outline.clone()));
+        }
+        if let Some(fa) = self.appearance.fill_opacity {
+            d.set("RLFillOpacity", real(fa));
+        }
         let mut bs = Dictionary::new();
         bs.set("W", real(self.appearance.line_weight));
         bs.set(
@@ -552,6 +561,11 @@ impl Markup {
                         .unwrap_or_else(|| "Helvetica".to_string()),
                     size_pt,
                 }),
+                // Box border colour + fill alpha — absent on pre-outline / foreign
+                // annotations, which then deserialise to None (a sane default: border
+                // falls back to `color`, fill stays fully opaque).
+                outline_color: get_string(d, b"RLOutlineColor"),
+                fill_opacity: get_real(d, b"RLFillOpacity"),
             },
             subject: get_string(d, b"Subj"),
             layer: get_string(d, b"RLLayer"),
@@ -630,6 +644,8 @@ mod tests {
         m.appearance.opacity = 0.8;
         m.appearance.line_weight = 2.5;
         m.appearance.fill = Some("#ffeecc".into());
+        m.appearance.outline_color = Some("#112233".into());
+        m.appearance.fill_opacity = Some(0.4);
         m.workflow.status = MarkupStatus::Accepted;
         m.touch(user("Bob")); // revision 1, distinct modifier
         m.audit.created_at = Utc.with_ymd_and_hms(2026, 6, 8, 10, 30, 0).unwrap();
@@ -676,6 +692,14 @@ mod tests {
         assert_eq!(back.layer, m.layer);
         assert_eq!(back.appearance.color, m.appearance.color);
         assert_eq!(back.appearance.fill, m.appearance.fill);
+        assert_eq!(
+            back.appearance.outline_color, m.appearance.outline_color,
+            "outline_color"
+        );
+        match (back.appearance.fill_opacity, m.appearance.fill_opacity) {
+            (Some(b), Some(a)) => assert!((b - a).abs() < 0.01, "fill_opacity {b} != {a}"),
+            (b, a) => assert_eq!(b, a, "fill_opacity"),
+        }
         assert_eq!(back.appearance.line_style, m.appearance.line_style);
         assert!((back.appearance.opacity - m.appearance.opacity).abs() < 0.01);
         assert!((back.appearance.line_weight - m.appearance.line_weight).abs() < 0.01);
@@ -1073,5 +1097,55 @@ mod tests {
         let d = m.to_annotation_dict();
         assert!(!d.has(b"RLCountSetId"), "no /RLCountSetId without a set");
         assert!(Markup::from_annotation_dict(&d).count_set.is_none());
+    }
+
+    // --- Text-box outline colour + fill alpha round-trip ---
+
+    #[test]
+    fn text_box_outline_and_fill_opacity_emit_private_keys_and_round_trip() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 10.0, y: 20.0 },
+            max: PdfPoint { x: 160.0, y: 38.0 },
+        };
+        // fixture() already sets outline_color = "#112233" and fill_opacity = 0.4.
+        let mut m = fixture(g, MarkupType::Text);
+        m.appearance.font = Some(FontSpec {
+            family: "Helvetica".into(),
+            size_pt: 12.0,
+        });
+
+        let d = m.to_annotation_dict();
+        assert_eq!(
+            get_string(&d, b"RLOutlineColor").as_deref(),
+            Some("#112233"),
+            "/RLOutlineColor must carry the box border colour"
+        );
+        assert!(d.has(b"RLFillOpacity"), "/RLFillOpacity must be present");
+        // The text glyph colour stays on the standard /C key (unaffected by the outline).
+        assert!(d.has(b"C"), "glyph colour stays on /C");
+
+        assert_roundtrip(&m); // assert_roundtrip now also checks outline_color + fill_opacity
+    }
+
+    #[test]
+    fn markup_without_outline_or_fill_opacity_omits_keys_and_defaults_to_none() {
+        // A plain markup with neither field set must not emit the private keys, and a
+        // foreign annotation lacking them imports with both as None (sane default).
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 0.0, y: 0.0 },
+            max: PdfPoint { x: 10.0, y: 10.0 },
+        };
+        let mut m = Markup::new(MarkupType::Text, 0, g, Appearance::default(), user("Alice"));
+        m.contents = Some("plain".into());
+        assert!(m.appearance.outline_color.is_none());
+        assert!(m.appearance.fill_opacity.is_none());
+
+        let d = m.to_annotation_dict();
+        assert!(!d.has(b"RLOutlineColor"), "no /RLOutlineColor when unset");
+        assert!(!d.has(b"RLFillOpacity"), "no /RLFillOpacity when unset");
+
+        let back = Markup::from_annotation_dict(&d);
+        assert!(back.appearance.outline_color.is_none());
+        assert!(back.appearance.fill_opacity.is_none());
     }
 }
