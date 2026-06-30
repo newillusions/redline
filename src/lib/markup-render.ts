@@ -5,7 +5,7 @@
  *
  * line_weight is in PDF points; it is scaled by zoom so a 2pt line looks 2pt at any zoom.
  */
-import type { Markup, MarkupType } from "./ipc";
+import type { Markup, MarkupType, PdfPoint } from "./ipc";
 import { pdfUserSpaceToScreen, type ViewportState } from "./viewport";
 import { type Bounds, type HandleId, HANDLE_IDS, handleAnchors } from "./markup-select";
 
@@ -42,6 +42,11 @@ const CLOSED_TYPES: ReadonlySet<MarkupType> = new Set<MarkupType>([
   "Polygon", "Cloud", "MeasurementArea", "MeasurementPerimeter", "MeasurementVolume",
 ]);
 
+/** True for markup types whose Polyline geometry forms a closed loop (last → first). */
+export function isClosedMarkupType(t: MarkupType): boolean {
+  return CLOSED_TYPES.has(t);
+}
+
 function dashFor(style: string, w: number): string | undefined {
   if (style === "Dashed") return `${w * 3},${w * 2}`;
   if (style === "Dotted") return `${w},${w * 2}`;
@@ -66,6 +71,18 @@ function styleOf(m: Markup, v: ViewportState): SvgStyle {
  */
 export function cloudPath(pts: { x: number; y: number }[], r: number): string {
   if (pts.length < 2) return "";
+  // Choose the SVG arc sweep flag from the polygon winding so the scallops always bulge to
+  // the EXTERIOR regardless of draw direction. The incoming points are screen space (y-DOWN
+  // via pdfUserSpaceToScreen), so the shoelace sign is inverted vs. the y-up convention:
+  // a clockwise-on-screen loop has POSITIVE signed area. sweep=1 (clockwise arc) bulges to
+  // the exterior of a clockwise loop; for a counter-clockwise loop we flip to sweep=0.
+  // (Bug: the flag was hardcoded to 1, so CCW-drawn clouds bulged inward.)
+  let area2 = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length];
+    area2 += a.x * b.y - b.x * a.y;
+  }
+  const sweep = area2 > 0 ? 1 : 0;
   const loop = [...pts, pts[0]];
   let d = `M ${pts[0].x.toFixed(2)} ${pts[0].y.toFixed(2)}`;
   for (let i = 0; i < loop.length - 1; i++) {
@@ -78,7 +95,7 @@ export function cloudPath(pts: { x: number; y: number }[], r: number): string {
     for (let j = 0; j < bumps; j++) {
       const nx = cx + ux * step, ny = cy + uy * step;
       const rad = (step / 2).toFixed(2);
-      d += ` A ${rad} ${rad} 0 0 1 ${nx.toFixed(2)} ${ny.toFixed(2)}`;
+      d += ` A ${rad} ${rad} 0 0 ${sweep} ${nx.toFixed(2)} ${ny.toFixed(2)}`;
       cx = nx; cy = ny;
     }
   }
@@ -199,6 +216,49 @@ export function selectionChrome(b: Bounds, v: ViewportState, showHandles: boolea
   }
 
   return { box, handles };
+}
+
+// ---------------------------------------------------------------------------
+// VertexChrome — screen-space per-vertex editing handles for multipoint markups
+// ---------------------------------------------------------------------------
+
+/** A draggable vertex handle (one per Polyline point), in screen pixels. */
+export interface VertexHandle {
+  /** Index into the markup's Polyline points. */
+  index: number;
+  x: number;
+  y: number;
+}
+
+/** A midpoint "insert" handle, sitting at the centre of segment `segmentIndex`. */
+export interface MidpointHandle {
+  /** The segment (vertex segmentIndex → segmentIndex+1) this midpoint splits. */
+  segmentIndex: number;
+  x: number;
+  y: number;
+}
+
+export interface VertexChrome {
+  vertices: VertexHandle[];
+  midpoints: MidpointHandle[];
+}
+
+/**
+ * Map a multipoint markup's PDF-space vertices to screen-space editing handles:
+ * one handle per vertex plus one midpoint handle per segment (for inserting a new
+ * vertex). For a closed shape the loop includes the closing segment (last → first).
+ */
+export function vertexChrome(pts: PdfPoint[], v: ViewportState, closed: boolean): VertexChrome {
+  const screen = pts.map((p) => pdfUserSpaceToScreen(p.x, p.y, v));
+  const vertices: VertexHandle[] = screen.map((s, i) => ({ index: i, x: s.x, y: s.y }));
+  const midpoints: MidpointHandle[] = [];
+  const segCount = closed ? screen.length : screen.length - 1;
+  for (let i = 0; i < segCount; i++) {
+    const a = screen[i];
+    const b = screen[(i + 1) % screen.length];
+    midpoints.push({ segmentIndex: i, x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+  }
+  return { vertices, midpoints };
 }
 
 export function markupToSvg(m: Markup, v: ViewportState): SvgShape {

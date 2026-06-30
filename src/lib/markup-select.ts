@@ -209,6 +209,55 @@ export function translateGeometry(g: MarkupGeometry, dx: number, dy: number): Ma
 }
 
 // ---------------------------------------------------------------------------
+// Per-vertex editing (multipoint markups: Polyline/Polygon/Cloud/Arrow/Measurement)
+// ---------------------------------------------------------------------------
+
+/**
+ * Return a new geometry with the vertex at `index` replaced by `newPoint`. Only
+ * Polyline geometry has movable vertices; any other geometry (or an out-of-range
+ * index) is returned unchanged. Never mutates the input.
+ */
+export function moveVertex(g: MarkupGeometry, index: number, newPoint: PdfPoint): MarkupGeometry {
+  if (!("Polyline" in g)) return g;
+  if (index < 0 || index >= g.Polyline.length) return g;
+  return {
+    Polyline: g.Polyline.map((p, i) =>
+      i === index ? { x: newPoint.x, y: newPoint.y } : { x: p.x, y: p.y },
+    ),
+  };
+}
+
+/**
+ * Insert `point` into a Polyline as a new vertex on segment `segmentIndex` (the
+ * segment from vertex `segmentIndex` to `segmentIndex + 1`). The new vertex lands
+ * at index `segmentIndex + 1`. For a closed shape, `segmentIndex === length - 1`
+ * is the closing segment (last → first); the point is appended. Non-Polyline
+ * geometry or an out-of-range segment is returned unchanged. Never mutates input.
+ */
+export function insertVertex(g: MarkupGeometry, segmentIndex: number, point: PdfPoint): MarkupGeometry {
+  if (!("Polyline" in g)) return g;
+  const pts = g.Polyline;
+  if (segmentIndex < 0 || segmentIndex >= pts.length) return g;
+  const copy = pts.map((p) => ({ x: p.x, y: p.y }));
+  copy.splice(segmentIndex + 1, 0, { x: point.x, y: point.y });
+  return { Polyline: copy };
+}
+
+/**
+ * Remove the vertex at `index` from a Polyline, unless doing so would drop the
+ * point count below `minPoints` (the floor: 2 for open lines/arrows, 3 for closed
+ * polygons/clouds). At or below the floor this is a no-op. Non-Polyline geometry or
+ * an out-of-range index is returned unchanged. Never mutates input.
+ */
+export function deleteVertex(g: MarkupGeometry, index: number, minPoints: number): MarkupGeometry {
+  if (!("Polyline" in g)) return g;
+  const pts = g.Polyline;
+  if (pts.length <= minPoints) return g;
+  if (index < 0 || index >= pts.length) return g;
+  return { Polyline: pts.filter((_, i) => i !== index).map((p) => ({ x: p.x, y: p.y })) };
+}
+
+// ---------------------------------------------------------------------------
 // scaleGeometryToBounds
 // ---------------------------------------------------------------------------
 

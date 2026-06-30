@@ -315,4 +315,33 @@ describe("cloud rendering", () => {
     expect(typeof s.path).toBe("string");
     expect(s.path.length).toBeGreaterThan(0);
   });
+
+  // The sweep flag must follow the winding so scallops bulge OUTWARD regardless of draw
+  // direction. cloudPath receives SCREEN-space (y-DOWN) points; a clockwise-on-screen loop
+  // (positive shoelace) → sweep 1, counter-clockwise → sweep 0.
+  const sweepFlags = (d: string): number[] =>
+    [...d.matchAll(/A [\d.]+ [\d.]+ 0 0 (\d)/g)].map((m) => Number(m[1]));
+
+  it("a clockwise-on-screen triangle uses sweep flag 1 (outward bulge)", () => {
+    // (0,0)→(10,0)→(10,10) closed: shoelace = +100 → clockwise on screen.
+    const d = cloudPath([{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }], 3);
+    const flags = sweepFlags(d);
+    expect(flags.length).toBeGreaterThan(0);
+    expect(flags.every((f) => f === 1)).toBe(true);
+  });
+
+  it("the same triangle wound counter-clockwise flips to sweep flag 0 (still outward)", () => {
+    // Reversed winding: shoelace = -100 → counter-clockwise on screen.
+    const d = cloudPath([{ x: 0, y: 0 }, { x: 10, y: 10 }, { x: 10, y: 0 }], 3);
+    const flags = sweepFlags(d);
+    expect(flags.length).toBeGreaterThan(0);
+    expect(flags.every((f) => f === 0)).toBe(true);
+  });
+
+  it("CW and CCW windings of the same polygon choose opposite sweep flags", () => {
+    const cw = sweepFlags(cloudPath([{ x: 0, y: 0 }, { x: 20, y: 0 }, { x: 20, y: 20 }, { x: 0, y: 20 }], 4));
+    const ccw = sweepFlags(cloudPath([{ x: 0, y: 20 }, { x: 20, y: 20 }, { x: 20, y: 0 }, { x: 0, y: 0 }], 4));
+    expect(cw.every((f) => f === 1)).toBe(true);
+    expect(ccw.every((f) => f === 0)).toBe(true);
+  });
 });

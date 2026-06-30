@@ -13,10 +13,13 @@ import {
   handleAnchors,
   resizeBounds,
   expandSelectionToGroups,
+  moveVertex,
+  insertVertex,
+  deleteVertex,
   HANDLE_IDS,
 } from "./markup-select";
 import type { Bounds, HandleId } from "./markup-select";
-import type { Markup, Appearance, UserRef } from "./ipc";
+import type { Markup, MarkupGeometry, Appearance, UserRef } from "./ipc";
 
 // ---------------------------------------------------------------------------
 // Minimal fixtures
@@ -391,5 +394,120 @@ describe("expandSelectionToGroups", () => {
     const original = new Set(["m1"]);
     expandSelectionToGroups(allMarkups, original);
     expect(original.size).toBe(1); // unchanged
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-vertex editing: moveVertex / insertVertex / deleteVertex
+// ---------------------------------------------------------------------------
+
+const poly = (pts: { x: number; y: number }[]): MarkupGeometry => ({ Polyline: pts });
+
+describe("moveVertex", () => {
+  const g = poly([{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }]);
+
+  it("moves an interior vertex, leaving the others unchanged", () => {
+    const out = moveVertex(g, 1, { x: 99, y: 88 });
+    const pts = (out as { Polyline: { x: number; y: number }[] }).Polyline;
+    expect(pts[1]).toEqual({ x: 99, y: 88 });
+    expect(pts[0]).toEqual({ x: 0, y: 0 });
+    expect(pts[2]).toEqual({ x: 10, y: 10 });
+    expect(pts[3]).toEqual({ x: 0, y: 10 });
+  });
+
+  it("moves the first vertex", () => {
+    const pts = (moveVertex(g, 0, { x: -5, y: -5 }) as { Polyline: { x: number; y: number }[] }).Polyline;
+    expect(pts[0]).toEqual({ x: -5, y: -5 });
+    expect(pts[1]).toEqual({ x: 10, y: 0 });
+  });
+
+  it("moves the last vertex", () => {
+    const pts = (moveVertex(g, 3, { x: 7, y: 7 }) as { Polyline: { x: number; y: number }[] }).Polyline;
+    expect(pts[3]).toEqual({ x: 7, y: 7 });
+    expect(pts[2]).toEqual({ x: 10, y: 10 });
+  });
+
+  it("does not mutate the input geometry", () => {
+    const before = JSON.stringify(g);
+    moveVertex(g, 1, { x: 1, y: 1 });
+    expect(JSON.stringify(g)).toBe(before);
+  });
+
+  it("out-of-range index is a no-op (returns equivalent geometry)", () => {
+    expect(moveVertex(g, 9, { x: 1, y: 1 })).toEqual(g);
+    expect(moveVertex(g, -1, { x: 1, y: 1 })).toEqual(g);
+  });
+
+  it("non-Polyline geometry is returned unchanged", () => {
+    const rect: MarkupGeometry = { Rect: { min: { x: 0, y: 0 }, max: { x: 1, y: 1 } } };
+    expect(moveVertex(rect, 0, { x: 9, y: 9 })).toBe(rect);
+  });
+});
+
+describe("insertVertex", () => {
+  const g = poly([{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }]);
+
+  it("inserts a vertex into the middle of a segment at index segmentIndex+1", () => {
+    const pts = (insertVertex(g, 0, { x: 5, y: 0 }) as { Polyline: { x: number; y: number }[] }).Polyline;
+    expect(pts).toHaveLength(4);
+    expect(pts[0]).toEqual({ x: 0, y: 0 });
+    expect(pts[1]).toEqual({ x: 5, y: 0 }); // new vertex lands at index 1
+    expect(pts[2]).toEqual({ x: 10, y: 0 });
+  });
+
+  it("inserting on the last segment (closing segment) appends the point", () => {
+    const pts = (insertVertex(g, 2, { x: 5, y: 5 }) as { Polyline: { x: number; y: number }[] }).Polyline;
+    expect(pts).toHaveLength(4);
+    expect(pts[3]).toEqual({ x: 5, y: 5 });
+  });
+
+  it("out-of-range segment is a no-op", () => {
+    expect(insertVertex(g, 5, { x: 1, y: 1 })).toEqual(g);
+    expect(insertVertex(g, -1, { x: 1, y: 1 })).toEqual(g);
+  });
+
+  it("does not mutate the input geometry", () => {
+    const before = JSON.stringify(g);
+    insertVertex(g, 0, { x: 5, y: 0 });
+    expect(JSON.stringify(g)).toBe(before);
+  });
+});
+
+describe("deleteVertex", () => {
+  it("removes an interior vertex above the floor", () => {
+    const g = poly([{ x: 0, y: 0 }, { x: 5, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }]);
+    const pts = (deleteVertex(g, 1, 2) as { Polyline: { x: number; y: number }[] }).Polyline;
+    expect(pts).toHaveLength(3);
+    expect(pts[0]).toEqual({ x: 0, y: 0 });
+    expect(pts[1]).toEqual({ x: 10, y: 0 });
+  });
+
+  it("removes the first and last vertices", () => {
+    const g = poly([{ x: 0, y: 0 }, { x: 5, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }]);
+    expect((deleteVertex(g, 0, 2) as { Polyline: unknown[] }).Polyline).toHaveLength(3);
+    expect((deleteVertex(g, 3, 2) as { Polyline: unknown[] }).Polyline).toHaveLength(3);
+  });
+
+  it("no-ops at the open-line floor (≥2)", () => {
+    const g = poly([{ x: 0, y: 0 }, { x: 10, y: 0 }]);
+    expect(deleteVertex(g, 0, 2)).toEqual(g); // already at the floor → unchanged
+  });
+
+  it("no-ops at the closed-polygon floor (≥3)", () => {
+    const g = poly([{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 5, y: 10 }]);
+    expect(deleteVertex(g, 1, 3)).toEqual(g); // already at the floor → unchanged
+  });
+
+  it("allows deletion down to (but not below) the floor", () => {
+    const g = poly([{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 5, y: 10 }]);
+    const pts = (deleteVertex(g, 2, 2) as { Polyline: unknown[] }).Polyline; // 3 → 2, floor 2 ok
+    expect(pts).toHaveLength(2);
+  });
+
+  it("does not mutate the input geometry", () => {
+    const g = poly([{ x: 0, y: 0 }, { x: 5, y: 0 }, { x: 10, y: 0 }]);
+    const before = JSON.stringify(g);
+    deleteVertex(g, 1, 2);
+    expect(JSON.stringify(g)).toBe(before);
   });
 });

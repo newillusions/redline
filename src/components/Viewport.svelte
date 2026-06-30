@@ -36,12 +36,15 @@
     type ViewportState,
     type ViewportSnapshot,
   } from "$lib/viewport";
-  import { markupToSvg, selectionChrome, type SvgShape, type SelectionChrome } from "$lib/markup-render";
+  import {
+    markupToSvg, selectionChrome, vertexChrome, isClosedMarkupType,
+    type SvgShape, type SelectionChrome, type VertexChrome,
+  } from "$lib/markup-render";
   import { MarkupStore } from "$lib/markup-store.svelte";
   import {
     hitTest, marqueeHits, boundsOf, isRectResizable,
     handleAnchors, resizeBounds, translateGeometry, scaleGeometryToBounds,
-    expandSelectionToGroups,
+    expandSelectionToGroups, moveVertex, insertVertex, deleteVertex,
     type Bounds, type HandleId,
   } from "$lib/markup-select";
   import {
@@ -189,7 +192,7 @@
   /** Grab radius (screen px) around a handle centre. */
   const HANDLE_GRAB_PX = 8;
   /** Active transform gesture on the selection. */
-  let gesture: "none" | "move" | "resize" = "none";
+  let gesture: "none" | "move" | "resize" | "vertex" = "none";
   let moveStartPdf: { x: number; y: number } | null = null;
   let moveOrigins: Markup[] = [];               // committed selected markups at gesture start
   let resizeHandle: HandleId | null = null;
@@ -197,6 +200,17 @@
   let resizeOrigBounds: Bounds | null = null;
   /** Live transformed clones rendered in place of the committed markups during a drag. */
   let dragPreview = $state<Markup[] | null>(null);
+
+  // --- Per-vertex editing gesture state (single multipoint markup) ---
+  /** The committed markup the vertex edit will undo back to (the `before` of the commit). */
+  let vertexBefore: Markup | null = null;
+  /** The markup whose vertex is being dragged. For an insert this carries the freshly
+   *  inserted vertex; for a plain drag it equals vertexBefore. */
+  let vertexWorking: Markup | null = null;
+  /** Index (into the working markup's Polyline) of the vertex being dragged. */
+  let vertexIndex: number | null = null;
+  /** Vertex eligible for keyboard delete (Delete/Backspace) — set when a vertex is engaged. */
+  let activeVertex = $state<number | null>(null);
 
   /** True when any creation tool is active (all tools except hand/select). */
   const isCreateTool = (t = store.activeTool) =>
@@ -287,6 +301,26 @@
   const chrome = $derived<SelectionChrome | null>(
     selectionBounds ? selectionChrome(selectionBounds, viewState, showHandles) : null,
   );
+
+  // The single selected multipoint markup (Polyline geometry, vertex-editable). Tracks the
+  // live dragPreview so handles follow a vertex drag. Callout's leader Polyline is excluded
+  // (its 2-point geometry is a leader, not an editable path). null when not exactly one such.
+  const singleMultipoint = $derived.by<Markup | null>(() => {
+    const src = dragPreview ?? selectedOnPage;
+    if (src.length !== 1) return null;
+    const m = src[0];
+    return "Polyline" in m.geometry && m.markup_type !== "Callout" ? m : null;
+  });
+
+  // Screen-space per-vertex + midpoint handles for the single multipoint markup.
+  const vertexHandles = $derived.by<VertexChrome | null>(() => {
+    const m = singleMultipoint;
+    if (!m || !("Polyline" in m.geometry)) return null;
+    return vertexChrome(m.geometry.Polyline, viewState, isClosedMarkupType(m.markup_type));
+  });
+
+  /** Min point-count floor for vertex deletion (closed shapes keep ≥3, open keep ≥2). */
+  const vertexFloor = (m: Markup): number => (isClosedMarkupType(m.markup_type) ? 3 : 2);
 
   // Search hit highlight rects for the current page in screen space.
   // Uses the same §5 pdfUserSpaceToScreen transform as markups so highlights
@@ -559,12 +593,29 @@
       if (e.key === "ArrowLeft")  { e.preventDefault(); prevPage(); return; }
       if (e.key === "ArrowRight") { e.preventDefault(); nextPage(); return; }
     }
-    // Don't fire multi-click Escape when the text editor is open — the textarea
-    // handles it itself via its own onkeydown.
+    // Don't fire the shortcuts below when the text editor is open — the textarea
+    // handles its own keys (typing must not be hijacked).
     if (editor) return;
-    // Delete / Backspace removes the current selection (one undo frame).
+    // V — jump straight to the select / pointer tool (no modifier; Cmd/Ctrl+V is paste).
+    if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === "v" || e.key === "V")) {
+      e.preventDefault();
+      store.activeTool = "select";
+      return;
+    }
+    // Delete / Backspace: remove the active vertex of a single multipoint markup if one is
+    // engaged; otherwise remove the whole selection (one undo frame).
     if ((e.key === "Delete" || e.key === "Backspace") && store.selectedIds.size > 0) {
       e.preventDefault();
+      const mp = singleMultipoint;
+      if (mp && activeVertex !== null) {
+        const after = deleteVertex(mp.geometry, activeVertex, vertexFloor(mp));
+        if (JSON.stringify(after) !== JSON.stringify(mp.geometry)) {
+          const now = new Date().toISOString();
+          store.applyBatch([{ before: mp, after: bumpAudit({ ...mp, geometry: after }, identity ?? mp.audit.modified_by, now) }]);
+        }
+        activeVertex = null; // index may have shifted; require re-selecting a vertex
+        return;
+      }
       store.deleteSelected();
       return;
     }
@@ -625,11 +676,14 @@
       resetMultiClick();
       cancelDraw();
       store.selectedIds = new Set();
+      activeVertex = null;
       // Cancel in-progress calibration.
       if (takeoffStore.calibrationState) {
         takeoffStore.cancelCalibration();
         showCalibDialog = false;
       }
+      // After cancelling any in-progress gesture, fall back to the select / pointer tool.
+      store.activeTool = "select";
     }
   }
 
@@ -866,9 +920,10 @@
     // dependencies of this $effect (they're read inside commitEditor). Without it, the
     // effect re-runs when e.g. identity loads and would prematurely cancel a just-opened editor.
     untrack(() => commitEditor());
-    // Clear marquee + move/resize transient state on any tool switch.
+    // Clear marquee + move/resize/vertex transient state on any tool switch.
     marquee = null;
     marqueeAdditive = false;
+    activeVertex = null;
     resetGesture();
     // Clear selection when switching AWAY from the select tool.
     if (!isSelectTool(tool)) {
@@ -885,7 +940,25 @@
     return null;
   }
 
-  /** Clear all move/resize transient state (does not touch the committed selection). */
+  /** The vertex index (if any) whose screen handle is within HANDLE_GRAB_PX of (sx, sy). */
+  function vertexAtScreen(sx: number, sy: number): number | null {
+    if (!vertexHandles) return null;
+    for (const v of vertexHandles.vertices) {
+      if (Math.abs(v.x - sx) <= HANDLE_GRAB_PX && Math.abs(v.y - sy) <= HANDLE_GRAB_PX) return v.index;
+    }
+    return null;
+  }
+
+  /** The segment index (if any) whose midpoint handle is within HANDLE_GRAB_PX of (sx, sy). */
+  function midpointAtScreen(sx: number, sy: number): number | null {
+    if (!vertexHandles) return null;
+    for (const mp of vertexHandles.midpoints) {
+      if (Math.abs(mp.x - sx) <= HANDLE_GRAB_PX && Math.abs(mp.y - sy) <= HANDLE_GRAB_PX) return mp.segmentIndex;
+    }
+    return null;
+  }
+
+  /** Clear all move/resize/vertex transient state (does not touch the committed selection). */
   function resetGesture() {
     gesture = "none";
     moveStartPdf = null;
@@ -893,6 +966,9 @@
     resizeHandle = null;
     resizeOrig = null;
     resizeOrigBounds = null;
+    vertexBefore = null;
+    vertexWorking = null;
+    vertexIndex = null;
     dragPreview = null;
   }
 
@@ -907,6 +983,9 @@
       const sx = r ? e.clientX - r.left : e.clientX;
       const sy = r ? e.clientY - r.top : e.clientY;
 
+      // Any select pointerdown clears the keyboard-delete vertex unless a vertex is engaged below.
+      activeVertex = null;
+
       // 1. Resize: pointerdown on a handle of a single resizable selection.
       const handle = showHandles ? handleAtScreen(sx, sy) : null;
       if (handle && selectedOnPage.length === 1) {
@@ -918,6 +997,48 @@
         e.stopPropagation();
         e.preventDefault();
         return;
+      }
+
+      // 1b. Vertex editing: when a single multipoint markup is selected, its vertex and
+      //     midpoint handles take priority over markup hit-testing.
+      const mp = singleMultipoint;
+      if (mp) {
+        const vi = vertexAtScreen(sx, sy);
+        if (vi !== null) {
+          if (e.altKey) {
+            // Alt-click deletes the vertex (no-op at the min-points floor).
+            const after = deleteVertex(mp.geometry, vi, vertexFloor(mp));
+            if (JSON.stringify(after) !== JSON.stringify(mp.geometry)) {
+              const now = new Date().toISOString();
+              store.applyBatch([{ before: mp, after: bumpAudit({ ...mp, geometry: after }, identity ?? mp.audit.modified_by, now) }]);
+            }
+          } else {
+            // Begin dragging this existing vertex.
+            gesture = "vertex";
+            vertexBefore = mp;
+            vertexWorking = mp;
+            vertexIndex = vi;
+            activeVertex = vi;
+            (e.target as Element).setPointerCapture(e.pointerId);
+          }
+          e.stopPropagation();
+          e.preventDefault();
+          return;
+        }
+        const seg = midpointAtScreen(sx, sy);
+        if (seg !== null) {
+          // Insert a new vertex on this segment, then drag it (one undo frame on release).
+          gesture = "vertex";
+          vertexBefore = mp;
+          vertexWorking = { ...mp, geometry: insertVertex(mp.geometry, seg, p) };
+          vertexIndex = seg + 1;
+          activeVertex = seg + 1;
+          dragPreview = [vertexWorking];
+          (e.target as Element).setPointerCapture(e.pointerId);
+          e.stopPropagation();
+          e.preventDefault();
+          return;
+        }
       }
 
       // 2. Hit-test markups on this page (topmost wins).
@@ -1001,8 +1122,15 @@
   function onOverlayPointerMove(e: PointerEvent) {
     const tool = store.activeTool;
 
-    // --- SELECT tool: live resize / move preview, or marquee ---
+    // --- SELECT tool: live resize / move / vertex preview, or marquee ---
     if (isSelectTool(tool)) {
+      if (gesture === "vertex" && vertexWorking && vertexIndex !== null) {
+        const p = localPdf(e);
+        if (p) {
+          dragPreview = [{ ...vertexWorking, geometry: moveVertex(vertexWorking.geometry, vertexIndex, p) }];
+        }
+        return;
+      }
       if (gesture === "resize" && resizeOrig && resizeHandle && resizeOrigBounds) {
         const p = localPdf(e);
         if (p) {
@@ -1071,9 +1199,24 @@
     previewMarkup = null; // clear the live preview unconditionally (no ghost on early-return)
     const tool = store.activeTool;
 
-    // --- SELECT tool: commit resize / move / marquee ---
+    // --- SELECT tool: commit resize / move / vertex / marquee ---
     if (isSelectTool(tool)) {
       const now = new Date().toISOString();
+
+      if (gesture === "vertex" && vertexWorking && vertexIndex !== null && vertexBefore) {
+        const before = vertexBefore, working = vertexWorking, idx = vertexIndex;
+        const p = localPdf(e);
+        resetGesture();
+        if (p) {
+          const after = moveVertex(working.geometry, idx, p);
+          // Commit when the geometry actually changed vs. the original committed markup —
+          // covers both a vertex drag and a midpoint insert released without a drag.
+          if (JSON.stringify(after) !== JSON.stringify(before.geometry)) {
+            store.applyBatch([{ before, after: bumpAudit({ ...before, geometry: after }, identity ?? before.audit.modified_by, now) }]);
+          }
+        }
+        return;
+      }
 
       if (gesture === "resize" && resizeOrig && resizeHandle && resizeOrigBounds) {
         const orig = resizeOrig, handle = resizeHandle, ob = resizeOrigBounds;
@@ -1557,6 +1700,30 @@
       {/each}
     {/if}
 
+    <!-- Per-vertex editing handles for a single selected multipoint markup.
+         Midpoints (insert a vertex) render under the vertices (drag/delete a vertex).
+         Hit-testing is mathematical (vertexAtScreen/midpointAtScreen), so these carry
+         pointer-events:none like every other overlay shape. -->
+    {#if vertexHandles}
+      {#each vertexHandles.midpoints as mp (mp.segmentIndex)}
+        <rect
+          class="midpoint-handle"
+          x={mp.x - 3} y={mp.y - 3}
+          width={6} height={6}
+          pointer-events="none"
+        />
+      {/each}
+      {#each vertexHandles.vertices as v (v.index)}
+        <rect
+          class="vertex-handle"
+          class:vertex-handle-active={v.index === activeVertex}
+          x={v.x - 4} y={v.y - 4}
+          width={8} height={8}
+          pointer-events="none"
+        />
+      {/each}
+    {/if}
+
     <!-- Marquee drag preview. -->
     {#if marquee}
       <rect
@@ -1737,6 +1904,25 @@
     stroke: var(--color-primary);
     stroke-width: 1.5px;
     opacity: 1;
+  }
+
+  /* Per-vertex editing handles (square, filled — one per Polyline point). */
+  :global(.markup-overlay .vertex-handle) {
+    fill: var(--color-bg, #fff);
+    stroke: var(--color-primary);
+    stroke-width: 1.5px;
+    opacity: 1;
+  }
+  /* The vertex armed for keyboard delete is filled with the accent colour. */
+  :global(.markup-overlay .vertex-handle-active) {
+    fill: var(--color-primary);
+  }
+  /* Midpoint "insert here" handles — smaller, semi-transparent accent squares. */
+  :global(.markup-overlay .midpoint-handle) {
+    fill: var(--color-primary);
+    fill-opacity: 0.4;
+    stroke: var(--color-primary);
+    stroke-width: 1px;
   }
 
   /* Marquee drag preview (dashed, no fill). */

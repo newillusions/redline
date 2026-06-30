@@ -1870,3 +1870,257 @@ describe("Viewport G8 grouping", () => {
     expect(mB2.group_id).toBe(GID);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Per-vertex editing (move / insert / delete points on multipoint markups)
+// ---------------------------------------------------------------------------
+
+/**
+ * Coordinate reference (zoom=1, scroll=0, page=200×200, container=200×200 at 0,0):
+ *   pdfUserSpaceToScreen(px, py) -> screen(px, 200 - py)
+ *   screenToPdfUserSpace(sx, sy) -> PDF(sx, 200 - sy)
+ */
+describe("Viewport vertex editing", () => {
+  let ipc: ReturnType<typeof fakeIpc>;
+  let store: MarkupStore;
+
+  const DEFAULT_APP = {
+    color: "#e02424", line_weight: 2, opacity: 1, fill: null, line_style: "Solid" as const, font: null,
+  };
+
+  // Seed a Polyline markup with the given PDF points.
+  function seedPoly(s: MarkupStore, id: string, pts: { x: number; y: number }[], type: "Polyline" | "Polygon" = "Polyline") {
+    s.markups.push(buildMarkup({
+      markupType: type, page: 0, geometry: { Polyline: pts.map((p) => ({ ...p })) },
+      appearance: DEFAULT_APP, identity: FAKE_IDENTITY, now: "2026-01-01T00:00:00Z", id,
+    }));
+  }
+  const polyOf = (m: { geometry: unknown }) => (m.geometry as { Polyline: { x: number; y: number }[] }).Polyline;
+
+  /** Fire a PointerEvent with altKey set. */
+  function altPtr(target: Element, type: string, x: number, y: number) {
+    fireEvent(target, new PointerEvent(type, {
+      bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 1, altKey: true,
+    }));
+  }
+
+  beforeEach(() => {
+    vi.mocked(ipcMocks.getPageSize).mockResolvedValue(FAKE_PAGE_SIZE);
+    vi.mocked(ipcMocks.renderTile).mockResolvedValue({
+      doc_id: "d1", page_index: 0, tile_x: 0, tile_y: 0,
+      width_px: 512, height_px: 512, zoom: 1, dpr: 1, png_base64: "", render_ms: 1,
+    });
+    vi.mocked(ipcMocks.processRssMb).mockResolvedValue(0);
+    vi.mocked(ipcMocks.getUserIdentity).mockResolvedValue(FAKE_IDENTITY);
+    ipc = fakeIpc();
+    store = new MarkupStore("d1", ipc);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // -------------------------------------------------------------------------
+  // VE0: single multipoint selection renders per-vertex handles
+  // -------------------------------------------------------------------------
+  it("VE0: selecting a single Polyline renders one vertex handle per point", async () => {
+    const { container } = await mountViewport(store);
+    // P0(40,160)->(40,40)  P1(100,160)->(100,40)  P2(160,100)->(160,100)
+    seedPoly(store, "poly", [{ x: 40, y: 160 }, { x: 100, y: 160 }, { x: 160, y: 100 }]);
+    store.activeTool = "select";
+    store.selectedIds = new Set(["poly"]);
+    await tick();
+
+    const vh = container.querySelectorAll("svg.markup-overlay .vertex-handle");
+    expect(vh.length).toBe(3);
+    // 2 segments on an open polyline -> 2 midpoint handles.
+    const mh = container.querySelectorAll("svg.markup-overlay .midpoint-handle");
+    expect(mh.length).toBe(2);
+    // A Rect selection (8 bbox handles) must NOT appear for a multipoint markup.
+    expect(container.querySelectorAll("svg.markup-overlay .selection-handle").length).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // VE1: drag one vertex moves only that point, undoable
+  // -------------------------------------------------------------------------
+  it("VE1: dragging a vertex moves only that point and mirrors one ipc.update", async () => {
+    const { overlay } = await mountViewport(store);
+    seedPoly(store, "poly", [{ x: 40, y: 160 }, { x: 100, y: 160 }, { x: 160, y: 100 }]);
+    store.activeTool = "select";
+    store.selectedIds = new Set(["poly"]);
+    await tick();
+
+    // Drag P1 from screen(100,40) to screen(120,60) -> PDF(120,140).
+    ptr(overlay, "pointerdown", 100, 40);
+    ptr(overlay, "pointermove", 120, 60);
+    ptr(overlay, "pointerup", 120, 60);
+    await tick();
+
+    const pts = polyOf(store.markups[0]);
+    expect(pts).toHaveLength(3);
+    expect(pts[0]).toEqual({ x: 40, y: 160 });   // unchanged
+    expect(pts[1].x).toBeCloseTo(120);            // moved
+    expect(pts[1].y).toBeCloseTo(140);
+    expect(pts[2]).toEqual({ x: 160, y: 100 });   // unchanged
+
+    await waitFor(() => expect(ipc.update).toHaveBeenCalledTimes(1));
+
+    store.undo();
+    expect(polyOf(store.markups[0])[1]).toEqual({ x: 100, y: 160 });
+  });
+
+  // -------------------------------------------------------------------------
+  // VE2: clicking a midpoint inserts a new vertex on that segment
+  // -------------------------------------------------------------------------
+  it("VE2: clicking a midpoint inserts a vertex at segmentIndex+1", async () => {
+    const { overlay } = await mountViewport(store);
+    seedPoly(store, "poly", [{ x: 40, y: 160 }, { x: 100, y: 160 }, { x: 160, y: 100 }]);
+    store.activeTool = "select";
+    store.selectedIds = new Set(["poly"]);
+    await tick();
+
+    // Midpoint of segment 0 (P0-P1) is screen(70,40) -> PDF(70,160).
+    ptr(overlay, "pointerdown", 70, 40);
+    ptr(overlay, "pointerup", 70, 40);
+    await tick();
+
+    const pts = polyOf(store.markups[0]);
+    expect(pts).toHaveLength(4);
+    expect(pts[0]).toEqual({ x: 40, y: 160 });
+    expect(pts[1].x).toBeCloseTo(70);    // inserted vertex
+    expect(pts[1].y).toBeCloseTo(160);
+    expect(pts[2]).toEqual({ x: 100, y: 160 });
+
+    await waitFor(() => expect(ipc.update).toHaveBeenCalledTimes(1));
+    store.undo();
+    expect(polyOf(store.markups[0])).toHaveLength(3);
+  });
+
+  // -------------------------------------------------------------------------
+  // VE3: alt-click a vertex deletes it
+  // -------------------------------------------------------------------------
+  it("VE3: alt-click a vertex deletes that point (above the floor)", async () => {
+    const { overlay } = await mountViewport(store);
+    // 4-point polyline. P1 at screen(80,40).
+    seedPoly(store, "poly", [{ x: 40, y: 160 }, { x: 80, y: 160 }, { x: 120, y: 160 }, { x: 160, y: 100 }]);
+    store.activeTool = "select";
+    store.selectedIds = new Set(["poly"]);
+    await tick();
+
+    altPtr(overlay, "pointerdown", 80, 40);
+    await tick();
+
+    const pts = polyOf(store.markups[0]);
+    expect(pts).toHaveLength(3);
+    expect(pts.find((p) => p.x === 80 && p.y === 160)).toBeUndefined(); // P1 gone
+    await waitFor(() => expect(ipc.update).toHaveBeenCalledTimes(1));
+  });
+
+  // -------------------------------------------------------------------------
+  // VE4: select a vertex + Delete removes that vertex (not the whole markup)
+  // -------------------------------------------------------------------------
+  it("VE4: clicking a vertex then Delete removes the vertex, not the markup", async () => {
+    const { overlay } = await mountViewport(store);
+    seedPoly(store, "poly", [{ x: 40, y: 160 }, { x: 80, y: 160 }, { x: 120, y: 160 }, { x: 160, y: 100 }]);
+    store.activeTool = "select";
+    store.selectedIds = new Set(["poly"]);
+    await tick();
+
+    // Click (no drag) on vertex P1 at screen(80,40) to arm it for keyboard delete.
+    ptr(overlay, "pointerdown", 80, 40);
+    ptr(overlay, "pointerup", 80, 40);
+    await tick();
+
+    fireEvent.keyDown(window, { key: "Delete" });
+    await tick();
+
+    expect(store.markups).toHaveLength(1);          // markup survives
+    expect(polyOf(store.markups[0])).toHaveLength(3); // one vertex removed
+  });
+
+  // -------------------------------------------------------------------------
+  // VE5: vertex delete floor — a 2-point line keeps both points (no-op), markup stays
+  // -------------------------------------------------------------------------
+  it("VE5: deleting a vertex at the open-line floor (2) is a no-op", async () => {
+    const { overlay } = await mountViewport(store);
+    seedPoly(store, "poly", [{ x: 40, y: 160 }, { x: 100, y: 160 }]);
+    store.activeTool = "select";
+    store.selectedIds = new Set(["poly"]);
+    await tick();
+
+    ptr(overlay, "pointerdown", 40, 40); // arm vertex 0
+    ptr(overlay, "pointerup", 40, 40);
+    await tick();
+
+    fireEvent.keyDown(window, { key: "Delete" });
+    await tick();
+
+    expect(store.markups).toHaveLength(1);            // markup not deleted
+    expect(polyOf(store.markups[0])).toHaveLength(2); // both points kept
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pointer / select tool shortcut (V + Escape)
+// ---------------------------------------------------------------------------
+describe("Viewport pointer-tool shortcut", () => {
+  let store: MarkupStore;
+
+  beforeEach(() => {
+    vi.mocked(ipcMocks.getPageSize).mockResolvedValue(FAKE_PAGE_SIZE);
+    vi.mocked(ipcMocks.renderTile).mockResolvedValue({
+      doc_id: "d1", page_index: 0, tile_x: 0, tile_y: 0,
+      width_px: 512, height_px: 512, zoom: 1, dpr: 1, png_base64: "", render_ms: 1,
+    });
+    vi.mocked(ipcMocks.processRssMb).mockResolvedValue(0);
+    vi.mocked(ipcMocks.getUserIdentity).mockResolvedValue(FAKE_IDENTITY);
+    store = new MarkupStore("d1", fakeIpc());
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("PT1: pressing V switches to the select tool", async () => {
+    await mountViewport(store);
+    store.activeTool = "Rectangle";
+    await tick();
+    fireEvent.keyDown(window, { key: "v" });
+    await tick();
+    expect(store.activeTool).toBe("select");
+  });
+
+  it("PT2: Cmd/Ctrl+V (paste) does NOT switch tools", async () => {
+    await mountViewport(store);
+    store.activeTool = "Rectangle";
+    await tick();
+    fireEvent.keyDown(window, { key: "v", metaKey: true });
+    await tick();
+    expect(store.activeTool).toBe("Rectangle");
+  });
+
+  it("PT3: Escape returns to the select tool after cancelling a draw", async () => {
+    const { overlay } = await mountViewport(store);
+    store.activeTool = "Polygon";
+    await tick();
+    // Start an in-progress polygon.
+    fireEvent.click(overlay, { clientX: 50, clientY: 50 });
+    fireEvent.click(overlay, { clientX: 100, clientY: 50 });
+    fireEvent.keyDown(window, { key: "Escape" });
+    await tick();
+    expect(store.activeTool).toBe("select");
+    expect(store.markups).toHaveLength(0); // nothing committed
+  });
+
+  it("PT4: V does not switch tools while the text editor is open", async () => {
+    const { overlay } = await mountViewport(store);
+    store.activeTool = "Text";
+    await tick();
+    fireEvent.click(overlay, { clientX: 60, clientY: 80 });
+    await tick();
+    // Editor is open; a global V keydown must not hijack the tool.
+    fireEvent.keyDown(window, { key: "v" });
+    await tick();
+    expect(store.activeTool).toBe("Text");
+  });
+});

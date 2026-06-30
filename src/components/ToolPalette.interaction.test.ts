@@ -54,7 +54,7 @@ describe("ToolPalette", () => {
     await user.click(screen.getByTitle("Rectangle"));
 
     // Every other tool button must report aria-pressed=false
-    for (const title of ["Pan (Hand)", "Select", "Ellipse", "Line", "Arrow", "Highlight"]) {
+    for (const title of ["Pan (Hand)", "Select / Pointer (V)", "Ellipse", "Line", "Arrow", "Highlight"]) {
       expect(screen.getByTitle(title)).toHaveAttribute("aria-pressed", "false");
     }
   });
@@ -89,5 +89,14 @@ describe("ToolPalette", () => {
   it("MeasurementLength tool button is present", () => {
     render(ToolPalette, { props: { store } });
     expect(screen.getByTitle("Measure Length")).toBeTruthy();
+  });
+
+  it("Select / Pointer tool button is present and activates the select tool", async () => {
+    const user = userEvent.setup();
+    render(ToolPalette, { props: { store } });
+    const btn = screen.getByTitle("Select / Pointer (V)");
+    expect(btn).toBeTruthy();
+    await user.click(btn);
+    expect(store.activeTool).toBe("select");
   });
 });

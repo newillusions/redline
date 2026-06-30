@@ -3,7 +3,7 @@
   const { store }: { store: MarkupStore } = $props();
   const TOOLS: { kind: ToolKind; label: string; title: string }[] = [
     { kind: "hand", label: "✋", title: "Pan (Hand)" },
-    { kind: "select", label: "▭", title: "Select" },
+    { kind: "select", label: "↖", title: "Select / Pointer (V)" },
     { kind: "Rectangle", label: "▢", title: "Rectangle" },
     { kind: "Ellipse", label: "◯", title: "Ellipse" },
     { kind: "Line", label: "╱", title: "Line" },
