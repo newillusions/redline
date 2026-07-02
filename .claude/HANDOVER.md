@@ -2,29 +2,59 @@
 
 ## Current Status
 
-**M5 optimize shipped (feat/m5-docops-optimize, PR open).**
+**M1-M6 + Phase 1.1 (compare) all complete and merged to `main`. 0 open PRs as of 2026-07-02.**
 
-- **M4 all complete**: S1-S4 + fmt/clippy cleanup (PR #16, commit `05b149b`)
-- **M5 flatten baseline**: PR #17, squash-merged `ba87ed5` (2026-06-27)
-- **M5 optimize**: PR #18 open on `feat/m5-docops-optimize` (2026-06-27) — prune unused objects (level 1) + Deflate-compress streams (level 2) via lopdf's `prune_objects()` + `compress()`
-
-All tests: 193 Rust / 340 frontend green. Clippy 0. npm run check 0 errors.
+Latest work: PR #32 (count-marker selection hit-region fix + per-page count breakdown +
+page number in Properties panel), squash-merged to `main` as `fff93c8` (2026-06-30). Main
+is the working branch — there is no active feature branch right now.
 
 ## Last Session
 
-**Date**: 2026-06-27
-**Summary**: Implemented M5 optimize. Added `optimize_in_place(doc, level)` to `docops/mod.rs` (level 0 = noop, level 1 = prune, level 2 = prune + compress). Replaced passthrough stub in `LopdfDocOps::optimize()`. Added `optimize_document` Tauri command in `commands/docops.rs`, registered in `lib.rs`, wired `optimizeDocument()` IPC wrapper in `ipc.ts`, added Optimize toolbar button to `App.svelte`. 9 new Rust tests, all green. PR #18 open.
-
-## Untracked Items (left as-is)
-
-- `docs/superpowers/plans/2026-06-13-s2a-markup-overlay-display.md` — old plan doc, not part of any current workstream. Leave untracked unless needed for M6 compare work.
+**Date**: 2026-06-30 (PR #32)
+**Summary**: Fixed count-marker selection — non-circular symbols (Cross/Square/Diamond)
+were unselectable because the hit-test used Euclidean distance against a tolerance smaller
+than the symbol's corner radius; switched Point-geometry hit-testing to a Chebyshev
+(bounding-box) test. Added a per-page count breakdown under each count set's subtotal in
+the Quantities panel. Added a read-only "Page: N" row to the Properties panel (selection
+mode only). 14 new tests; 496 FE tests reported green in the PR (not re-run this pass —
+this is a documentation-only session, see below).
 
 ## Next Steps
 
-1. **§20 definitive floor-machine run** (16 GB, Windows + macOS) — OWED, formal M1 Go/No-Go (blocked on hardware)
-2. **G9 human step** — open `/tmp/redline-g9-sample.pdf` in Acrobat/Bluebeam to verify Times-fonted text + group rendering
-3. **M5 redact** — rasterize-region safe floor: render each redact region via PDFium at high DPI → Image XObject in lopdf → remove annotation; true vector redact deferred to MuPDF/Apryse (spec §8)
-4. **M6 compare** — page-pair diff rendering (Phase 1.1): manual two-point registration, color-channel overlay, change-highlight; `compare` module stub exists in `src-tauri/src/compare/mod.rs`
+No active development branch. Two verification items remain owed; everything else is
+owner-gated:
+
+1. **§20 definitive floor-machine run** (16 GB RAM, Windows + macOS) — the formal M1
+   Go/No-Go. Only an *indicative* pass exists today (Apple Silicon, headless). Blocked on
+   hardware access. Procedure: `bench/RUNBOOK-S20.md`.
+2. **G9 human visual check** — regenerate the sample via `cd src-tauri && cargo test
+   g9_emit_sample -- --ignored --nocapture` (writes `/tmp/redline-g9-sample.pdf`), then open
+   it in Acrobat AND Bluebeam to confirm font + group rendering. Owed since M2 (2026-06-16).
+3. **Project direction beyond polish** (pause / registration fast-follow / next milestone)
+   is an owner-gated decision on Martin's business backlog — not yet made, don't infer one.
+
+## Housekeeping flagged for the orchestrator
+
+- This session found the repo checked out on a stray local branch `verify/redline-count`
+  (3 commits identical in content to what PR #32 squash-merged, never pushed/PR'd) with an
+  uncommitted, stale edit to this file. Stashed that edit (`git stash list` — message
+  "stray HANDOVER.md edit + worktrees on verify/redline-count") and switched to `main`,
+  which was 1 commit behind `origin/main` and has been fast-forwarded. The stray branch
+  itself was left alone (not deleted — out of scope for a docs-only pass).
+- `.claude/worktrees/` has 9 untracked, uncommitted agent-worktree directories from
+  2026-06-30 (`agent-<hash>/`, one per dispatched sub-agent). Not part of this task; flagging
+  for cleanup since it's untracked disk clutter in the repo root.
+
+## Key Context
+
+| Item | Value |
+|------|-------|
+| Remote | `git@ssh.forge.mms.name:emittiv/redline.git` |
+| Main branch | `main` @ `fff93c8` (M1-M6 + Phase 1.1 all merged, 0 open PRs) |
+| Active branch | none — work happens directly off `main` until the next feature starts |
+| KB mission record | `project:q8gm8dv3k7smld12rm25` (stage: stabilizing, health: on_track) |
+| Ship pipeline | `.claude/skills/sendit/SKILL.md` |
+| Judgment rules | `.claude/rules/judgment.md` (new, 2026-07-02 — incident/decision distillation) |
 
 ## Key Gotchas (carry forward)
 
@@ -32,39 +62,17 @@ All tests: 193 Rust / 340 frontend green. Clippy 0. npm run check 0 errors.
 - **Background indexer uses `std::thread::spawn`** (not tokio) — watcher loop is indefinitely blocking, must NOT consume tokio's blocking thread pool
 - **Tantivy `Document` trait must be imported** for `to_json()` to be in scope: `use tantivy::{Document, ...};`
 - **Svelte store is in-session SoT**; Rust store is a mirror + save buffer. `flush()` throws on undrained mirror queue.
-- **lopdf reals: read with `as_float()`, NEVER `as_f32()`** — integer-valued reals serialise without decimal and reload as `Object::Integer`
+- **lopdf reals: read with `as_float()`, NEVER `as_f32()`** — see `.claude/rules/judgment.md` for the full incident (integer-valued reals silently corrupt on save→reopen)
 - **lopdf borrow checker pattern**: immutable read phase (collect owned structs) then mutable write phase — avoids aliasing on `&mut Document`
-- **lopdf `Document::load_from(Cursor::new(bytes))`** and **`doc.save_to(&mut out)`** work correctly in 0.36
-- **lopdf `Stream::compress()` threshold**: only applies Deflate when `compressed.len() + 19 < original.len()` — streams shorter than ~50 bytes typically don't compress. Tests must use `compressible_stream_content()` (20x repeated PDF ops, ~1 KB) to reliably exercise compression.
-- **Resources mutation**: clone /XObject dict as owned, modify, write back as direct dict (acceptable — semantically equivalent to indirect)
+- **lopdf `Stream::compress()` threshold**: only applies Deflate when `compressed.len() + 19 < original.len()` — streams shorter than ~50 bytes typically don't compress
 - **M5 flatten v1 limitation**: only handles indirect /AP /N appearance streams; inline /AP /N streams (rare) are preserved as-is
 - **M5 optimize v1 limitation**: no deep image downsampling (spec §8 — deferred to pluggable engine)
-- Overlay `pointer-events` toggles via `isCreateTool()`; Hand tool pans, creation tools capture on SVG overlay.
-- Tests: `npm run test` (vitest, mixed node+jsdom). Rust: `cargo test` from `src-tauri/` (not project root)
+- **Recent docs IPC**: lives in `src/lib/recent-docs.ts` (NOT `ipc.ts`) — intentional conflict-avoidance pattern, see judgment.md
+- Overlay `pointer-events` toggles via `isCreateTool()`; Hand tool pans, creation tools capture on SVG overlay
 - §5 precision invariant: overlay maps PDF user space → screen every render (never reads raster)
 - **`next_version_seq`** in `SidecarMeta` is monotonic — increment BEFORE deriving seq; don't revert to `versions.len()+1` (breaks after prune)
 - PDFium 2 GiB limit, global C state, `RenderEngine` drop order — unchanged from M1
-
-## Key References
-
-| Item | Value |
-|------|-------|
-| Remote | `git@ssh.forge.mms.name:emittiv/redline.git` |
-| Main branch | `main` (M4 + M5 flatten merged) |
-| Active branch | `feat/m5-docops-optimize` (PR #18 open) |
-| M4 spec | `.claude/specs/2026-06-25-redline-m4-plan.md` |
-| Ship pipeline | `.claude/skills/sendit/SKILL.md` |
-| KB obs M5 optimize | `obs:TBD` (recorded this session) |
-| KB obs M5 flatten | `obs:b0gvmk85m4wpalj5g4i1` |
-| KB obs S4 | `obs:v42tjtmz4tmicd2jn0n2` |
-| KB obs S2 | `obs:p5uy0je5vj15n72jezaa` |
-| KB obs fmt/PR#16 | `obs:o1biypj4taff1irczgcc` |
-
-## M5 Progress
-
-- **flatten baseline**: DONE - PR #17, merged `ba87ed5`
-- **optimize**: DONE - PR #18 open on `feat/m5-docops-optimize`
-- **redact**: stub only — rasterize-region floor; vector redact needs MuPDF/Apryse (deferred, spec §8)
+- Tests: `npm run test` (vitest, mixed node+jsdom). Rust: `cargo test` from `src-tauri/` (not project root)
 
 ---
-*Updated: 2026-06-27*
+*Updated: 2026-07-02 (departing-architect distillation pass)*
