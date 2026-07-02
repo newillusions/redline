@@ -18,7 +18,9 @@ jobs:
     # The first run is slow (full apt + cargo compile); subsequent runs skip both.
     runs-on: ubuntu-latest
     env:
-      DOCKER_HOST: tcp://10.0.23.137:2375
+      DOCKER_HOST: tcp://10.0.23.137:2376
+      DOCKER_TLS_VERIFY: "1"
+      DOCKER_CERT_PATH: /certs/client-primary
     steps:
       - uses: actions/checkout@v4
 
