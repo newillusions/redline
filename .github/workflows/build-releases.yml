@@ -245,10 +245,8 @@ jobs:
         id: find_installers
         shell: bash
         run: |
-          MSI_PATH=$(find target/release/bundle/msi -name "*.msi" | head -1)
           NSIS_PATH=$(find target/release/bundle/nsis -name "*-setup.exe" | head -1)
           NSIS_SIG=$(find target/release/bundle/nsis -name "*-setup.exe.sig" | head -1)
-          echo "MSI_PATH=$MSI_PATH" >> $GITHUB_OUTPUT
           echo "NSIS_PATH=$NSIS_PATH" >> $GITHUB_OUTPUT
           echo "NSIS_SIG=$NSIS_SIG" >> $GITHUB_OUTPUT
 
@@ -302,12 +300,6 @@ jobs:
             exit 1
           fi
 
-          echo "Uploading MSI..."
-          curl -X POST \
-            -H "Authorization: token ${{ secrets.GITEA_TOKEN }}" \
-            -F "attachment=@${{ steps.find_installers.outputs.MSI_PATH }}" \
-            "${{ env.GITEA_SERVER }}/api/v1/repos/${{ env.GITEA_OWNER }}/${{ env.GITEA_REPO }}/releases/$RELEASE_ID/assets?name=Redline_${{ steps.version.outputs.VERSION }}_x64.msi"
-
           echo "Uploading NSIS installer..."
           curl -X POST \
             -H "Authorization: token ${{ secrets.GITEA_TOKEN }}" \
@@ -320,7 +312,6 @@ jobs:
         with:
           name: windows
           path: |
-            ${{ steps.find_installers.outputs.MSI_PATH }}
             ${{ steps.find_installers.outputs.NSIS_PATH }}
             ${{ steps.find_installers.outputs.NSIS_SIG }}
 
