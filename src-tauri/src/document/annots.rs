@@ -199,6 +199,38 @@ pub(crate) mod tests {
         (doc, page_id)
     }
 
+    /// Same shape as `one_page_doc`, but encrypted with the given owner/user passwords
+    /// (RC4-128, revision 3 - `EncryptionVersion::V2`, the widest cross-reader-compatible
+    /// option lopdf 0.36 supports). Used to build a password-protected fixture in-memory
+    /// for tests, without any external tool or committed binary fixture.
+    ///
+    /// lopdf requires the trailer `/ID` to be set before building the encryption state
+    /// (it feeds the file-encryption-key derivation) - a fresh doc from `one_page_doc()`
+    /// has none, so one is set here.
+    ///
+    /// Cross-checked against PDFium (via pdfium-render) at implementation time: this
+    /// exact recipe opens correctly with the right password and fails with
+    /// `PdfiumInternalError::PasswordError` with no/wrong password, on both PDFium and
+    /// lopdf's own `decrypt()`.
+    pub(crate) fn encrypted_one_page_doc(user_password: &str, owner_password: &str) -> Document {
+        use lopdf::encryption::{EncryptionState, EncryptionVersion, Permissions};
+
+        let (mut doc, _page_id) = one_page_doc();
+        let id = Object::string_literal(b"redline-test-fixture-id".to_vec());
+        doc.trailer.set("ID", vec![id.clone(), id]);
+
+        let state = EncryptionState::try_from(EncryptionVersion::V2 {
+            document: &doc,
+            owner_password,
+            user_password,
+            key_length: 128,
+            permissions: Permissions::all(),
+        })
+        .expect("build encryption state for test fixture");
+        doc.encrypt(&state).expect("encrypt test fixture");
+        doc
+    }
+
     /// Same shape as `one_page_doc` but with three page objects in Kids / Count = 3.
     /// Returns the page ObjectIds in page order (index 0..=2).
     fn three_page_doc() -> (Document, Vec<lopdf::ObjectId>) {

@@ -6,15 +6,25 @@ use tauri::{Manager, State};
 
 use crate::document::page_ops;
 use crate::document::save::{load_markups_from, save_with_markups};
-use crate::document::{new_doc_id, DocumentInfo};
+use crate::document::{new_doc_id, DocumentInfo, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD};
 use crate::markup::Markup;
+use crate::render::OpenOutcome;
 use crate::AppState;
 
 /// Open a PDF file. Returns a `DocumentInfo` with a fresh `doc_id`.
+///
+/// `password` is `None` on the first attempt for a given file. If the file is
+/// encrypted, this returns `Err(ERR_PASSWORD_REQUIRED)` (no password given) or
+/// `Err(ERR_WRONG_PASSWORD)` (a password was given but didn't decrypt it) - the
+/// frontend re-invokes with the user-entered password on either sentinel. On
+/// success, the password is cached in the markup store (session-only, in-memory)
+/// so `load_markups` can decrypt the same file's existing annotations without
+/// re-prompting.
 #[tauri::command]
 pub async fn open_document(
     state: State<'_, AppState>,
     path: String,
+    password: Option<String>,
 ) -> Result<DocumentInfo, String> {
     let path = PathBuf::from(&path);
 
@@ -26,13 +36,19 @@ pub async fn open_document(
     }
 
     let doc_id = new_doc_id();
-    let page_count = state
+    let outcome = state
         .render
-        .open_document(path.clone(), doc_id.clone())
+        .open_document(path.clone(), doc_id.clone(), password.clone())
         .await
         .map_err(|e| format!("{:#}", e))?;
 
-    state.markups.register(&doc_id, path.clone());
+    let page_count = match outcome {
+        OpenOutcome::Opened(page_count) => page_count,
+        OpenOutcome::PasswordRequired => return Err(ERR_PASSWORD_REQUIRED.to_string()),
+        OpenOutcome::WrongPassword => return Err(ERR_WRONG_PASSWORD.to_string()),
+    };
+
+    state.markups.register(&doc_id, path.clone(), password);
 
     Ok(DocumentInfo {
         doc_id,
@@ -124,10 +140,13 @@ pub async fn load_markups(
 
     // Slow path: full lopdf parse (blocking; tens of seconds on large files).
     let path_for_parse = path.clone();
-    let loaded = tokio::task::spawn_blocking(move || load_markups_from(&path_for_parse))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("{e:#}"))?;
+    let password = state.markups.password(&doc_id);
+    let loaded = tokio::task::spawn_blocking(move || {
+        load_markups_from(&path_for_parse, password.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))?;
     // Populate the cache so the next reopen of this unmodified file returns immediately.
     state.markups.cache_loaded(path, loaded.clone());
     state.markups.seed_loaded(&doc_id, loaded)
@@ -179,13 +198,15 @@ async fn save_inner(
         .path(doc_id)
         .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
     let dest = new_path.clone().unwrap_or_else(|| src.clone());
+    let password = state.markups.password(doc_id);
 
     // Load-before-save guard: never strip annotations that were never imported.
     // is_managed treats every /RLType annot as ours, so saving an un-loaded doc
     // would replace pre-existing redline annotations with only the new ones.
     if !state.markups.is_loaded(doc_id) {
         let p = src.clone();
-        let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p))
+        let pw = password.clone();
+        let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| format!("{e:#}"))?;
@@ -193,7 +214,10 @@ async fn save_inner(
     }
     let markups = state.markups.list(doc_id)?;
 
-    // 1. Stage the complete rewritten file next to the destination.
+    // 1. Stage the complete rewritten file next to the destination. Encrypted source
+    //    documents are refused inside save_with_markups (see its doc comment) - lopdf
+    //    has no re-encrypt-on-save path, so saving would silently strip the PDF's
+    //    password protection.
     let staged = dest.with_extension("pdf.redline-staged");
     {
         let src = src.clone();
@@ -215,14 +239,15 @@ async fn save_inner(
         // Try to restore the render doc on the ORIGINAL path before failing.
         let _ = state
             .render
-            .open_document(src.clone(), doc_id.to_string())
+            .open_document(src.clone(), doc_id.to_string(), password.clone())
             .await;
         return Err(format!("swap failed: {e}"));
     }
     state
         .render
-        .open_document(dest.clone(), doc_id.to_string())
+        .open_document(dest.clone(), doc_id.to_string(), password)
         .await
+        .and_then(|outcome| outcome.into_page_count())
         .map_err(|e| format!("reopen after save: {e:#}"))?;
     // The save changed the file's content + mtime: drop the stale cache entry so the next
     // load_markups re-parses rather than returning the pre-save snapshot.
@@ -257,12 +282,14 @@ pub(crate) async fn apply_page_edit(
         .markups
         .path(doc_id)
         .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+    let password = state.markups.password(doc_id);
 
     // Load-before-op: ensure the markup store is seeded so save doesn't drop existing
     // redline annotations that haven't been loaded into memory yet.
     if !state.markups.is_loaded(doc_id) {
         let p = src.clone();
-        let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p))
+        let pw = password.clone();
+        let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| format!("{e:#}"))?;
@@ -275,6 +302,15 @@ pub(crate) async fn apply_page_edit(
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let mut doc =
             lopdf::Document::load(&src2).with_context(|| format!("load {}", src2.display()))?;
+        // Page ops rewrite the file the same way save_with_markups does (full lopdf
+        // load -> save), which would silently strip encryption on an encrypted PDF
+        // (lopdf has no re-encrypt-on-save path). Refuse rather than corrupt/de-protect.
+        if doc.is_encrypted() {
+            anyhow::bail!(
+                "Page operations (rotate/delete/reorder/insert) on a password-protected \
+                 PDF are not supported yet - saving would strip its password protection."
+            );
+        }
         op(&mut doc)?;
         // Write markups back so they survive the page restructuring.
         crate::document::annots::write_markups(&mut doc, &markups)?;
@@ -310,8 +346,9 @@ pub(crate) async fn apply_page_edit(
         .map_err(|e| format!("{e:#}"))?;
     state
         .render
-        .open_document(src.clone(), doc_id.to_string())
+        .open_document(src.clone(), doc_id.to_string(), password)
         .await
+        .and_then(|outcome| outcome.into_page_count())
         .map_err(|e| format!("reopen after page op: {e:#}"))?;
     state.markups.invalidate_cache(&src);
     Ok(())

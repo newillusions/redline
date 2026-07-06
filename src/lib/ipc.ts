@@ -16,6 +16,18 @@ export interface DocumentInfo {
   page_count: number;
 }
 
+/**
+ * Sentinel error strings the `open_document` command returns for a
+ * password-protected PDF. Must match the Rust constants of the same name in
+ * `src-tauri/src/document/mod.rs` exactly - keep in sync.
+ *
+ * `open_document`'s rejected promise value is the raw Rust `Err` string (Tauri
+ * v2 serializes `Result<T, String>` errors as a plain string, not an Error
+ * object), so callers compare `String(err)` against these directly.
+ */
+export const ERR_PASSWORD_REQUIRED = "PASSWORD_REQUIRED";
+export const ERR_WRONG_PASSWORD = "WRONG_PASSWORD";
+
 export interface PageSize {
   doc_id: string;
   page_index: number;
@@ -50,8 +62,17 @@ export interface RenderedTile {
 // Document commands
 // ---------------------------------------------------------------------------
 
-export async function openDocument(path: string): Promise<DocumentInfo> {
-  return invoke<DocumentInfo>("open_document", { path });
+/**
+ * Open a PDF. `password` is omitted (sent as `null`) on the first attempt for a
+ * given file. If the file is password-protected, the returned promise rejects
+ * with `ERR_PASSWORD_REQUIRED` or `ERR_WRONG_PASSWORD` (see above) - callers
+ * should catch those and re-invoke with the user-entered password.
+ */
+export async function openDocument(
+  path: string,
+  password?: string | null,
+): Promise<DocumentInfo> {
+  return invoke<DocumentInfo>("open_document", { path, password: password ?? null });
 }
 
 export async function closeDocument(doc_id: string): Promise<void> {

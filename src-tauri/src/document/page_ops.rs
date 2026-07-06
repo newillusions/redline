@@ -479,7 +479,7 @@ pub(crate) mod tests {
         let path = dir.path().join("rotated.pdf");
         doc.save(&path).unwrap();
 
-        let reloaded = load_markups_from(&path).unwrap();
+        let reloaded = load_markups_from(&path, None).unwrap();
         assert_eq!(reloaded.len(), 1, "markup survives rotate round-trip");
         assert_eq!(reloaded[0].id(), m.id());
         // Geometry coordinates must be exactly preserved (no f32 precision loss).
@@ -540,7 +540,7 @@ pub(crate) mod tests {
         let path = dir.path().join("reordered.pdf");
         doc.save(&path).unwrap();
 
-        let reloaded = load_markups_from(&path).unwrap();
+        let reloaded = load_markups_from(&path, None).unwrap();
         assert_eq!(reloaded.len(), 1, "markup survives reorder round-trip");
         assert_eq!(reloaded[0].id(), m.id());
         match (&reloaded[0].geometry, &m.geometry) {
@@ -573,7 +573,7 @@ pub(crate) mod tests {
         let reload_doc = Document::load(&path).unwrap();
         assert_eq!(reload_doc.get_pages().len(), 2, "page count incremented");
 
-        let reloaded = load_markups_from(&path).unwrap();
+        let reloaded = load_markups_from(&path, None).unwrap();
         assert_eq!(reloaded.len(), 1, "markup survives insert round-trip");
         assert_eq!(reloaded[0].id(), m.id());
         match (&reloaded[0].geometry, &m.geometry) {
@@ -610,7 +610,7 @@ pub(crate) mod tests {
         // Verify rotation and markup survive.
         let doc3 = Document::load(&src).unwrap();
         assert_eq!(page_rotation(&doc3, 0).unwrap(), 180);
-        let markups = load_markups_from(&src).unwrap();
+        let markups = load_markups_from(&src, None).unwrap();
         assert_eq!(markups.len(), 1);
         assert_eq!(markups[0].id(), m.id());
     }

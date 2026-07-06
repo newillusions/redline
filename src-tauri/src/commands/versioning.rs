@@ -74,6 +74,7 @@ pub async fn restore_document_version(
     state.markups.invalidate_cache(&path);
 
     // Close + reopen the render engine so tiles reflect restored content.
+    let password = state.markups.password(&doc_id);
     state
         .render
         .close_document(doc_id.clone())
@@ -81,8 +82,9 @@ pub async fn restore_document_version(
         .map_err(|e| format!("{e:#}"))?;
     state
         .render
-        .open_document(path.clone(), doc_id)
+        .open_document(path.clone(), doc_id, password)
         .await
+        .and_then(|outcome| outcome.into_page_count())
         .map_err(|e| format!("reopen after restore: {e:#}"))?;
 
     Ok(())
