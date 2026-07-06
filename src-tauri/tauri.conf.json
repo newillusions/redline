@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Redline",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.emittiv.redline",
   "build": {
     "frontendDist": "../dist",
@@ -64,7 +64,7 @@
       "endpoints": [
         "https://raw.githubusercontent.com/newillusions/redline/main/update.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IFBMQUNFSE9MREVSIG1pbmlzaWduIHB1YmxpYyBrZXkgLSByZXBsYWNlIGFmdGVyIG9yY2hlc3RyYXRvciBydW5zICJ0YXVyaSBzaWduZXIgZ2VuZXJhdGUiIGZvciByZWRsaW5lClJXUExBQ0VIT0xERVJQTEFDRUhPTERFUlBMQUNFSE9MREVSUExBQ0VIT0xERVJQTEFDRUhPTERFUlBMQUNFSE9MREVSCg==",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY3NjA4RUEwRjUzMURGQTYKUldTbTN6SDFvSTVnWjZvaGVzNzdteUxMeUF5dVFKWU5zVWFYVWVKLzJ2WTN2bFVkR1NPdis4MVgK",
       "windows": {
         "installMode": "passive"
       }
