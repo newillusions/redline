@@ -13,6 +13,10 @@ use crate::markup::Markup;
 #[derive(Debug)]
 pub struct DocEntry {
     pub path: PathBuf,
+    /// Password used to open this document via PDFium, if it was encrypted.
+    /// Session-only (never persisted to disk) - used to decrypt the same file's
+    /// existing annotations via lopdf in `load_markups` without re-prompting.
+    pub password: Option<String>,
     pub markups: Vec<Markup>,
     pub loaded: bool,
     pub saving: bool,
@@ -61,11 +65,12 @@ pub struct MarkupStore {
 }
 
 impl MarkupStore {
-    pub fn register(&self, doc_id: &str, path: PathBuf) {
+    pub fn register(&self, doc_id: &str, path: PathBuf, password: Option<String>) {
         self.docs.lock().unwrap().insert(
             doc_id.to_string(),
             DocEntry {
                 path,
+                password,
                 markups: Vec::new(),
                 loaded: false,
                 saving: false,
@@ -84,6 +89,17 @@ impl MarkupStore {
             .unwrap()
             .get(doc_id)
             .map(|e| e.path.clone())
+    }
+
+    /// Password this doc was opened with, if it required one. `None` for both
+    /// "unknown doc_id" and "doc is open but wasn't encrypted" - callers that need
+    /// to tell those apart should check `path()` first.
+    pub fn password(&self, doc_id: &str) -> Option<String> {
+        self.docs
+            .lock()
+            .unwrap()
+            .get(doc_id)
+            .and_then(|e| e.password.clone())
     }
 
     pub fn set_path(&self, doc_id: &str, path: PathBuf) -> Result<(), String> {
@@ -243,7 +259,7 @@ mod tests {
     #[test]
     fn register_add_list_roundtrip() {
         let s = MarkupStore::default();
-        s.register("d1", PathBuf::from("/tmp/a.pdf"));
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
         let m = markup();
         let id = m.id();
         s.add("d1", m).unwrap();
@@ -254,9 +270,33 @@ mod tests {
     }
 
     #[test]
+    fn password_none_when_registered_without_one() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        assert_eq!(s.password("d1"), None);
+    }
+
+    #[test]
+    fn password_roundtrips_when_registered_with_one() {
+        let s = MarkupStore::default();
+        s.register(
+            "d1",
+            PathBuf::from("/tmp/a.pdf"),
+            Some("redline-pw".to_string()),
+        );
+        assert_eq!(s.password("d1"), Some("redline-pw".to_string()));
+    }
+
+    #[test]
+    fn password_none_for_unknown_doc() {
+        let s = MarkupStore::default();
+        assert_eq!(s.password("nope"), None);
+    }
+
+    #[test]
     fn duplicate_id_rejected() {
         let s = MarkupStore::default();
-        s.register("d1", PathBuf::from("/tmp/a.pdf"));
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
         let m = markup();
         s.add("d1", m.clone()).unwrap();
         assert!(s.add("d1", m).is_err());
@@ -266,7 +306,7 @@ mod tests {
     fn unknown_doc_errors_and_remove_forgets() {
         let s = MarkupStore::default();
         assert!(s.list("nope").is_err());
-        s.register("d1", PathBuf::from("/tmp/a.pdf"));
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
         s.remove("d1");
         assert!(s.list("d1").is_err());
     }
@@ -274,7 +314,7 @@ mod tests {
     #[test]
     fn seed_loaded_merges_and_marks_loaded() {
         let s = MarkupStore::default();
-        s.register("d1", PathBuf::from("/tmp/a.pdf"));
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
 
         // Add one markup in-memory (unsaved) - this is markup A.
         let a = markup();
@@ -337,7 +377,7 @@ mod tests {
     #[test]
     fn begin_save_blocks_second_save() {
         let s = MarkupStore::default();
-        s.register("d1", PathBuf::from("/tmp/a.pdf"));
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
 
         // First begin succeeds.
         s.begin_save("d1").unwrap();
@@ -362,7 +402,7 @@ mod tests {
     #[test]
     fn update_replaces_markup_by_id() {
         let s = MarkupStore::default();
-        s.register("d1", PathBuf::from("/tmp/a.pdf"));
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
         let m = markup();
         let id = m.id();
         s.add("d1", m.clone()).unwrap();
@@ -380,7 +420,7 @@ mod tests {
     #[test]
     fn update_unknown_id_errors() {
         let s = MarkupStore::default();
-        s.register("d1", PathBuf::from("/tmp/a.pdf"));
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
         // markup() not added -> its id is absent
         assert!(s.update("d1", markup()).is_err());
         // unknown doc also errors
@@ -390,7 +430,7 @@ mod tests {
     #[test]
     fn delete_removes_by_id() {
         let s = MarkupStore::default();
-        s.register("d1", PathBuf::from("/tmp/a.pdf"));
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
         let m = markup();
         let id = m.id();
         s.add("d1", m).unwrap();
@@ -401,7 +441,7 @@ mod tests {
     #[test]
     fn delete_unknown_id_or_doc_errors() {
         let s = MarkupStore::default();
-        s.register("d1", PathBuf::from("/tmp/a.pdf"));
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
         assert!(s.delete("d1", uuid::Uuid::new_v4()).is_err());
         assert!(s.delete("nope", uuid::Uuid::new_v4()).is_err());
     }

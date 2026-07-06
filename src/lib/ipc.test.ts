@@ -68,9 +68,20 @@ describe("ipc invoke argument keys (Tauri v2 camelCase)", () => {
     expect(mockInvoke).toHaveBeenCalledWith("update_markup", { docId: "d1", markup: m });
   });
 
-  it("open_document → path (single-word, unchanged)", async () => {
+  it("open_document → path, password defaults to null when omitted", async () => {
     await ipc.openDocument("/tmp/a.pdf");
-    expect(mockInvoke).toHaveBeenCalledWith("open_document", { path: "/tmp/a.pdf" });
+    expect(mockInvoke).toHaveBeenCalledWith("open_document", {
+      path: "/tmp/a.pdf",
+      password: null,
+    });
+  });
+
+  it("open_document → password passed through when given", async () => {
+    await ipc.openDocument("/tmp/a.pdf", "secret");
+    expect(mockInvoke).toHaveBeenCalledWith("open_document", {
+      path: "/tmp/a.pdf",
+      password: "secret",
+    });
   });
 
   it("render_tile → req struct (inner fields stay snake_case via serde)", async () => {

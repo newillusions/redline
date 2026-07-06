@@ -67,6 +67,62 @@ const DEFAULT_MAX_LOADED_PAGES: usize = 24;
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Outcome of an `open_document` attempt that may require a password.
+///
+/// PDFium's own error code (`FPDF_ERR_PASSWORD`) does NOT distinguish "no password
+/// supplied" from "wrong password supplied" - both surface as the same
+/// `PdfiumInternalError::PasswordError`. The distinction here is made at the
+/// application level: if the caller passed `None` and got a password error, the
+/// document needs a first password (`PasswordRequired`); if the caller passed
+/// `Some(pw)` and still got a password error, that password was wrong
+/// (`WrongPassword`). This lets the frontend show "enter password" vs "wrong
+/// password, try again" instead of one generic failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenOutcome {
+    /// Opened successfully; carries the page count (same value `open_document`
+    /// used to return directly before password support was added).
+    Opened(u32),
+    /// The document is encrypted and no password was supplied.
+    PasswordRequired,
+    /// The document is encrypted and the supplied password did not decrypt it.
+    WrongPassword,
+}
+
+impl OpenOutcome {
+    /// Collapse the password-outcome variants into a plain error, for callers that
+    /// only want the pre-password-support behaviour (open succeeds or it doesn't) -
+    /// internal reopen-after-save/page-op, versioning restore, and the bench harness
+    /// never expect an encrypted file at these points, so surfacing PasswordRequired/
+    /// WrongPassword as a hard error there is correct.
+    pub fn into_page_count(self) -> Result<u32> {
+        match self {
+            OpenOutcome::Opened(page_count) => Ok(page_count),
+            OpenOutcome::PasswordRequired => {
+                anyhow::bail!("document requires a password to open")
+            }
+            OpenOutcome::WrongPassword => {
+                anyhow::bail!("incorrect password supplied for document")
+            }
+        }
+    }
+}
+
+/// If `err` is PDFium's password error, classify it against whether a password was
+/// supplied on this attempt. Returns `None` for every other error (genuine I/O/format
+/// failures), which callers should propagate as a hard error instead.
+fn classify_password_error(err: &PdfiumError, password_was_supplied: bool) -> Option<OpenOutcome> {
+    match err {
+        PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError) => {
+            Some(if password_was_supplied {
+                OpenOutcome::WrongPassword
+            } else {
+                OpenOutcome::PasswordRequired
+            })
+        }
+        _ => None,
+    }
+}
+
 /// A rendered tile returned to the frontend: raw RGBA bytes (or PNG-encoded).
 /// The webview draws this onto an `<img>` / canvas element.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,7 +434,12 @@ impl RenderEngine {
     ///      file is never modified. (C5: 2.28 GB → 54.8 MB normalised copy; renders
     ///      at 22 ms/tile. The one-time normalise step peaks ~4.6 GB RSS — an ingest
     ///      cost, not steady-state — acceptable like Acrobat/Bluebeam "reduce size".)
-    pub fn open_document(&mut self, path: PathBuf, doc_id: String) -> Result<u32> {
+    pub fn open_document(
+        &mut self,
+        path: PathBuf,
+        doc_id: String,
+        password: Option<&str>,
+    ) -> Result<OpenOutcome> {
         info!("Opening document: {:?} as {}", path, doc_id);
 
         let file_len = std::fs::metadata(&path)
@@ -386,10 +447,23 @@ impl RenderEngine {
             .len();
 
         // Stage 1/2: size-based load.
-        let (doc, backing) = Self::load_doc(&self.pdfium, &path, file_len)?;
+        let (doc, backing) = match Self::load_doc(&self.pdfium, &path, file_len, password) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                return match err.downcast_ref::<PdfiumError>() {
+                    Some(pdfium_err) => {
+                        match classify_password_error(pdfium_err, password.is_some()) {
+                            Some(outcome) => Ok(outcome),
+                            None => Err(err),
+                        }
+                    }
+                    None => Err(err),
+                };
+            }
+        };
         let page_count = doc.pages().len() as u32;
 
-        // Probe page 0. If it loads, the doc is healthy — register and return.
+        // Probe page 0. If it loads, the doc is healthy - register and return.
         let probe_ok = doc.pages().get(0).is_ok();
 
         if probe_ok || file_len < MMAP_LOAD_THRESHOLD {
@@ -399,8 +473,8 @@ impl RenderEngine {
                 doc_id.clone(),
                 OpenDoc::new(doc, backing, path, page_count, self.max_loaded_pages),
             );
-            info!("Opened document {} — {} pages", doc_id, page_count);
-            return Ok(page_count);
+            info!("Opened document {} - {} pages", doc_id, page_count);
+            return Ok(OpenOutcome::Opened(page_count));
         }
 
         // Stage 3: large file whose pages won't load (PDFium >2 GiB offset limit).
@@ -416,17 +490,17 @@ impl RenderEngine {
             .with_context(|| format!("Failed to normalise oversized PDF: {:?}", path))?;
         let norm_len = std::fs::metadata(&normalized).map(|m| m.len()).unwrap_or(0);
         info!(
-            "Normalised {:?} → {:?} ({:.1} MB)",
+            "Normalised {:?} -> {:?} ({:.1} MB)",
             path,
             normalized,
             norm_len as f64 / (1u64 << 20) as f64
         );
 
-        let (doc2, backing2) = Self::load_doc(&self.pdfium, &normalized, norm_len)?;
+        let (doc2, backing2) = Self::load_doc(&self.pdfium, &normalized, norm_len, password)?;
         let page_count2 = doc2.pages().len() as u32;
         doc2.pages()
             .get(0)
-            .context("Normalised PDF still fails page load — file may be corrupt")?;
+            .context("Normalised PDF still fails page load - file may be corrupt")?;
 
         self.documents.insert(
             doc_id.clone(),
@@ -434,22 +508,28 @@ impl RenderEngine {
             OpenDoc::new(doc2, backing2, path, page_count2, self.max_loaded_pages),
         );
         info!(
-            "Opened (normalised) document {} — {} pages",
+            "Opened (normalised) document {} - {} pages",
             doc_id, page_count2
         );
-        Ok(page_count2)
+        Ok(OpenOutcome::Opened(page_count2))
     }
 
     /// Load a PDF, choosing streaming vs mmap by size. Returns the `'static`-cast
     /// document and an optional backing mmap that must outlive it.
+    ///
+    /// On a password error, the returned `anyhow::Error` wraps the underlying
+    /// `PdfiumError` (via `with_context`, which preserves the source via `downcast_ref`)
+    /// so `open_document` can classify it into `OpenOutcome::PasswordRequired` /
+    /// `WrongPassword` instead of a hard failure.
     fn load_doc(
         pdfium: &Pdfium,
         path: &std::path::Path,
         file_len: u64,
+        password: Option<&str>,
     ) -> Result<(PdfDocument<'static>, Option<Mmap>)> {
         if file_len >= MMAP_LOAD_THRESHOLD {
             info!(
-                "Large PDF ({:.2} GiB ≥ {:.2} GiB): mmap + FPDF_LoadMemDocument64",
+                "Large PDF ({:.2} GiB >= {:.2} GiB): mmap + FPDF_LoadMemDocument64",
                 file_len as f64 / (1u64 << 30) as f64,
                 MMAP_LOAD_THRESHOLD as f64 / (1u64 << 30) as f64,
             );
@@ -463,14 +543,14 @@ impl RenderEngine {
             let doc = pdfium
                 .load_pdf_from_byte_slice(
                     unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&mmap[..]) },
-                    None,
+                    password,
                 )
                 .with_context(|| format!("Failed to load large PDF via mmap: {:?}", path))?;
             let doc: PdfDocument<'static> = unsafe { std::mem::transmute(doc) };
             Ok((doc, Some(mmap)))
         } else {
             let doc = pdfium
-                .load_pdf_from_file(path, None)
+                .load_pdf_from_file(path, password)
                 .with_context(|| format!("Failed to open PDF: {:?}", path))?;
             // SAFETY: doc borrows the Pdfium bindings (live as long as the engine);
             // streaming reader is owned internally. 'static tied to OpenDoc's life.
@@ -877,7 +957,8 @@ pub enum RenderCmd {
     OpenDocument {
         path: PathBuf,
         doc_id: String,
-        reply: oneshot::Sender<Result<u32>>,
+        password: Option<String>,
+        reply: oneshot::Sender<Result<OpenOutcome>>,
     },
     CloseDocument {
         doc_id: String,
@@ -958,9 +1039,11 @@ impl RenderHandle {
                         RenderCmd::OpenDocument {
                             path,
                             doc_id,
+                            password,
                             reply,
                         } => {
-                            let _ = reply.send(engine.open_document(path, doc_id));
+                            let _ =
+                                reply.send(engine.open_document(path, doc_id, password.as_deref()));
                         }
                         RenderCmd::CloseDocument { doc_id, reply } => {
                             engine.close_document(&doc_id);
@@ -1005,12 +1088,18 @@ impl RenderHandle {
     // These are called from Tauri async commands.
     // -----------------------------------------------------------------------
 
-    pub async fn open_document(&self, path: PathBuf, doc_id: String) -> Result<u32> {
+    pub async fn open_document(
+        &self,
+        path: PathBuf,
+        doc_id: String,
+        password: Option<String>,
+    ) -> Result<OpenOutcome> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(RenderCmd::OpenDocument {
                 path,
                 doc_id,
+                password,
                 reply: reply_tx,
             })
             .map_err(|_| anyhow::anyhow!("render thread gone"))?;
@@ -1209,8 +1298,90 @@ pub(crate) mod tests {
         // In CI / dev without PDFium binary, new() returns an Err.
         // This test confirms the error path is reachable and doesn't panic.
         // When PDFIUM_DYNAMIC_LIB_PATH is set correctly this test would
-        // succeed via Ok(...) — adapt in integration harness accordingly.
-        let _ = RenderEngine::new(); // either Ok or Err — both are valid here
+        // succeed via Ok(...) - adapt in integration harness accordingly.
+        let _ = RenderEngine::new(); // either Ok or Err - both are valid here
+    }
+
+    // -----------------------------------------------------------------------
+    // Password-protected PDF tests.
+    //
+    // Gated on PDFIUM_DYNAMIC_LIB_PATH only (no corpus needed) - the fixture is
+    // built + encrypted in-memory via document::annots::tests::encrypted_one_page_doc
+    // and written to a temp file, so these run in any dev environment with the
+    // PDFium binary fetched (scripts/fetch-pdfium.sh), same gate as the corpus tests.
+    // -----------------------------------------------------------------------
+
+    /// Write a fresh one-page PDF, encrypted with the given user/owner passwords,
+    /// to a temp file. Returns the temp dir (keep alive for the file's lifetime)
+    /// and the file path.
+    fn write_encrypted_fixture(user_password: &str, owner_password: &str) -> (tempfile::TempDir, PathBuf) {
+        let mut doc = crate::document::annots::tests::encrypted_one_page_doc(user_password, owner_password);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("encrypted.pdf");
+        doc.save(&path).expect("save encrypted fixture");
+        (dir, path)
+    }
+
+    #[test]
+    fn open_document_returns_password_required_when_no_password_given() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+        let (_dir, path) = write_encrypted_fixture("redline-pw", "owner-pw");
+        let mut e = RenderEngine::new().expect("pdfium");
+        let outcome = e
+            .open_document(path, "pw-test".into(), None)
+            .expect("open_document should not hard-error on a password-protected file");
+        assert_eq!(outcome, OpenOutcome::PasswordRequired);
+    }
+
+    #[test]
+    fn open_document_returns_wrong_password_on_incorrect_password() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+        let (_dir, path) = write_encrypted_fixture("redline-pw", "owner-pw");
+        let mut e = RenderEngine::new().expect("pdfium");
+        let outcome = e
+            .open_document(path, "pw-test".into(), Some("definitely-wrong"))
+            .expect("wrong password should classify, not hard-error");
+        assert_eq!(outcome, OpenOutcome::WrongPassword);
+    }
+
+    #[test]
+    fn open_document_succeeds_with_correct_password() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+        let (_dir, path) = write_encrypted_fixture("redline-pw", "owner-pw");
+        let mut e = RenderEngine::new().expect("pdfium");
+        let outcome = e
+            .open_document(path, "pw-test".into(), Some("redline-pw"))
+            .expect("correct password should open");
+        assert_eq!(outcome, OpenOutcome::Opened(1));
+    }
+
+    #[test]
+    fn open_document_unencrypted_file_ignores_password_arg() {
+        // A password argument on a NON-encrypted file must not break the normal
+        // open path (pdfium-render treats a superfluous password as a no-op).
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+        let mut doc = crate::document::annots::tests::one_page_doc().0;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.pdf");
+        doc.save(&path).expect("save plain fixture");
+
+        let mut e = RenderEngine::new().expect("pdfium");
+        let outcome = e
+            .open_document(path, "pw-test".into(), Some("unused-password"))
+            .expect("open should succeed regardless of the unused password arg");
+        assert_eq!(outcome, OpenOutcome::Opened(1));
     }
 
     // -----------------------------------------------------------------------
@@ -1275,7 +1446,10 @@ pub(crate) mod tests {
             return;
         };
         let mut e = RenderEngine::new().expect("pdfium");
-        let pages = e.open_document(path, "t".into()).expect("open c1");
+        let pages = e
+            .open_document(path, "t".into(), None)
+            .and_then(OpenOutcome::into_page_count)
+            .expect("open c1");
         assert!(pages > 100, "C1 should have many pages");
         let tile = e.render_tile(&one_tile(0)).expect("render c1 tile");
         assert!(!tile.png_base64.is_empty());
@@ -1293,7 +1467,10 @@ pub(crate) mod tests {
         let mut e = RenderEngine::new()
             .expect("pdfium")
             .with_cache_budget(budget);
-        let pages = e.open_document(path, "t".into()).expect("open c1");
+        let pages = e
+            .open_document(path, "t".into(), None)
+            .and_then(OpenOutcome::into_page_count)
+            .expect("open c1");
         // Render distinct tiles across many pages to accumulate cache pressure.
         let mut rendered = 0;
         for pg in 0..pages.min(60) {
@@ -1339,7 +1516,9 @@ pub(crate) mod tests {
             return;
         };
         let mut e = RenderEngine::new().expect("pdfium");
-        e.open_document(path, "t".into()).expect("open c4");
+        e.open_document(path, "t".into(), None)
+            .and_then(OpenOutcome::into_page_count)
+            .expect("open c4");
         // First tile pays the one-time page-load (~1s for a dense A0).
         let _ = e.render_tile(&one_tile(0)).expect("render c4 first tile");
         // Subsequent distinct tiles reuse the cached page handle → must be fast.
@@ -1372,7 +1551,8 @@ pub(crate) mod tests {
         // The 2.1 GB file triggers the normalize-on-open fallback (PDFium 2 GiB
         // offset limit). It must end up renderable.
         let pages = e
-            .open_document(path, "t".into())
+            .open_document(path, "t".into(), None)
+            .and_then(OpenOutcome::into_page_count)
             .expect("open c5 (auto-normalize)");
         assert!(pages > 100, "C5 should expose its pages after normalize");
         let tile = e

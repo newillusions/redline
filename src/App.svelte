@@ -31,7 +31,9 @@
   import ComparePanel from "./components/ComparePanel.svelte";
   import TabBar from "./components/TabBar.svelte";
   import SavePromptDialog from "./components/SavePromptDialog.svelte";
-  import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument } from "$lib/ipc";
+  import PasswordPromptDialog from "./components/PasswordPromptDialog.svelte";
+  import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD } from "$lib/ipc";
+  import { createPasswordCache, getCachedPassword, setCachedPassword } from "$lib/password-cache";
   import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -66,6 +68,15 @@
   /** docId of the document awaiting save/discard/cancel decision; null when dialog is hidden. */
   let savePromptDocId = $state<string | null>(null);
   let savePromptFilename = $state("");
+
+  // --- Password prompt dialog state ---
+  /** Path awaiting a password to open; null when the dialog is hidden. */
+  let passwordPromptPath = $state<string | null>(null);
+  /** Set on a retry after a wrong password; null on the first prompt for a file. */
+  let passwordPromptError = $state<string | null>(null);
+  /** Session-only password cache (never persisted) - avoids re-prompting for a
+      file already unlocked earlier in this session. */
+  const passwordCache = createPasswordCache();
 
   // --- Compare panel state (M6 Phase 1.1) ---
   let compareVisible = $state(false);
@@ -143,8 +154,14 @@
    * Core open logic shared by File>Open dialog, file-drop, and auto-open.
    * - If the path is already open, switch to its tab (dedup).
    * - Otherwise open a new PDFium document, create a tab, and activate it.
+   *
+   * `password` is omitted on the first attempt (falling back to a cached
+   * password from earlier this session, if any). If the backend reports the
+   * file is encrypted, this shows PasswordPromptDialog instead of the generic
+   * error banner; submitting the dialog re-invokes this function with the
+   * entered password (see handlePasswordSubmit).
    */
-  async function openFilePath(path: string) {
+  async function openFilePath(path: string, password?: string) {
     // Dedup: if this path is already open, just switch to it.
     const existing = tabStore.findByPath(path);
     if (existing) {
@@ -155,7 +172,12 @@
     openError = null;
     isOpening = true;
     try {
-      const doc: DocumentInfo = await openDocument(path);
+      const pw = password ?? getCachedPassword(passwordCache, path);
+      const doc: DocumentInfo = await openDocument(path, pw);
+      if (pw) setCachedPassword(passwordCache, path, pw);
+      passwordPromptPath = null;
+      passwordPromptError = null;
+
       const store = new MarkupStore(doc.doc_id, {
         add: addMarkup,
         update: updateMarkup,
@@ -175,10 +197,32 @@
         .then((scales) => { ts.seedScales(scales); })
         .catch(() => {}); // scales are non-critical
     } catch (e) {
-      openError = String(e);
+      const message = String(e);
+      if (message === ERR_PASSWORD_REQUIRED) {
+        passwordPromptPath = path;
+        passwordPromptError = null;
+      } else if (message === ERR_WRONG_PASSWORD) {
+        passwordPromptPath = path;
+        passwordPromptError = "Incorrect password. Try again.";
+      } else {
+        openError = message;
+      }
     } finally {
       isOpening = false;
     }
+  }
+
+  /** PasswordPromptDialog submit handler: retry the open with the entered password. */
+  async function handlePasswordSubmit(password: string) {
+    const path = passwordPromptPath;
+    if (!path) return;
+    await openFilePath(path, password);
+  }
+
+  /** PasswordPromptDialog cancel handler: abandon the open attempt cleanly. */
+  function handlePasswordCancel() {
+    passwordPromptPath = null;
+    passwordPromptError = null;
   }
 
   async function handleOpenFile() {
@@ -644,6 +688,16 @@
       onSave={handleSavePromptSave}
       onDiscard={handleSavePromptDiscard}
       onCancel={handleSavePromptCancel}
+    />
+  {/if}
+
+  <!-- Password prompt dialog - shown when open_document reports an encrypted PDF -->
+  {#if passwordPromptPath !== null}
+    <PasswordPromptDialog
+      filename={passwordPromptPath.split(/[\\/]/).at(-1) ?? passwordPromptPath}
+      errorHint={passwordPromptError}
+      onSubmit={handlePasswordSubmit}
+      onCancel={handlePasswordCancel}
     />
   {/if}
 

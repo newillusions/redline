@@ -97,7 +97,10 @@ fn bench_tier(engine: &mut RenderEngine, tier: &str, path: &Path) -> Option<Tier
 
     // --- Cold open ---
     let t = Instant::now();
-    let pages = match engine.open_document(path.to_path_buf(), doc_id.clone()) {
+    let pages = match engine
+        .open_document(path.to_path_buf(), doc_id.clone(), None)
+        .and_then(|outcome| outcome.into_page_count())
+    {
         Ok(p) => p,
         Err(e) => {
             eprintln!("  OPEN FAILED: {e:#}");

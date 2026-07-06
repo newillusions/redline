@@ -15,8 +15,17 @@ use super::annots::{read_markups, write_markups};
 use crate::markup::Markup;
 
 /// Read the markup set from a PDF on disk.
-pub fn load_markups_from(path: &Path) -> Result<Vec<Markup>> {
-    let doc = Document::load(path).with_context(|| format!("load {}", path.display()))?;
+///
+/// If the PDF is encrypted, `password` decrypts it first (lopdf's `Document::load`
+/// does NOT auto-decrypt - it leaves streams/strings as ciphertext). Returns an
+/// error rather than silently reading garbled ciphertext as annotation content if
+/// decryption fails or no password was supplied for an encrypted file.
+pub fn load_markups_from(path: &Path, password: Option<&str>) -> Result<Vec<Markup>> {
+    let mut doc = Document::load(path).with_context(|| format!("load {}", path.display()))?;
+    if doc.is_encrypted() {
+        doc.decrypt(password.unwrap_or(""))
+            .map_err(|e| anyhow::anyhow!("incorrect password for encrypted PDF: {e}"))?;
+    }
     read_markups(&doc)
 }
 
@@ -35,8 +44,23 @@ pub fn load_markups_from(path: &Path) -> Result<Vec<Markup>> {
 /// calling. Windows rename-over-an-open-file fails with ERROR_ACCESS_DENIED;
 /// macOS tolerates it. The command layer closes the render doc before the
 /// swap and reopens it after.
+///
+/// # Encrypted PDFs are refused, not decrypted-and-resaved
+/// lopdf's `decrypt()` strips the `/Encrypt` entry and has no matching
+/// re-encrypt-on-save path (`encrypt()` requires a fresh `EncryptionState` and
+/// errors if the document is already encrypted). Silently decrypting on load and
+/// saving plain would strip the user's password protection from their file - a
+/// worse outcome than refusing outright. v1 scope is open+view of encrypted PDFs
+/// (see render::open_document / load_markups_from); editing and saving markups
+/// back into an encrypted PDF is a known, named gap, not implemented here.
 pub fn save_with_markups(src: &Path, dest: &Path, markups: &[Markup]) -> Result<()> {
     let mut doc = Document::load(src).with_context(|| format!("load {}", src.display()))?;
+    if doc.is_encrypted() {
+        anyhow::bail!(
+            "Saving markups into a password-protected PDF is not supported yet - saving \
+             would strip the file's password protection. Your changes were not saved."
+        );
+    }
     write_markups(&mut doc, markups)?;
 
     let dir = dest.parent().context("dest has no parent dir")?;
@@ -77,11 +101,11 @@ mod tests {
         let m = redline_markup(0);
         save_with_markups(&src, &dest, std::slice::from_ref(&m)).unwrap();
 
-        let got = load_markups_from(&dest).unwrap();
+        let got = load_markups_from(&dest, None).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id(), m.id());
         // Source untouched.
-        assert!(load_markups_from(&src).unwrap().is_empty());
+        assert!(load_markups_from(&src, None).unwrap().is_empty());
     }
 
     #[test]
@@ -92,7 +116,7 @@ mod tests {
         doc.save(&p).unwrap();
 
         save_with_markups(&p, &p, &[redline_markup(0)]).unwrap();
-        assert_eq!(load_markups_from(&p).unwrap().len(), 1);
+        assert_eq!(load_markups_from(&p, None).unwrap().len(), 1);
         // No stray temp files left behind.
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -100,6 +124,102 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".redline-tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp file not cleaned: {leftovers:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Password-protected PDFs: view works, save is refused (not half-shipped).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn load_markups_from_decrypts_with_correct_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("encrypted.pdf");
+
+        // Build the markup BEFORE encrypting, so it's present as encrypted content
+        // when saved - matches how a real password-protected PDF with existing
+        // annotations looks on disk.
+        let mut doc = encrypted_one_page_doc_with_markup("redline-pw", "owner-pw");
+        doc.save(&path).unwrap();
+
+        let got = load_markups_from(&path, Some("redline-pw")).expect("decrypt + read");
+        assert_eq!(got.len(), 1, "existing markup must survive encrypted round-trip");
+    }
+
+    #[test]
+    fn load_markups_from_wrong_password_errors() {
+        use crate::document::annots::tests::encrypted_one_page_doc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("encrypted.pdf");
+        let mut doc = encrypted_one_page_doc("redline-pw", "owner-pw");
+        doc.save(&path).unwrap();
+
+        let err = load_markups_from(&path, Some("wrong-password"));
+        assert!(err.is_err(), "wrong password must error, not return garbage");
+    }
+
+    #[test]
+    fn load_markups_from_no_password_on_encrypted_doc_errors() {
+        use crate::document::annots::tests::encrypted_one_page_doc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("encrypted.pdf");
+        let mut doc = encrypted_one_page_doc("redline-pw", "owner-pw");
+        doc.save(&path).unwrap();
+
+        let err = load_markups_from(&path, None);
+        assert!(
+            err.is_err(),
+            "no password on an encrypted doc must error, never silently read ciphertext"
+        );
+    }
+
+    #[test]
+    fn save_with_markups_refuses_encrypted_document() {
+        use crate::document::annots::tests::encrypted_one_page_doc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("encrypted.pdf");
+        let mut doc = encrypted_one_page_doc("redline-pw", "owner-pw");
+        doc.save(&src).unwrap();
+
+        let dest = dir.path().join("out.pdf");
+        let err = save_with_markups(&src, &dest, &[redline_markup(0)]);
+
+        assert!(
+            err.is_err(),
+            "save on an encrypted doc must be refused, not silently strip protection"
+        );
+        assert!(
+            !dest.exists(),
+            "refused save must not leave a partial/unprotected output file"
+        );
+    }
+
+    /// Same fixture as `encrypted_one_page_doc`, but with one redline markup written
+    /// into the /Annots array BEFORE encrypting - so decrypt-then-read exercises a
+    /// realistic "existing annotations in an encrypted file" scenario.
+    fn encrypted_one_page_doc_with_markup(user_password: &str, owner_password: &str) -> Document {
+        let (mut doc, page_id) = one_page_doc();
+        write_markups(&mut doc, &[redline_markup(0)]).unwrap();
+        // Re-derive the page id lookup isn't needed further; write_markups already
+        // targeted page 0 via the /Kids array set up by one_page_doc().
+        let _ = page_id;
+
+        let id = lopdf::Object::string_literal(b"redline-test-fixture-id".to_vec());
+        doc.trailer.set("ID", vec![id.clone(), id]);
+
+        use lopdf::encryption::{EncryptionState, EncryptionVersion, Permissions};
+        let state = EncryptionState::try_from(EncryptionVersion::V2 {
+            document: &doc,
+            owner_password,
+            user_password,
+            key_length: 128,
+            permissions: Permissions::all(),
+        })
+        .expect("build encryption state for test fixture");
+        doc.encrypt(&state).expect("encrypt test fixture");
+        doc
     }
 
     /// Build a grouped pair (shared `group_id`) + one fonted Text markup on page 0.
@@ -183,7 +303,7 @@ mod tests {
         save_with_markups(&src, &dest, &markups).unwrap();
 
         // Reopen from the real file on disk.
-        let got = load_markups_from(&dest).unwrap();
+        let got = load_markups_from(&dest, None).unwrap();
         assert_eq!(got.len(), 3, "all three markups survive");
         let find = |id: uuid::Uuid| got.iter().find(|m| m.id() == id).unwrap();
 
@@ -306,7 +426,7 @@ mod tests {
             .expect("save_with_markups on C1 corpus");
 
         // 3. Reload markups and verify the annotation survived the round-trip.
-        let got = load_markups_from(&work).expect("load_markups_from saved C1");
+        let got = load_markups_from(&work, None).expect("load_markups_from saved C1");
         assert!(
             got.iter().any(|x| x.id() == m.id()),
             "markup id {} not found after save; got {:?}",
@@ -318,7 +438,7 @@ mod tests {
         let mut engine =
             RenderEngine::new().expect("PDFium must load (PDFIUM_DYNAMIC_LIB_PATH set)");
         engine
-            .open_document(work.clone(), "c1-saved".into())
+            .open_document(work.clone(), "c1-saved".into(), None)
             .expect("PDFium open saved C1");
         let req = TileRequest {
             doc_id: "c1-saved".into(),

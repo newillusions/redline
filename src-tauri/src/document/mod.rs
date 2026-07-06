@@ -16,6 +16,16 @@ pub struct DocumentInfo {
     pub page_count: u32,
 }
 
+/// Sentinel error strings returned by the `open_document` command when a PDF is
+/// password-protected. Every other `open_document` failure keeps the existing
+/// free-form `format!("{:#}", e)` message - these two are the only machine-checked
+/// values, matching this codebase's `Result<T, String>` command convention (no
+/// custom Tauri error-serialization type exists anywhere else in this crate).
+/// The frontend (`src/lib/ipc.ts`) checks for these exact strings to decide
+/// whether to show the password dialog vs a generic error banner - keep in sync.
+pub const ERR_PASSWORD_REQUIRED: &str = "PASSWORD_REQUIRED";
+pub const ERR_WRONG_PASSWORD: &str = "WRONG_PASSWORD";
+
 pub mod annots;
 pub mod page_ops;
 pub mod save;
