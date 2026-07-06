@@ -4,6 +4,11 @@ import {
   fitHeightZoom,
   ACTUAL_SIZE_ZOOM,
   wheelZoomFactor,
+  quantizeZoom,
+  clampTileDpr,
+  MAX_TILE_DPR,
+  ZOOM_MIN,
+  ZOOM_MAX,
 } from "./viewport";
 
 // ---------------------------------------------------------------------------
@@ -46,5 +51,63 @@ describe("wheelZoomFactor", () => {
     expect(wheelZoomFactor(0)).toBeCloseTo(1);
     expect(wheelZoomFactor(-100000)).toBeCloseTo(2);
     expect(wheelZoomFactor(100000)).toBeCloseTo(0.5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// quantizeZoom - Windows-freeze fix (bounds the number of distinct raster zoom
+// levels a smooth wheel-zoom gesture can generate).
+// ---------------------------------------------------------------------------
+describe("quantizeZoom", () => {
+  it("collapses the real Windows-freeze zoom sequence onto a small, bounded set of rungs", () => {
+    // The actual sequence captured from the freeze-reproducing Windows log: a run of close
+    // fractional zoom values from a smooth wheel gesture, each of which minted a fresh tile
+    // set under the old unquantized behaviour.
+    const observedSequence = [
+      0.9895, 0.9807, 1.0698, 0.8517, 0.8843, 0.8390, 0.8378, 0.9912, 1.0123, 0.9456,
+    ];
+    const rungs = new Set(observedSequence.map((z) => quantizeZoom(z)));
+    // Values within ~12% of each other must collapse onto the same or adjacent rungs -
+    // nowhere near one distinct rung per input value.
+    expect(rungs.size).toBeLessThan(observedSequence.length);
+  });
+
+  it("maps a dense continuous zoom range onto a bounded ladder of discrete levels", () => {
+    const rungs = new Set<number>();
+    // 200 distinct continuous zoom levels sampled smoothly across the valid range - directly
+    // mirrors the TDD scenario feeding the tile cache in tile-cache.test.ts.
+    for (let i = 0; i < 200; i++) {
+      const z = ZOOM_MIN + ((ZOOM_MAX - ZOOM_MIN) * i) / 199;
+      rungs.add(quantizeZoom(z));
+    }
+    // The ladder spans [ZOOM_MIN, ZOOM_MAX] in ~12% steps - a small, bounded rung count
+    // regardless of how many continuous input samples are fed in.
+    expect(rungs.size).toBeLessThan(50);
+  });
+
+  it("is a pure, gesture-independent function - the same input always yields the same rung", () => {
+    expect(quantizeZoom(1.0)).toBe(quantizeZoom(1.0));
+    expect(quantizeZoom(0.8517)).toBe(quantizeZoom(0.8517));
+  });
+
+  it("clamps output to [min, max]", () => {
+    expect(quantizeZoom(0.001)).toBeGreaterThanOrEqual(ZOOM_MIN);
+    expect(quantizeZoom(1000)).toBeLessThanOrEqual(ZOOM_MAX);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// clampTileDpr - Windows-freeze fix (bounds per-tile decoded byte size on
+// high display-scaling Windows machines, e.g. 250% -> dpr 2.5).
+// ---------------------------------------------------------------------------
+describe("clampTileDpr", () => {
+  it("passes through dpr values at or below the cap", () => {
+    expect(clampTileDpr(1)).toBe(1);
+    expect(clampTileDpr(2)).toBe(2);
+  });
+
+  it("clamps the real Windows 250% scaling case (dpr 2.5) down to MAX_TILE_DPR", () => {
+    expect(clampTileDpr(2.5)).toBe(MAX_TILE_DPR);
+    expect(clampTileDpr(3)).toBe(MAX_TILE_DPR);
   });
 });

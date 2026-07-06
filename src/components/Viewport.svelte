@@ -33,9 +33,14 @@
     fitWidthZoom,
     fitHeightZoom,
     ACTUAL_SIZE_ZOOM,
+    quantizeZoom,
+    clampTileDpr,
+    ZOOM_MIN,
+    ZOOM_MAX,
     type ViewportState,
     type ViewportSnapshot,
   } from "$lib/viewport";
+  import { BoundedTileCache, DEFAULT_TILE_CACHE_CAP_BYTES } from "$lib/tile-cache";
   import {
     markupToSvg, selectionChrome, vertexChrome, isClosedMarkupType,
     type SvgShape, type SelectionChrome, type VertexChrome,
@@ -114,10 +119,13 @@
 
   // Track in-flight tile renders to avoid duplicate requests
   const pendingTiles = new Set<string>();
-  // Drawn tile image data keyed by "page,tx,ty,zoom_millis"
-  const tileCache = new Map<string, HTMLImageElement>();
-  // Bumped whenever the view is invalidated (zoom/page change). A fetchTile that started
-  // under an older epoch discards its paint on arrival, killing stale-tile races.
+  // Drawn tile image data keyed by "page,tx,ty,zoom_millis". Bounded LRU (Windows-freeze fix,
+  // 2026-07): an unbounded Map here let a smooth wheel-zoom mint an unbounded number of large
+  // decoded tiles (one fresh set per fractional zoom value) and wedge the WebView2 main
+  // thread. See src/lib/tile-cache.ts for the eviction policy.
+  const tileCache = new BoundedTileCache<HTMLImageElement>(DEFAULT_TILE_CACHE_CAP_BYTES);
+  // Bumped whenever the view is invalidated (zoom bucket change / page change). A fetchTile
+  // that started under an older epoch discards its paint on arrival, killing stale-tile races.
   let renderEpoch = 0;
 
   // Smooth-zoom: during a wheel/keyboard zoom gesture the canvas is CSS-scaled as an instant
@@ -393,11 +401,27 @@
     return `${pageIndex},${tx},${ty},${zoomMillis}`;
   }
 
+  /** dpr used for tile rasterization / pixel-budget math (clamped - see MAX_TILE_DPR). CSS
+   *  layout (viewState.dpr) keeps the real, unclamped devicePixelRatio. */
+  function tileDpr(): number {
+    return clampTileDpr(window.devicePixelRatio || 1);
+  }
+
   function requestTiles() {
     if (!canvasEl || pageWidthPts === 0) return;
 
-    const dpr = window.devicePixelRatio || 1;
-    const tiles = visibleTiles(viewState);
+    const dpr = tileDpr();
+    // Quantize the RASTER zoom to a discrete ladder (Windows-freeze fix): many nearby
+    // continuous `zoom` values collapse onto the same renderZoom, so a smooth wheel-zoom
+    // gesture reuses cached tiles instead of rasterizing a fresh full-res set per sub-pixel
+    // delta. `zoom` itself stays continuous for the SVG overlay / markup math and for the
+    // CSS-transform correction below (applyZoomPlaceholder absorbs the residual gap).
+    const renderZoom = quantizeZoom(zoom);
+    const renderScale = renderZoom / zoom;
+    const renderScrollX = scrollX * renderScale;
+    const renderScrollY = scrollY * renderScale;
+    const renderViewState: ViewportState = { ...viewState, zoom: renderZoom, scrollX: renderScrollX, scrollY: renderScrollY };
+    const tiles = visibleTiles(renderViewState);
 
     let ctx: CanvasRenderingContext2D | null = null;
     try {
@@ -407,34 +431,44 @@
     }
     if (!ctx) return;
 
-    // Rendering natively at the current zoom/scroll — drop any zoom placeholder transform
-    // and record this as the last sharp render (the basis for the next placeholder).
-    canvasEl.style.transform = "none";
-    lastRenderZoom = zoom;
-    lastRenderScrollX = scrollX;
-    lastRenderScrollY = scrollY;
+    // Only bump the epoch (discarding in-flight fetches from the previous bucket) when the
+    // committed render bucket actually changes. Same-bucket settles (several wheel ticks
+    // quantizing to the same renderZoom) intentionally keep the existing cache/epoch so they
+    // hit the cache instead of re-rasterizing identical content.
+    if (renderZoom !== lastRenderZoom) renderEpoch++;
+    const epoch = renderEpoch;
+
+    lastRenderZoom = renderZoom;
+    lastRenderScrollX = renderScrollX;
+    lastRenderScrollY = renderScrollY;
+    // Recompute the CSS transform against the just-committed render basis - identity when
+    // renderZoom === zoom, a small corrective scale/translate otherwise.
+    applyZoomPlaceholder();
 
     // Clear the whole backing store (device px) before redrawing so the previous frame's
     // tiles don't ghost when the page shrinks (zoom-out), on pan, or on page-switch.
     ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
 
-    const epoch = renderEpoch;
+    // The tile set about to be painted must never be evicted mid-render even under memory
+    // pressure from other zoom buckets still cached (see BoundedTileCache protectedKeys).
+    const zoomMillis = Math.round(renderZoom * dpr * 1000);
+    const visibleKeys = new Set(tiles.map(({ tx, ty }) => tileKey(tx, ty, zoomMillis)));
 
     // Draw placeholders immediately for tiles not yet cached.
     for (const { tx, ty } of tiles) {
-      const zoomMillis = Math.round(zoom * dpr * 1000);
       const key = tileKey(tx, ty, zoomMillis);
 
-      if (tileCache.has(key)) {
-        // Already rendered — draw it.
-        drawTile(ctx, tileCache.get(key)!, tx, ty);
+      const cached = tileCache.get(key); // get() also marks most-recently-used
+      if (cached) {
+        // Already rendered - draw it.
+        drawTile(ctx, cached, tx, ty);
       } else {
-        // Draw placeholder immediately (≤16ms spec §20).
+        // Draw placeholder immediately (<=16ms spec section 20).
         drawPlaceholder(ctx, tx, ty);
 
         if (!pendingTiles.has(key)) {
           pendingTiles.add(key);
-          fetchTile(tx, ty, zoomMillis, dpr, key, epoch);
+          fetchTile(tx, ty, zoomMillis, dpr, renderZoom, key, epoch, visibleKeys);
         }
       }
     }
@@ -445,8 +479,10 @@
     ty: number,
     zoomMillis: number,
     dpr: number,
+    renderZoom: number,
     key: string,
-    epoch: number
+    epoch: number,
+    visibleKeys: ReadonlySet<string>
   ) {
     try {
       const result: RenderedTile = await renderTile({
@@ -455,14 +491,14 @@
         tile_size_css: TILE_SIZE_CSS,
         tile_x: tx,
         tile_y: ty,
-        zoom,
+        zoom: renderZoom,
         dpr,
       });
 
       lastTileMs = result.render_ms;
       tileCount += 1;
 
-      // Decode PNG base64 → HTMLImageElement.
+      // Decode PNG base64 -> HTMLImageElement.
       const img = new Image();
       img.src = `data:image/png;base64,${result.png_base64}`;
       await new Promise<void>((resolve, reject) => {
@@ -470,11 +506,12 @@
         img.onerror = reject;
       });
 
-      tileCache.set(key, img);
+      tileCache.set(key, img, visibleKeys);
 
-      // Only paint if the view hasn't changed since this fetch began — otherwise a slow
-      // tile from a previous page/zoom would land on the current view (page-switch race /
-      // zoom ghosting). Pan is exempt: drawTile reads live scroll, so it stays aligned.
+      // Only paint if the view hasn't changed since this fetch began - otherwise a slow
+      // tile from a previous page/zoom-bucket would land on the current view (page-switch
+      // race / zoom ghosting). Pan is exempt: drawTile reads the live render-scroll basis,
+      // so it stays aligned.
       const ctx = canvasEl?.getContext("2d");
       if (ctx && epoch === renderEpoch) drawTile(ctx, img, tx, ty);
     } catch (e) {
@@ -482,7 +519,7 @@
     } finally {
       pendingTiles.delete(key);
       // After this tile resolves, if a zoom is pending and nothing is in flight,
-      // the view has settled — record the zoom-settle time.
+      // the view has settled - record the zoom-settle time.
       checkZoomSettled();
     }
   }
@@ -493,13 +530,17 @@
     tx: number,
     ty: number
   ) {
-    // Draw in DEVICE pixels at the bitmap's native size and an integer origin. Because the
-    // tile stride (TILE_SIZE_CSS × dpr) is an integer, rounding each tile's origin makes
-    // adjacent tiles abut exactly — no sub-pixel seam between blocks. (Backing store is
-    // container × dpr; the ctx is NOT dpr-scaled.)
-    const dpr = window.devicePixelRatio || 1;
-    const dx = Math.round((tx * TILE_SIZE_CSS - scrollX) * dpr);
-    const dy = Math.round((ty * TILE_SIZE_CSS - scrollY) * dpr);
+    // Draw in DEVICE pixels at the bitmap's native size and an integer origin, positioned
+    // against the last COMMITTED render basis (lastRenderZoom/lastRenderScrollX/Y) rather than
+    // the live continuous zoom/scroll - the tile's pixel content was rasterized at that basis
+    // (see requestTiles' quantization), and the CSS transform on the canvas element corrects
+    // the residual gap to the live zoom/scroll. Because the tile stride (TILE_SIZE_CSS * dpr)
+    // is an integer, rounding each tile's origin makes adjacent tiles abut exactly - no
+    // sub-pixel seam between blocks. (Backing store is container * dpr; the ctx is NOT
+    // dpr-scaled.)
+    const dpr = tileDpr();
+    const dx = Math.round((tx * TILE_SIZE_CSS - lastRenderScrollX) * dpr);
+    const dy = Math.round((ty * TILE_SIZE_CSS - lastRenderScrollY) * dpr);
     ctx.drawImage(img, dx, dy);
   }
 
@@ -509,11 +550,14 @@
     ty: number
   ) {
     // Device-px, matching drawTile so placeholders tile seamlessly under the sharp tiles.
-    const dpr = window.devicePixelRatio || 1;
-    const dx = Math.round((tx * TILE_SIZE_CSS - scrollX) * dpr);
-    const dy = Math.round((ty * TILE_SIZE_CSS - scrollY) * dpr);
-    const w = Math.min(TILE_SIZE_CSS, pageWidthPx - tx * TILE_SIZE_CSS) * dpr;
-    const h = Math.min(TILE_SIZE_CSS, pageHeightPx - ty * TILE_SIZE_CSS) * dpr;
+    // Uses the same committed render basis as drawTile (see its comment).
+    const dpr = tileDpr();
+    const renderPageWidthPx = pageWidthPts * lastRenderZoom;
+    const renderPageHeightPx = pageHeightPts * lastRenderZoom;
+    const dx = Math.round((tx * TILE_SIZE_CSS - lastRenderScrollX) * dpr);
+    const dy = Math.round((ty * TILE_SIZE_CSS - lastRenderScrollY) * dpr);
+    const w = Math.min(TILE_SIZE_CSS, renderPageWidthPx - tx * TILE_SIZE_CSS) * dpr;
+    const h = Math.min(TILE_SIZE_CSS, renderPageHeightPx - ty * TILE_SIZE_CSS) * dpr;
     ctx.fillStyle = "#2c2c2e";
     ctx.fillRect(dx, dy, Math.ceil(w), Math.ceil(h));
   }
@@ -529,11 +573,14 @@
     containerWidth  = entry.contentRect.width;
     containerHeight = entry.contentRect.height;
 
-    // Resize the canvas backing store (device px). The 2D context is intentionally NOT
-    // dpr-scaled — tiles are drawn in device pixels at integer positions (see drawTile) so
-    // adjacent tiles abut seamlessly (no sub-pixel join line between blocks).
+    // Resize the canvas backing store (device px), at the same clamped dpr used to
+    // rasterize/position tiles (tileDpr) - Windows-freeze fix: a backing store sized at the
+    // real (unclamped) dpr while tiles are drawn at a clamped dpr would leave the canvas only
+    // partially painted. The 2D context is intentionally NOT dpr-scaled - tiles are drawn in
+    // device pixels at integer positions (see drawTile) so adjacent tiles abut seamlessly (no
+    // sub-pixel join line between blocks).
     if (canvasEl) {
-      const dpr = window.devicePixelRatio || 1;
+      const dpr = tileDpr();
       canvasEl.width  = containerWidth  * dpr;
       canvasEl.height = containerHeight * dpr;
     }
@@ -718,8 +765,7 @@
   // ---------------------------------------------------------------------------
   // Zoom (wheel + keyboard) — multiplicative, anchored to a screen point
   // ---------------------------------------------------------------------------
-  const ZOOM_MIN = 0.1;
-  const ZOOM_MAX = 8.0;
+  // ZOOM_MIN / ZOOM_MAX live in $lib/viewport (shared with quantizeZoom's clamp range).
 
   /** Clamp scroll so the page can't be pushed past its bounds (pins to 0 when smaller). */
   function clampScroll() {
@@ -769,7 +815,12 @@
     if (zoomSettleTimer) clearTimeout(zoomSettleTimer);
     zoomSettleTimer = setTimeout(() => {
       zoomSettleTimer = null;
-      invalidateTiles(); // requestTiles (next) resets the transform + lastRender*
+      // NOTE: no unconditional invalidateTiles() here (Windows-freeze fix) - requestTiles()
+      // itself now bumps the epoch only when the quantized renderZoom bucket actually
+      // changes, and cache hygiene comes from the bounded LRU (tile-cache.ts) rather than a
+      // full clear on every settle. A full clear here would defeat quantization's whole
+      // point: several wheel-tick settles landing in the same renderZoom bucket should reuse
+      // the tiles already fetched for that bucket, not re-rasterize them from scratch.
       requestTiles();
     }, 120);
   }

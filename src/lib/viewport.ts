@@ -84,8 +84,47 @@ export function wheelZoomFactor(deltaY: number): number {
   return Math.min(2, Math.max(0.5, Math.exp(-deltaY * 0.0015)));
 }
 
-/** Zoom-snap presets — 1:1 (actual size / 100%). */
+/** Zoom-snap presets - 1:1 (actual size / 100%). */
 export const ACTUAL_SIZE_ZOOM = 1.0;
+
+/**
+ * Discrete geometric zoom ladder used to bound tile-cache churn during a smooth zoom gesture
+ * (Windows-freeze fix, 2026-07). Snapping the RASTER zoom to this ladder means many nearby
+ * continuous zoom values (a run of wheel ticks a few percent apart) collapse onto the SAME
+ * tile-cache key, instead of each minting a fresh full-resolution tile set. The live
+ * (continuous) `zoom` is left untouched for the SVG overlay / markup math (section 5 precision
+ * invariant) and for the CSS-transform placeholder, which already absorbs the residual gap
+ * between a quantized raster and the true zoom (see Viewport.svelte applyZoomPlaceholder).
+ */
+export const ZOOM_QUANT_STEP = 1.12; // ~12% per rung
+
+/** Zoom bounds shared with Viewport.svelte's ZOOM_MIN/ZOOM_MAX (kept in sync; see quantizeZoom). */
+export const ZOOM_MIN = 0.1;
+export const ZOOM_MAX = 8.0;
+
+/**
+ * Snap a continuous zoom value onto the nearest rung of the geometric ladder
+ * (ZOOM_QUANT_STEP ^ n), clamped to [min, max]. Pure function of `zoom` alone - independent
+ * of gesture history - so a smooth zoom-in/out always lands on the same rungs.
+ */
+export function quantizeZoom(zoom: number, min = ZOOM_MIN, max = ZOOM_MAX): number {
+  const clamped = Math.max(min, Math.min(max, zoom));
+  const rung = Math.round(Math.log(clamped) / Math.log(ZOOM_QUANT_STEP));
+  return Math.pow(ZOOM_QUANT_STEP, rung);
+}
+
+/**
+ * Cap on the dpr used for tile RASTERIZATION only (spec section 20 Windows-freeze fix). At
+ * 250%+ Windows display scaling, devicePixelRatio can be 2.5+; rasterizing every tile at that
+ * resolution inflates decoded tile bytes by (dpr/2)^2 for no visible benefit - 2x oversampling
+ * is already visually sharp. CSS layout keeps using the real (unclamped) devicePixelRatio.
+ */
+export const MAX_TILE_DPR = 2.0;
+
+/** Clamp a devicePixelRatio value for use in tile rasterization / pixel-budget math only. */
+export function clampTileDpr(dpr: number, max = MAX_TILE_DPR): number {
+  return Math.min(dpr, max);
+}
 
 /**
  * Zoom level at which the page WIDTH exactly fills the viewport width.
