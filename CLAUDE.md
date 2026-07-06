@@ -16,7 +16,7 @@ The authoritative v1 technical specification lives at `docs/bluebeam-alternative
 - **OCR:** Tesseract (Apache-2.0) via `leptess`
 - **Full-text search:** Tantivy (MIT) - folder/library index
 - **Doc-surgery backend:** trait-based, swappable - free baseline for v1; MuPDF/Apryse pluggable later
-- **Targets:** Windows x64, macOS (universal)
+- **Targets:** Windows x64, macOS Apple Silicon only (Intel dropped per decision:boujy4d42i8w7zovifts, 2026-06-29)
 
 ## Architecture (Rust core modules)
 `render` (tiled rasterization, display only) · `geometry` (vector path extraction + snap-target spatial index, PDF user space) · `document` (parse/model, page manipulation) · `text` (extraction + search) · `ocr` (invisible text layer) · `search` (Tantivy folder index) · `markup` (annotation model → standard PDF annotations) · `takeoff` (calibration, measurement, quantity calc, f64 user space) · `docops` *(swappable trait: flatten/optimize/redact)* · `compare` (Phase 1.1) · `storage` (local-first + version hooks).
