@@ -43,6 +43,8 @@
   import DocumentHistoryPanel from "./components/DocumentHistoryPanel.svelte";
   import { loadRecentDocs, saveRecentDocs, upsertMru } from "$lib/recent-docs";
   import type { RecentDoc } from "$lib/recent-docs";
+  import SettingsDialog from "./components/SettingsDialog.svelte";
+  import UpdateNotification from "./components/UpdateNotification.svelte";
 
   // ---------------------------------------------------------------------------
   // Multi-doc state
@@ -129,6 +131,9 @@
   let leftCollapsed  = $state(false);
   let rightCollapsed = $state(false);
   let bottomCollapsed = $state(true);
+
+  // Settings dialog visibility
+  let settingsOpen = $state(false);
 
   // ---------------------------------------------------------------------------
   // Open flow — dedup by path, new tab per file
@@ -499,6 +504,11 @@
         onclick={() => (bottomCollapsed = !bottomCollapsed)}
         title="Toggle markups list"
       >▼</button>
+      <button
+        class="btn-toolbar btn-icon"
+        onclick={() => (settingsOpen = true)}
+        title="Settings"
+      >⚙</button>
     </div>
   </header>
 
@@ -636,6 +646,13 @@
       onCancel={handleSavePromptCancel}
     />
   {/if}
+
+  <!-- Settings dialog -->
+  {#if settingsOpen}
+    <SettingsDialog onClose={() => (settingsOpen = false)} />
+  {/if}
+
+  <UpdateNotification />
 </div>
 
 <style>

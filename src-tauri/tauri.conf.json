@@ -56,6 +56,18 @@
         "displayLanguageSelector": false
       },
       "allowDowngrades": true
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://raw.githubusercontent.com/newillusions/redline/main/update.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IFBMQUNFSE9MREVSIG1pbmlzaWduIHB1YmxpYyBrZXkgLSByZXBsYWNlIGFmdGVyIG9yY2hlc3RyYXRvciBydW5zICJ0YXVyaSBzaWduZXIgZ2VuZXJhdGUiIGZvciByZWRsaW5lClJXUExBQ0VIT0xERVJQTEFDRUhPTERFUlBMQUNFSE9MREVSUExBQ0VIT0xERVJQTEFDRUhPTERFUlBMQUNFSE9MREVSCg==",
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

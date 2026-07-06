@@ -119,6 +119,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_log::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // Resolve the bundled PDFium path BEFORE spawning the render thread
             // (which loads PDFium). Needs the AppHandle for the resource dir, so it
@@ -186,6 +188,9 @@ pub fn run() {
             commands::recent_docs::load_recent_docs,
             commands::recent_docs::save_recent_docs,
             commands::recent_docs::check_file_exists,
+            // Application settings (local user preferences)
+            commands::settings::load_settings,
+            commands::settings::save_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running redline");
