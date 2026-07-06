@@ -330,6 +330,8 @@ jobs:
     name: Update manifest
     needs: [build-macos, build-windows]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     if: always() && needs.build-macos.result != 'cancelled' && needs.build-windows.result != 'cancelled'
     steps:
       - name: Get version
@@ -423,3 +425,19 @@ jobs:
             echo "Failed to push to Gitea (may need manual update)"
             echo "The update.json artifact is available for manual upload"
           fi
+
+      # The updater endpoint reads update.json from THIS repo's main branch on
+      # raw.githubusercontent.com - commit it back here so released clients see
+      # new versions (e-fees relies on a manual sync for this step and its GitHub
+      # manifest goes stale; this closes that gap for redline).
+      - name: Commit update.json to GitHub main
+        continue-on-error: true
+        run: |
+          git clone --depth 1 "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" manifest-repo
+          cp update.json manifest-repo/update.json
+          cd manifest-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add update.json
+          git diff --cached --quiet || git commit -m "chore: update manifest for v${{ steps.version.outputs.VERSION }}"
+          git push origin HEAD:main
