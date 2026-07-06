@@ -28,13 +28,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Apple Silicon only - Intel Mac support dropped per decision:boujy4d42i8w7zovifts (2026-06-29)
           - target: aarch64-apple-darwin
             pdfium_target: mac-arm64
-          - target: x86_64-apple-darwin
-            pdfium_target: mac-x64
     outputs:
       sig-aarch64: ${{ steps.get_sig.outputs.sig_aarch64 }}
-      sig-x86_64: ${{ steps.get_sig.outputs.sig_x86_64 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -349,7 +347,6 @@ jobs:
           VERSION="${{ steps.version.outputs.VERSION }}"
           PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           SIG_AARCH64="${{ needs.build-macos.outputs.sig-aarch64 }}"
-          SIG_X64="${{ needs.build-macos.outputs.sig-x86_64 }}"
           SIG_WIN="${{ needs.build-windows.outputs.sig-windows }}"
 
           cat > update.json << EOF
@@ -361,10 +358,6 @@ jobs:
               "darwin-aarch64": {
                 "signature": "$SIG_AARCH64",
                 "url": "https://forge.mms.name/emittiv/redline/releases/download/v$VERSION/Redline_${VERSION}_aarch64.app.tar.gz"
-              },
-              "darwin-x86_64": {
-                "signature": "$SIG_X64",
-                "url": "https://forge.mms.name/emittiv/redline/releases/download/v$VERSION/Redline_${VERSION}_x64.app.tar.gz"
               },
               "windows-x86_64": {
                 "signature": "$SIG_WIN",
