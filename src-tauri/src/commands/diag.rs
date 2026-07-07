@@ -43,10 +43,15 @@ fn rss_mb() -> f64 {
 
 #[cfg(target_os = "windows")]
 fn rss_mb() -> f64 {
+    use std::os::windows::process::CommandExt;
+    // Suppress the child console window: redline is a GUI-subsystem process, so a
+    // plain spawn gives `tasklist` its own console (one visible window per sample).
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     // `tasklist /FI "PID eq <pid>" /FO CSV /NH` → last CSV field is "1,234 K".
     let pid = std::process::id();
     let out = std::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     match out {
         Ok(o) => {

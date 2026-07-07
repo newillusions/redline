@@ -157,7 +157,29 @@
 
   let lastFrameTs   = 0;           // rAF timestamp of previous pan frame
   let zoomStartTs   = 0;           // performance.now() at last zoom change (0 = settled)
-  let rssTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Poll process RSS only while the §20 overlay is visible. The readout shells out
+  // per sample (`ps` / `tasklist`), so a standing 1 Hz poll is wasted work - and on
+  // Windows each spawn opened a visible console window (fixed in diag.rs too, but
+  // the poll simply shouldn't run when nothing displays the value).
+  $effect(() => {
+    if (!benchOverlay) return;
+    let cancelled = false;
+    const sample = async () => {
+      try {
+        const v = await processRssMb();
+        if (!cancelled) rssMb = v;
+      } catch {
+        if (!cancelled) rssMb = 0;
+      }
+    };
+    sample();
+    const timer = setInterval(sample, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  });
 
   // --- Draw gesture state ---
   let identity = $state<UserRef | null>(null);
@@ -1630,14 +1652,6 @@
       resizeObserver.observe(containerEl);
     }
     window.addEventListener("keydown", onKeyDown);
-    // Poll process RSS once per second for the §20 overlay.
-    rssTimer = setInterval(async () => {
-      try {
-        rssMb = await processRssMb();
-      } catch {
-        rssMb = 0;
-      }
-    }, 1000);
     loadPageSize();
     // Load user identity for markup authoring. On failure, surface a notice so the
     // crosshair-but-nothing-happens state isn't silent.
@@ -1649,7 +1663,6 @@
   onDestroy(() => {
     resizeObserver?.disconnect();
     window.removeEventListener("keydown", onKeyDown);
-    if (rssTimer) clearInterval(rssTimer);
     if (zoomSettleTimer) clearTimeout(zoomSettleTimer);
     tileCache.clear();
     pendingTiles.clear();

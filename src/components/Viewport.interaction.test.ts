@@ -2210,3 +2210,57 @@ describe("Viewport pointer-tool shortcut", () => {
     expect(store.activeTool).toBe("Text");
   });
 });
+
+// ---------------------------------------------------------------------------
+// §20 RSS poll gating (v0.2.2 hotfix regression tests)
+//
+// The RSS readout shells out per sample (`ps` / `tasklist`); on Windows every
+// spawn opened a visible console window. The poll must therefore run ONLY
+// while the bench overlay (B key) is visible - never as a standing interval.
+// ---------------------------------------------------------------------------
+describe("S20 RSS poll gating", () => {
+  let ipc: ReturnType<typeof fakeIpc>;
+  let store: MarkupStore;
+
+  beforeEach(() => {
+    vi.mocked(ipcMocks.getPageSize).mockResolvedValue(FAKE_PAGE_SIZE);
+    vi.mocked(ipcMocks.renderTile).mockResolvedValue({
+      doc_id: "d1", page_index: 0, tile_x: 0, tile_y: 0,
+      width_px: 512, height_px: 512, zoom: 1, dpr: 1,
+      png_base64: "", render_ms: 1,
+    });
+    vi.mocked(ipcMocks.processRssMb).mockResolvedValue(0);
+    vi.mocked(ipcMocks.getUserIdentity).mockResolvedValue(FAKE_IDENTITY);
+    ipc = fakeIpc();
+    store = new MarkupStore("d1", ipc);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("RSS1: does not poll processRssMb while the overlay is hidden", async () => {
+    await mountViewport(store);
+    // Longer than one poll period - the old code sampled every 1000 ms unconditionally.
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(vi.mocked(ipcMocks.processRssMb)).not.toHaveBeenCalled();
+  });
+
+  it("RSS2: starts polling when the overlay is toggled on, stops when toggled off", async () => {
+    await mountViewport(store);
+    expect(vi.mocked(ipcMocks.processRssMb)).not.toHaveBeenCalled();
+
+    // Toggle the bench overlay on (B) - the effect samples immediately.
+    fireEvent.keyDown(window, { key: "b" });
+    await waitFor(() => {
+      expect(vi.mocked(ipcMocks.processRssMb)).toHaveBeenCalled();
+    });
+
+    // Toggle off - the interval must be torn down.
+    fireEvent.keyDown(window, { key: "b" });
+    await tick();
+    const callsAtToggleOff = vi.mocked(ipcMocks.processRssMb).mock.calls.length;
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(vi.mocked(ipcMocks.processRssMb).mock.calls.length).toBe(callsAtToggleOff);
+  });
+});

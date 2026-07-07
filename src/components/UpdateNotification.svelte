@@ -2,13 +2,15 @@
   /**
    * Auto-update notification (Tauri updater plugin). Checks for an update a
    * few seconds after launch; on find, shows a modal with release notes and
-   * a download-then-relaunch flow. Mirrors e-fees' UpdateNotification but
-   * without its custom backend logging hook (redline has no equivalent
-   * system-log API command yet) - console logging only.
+   * a download-then-relaunch flow. Every check outcome (up-to-date, found,
+   * failed) is written to the file log via tauri-plugin-log so a pasted log
+   * shows whether the updater ran - silence in the UI means "up to date",
+   * never "didn't check".
    */
   import { onMount } from "svelte";
   import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
+  import { info as logInfo, error as logError } from "@tauri-apps/plugin-log";
 
   let showModal = $state(false);
   let updateInfo = $state<{ version: string; notes: string } | null>(null);
@@ -26,18 +28,24 @@
   });
 
   async function checkForUpdates() {
+    void logInfo("[updater] checking for updates");
     try {
       const update = await check();
       if (update) {
+        void logInfo(`[updater] update available: ${update.version} (current ${update.currentVersion})`);
         updateObject = update;
         updateInfo = {
           version: update.version,
           notes: update.body || `New version ${update.version} is available`,
         };
         showModal = true;
+      } else {
+        void logInfo("[updater] up to date - no newer version on the manifest");
       }
     } catch (e) {
-      // Update-check failures are non-fatal and silent to the user; log for diagnostics.
+      // Update-check failures are non-fatal and silent in the UI; the file log
+      // carries the evidence so a silent failure is distinguishable from up-to-date.
+      void logError(`[updater] check failed: ${e instanceof Error ? e.message : String(e)}`);
       console.error("[updater] check failed:", e);
     }
   }
@@ -67,9 +75,11 @@
       });
       readyToInstall = true;
       downloading = false;
+      void logInfo(`[updater] downloaded + staged ${updateInfo?.version ?? "?"} - awaiting restart`);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       downloading = false;
+      void logError(`[updater] download/install failed: ${error}`);
     }
   }
 
