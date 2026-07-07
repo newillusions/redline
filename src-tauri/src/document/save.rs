@@ -489,6 +489,51 @@ mod tests {
         eprintln!("G9 sample PDF written to: {out}");
     }
 
+    /// Bluebeam interop ship gate: a saved markup's `/AP /N` appearance stream survives a
+    /// REAL file save -> reopen (not just dict<->dict) as a resolvable indirect Form
+    /// XObject with a non-empty content stream. This is what makes redline-authored PDFs
+    /// render/persist correctly in a strict external viewer that does not synthesize
+    /// appearances from geometry - Acrobat/PDFium already tolerate a missing `/AP`,
+    /// Bluebeam does not.
+    #[test]
+    fn saved_markup_ap_stream_survives_real_file_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.pdf");
+        let (mut doc, _) = one_page_doc();
+        doc.save(&src).unwrap();
+
+        let m = redline_markup(0);
+        let dest = dir.path().join("out.pdf");
+        save_with_markups(&src, &dest, std::slice::from_ref(&m)).unwrap();
+
+        // Reopen from the real file on disk and walk the page's /Annots -> /AP -> /N chain.
+        let reopened = Document::load(&dest).unwrap();
+        let page_id = *reopened.get_pages().values().next().unwrap();
+        let page = reopened.get_dictionary(page_id).unwrap();
+        let annots = match page.get(b"Annots").unwrap() {
+            lopdf::Object::Array(a) => a.clone(),
+            lopdf::Object::Reference(r) => reopened.get_object(*r).unwrap().as_array().unwrap().clone(),
+            other => panic!("unexpected /Annots shape: {other:?}"),
+        };
+        assert_eq!(annots.len(), 1);
+        let annot_dict = match &annots[0] {
+            lopdf::Object::Reference(r) => reopened.get_dictionary(*r).unwrap(),
+            other => panic!("expected an indirect annotation, got {other:?}"),
+        };
+
+        let ap = annot_dict.get(b"AP").expect("/AP must survive the file round-trip").as_dict().unwrap();
+        let n_ref = match ap.get(b"N").expect("/AP /N must be present") {
+            lopdf::Object::Reference(r) => *r,
+            other => panic!("/AP /N must be an indirect reference, got {other:?}"),
+        };
+        let stream = match reopened.get_object(n_ref).expect("/AP /N must resolve") {
+            lopdf::Object::Stream(s) => s,
+            other => panic!("/AP /N must resolve to a Stream, got {other:?}"),
+        };
+        assert_eq!(stream.dict.get(b"Subtype").unwrap().as_name().unwrap(), b"Form");
+        assert!(!stream.content.is_empty(), "appearance content must survive the file round-trip");
+    }
+
     #[test]
     fn missing_source_errors_and_dest_untouched() {
         let dir = tempfile::tempdir().unwrap();

@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::geometry::{PdfPoint, Quad};
 
 mod annotation;
+pub(crate) mod appearance;
 
 /// v1 markup types (spec §12 decision a — locked).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
