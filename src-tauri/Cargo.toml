@@ -1,6 +1,6 @@
 [package]
 name = "redline"
-version = "0.2.4"
+version = "0.3.0"
 description = "Redline — AEC PDF markup, takeoff, and document management"
 authors = ["Emittiv L.L.C-FZ"]
 license = ""
