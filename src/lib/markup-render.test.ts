@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { markupToSvg, cloudPath, selectionChrome, countSymbolRender, type SvgShape } from "./markup-render";
+import { markupToSvg, cloudPath, selectionChrome, countSymbolRender, quadToScreenPolygon, type SvgShape } from "./markup-render";
 import type { Markup, MarkupType, Appearance, MarkupGeometry, CountSet } from "./ipc";
 import type { ViewportState } from "./viewport";
 import { pdfUserSpaceToScreen } from "./viewport";
@@ -91,6 +91,58 @@ describe("markupToSvg geometry", () => {
     if (s.render.shape !== "polygon") throw new Error("shape");
     // A triangle is 3 vertices → 3 "x,y" tokens.
     expect(s.render.points.trim().split(" ")).toHaveLength(3);
+  });
+
+  it("maps a text-anchored Highlight (Quads) to a 'quads' kind, one polygon per line", () => {
+    const geom: MarkupGeometry = {
+      Quads: [
+        [{ x: 0, y: 100 }, { x: 50, y: 100 }, { x: 0, y: 50 }, { x: 50, y: 50 }],
+      ],
+    };
+    const s = markupToSvg(mk(geom, "Highlight"), VS);
+    expect(s.kind).toBe("quads");
+    if (s.kind !== "quads") throw new Error("kind");
+    expect(s.polygons).toHaveLength(1);
+    // TL(0,100)->(0,0), TR(50,100)->(100,0), BL(0,50)->(0,100), BR(50,50)->(100,100).
+    // Rendered winding order is TL,TR,BR,BL (non-self-intersecting).
+    expect(s.polygons[0]).toBe("0,0 100,0 100,100 0,100");
+  });
+
+  it("preserves quad count for a multi-line text-anchored Highlight", () => {
+    const geom: MarkupGeometry = {
+      Quads: [
+        [{ x: 0, y: 100 }, { x: 50, y: 100 }, { x: 0, y: 90 }, { x: 50, y: 90 }],
+        [{ x: 0, y: 85 }, { x: 30, y: 85 }, { x: 0, y: 75 }, { x: 30, y: 75 }],
+      ],
+    };
+    const s = markupToSvg(mk(geom, "Highlight"), VS);
+    if (s.kind !== "quads") throw new Error("kind");
+    expect(s.polygons).toHaveLength(2);
+  });
+
+  it("text-anchored Highlight renders as a translucent colour wash, no stroke", () => {
+    const geom: MarkupGeometry = {
+      Quads: [[{ x: 0, y: 100 }, { x: 50, y: 100 }, { x: 0, y: 50 }, { x: 50, y: 50 }]],
+    };
+    const s = markupToSvg(mk(geom, "Highlight", { color: "#00ff00", opacity: 1 }), VS);
+    if (s.kind !== "quads") throw new Error("kind");
+    expect(s.fill).toBe("#00ff00");
+    expect(s.stroke).toBe("none");
+    expect(s.opacity).toBeCloseTo(0.35); // opacity(1) * HIGHLIGHT_FILL_ALPHA(0.35)
+  });
+
+  it("quadToScreenPolygon: TL/TR/BL/BR storage order renders as TL,TR,BR,BL winding", () => {
+    const quad: [{ x: number; y: number }, { x: number; y: number }, { x: number; y: number }, { x: number; y: number }] =
+      [{ x: 0, y: 100 }, { x: 50, y: 100 }, { x: 0, y: 50 }, { x: 50, y: 50 }];
+    expect(quadToScreenPolygon(quad, VS)).toBe("0,0 100,0 100,100 0,100");
+  });
+
+  it("rectangle-drag Highlight (freeform, non-text) is unchanged: still a plain 'rect' kind", () => {
+    // The old Rect-geometry Highlight path (drag-anywhere, e.g. for scans/drawings
+    // with no text layer) must keep working exactly as before - only the geometry
+    // KEY ("Quads" vs "Rect") decides which rendering path a Highlight markup takes.
+    const s = markupToSvg(mk({ Rect: { min: { x: 0, y: 0 }, max: { x: 50, y: 50 } } }, "Highlight"), VS);
+    expect(s.kind).toBe("rect");
   });
 });
 

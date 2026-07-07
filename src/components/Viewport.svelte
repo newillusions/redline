@@ -42,9 +42,10 @@
   } from "$lib/viewport";
   import { BoundedTileCache, DEFAULT_TILE_CACHE_CAP_BYTES } from "$lib/tile-cache";
   import {
-    markupToSvg, selectionChrome, vertexChrome, isClosedMarkupType,
+    markupToSvg, selectionChrome, vertexChrome, isClosedMarkupType, quadToScreenPolygon,
     type SvgShape, type SelectionChrome, type VertexChrome,
   } from "$lib/markup-render";
+  import { charIndexAtPoint, getTextSelection, selectionRange, type Quad } from "$lib/text-select";
   import { MarkupStore } from "$lib/markup-store.svelte";
   import {
     hitTest, marqueeHits, boundsOf, isRectResizable,
@@ -195,6 +196,20 @@
   // --- Ink freehand state ---
   let inkStroke = $state<{ x: number; y: number }[]>([]);
 
+  // --- Text-selection (I-beam) tool state ---
+  /** Char index resolved at pointer-down (the drag anchor). Null when not dragging. */
+  let textSelAnchorChar: number | null = null;
+  /** Page the current drag started on (a selection never crosses pages). */
+  let textSelPage: number | null = null;
+  /** Char index last fetched from the backend - avoids re-calling IPC on every
+   *  pixel of pointer movement when the hit-tested char index hasn't changed. */
+  let textSelLastFocusChar: number | null = null;
+  /** True while a text-selection drag is in progress (pointer down -> up). */
+  let textSelDragging = $state(false);
+  /** The current (committed-on-release, but visible live during drag) text selection.
+   *  Cleared by Escape, by switching tools, or after committing a Highlight. */
+  let textSelection = $state<{ page: number; start: number; end: number; quads: Quad[]; text: string } | null>(null);
+
   // --- Inline text editor (Text/Callout) ---
   // editor carries placement info; editorText is a separate $state so bind:value
   // never reaches into a potentially-null object (avoids a Svelte runtime crash when
@@ -250,8 +265,10 @@
   /** True when the select tool is active. */
   const isSelectTool = (t = store.activeTool): boolean => t === "select";
 
-  /** Overlay captures pointer events for create tools OR select tool. */
-  const overlayActive = $derived(isCreateTool() || isSelectTool());
+  /** Overlay captures pointer events for create tools, select tool, or the I-beam
+   *  text-selection tool (not a create/select tool in the drawn-shape sense, but
+   *  still needs pointer capture for its own drag gesture). */
+  const overlayActive = $derived(isCreateTool() || isSelectTool() || store.activeTool === "selectText");
 
   // --- Calibration dialog state ---
   let showCalibDialog = $state(false);
@@ -391,6 +408,16 @@
           active: idx === activeSearchHitIdx,
         };
       })
+  );
+
+  // Live text-selection preview: screen-space polygons for the active/in-progress
+  // I-beam selection on the current page (mirrors pageSearchHits' pattern). Shown
+  // whether the drag is still in progress or has ended - it stays live until
+  // Escape, a tool switch, or Enter commits it as a Highlight.
+  const textSelectionPolygons = $derived(
+    textSelection && textSelection.page === pageIndex
+      ? textSelection.quads.map((q) => quadToScreenPolygon(q, viewState))
+      : [],
   );
 
   // ---------------------------------------------------------------------------
@@ -667,6 +694,14 @@
     // so Arrow keys don't hijack navigation while the user is typing.
     if (e.metaKey || e.ctrlKey) {
       if (editor) return; // let textarea handle Cmd/Ctrl inside the editor
+      // Ctrl/Cmd+C: copy the active text selection (I-beam tool) to the clipboard.
+      // Only fires when there IS a text selection - otherwise this key combo falls
+      // through untouched (no markup-copy feature exists to conflict with).
+      if ((e.key === "c" || e.key === "C") && textSelection && textSelection.text) {
+        e.preventDefault();
+        copyTextSelection();
+        return;
+      }
       if (e.key === "=" || e.key === "+") { e.preventDefault(); applyZoom(zoom * 1.1, containerWidth / 2, containerHeight / 2); return; }
       if (e.key === "-" || e.key === "_") { e.preventDefault(); applyZoom(zoom / 1.1, containerWidth / 2, containerHeight / 2); return; }
       // Fit-width: Cmd/Ctrl+1 (legacy) or Cmd/Ctrl+0
@@ -756,6 +791,12 @@
         m.measurement = meas;
         store.create(m);
         resetMultiClick();
+      } else if (store.activeTool === "selectText" && textSelection) {
+        // Commit the active text selection as a text-anchored Highlight - mirrors
+        // the existing Enter-to-finish convention used by MeasurementArea/multi-click
+        // tools above, so there is no new gesture pattern to learn.
+        e.preventDefault();
+        commitTextSelectionHighlight();
       } else {
         finishMultiClick();
       }
@@ -763,6 +804,7 @@
     if (e.key === "Escape") {
       resetMultiClick();
       cancelDraw();
+      clearTextSelection();
       store.selectedIds = new Set();
       activeVertex = null;
       // Cancel in-progress calibration.
@@ -932,6 +974,101 @@
     return clientToPdf(e.clientX, e.clientY);
   }
 
+  // ---------------------------------------------------------------------------
+  // Text selection (I-beam tool) - async helpers.
+  //
+  // Pointer handlers are synchronous (native DOM events), but resolving a point
+  // to a character index and a range to quads both require an IPC round-trip to
+  // the render thread (PDFium owns the text page). These are called fire-and-
+  // forget (`void fn(...)`) from the sync handlers, matching the existing
+  // fetchTile() pattern elsewhere in this file. Each guards against a STALE
+  // response landing after a newer gesture started (drag ended, tool switched,
+  // or a new drag began) by re-checking textSelDragging/textSelAnchorChar/
+  // textSelPage before applying the result.
+  // ---------------------------------------------------------------------------
+
+  /** Hit-test a PDF-user-space point to a character index on `page`. */
+  async function resolveCharAt(p: { x: number; y: number }, page: number): Promise<number | null> {
+    if (!docInfo) return null;
+    // Tolerance in PDF points: SELECT_GRAB_PX screen px converted at the current zoom,
+    // matching the same "grab radius" convention markup hit-testing uses.
+    const tolerance = SELECT_GRAB_PX / zoom;
+    try {
+      return await charIndexAtPoint(docInfo.doc_id, page, p.x, p.y, tolerance);
+    } catch (err) {
+      console.error("charIndexAtPoint failed:", err);
+      return null;
+    }
+  }
+
+  /** Resolve the drag anchor character, then seed a zero-width selection at it. */
+  async function beginTextSelection(p: { x: number; y: number }, page: number): Promise<void> {
+    const anchor = await resolveCharAt(p, page);
+    if (!textSelDragging || textSelPage !== page) return; // gesture ended before this resolved
+    textSelAnchorChar = anchor;
+    if (anchor !== null) await refreshTextSelection(anchor, anchor, page);
+  }
+
+  /**
+   * Fetch quads + text for the range spanning `anchor`..`focus` (either order) and
+   * update `textSelection`. Throttled: skips the IPC call entirely when `focus`
+   * matches the last-fetched focus char (no-op drag jitter within the same glyph).
+   */
+  async function refreshTextSelection(anchor: number, focus: number, page: number): Promise<void> {
+    if (focus === textSelLastFocusChar) return;
+    textSelLastFocusChar = focus;
+    if (!docInfo) return;
+    const { start, end } = selectionRange(anchor, focus);
+    try {
+      const sel = await getTextSelection(docInfo.doc_id, page, start, end);
+      // Stale-response guard: a newer drag (different anchor/page) may have started
+      // while this request was in flight.
+      if (textSelAnchorChar !== anchor || textSelPage !== page) return;
+      textSelection = { page, start, end, quads: sel.quads, text: sel.text };
+    } catch (err) {
+      console.error("getTextSelection failed:", err);
+    }
+  }
+
+  /** Clear the active text selection (Escape, tool switch, or after committing a Highlight). */
+  function clearTextSelection(): void {
+    textSelection = null;
+    textSelAnchorChar = null;
+    textSelPage = null;
+    textSelLastFocusChar = null;
+    textSelDragging = false;
+  }
+
+  /**
+   * Commit the active text selection as a text-anchored Highlight annotation
+   * (Quads geometry, spec section 6 addendum) - the QuadPoints-carrying
+   * counterpart to the freeform rectangle-drag Highlight tool (unchanged, still
+   * available). No-op when there is no active selection or no quads (e.g. an
+   * image-only region with no text layer under the drag).
+   */
+  function commitTextSelectionHighlight(): void {
+    if (!textSelection || !identity || textSelection.quads.length === 0) return;
+    const m = buildMarkup({
+      markupType: "Highlight",
+      page: textSelection.page,
+      geometry: { Quads: textSelection.quads },
+      appearance: store.draftAppearance,
+      identity,
+      now: new Date().toISOString(),
+      id: crypto.randomUUID(),
+    });
+    store.create(m);
+    clearTextSelection();
+  }
+
+  /** Copy the active text selection's extracted text to the clipboard (Ctrl/Cmd+C). */
+  function copyTextSelection(): void {
+    if (!textSelection || !textSelection.text) return;
+    navigator.clipboard.writeText(textSelection.text).catch((err) => {
+      console.error("clipboard writeText failed:", err);
+    });
+  }
+
   /** Reset all draw state — used by pointerup teardown and pointercancel. */
   function cancelDraw() {
     drawing = false;
@@ -1020,6 +1157,11 @@
     // Clear selection when switching AWAY from the select tool.
     if (!isSelectTool(tool)) {
       store.selectedIds = new Set();
+    }
+    // Clear any in-progress/active text selection when switching AWAY from the
+    // I-beam tool (staying on it, or just arriving at it, must NOT clear).
+    if (tool !== "selectText") {
+      clearTextSelection();
     }
   });
 
@@ -1194,6 +1336,23 @@
       return;
     }
 
+    // --- TEXT SELECTION (I-beam) tool branch: drag selects real PDF text. ---
+    if (tool === "selectText") {
+      if (!docInfo) return;
+      const p = localPdf(e);
+      if (!p) return;
+      (e.target as Element).setPointerCapture(e.pointerId);
+      textSelDragging = true;
+      textSelPage = pageIndex;
+      textSelAnchorChar = null;
+      textSelLastFocusChar = null;
+      textSelection = null;
+      e.stopPropagation();
+      e.preventDefault();
+      void beginTextSelection(p, pageIndex);
+      return;
+    }
+
     // --- CALIBRATE tool branch ---
     if (tool === "calibrate") {
       const p = localPdf(e);
@@ -1239,6 +1398,20 @@
 
   function onOverlayPointerMove(e: PointerEvent) {
     const tool = store.activeTool;
+
+    // --- TEXT SELECTION (I-beam) tool: extend the range to the current point. ---
+    if (tool === "selectText") {
+      if (!textSelDragging || textSelAnchorChar === null || textSelPage === null) return;
+      const p = localPdf(e);
+      if (!p) return;
+      const anchor = textSelAnchorChar;
+      const page = textSelPage;
+      void resolveCharAt(p, page).then((focus) => {
+        if (focus === null || !textSelDragging) return;
+        void refreshTextSelection(anchor, focus, page);
+      });
+      return;
+    }
 
     // --- SELECT tool: live resize / move / vertex preview, or marquee ---
     if (isSelectTool(tool)) {
@@ -1316,6 +1489,15 @@
   function onOverlayPointerUp(e: PointerEvent) {
     previewMarkup = null; // clear the live preview unconditionally (no ghost on early-return)
     const tool = store.activeTool;
+
+    // --- TEXT SELECTION (I-beam) tool: end the drag. The selection itself stays
+    //     live (rendered + copyable) until Escape, a tool switch, or Enter commits
+    //     it as a Highlight - mirrors how a native text selection persists after
+    //     mouseup until the user does something else. ---
+    if (tool === "selectText") {
+      textSelDragging = false;
+      return;
+    }
 
     // --- SELECT tool: commit resize / move / vertex / marquee ---
     if (isSelectTool(tool)) {
@@ -1715,6 +1897,16 @@
           stroke-dasharray={s.dashArray ?? undefined}
           pointer-events="none"
         />
+      {:else if s.kind === "quads"}
+        <!-- Text-anchored Highlight: one translucent polygon per underlying text line
+             (never a single bounding rect - see markup-render.ts markupToSvg). -->
+        {#each s.polygons as pts, i (i)}
+          <polygon points={pts}
+            stroke="none"
+            fill={s.fill} opacity={s.opacity}
+            pointer-events="none"
+          />
+        {/each}
       {:else if s.kind === "ellipse"}
         <ellipse
           cx={s.cx} cy={s.cy} rx={s.rx} ry={s.ry}
@@ -1899,6 +2091,18 @@
         pointer-events="none"
       />
     {/if}
+
+    <!-- Live text-selection preview (I-beam tool). One translucent polygon per
+         underlying text line, same shape/order Enter would commit as a Highlight -
+         so what you see during the drag is exactly what gets created. -->
+    {#each textSelectionPolygons as pts, i (i)}
+      <polygon
+        class="text-selection-preview"
+        points={pts}
+        pointer-events="none"
+        aria-hidden="true"
+      />
+    {/each}
 
     <!-- Search hit highlights (M4 S3). Semi-transparent rects over matched text.
          Active hit uses a stronger fill for the "you are here" indicator. -->
@@ -2096,6 +2300,16 @@
     stroke-width: 1px;
     stroke-dasharray: 4, 2;
     opacity: 0.7;
+  }
+
+  /* Live text-selection preview (I-beam tool). Translucent primary-colour fill, no
+     stroke - what Enter would commit as a text-anchored Highlight (the committed
+     markup itself uses the user's draftAppearance colour; this static preview
+     colour is a deliberate simplification, not a mismatch with what gets saved). */
+  :global(.markup-overlay .text-selection-preview) {
+    fill: var(--color-primary);
+    fill-opacity: 0.3;
+    stroke: none;
   }
 
   /* Search hit highlights (M4 S3). Semi-transparent yellow fill, no stroke. */

@@ -172,6 +172,9 @@ pub fn run() {
             commands::takeoff::write_page_measure,
             // Text search commands (M4 S3)
             commands::text::search_document,
+            // Text selection commands (I-beam tool: text selection + text-anchored highlight)
+            commands::text_select::char_index_at_point,
+            commands::text_select::get_text_selection,
             // Version snapshot commands (M4 S2)
             commands::versioning::snapshot_version,
             commands::versioning::list_document_versions,

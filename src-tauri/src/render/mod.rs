@@ -31,7 +31,8 @@ use pdfium_render::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use crate::text::{SearchHit, SearchOptions};
+use crate::geometry::rects_to_quads;
+use crate::text::{SearchHit, SearchOptions, TextRangeSelection};
 
 /// Files at or above this size use the memory-mapped `FPDF_LoadMemDocument64`
 /// (64-bit-clean) load path instead of the streaming file-access path, which has
@@ -702,6 +703,102 @@ impl RenderEngine {
         Ok(hits)
     }
 
+    /// Hit-test a PDF-user-space point to the nearest character index on a page,
+    /// within `tolerance` PDF points on each axis. Returns `None` when no character
+    /// is within tolerance (e.g. clicking whitespace or an image-only region).
+    ///
+    /// Used as the drag anchor/focus resolver for the I-beam text-selection tool -
+    /// the frontend converts a screen click to PDF user space (the same
+    /// `screenToPdfUserSpace` transform markups use, spec §5 invariant) and calls
+    /// this once per drag-move (throttled to char-index changes on the frontend
+    /// side, not here).
+    pub fn char_index_at_point(
+        &mut self,
+        doc_id: &str,
+        page_index: u32,
+        x: f64,
+        y: f64,
+        tolerance: f64,
+    ) -> Result<Option<usize>> {
+        let doc = self
+            .documents
+            .get_mut(doc_id)
+            .with_context(|| format!("Unknown doc_id: {doc_id}"))?;
+        let page = doc.page(page_index)?;
+        let page_text = page.text().with_context(|| {
+            format!("Failed to load text page for doc={doc_id} page={page_index}")
+        })?;
+        let tol = PdfPoints::new(tolerance as f32);
+        let chars = page_text.chars();
+        Ok(chars
+            .get_char_near_point(PdfPoints::new(x as f32), tol, PdfPoints::new(y as f32), tol)
+            .map(|c| c.index()))
+    }
+
+    /// Resolve a character range `[start, end)` on a page into the `Quad`s for a
+    /// text-anchored Highlight annotation plus the plain-text content for the
+    /// clipboard (spec §6 addendum, text-selection feature).
+    ///
+    /// Uses PDFium's `segments_subset` (FPDFText_CountRects/GetRect under the
+    /// hood), which returns one rect per visual text line in the range - the SAME
+    /// underlying rects `search_page` merges into one bounding box per hit. Here
+    /// they are kept separate (one `Quad` per rect) so a multi-line selection
+    /// highlights as N translucent bands hugging each line, matching how
+    /// Acrobat/Bluebeam render real text-markup annotations.
+    ///
+    /// Returns an empty selection (no error) for `end <= start` (degenerate/empty
+    /// range) - the frontend can call this speculatively during a drag without a
+    /// range-validity dance.
+    pub fn text_range_selection(
+        &mut self,
+        doc_id: &str,
+        page_index: u32,
+        start: usize,
+        end: usize,
+    ) -> Result<TextRangeSelection> {
+        if end <= start {
+            return Ok(TextRangeSelection::default());
+        }
+
+        let doc = self
+            .documents
+            .get_mut(doc_id)
+            .with_context(|| format!("Unknown doc_id: {doc_id}"))?;
+        let page = doc.page(page_index)?;
+        let page_text = page.text().with_context(|| {
+            format!("Failed to load text page for doc={doc_id} page={page_index}")
+        })?;
+
+        let count = end - start;
+        let mut rects: Vec<[f64; 4]> = Vec::new();
+        let segments = page_text.segments_subset(start, count);
+        for i in segments.as_range() {
+            let seg = segments
+                .get(i)
+                .with_context(|| format!("segment {i} out of range"))?;
+            let b = seg.bounds();
+            rects.push([
+                b.left().value as f64,
+                b.bottom().value as f64,
+                b.right().value as f64,
+                b.top().value as f64,
+            ]);
+        }
+        let quads = rects_to_quads(&rects);
+
+        let chars = page_text.chars();
+        let mut text = String::new();
+        for i in start..end {
+            if let Ok(c) = chars.get(i) {
+                if let Some(ch) = c.unicode_char() {
+                    text.push(ch);
+                }
+            }
+        }
+
+        Ok(TextRangeSelection { quads, text })
+    }
+
     /// Return the number of pages for an open document.
     pub fn page_count(&self, doc_id: &str) -> Option<u32> {
         self.documents.get(doc_id).map(|d| d.page_count)
@@ -987,6 +1084,23 @@ pub enum RenderCmd {
         options: SearchOptions,
         reply: oneshot::Sender<Result<Vec<SearchHit>>>,
     },
+    /// Hit-test a PDF-user-space point to a character index (text-selection tool).
+    CharIndexAtPoint {
+        doc_id: String,
+        page_index: u32,
+        x: f64,
+        y: f64,
+        tolerance: f64,
+        reply: oneshot::Sender<Result<Option<usize>>>,
+    },
+    /// Resolve a character range into Highlight quads + clipboard text.
+    TextRangeSelection {
+        doc_id: String,
+        page_index: u32,
+        start: usize,
+        end: usize,
+        reply: oneshot::Sender<Result<TextRangeSelection>>,
+    },
 }
 
 /// A `Send + Sync` handle to the render thread.
@@ -1070,6 +1184,25 @@ impl RenderHandle {
                             reply,
                         } => {
                             let _ = reply.send(engine.search_page(&doc_id, page_index, &query, &options));
+                        }
+                        RenderCmd::CharIndexAtPoint {
+                            doc_id,
+                            page_index,
+                            x,
+                            y,
+                            tolerance,
+                            reply,
+                        } => {
+                            let _ = reply.send(engine.char_index_at_point(&doc_id, page_index, x, y, tolerance));
+                        }
+                        RenderCmd::TextRangeSelection {
+                            doc_id,
+                            page_index,
+                            start,
+                            end,
+                            reply,
+                        } => {
+                            let _ = reply.send(engine.text_range_selection(&doc_id, page_index, start, end));
                         }
                     }
                 }
@@ -1190,6 +1323,56 @@ impl RenderHandle {
             .await
             .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
     }
+
+    /// Hit-test a PDF-user-space point to a character index (text-selection tool).
+    /// See [`RenderEngine::char_index_at_point`].
+    pub async fn char_index_at_point(
+        &self,
+        doc_id: String,
+        page_index: u32,
+        x: f64,
+        y: f64,
+        tolerance: f64,
+    ) -> Result<Option<usize>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(RenderCmd::CharIndexAtPoint {
+                doc_id,
+                page_index,
+                x,
+                y,
+                tolerance,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("render thread gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
+    }
+
+    /// Resolve a character range into Highlight quads + clipboard text.
+    /// See [`RenderEngine::text_range_selection`].
+    pub async fn text_range_selection(
+        &self,
+        doc_id: String,
+        page_index: u32,
+        start: usize,
+        end: usize,
+    ) -> Result<TextRangeSelection> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(RenderCmd::TextRangeSelection {
+                doc_id,
+                page_index,
+                start,
+                end,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("render thread gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
+    }
 }
 
 /// Send an init-error reply to any command that arrived before PDFium loaded.
@@ -1212,6 +1395,12 @@ fn send_init_error(cmd: RenderCmd, err: &anyhow::Error) {
             let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
         }
         RenderCmd::SearchPage { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+        }
+        RenderCmd::CharIndexAtPoint { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+        }
+        RenderCmd::TextRangeSelection { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
         }
     }
@@ -1454,6 +1643,93 @@ pub(crate) mod tests {
         let tile = e.render_tile(&one_tile(0)).expect("render c1 tile");
         assert!(!tile.png_base64.is_empty());
         assert!(tile.width_px > 0 && tile.height_px > 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Text-selection integration tests (redline text-selection + text-anchored
+    // highlight feature). Same PDFium/corpus gate as the render tests above -
+    // self-skip in CI (PDFIUM_DYNAMIC_LIB_PATH unset there, obs:he8y7010dlo82k88rocu).
+    // The pure quad-geometry math (rect ordering, quad count) is covered
+    // PDFium-free in geometry::tests; these tests only prove the PDFium plumbing
+    // wires up correctly against a real text-bearing page.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn text_range_selection_on_c1_returns_quads_and_text_for_first_chars() {
+        let Some(path) = corpus("c1-typical/c1-contract-691pg-A4.pdf") else {
+            eprintln!("skip text_range_selection: no PDFium env or corpus");
+            return;
+        };
+        let mut e = RenderEngine::new().expect("pdfium");
+        e.open_document(path, "t".into(), None)
+            .and_then(OpenOutcome::into_page_count)
+            .expect("open c1");
+
+        // First 20 characters of page 0's text stream - a real contract cover page
+        // has a text layer, so this should resolve to at least one quad.
+        let sel = e
+            .text_range_selection("t", 0, 0, 20)
+            .expect("text_range_selection should not error on a text-bearing page");
+        assert!(!sel.quads.is_empty(), "expected at least one line quad for the first 20 chars");
+        assert!(!sel.text.is_empty(), "expected non-empty extracted text");
+        assert!(
+            sel.text.chars().count() <= 20,
+            "extracted text must not exceed the requested char count"
+        );
+        // Every quad must be a well-formed axis-aligned rect: TL/TR share y (top),
+        // BL/BR share y (bottom), left points share x, right points share x.
+        for q in &sel.quads {
+            assert!((q[0].y - q[1].y).abs() < 1e-6, "top edge must be horizontal");
+            assert!((q[2].y - q[3].y).abs() < 1e-6, "bottom edge must be horizontal");
+            assert!(q[0].y >= q[2].y, "top must be at or above bottom (y-up)");
+        }
+    }
+
+    #[test]
+    fn text_range_selection_degenerate_range_is_empty_even_without_open_doc() {
+        // RenderEngine::new() itself loads PDFium, so this still needs the same gate
+        // as every other test here even though the assertion below (end<=start
+        // short-circuits before the doc_id lookup) does not depend on the corpus.
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip degenerate-range test: no PDFium env");
+            return;
+        }
+        let mut e = RenderEngine::new().expect("pdfium");
+        // Unknown doc_id + degenerate range: must return the empty default, not error,
+        // because the end<=start guard runs before the doc_id lookup.
+        let sel = e
+            .text_range_selection("nonexistent-doc", 0, 5, 5)
+            .expect("degenerate range must short-circuit before any doc lookup");
+        assert!(sel.quads.is_empty());
+        assert_eq!(sel.text, "");
+    }
+
+    #[test]
+    fn char_index_at_point_hits_near_a_known_quad_on_c1() {
+        let Some(path) = corpus("c1-typical/c1-contract-691pg-A4.pdf") else {
+            eprintln!("skip char_index_at_point: no PDFium env or corpus");
+            return;
+        };
+        let mut e = RenderEngine::new().expect("pdfium");
+        e.open_document(path, "t".into(), None)
+            .and_then(OpenOutcome::into_page_count)
+            .expect("open c1");
+
+        let sel = e
+            .text_range_selection("t", 0, 0, 5)
+            .expect("text_range_selection on first 5 chars");
+        assert!(!sel.quads.is_empty(), "need at least one quad to hit-test against");
+
+        // Hit-test the centre of the first quad's rect - generous tolerance (the
+        // quad's own half-width/height) so this is robust to font metrics.
+        let q = sel.quads[0];
+        let cx = (q[0].x + q[1].x) / 2.0;
+        let cy = (q[0].y + q[2].y) / 2.0;
+        let tol = ((q[1].x - q[0].x).abs() / 2.0).max(2.0);
+        let hit = e
+            .char_index_at_point("t", 0, cx, cy, tol)
+            .expect("char_index_at_point should not error");
+        assert!(hit.is_some(), "expected a character hit near the first selected quad");
     }
 
     #[test]

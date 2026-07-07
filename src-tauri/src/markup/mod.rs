@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::geometry::PdfPoint;
+use crate::geometry::{PdfPoint, Quad};
 
 mod annotation;
 
@@ -191,8 +191,15 @@ pub enum MarkupGeometry {
     Rect { min: PdfPoint, max: PdfPoint },
     /// Ordered vertices: line / polyline / arrow / polygon / cloud.
     Polyline(Vec<PdfPoint>),
-    /// Freehand ink — one or more independent strokes.
+    /// Freehand ink - one or more independent strokes.
     Ink(Vec<Vec<PdfPoint>>),
+    /// One quadrilateral per visual text line (PDF `/QuadPoints`), used by
+    /// text-anchored [`MarkupType::Highlight`] annotations built from a text
+    /// selection (redline text-selection feature). Never merged across lines -
+    /// each quad hugs exactly one line segment of the underlying text, so a
+    /// multi-line selection renders as N separate translucent bands, matching
+    /// how Acrobat/Bluebeam render real text-markup Highlights.
+    Quads(Vec<Quad>),
 }
 
 /// Audit + attribution carried by every markup (spec §6). The annotation embeds
@@ -534,6 +541,40 @@ mod tests {
             back.count_set.is_none(),
             "absent count_set field must deserialize to None"
         );
+    }
+
+    // --- Quads geometry (text-anchored Highlight) ---
+
+    #[test]
+    fn quads_markup_serde_round_trips() {
+        let quads = vec![
+            [
+                PdfPoint { x: 72.0, y: 712.0 },
+                PdfPoint { x: 500.0, y: 712.0 },
+                PdfPoint { x: 72.0, y: 700.0 },
+                PdfPoint { x: 500.0, y: 700.0 },
+            ],
+            [
+                PdfPoint { x: 72.0, y: 698.0 },
+                PdfPoint { x: 220.0, y: 698.0 },
+                PdfPoint { x: 72.0, y: 686.0 },
+                PdfPoint { x: 220.0, y: 686.0 },
+            ],
+        ];
+        let m = Markup::new(
+            MarkupType::Highlight,
+            2,
+            MarkupGeometry::Quads(quads.clone()),
+            Appearance::default(),
+            user("Alice"),
+        );
+        let json = serde_json::to_string(&m).expect("serialize");
+        let back: Markup = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(m, back);
+        match back.geometry {
+            MarkupGeometry::Quads(q) => assert_eq!(q, quads, "quad count and points preserved"),
+            other => panic!("expected Quads, got {other:?}"),
+        }
     }
 
     #[test]

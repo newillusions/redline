@@ -168,7 +168,16 @@ export type MarkupGeometry =
   | { Point: PdfPoint }
   | { Rect: { min: PdfPoint; max: PdfPoint } }
   | { Polyline: PdfPoint[] }
-  | { Ink: PdfPoint[][] };
+  | { Ink: PdfPoint[][] }
+  /**
+   * One quadrilateral per visual text line (PDF `/QuadPoints`), used by
+   * text-anchored Highlight annotations built from a text selection. Each quad
+   * is 4 points ordered top-left, top-right, bottom-left, bottom-right (mirrors
+   * Rust `geometry::Quad` - see its doc comment for why this order, not the
+   * spec's literal "counterclockwise" wording). See `src/lib/text-select.ts`
+   * for the shared `Quad` type used by the text-selection IPC surface.
+   */
+  | { Quads: [PdfPoint, PdfPoint, PdfPoint, PdfPoint][] };
 
 export interface Appearance {
   color: string;

@@ -20,6 +20,11 @@ interface SvgStyle {
 
 export type SvgShape =
   | (SvgStyle & { kind: "rect"; x: number; y: number; width: number; height: number })
+  | (SvgStyle & {
+      kind: "quads";
+      /** One SVG polygon points-string per quad (one per underlying text line). */
+      polygons: string[];
+    })
   | (SvgStyle & { kind: "ellipse"; cx: number; cy: number; rx: number; ry: number })
   | (SvgStyle & { kind: "polygon"; points: string })
   | (SvgStyle & { kind: "polyline"; points: string })
@@ -215,6 +220,24 @@ export function cloudPath(pts: { x: number; y: number }[], r: number): string {
     }
   }
   return d + " Z";
+}
+
+/**
+ * Screen-space SVG polygon points-string for one text-selection `Quad` (a 4-point
+ * tuple ordered top-left, top-right, bottom-left, bottom-right - the geometry::Quad
+ * convention). SVG needs a non-self-intersecting winding order for a rectangle
+ * (TL, TR, BR, BL), so the last two points are swapped relative to storage order.
+ *
+ * Exported so Viewport.svelte can render the LIVE (uncommitted) text-selection
+ * preview with the exact same screen mapping used for a committed Highlight
+ * markup's quads (markupToSvg's "Quads" branch below calls this too).
+ */
+export function quadToScreenPolygon(
+  quad: readonly [PdfPoint, PdfPoint, PdfPoint, PdfPoint],
+  v: ViewportState,
+): string {
+  const screen = [quad[0], quad[1], quad[3], quad[2]].map((p) => pdfUserSpaceToScreen(p.x, p.y, v));
+  return screen.map((s) => `${+s.x.toFixed(3)},${+s.y.toFixed(3)}`).join(" ");
 }
 
 function pointsStr(pts: { x: number; y: number }[], v: ViewportState): string {
@@ -429,7 +452,20 @@ export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
     };
   }
 
-  // Highlight: a translucent highlighter wash (colour fill, no border) — NOT a text box.
+  // Text-anchored Highlight: built from a text selection (I-beam tool). One translucent
+  // quad per underlying text line - NOT a bounding rectangle, so a multi-line selection
+  // renders as separate bands hugging each line (matches real PDF text-markup annotations,
+  // spec section 6 addendum). The rectangle-drag Highlight below (freeform, for non-text
+  // areas like scans/drawings) is unchanged and stays available as a separate creation path.
+  if ("Quads" in g && m.markup_type === "Highlight") {
+    return {
+      ...style, kind: "quads", polygons: g.Quads.map((q) => quadToScreenPolygon(q, v)),
+      fill: m.appearance.color, stroke: "none",
+      opacity: m.appearance.opacity * HIGHLIGHT_FILL_ALPHA,
+    };
+  }
+
+  // Highlight: a translucent highlighter wash (colour fill, no border) - NOT a text box.
   // Gated here so the text-box fill/outline treatment never applies to Highlight (it stays a
   // RECT_TOOL but renders as a marker pass, per the highlighter convention).
   if ("Rect" in g && m.markup_type === "Highlight") {
@@ -476,6 +512,17 @@ export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
   }
   if ("Ink" in g) {
     return { ...style, kind: "ink", strokes: g.Ink.map((stroke) => pointsStr(stroke, v)) };
+  }
+  if ("Quads" in g) {
+    // Defensive fallback: Quads geometry is only ever produced for Highlight
+    // markups (the branch above), but the type system can't express that
+    // constraint, so render it identically here rather than falling through to
+    // the Point case below (which would read a nonexistent .Point field).
+    return {
+      ...style, kind: "quads", polygons: g.Quads.map((q) => quadToScreenPolygon(q, v)),
+      fill: m.appearance.color, stroke: "none",
+      opacity: m.appearance.opacity * HIGHLIGHT_FILL_ALPHA,
+    };
   }
   const s = pdfUserSpaceToScreen(g.Point.x, g.Point.y, v);
   const symbol: CountSymbol = m.count_set?.symbol ?? "Circle";

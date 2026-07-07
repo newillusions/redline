@@ -13,6 +13,7 @@
     { kind: "Polygon", label: "⬠", title: "Polygon" },
     { kind: "Cloud", label: "☁", title: "Cloud" },
     { kind: "Ink", label: "✎", title: "Ink (Freehand)" },
+    { kind: "selectText", label: "I", title: "Select Text (drag to select; Enter highlights, Ctrl/Cmd+C copies)" },
     { kind: "Text", label: "A", title: "Text" },
     { kind: "Callout", label: "💬", title: "Callout" },
     { kind: "calibrate", label: "⚖", title: "Calibrate Scale (two-click)" },

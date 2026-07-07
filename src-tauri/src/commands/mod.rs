@@ -13,4 +13,5 @@ pub mod search;
 pub mod settings;
 pub mod takeoff;
 pub mod text;
+pub mod text_select;
 pub mod versioning;

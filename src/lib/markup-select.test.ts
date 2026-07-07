@@ -46,6 +46,14 @@ const inkMarkup = mkMarkup("i1", { Ink: [
   [{ x: 100, y: 50 }, { x: 120, y: 70 }],
 ] });
 const pointMarkup = mkMarkup("pt1", { Point: { x: 30, y: 40 } });
+// Two-line text-anchored highlight (Quads geometry): line 1 spans x 0-100 @ y 90-100,
+// line 2 spans x 0-60 @ y 70-80 (a shorter second line, as a real selection would have).
+const quadsMarkup = mkMarkup("q1", {
+  Quads: [
+    [{ x: 0, y: 100 }, { x: 100, y: 100 }, { x: 0, y: 90 }, { x: 100, y: 90 }],
+    [{ x: 0, y: 80 }, { x: 60, y: 80 }, { x: 0, y: 70 }, { x: 60, y: 70 }],
+  ],
+});
 
 // ---------------------------------------------------------------------------
 // boundsOf
@@ -69,6 +77,10 @@ describe("boundsOf", () => {
 
   it("Point: zero-size bounds at the point", () => {
     expect(boundsOf(pointMarkup)).toEqual({ minX: 30, minY: 40, maxX: 30, maxY: 40 });
+  });
+
+  it("Quads: AABB across ALL quads' points (multi-line selection)", () => {
+    expect(boundsOf(quadsMarkup)).toEqual({ minX: 0, minY: 70, maxX: 100, maxY: 100 });
   });
 });
 
@@ -135,6 +147,19 @@ describe("hitTest", () => {
 
   it("returns null for empty array", () => {
     expect(hitTest([], { x: 0, y: 0 }, tol)).toBeNull();
+  });
+
+  it("Quads: hit inside either line's rect", () => {
+    expect(hitTest([quadsMarkup], { x: 50, y: 95 }, tol)).toBe("q1"); // line 1
+    expect(hitTest([quadsMarkup], { x: 30, y: 75 }, tol)).toBe("q1"); // line 2
+  });
+
+  it("Quads: miss well below both lines, outside tol", () => {
+    expect(hitTest([quadsMarkup], { x: 30, y: 30 }, tol)).toBeNull();
+  });
+
+  it("Quads: miss past the shorter second line's right edge, outside tol", () => {
+    expect(hitTest([quadsMarkup], { x: 80, y: 75 }, tol)).toBeNull();
   });
 });
 
@@ -204,6 +229,17 @@ describe("translateGeometry", () => {
     translateGeometry(g, 99, 99);
     expect(g.Polyline[0]).toEqual({ x: 0, y: 0 });
   });
+
+  it("translates Quads, preserving quad count and per-point order", () => {
+    const g: MarkupGeometry = {
+      Quads: [[{ x: 0, y: 10 }, { x: 10, y: 10 }, { x: 0, y: 0 }, { x: 10, y: 0 }]],
+    };
+    const t = translateGeometry(g, 5, 2) as { Quads: { x: number; y: number }[][] };
+    expect(t.Quads).toHaveLength(1);
+    expect(t.Quads[0]).toEqual([
+      { x: 5, y: 12 }, { x: 15, y: 12 }, { x: 5, y: 2 }, { x: 15, y: 2 },
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -238,6 +274,19 @@ describe("scaleGeometryToBounds", () => {
     // y axis non-degenerate: 10/10 of the way = to.maxY
     expect(r.Point.y).toBeCloseTo(10);
   });
+
+  it("Quads: every point remaps proportionally, quad structure preserved", () => {
+    const g: MarkupGeometry = {
+      Quads: [[{ x: 0, y: 10 }, { x: 10, y: 10 }, { x: 0, y: 0 }, { x: 10, y: 0 }]],
+    };
+    const from: Bounds = { minX: 0, minY: 0, maxX: 10, maxY: 10 };
+    const to: Bounds   = { minX: 0, minY: 0, maxX: 20, maxY: 20 };
+    const r = scaleGeometryToBounds(g, from, to) as { Quads: { x: number; y: number }[][] };
+    expect(r.Quads).toHaveLength(1);
+    expect(r.Quads[0]).toEqual([
+      { x: 0, y: 20 }, { x: 20, y: 20 }, { x: 0, y: 0 }, { x: 20, y: 0 },
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -249,6 +298,9 @@ describe("isRectResizable", () => {
   });
   it("false for Polyline", () => {
     expect(isRectResizable(polyMarkup)).toBe(false);
+  });
+  it("false for Quads (text-anchored highlight is not handle-resizable)", () => {
+    expect(isRectResizable(quadsMarkup)).toBe(false);
   });
   it("false for Ink", () => {
     expect(isRectResizable(inkMarkup)).toBe(false);

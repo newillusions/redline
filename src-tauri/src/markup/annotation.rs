@@ -24,7 +24,7 @@ use super::{
     Appearance, Audit, CountSet, CountSymbol, FontSpec, LineStyle, Markup, MarkupGeometry,
     MarkupStatus, MarkupType, Origin, UserRef, Workflow,
 };
-use crate::geometry::PdfPoint;
+use crate::geometry::{PdfPoint, Quad};
 
 // --- small helpers -------------------------------------------------------------
 
@@ -207,6 +207,7 @@ fn bbox(g: &MarkupGeometry) -> [f64; 4] {
         MarkupGeometry::Rect { min, max } => vec![*min, *max],
         MarkupGeometry::Polyline(v) => v.clone(),
         MarkupGeometry::Ink(strokes) => strokes.iter().flatten().copied().collect(),
+        MarkupGeometry::Quads(quads) => quads.iter().flatten().copied().collect(),
     };
     let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     for p in &pts {
@@ -228,6 +229,7 @@ fn geom_tag(g: &MarkupGeometry) -> &'static str {
         MarkupGeometry::Rect { .. } => "rect",
         MarkupGeometry::Polyline(_) => "poly",
         MarkupGeometry::Ink(_) => "ink",
+        MarkupGeometry::Quads(_) => "quads",
     }
 }
 
@@ -235,9 +237,34 @@ fn flatten(pts: &[PdfPoint]) -> Object {
     Object::Array(pts.iter().flat_map(|p| [real(p.x), real(p.y)]).collect())
 }
 
+fn flatten_quads(quads: &[Quad]) -> Object {
+    Object::Array(
+        quads
+            .iter()
+            .flat_map(|q| q.iter().flat_map(|p| [real(p.x), real(p.y)]))
+            .collect(),
+    )
+}
+
 fn points_from_reals(r: &[f64]) -> Vec<PdfPoint> {
     r.chunks_exact(2)
         .map(|c| PdfPoint { x: c[0], y: c[1] })
+        .collect()
+}
+
+/// Reconstruct `Quad`s from a flat `/QuadPoints` real array (8 values per quad,
+/// x1 y1 x2 y2 x3 y3 x4 y4 - the TL/TR/BL/BR order documented on [`Quad`]).
+/// A trailing partial group (malformed annotation) is dropped via `chunks_exact`.
+fn quads_from_reals(r: &[f64]) -> Vec<Quad> {
+    r.chunks_exact(8)
+        .map(|c| {
+            [
+                PdfPoint { x: c[0], y: c[1] },
+                PdfPoint { x: c[2], y: c[3] },
+                PdfPoint { x: c[4], y: c[5] },
+                PdfPoint { x: c[6], y: c[7] },
+            ]
+        })
         .collect()
 }
 
@@ -280,9 +307,19 @@ fn geometry_from_dict(d: &Dictionary) -> MarkupGeometry {
                 .unwrap_or_default();
             MarkupGeometry::Ink(strokes)
         }
+        Some("quads") => {
+            let r = get_reals(d, b"QuadPoints").unwrap_or_default();
+            MarkupGeometry::Quads(quads_from_reals(&r))
+        }
         // Default / foreign: prefer explicit shapes, else the bounding /Rect.
+        //
+        // /QuadPoints is checked before the other foreign fallbacks so a Highlight
+        // annotation authored by Acrobat/Bluebeam (no /RLGeom tag) imports losslessly
+        // as Quads rather than collapsing to its bounding /Rect.
         _ => {
-            if let Some(r) = get_reals(d, b"InkList") {
+            if let Some(r) = get_reals(d, b"QuadPoints") {
+                MarkupGeometry::Quads(quads_from_reals(&r))
+            } else if let Some(r) = get_reals(d, b"InkList") {
                 MarkupGeometry::Polyline(points_from_reals(&r))
             } else if let Some(r) = get_reals(d, b"Vertices")
                 .or_else(|| get_reals(d, b"CL"))
@@ -333,6 +370,14 @@ impl Markup {
                     "InkList",
                     Object::Array(strokes.iter().map(|s| flatten(s)).collect()),
                 );
+            }
+            MarkupGeometry::Quads(quads) => {
+                // The standard PDF key for text-markup quadrilaterals (ISO 32000-1
+                // section 12.5.6.10). This is what makes a Highlight annotation a REAL
+                // text-anchored markup that round-trips through Acrobat/Bluebeam,
+                // instead of the plain bounding-box `/Rect` a foreign viewer would
+                // otherwise treat as the only geometry.
+                d.set("QuadPoints", flatten_quads(quads));
             }
             MarkupGeometry::Point(_) | MarkupGeometry::Rect { .. } => {}
         }
@@ -677,6 +722,14 @@ mod tests {
                     s.iter().zip(t).for_each(|(p, q)| assert_pt_eq(*p, *q));
                 }
             }
+            (MarkupGeometry::Quads(u), MarkupGeometry::Quads(v)) => {
+                assert_eq!(u.len(), v.len(), "quad count must match");
+                for (qa, qb) in u.iter().zip(v) {
+                    for (p, q) in qa.iter().zip(qb) {
+                        assert_pt_eq(*p, *q);
+                    }
+                }
+            }
             _ => panic!("geometry variant mismatch: {a:?} vs {b:?}"),
         }
     }
@@ -864,6 +917,92 @@ mod tests {
         assert!(d.has(b"CL"), "Callout must emit /CL leader");
         assert!(!d.has(b"Vertices"), "Callout uses /CL, not /Vertices");
         assert_roundtrip(&m);
+    }
+
+    // --- Text-anchored Highlight: /QuadPoints round-trip -----------------------------
+
+    fn sample_quads() -> Vec<super::Quad>{
+        vec![
+            [
+                PdfPoint { x: 72.0, y: 712.0 },
+                PdfPoint { x: 500.0, y: 712.0 },
+                PdfPoint { x: 72.0, y: 700.0 },
+                PdfPoint { x: 500.0, y: 700.0 },
+            ],
+            [
+                PdfPoint { x: 72.0, y: 698.0 },
+                PdfPoint { x: 220.0, y: 698.0 },
+                PdfPoint { x: 72.0, y: 686.0 },
+                PdfPoint { x: 220.0, y: 686.0 },
+            ],
+        ]
+    }
+
+    #[test]
+    fn highlight_quads_markup_emits_quadpoints_not_just_rect_and_round_trips() {
+        let quads = sample_quads();
+        let m = fixture(MarkupGeometry::Quads(quads.clone()), MarkupType::Highlight);
+        let d = m.to_annotation_dict();
+
+        assert_eq!(
+            get_name(&d, b"Subtype").as_deref(),
+            Some("Highlight"),
+            "text-anchored highlight must use the standard /Highlight subtype"
+        );
+        assert!(d.has(b"QuadPoints"), "Highlight from a text selection must emit /QuadPoints");
+        // /Rect (the bounding box) is still required on every annotation - a viewer with
+        // no QuadPoints support at least shows the right area.
+        assert!(d.has(b"Rect"), "/Rect bounding box must still be present");
+
+        let qp = get_reals(&d, b"QuadPoints").expect("/QuadPoints must be readable as reals");
+        assert_eq!(qp.len(), 16, "2 quads x 8 floats each");
+        // First quad, first point (top-left) must be exactly quads[0][0].
+        assert_eq!(qp[0], 72.0);
+        assert_eq!(qp[1], 712.0);
+
+        assert_eq!(get_name(&d, b"RLGeom").as_deref(), Some("quads"));
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn highlight_quads_bbox_covers_every_quad_point() {
+        let quads = sample_quads();
+        let m = fixture(MarkupGeometry::Quads(quads), MarkupType::Highlight);
+        let d = m.to_annotation_dict();
+        let rect = get_reals(&d, b"Rect").expect("/Rect present");
+        // bbox = [left, bottom, right, top] spanning both quads (min x=72, min y=686,
+        // max x=500, max y=712).
+        assert_eq!(rect, vec![72.0, 686.0, 500.0, 712.0]);
+    }
+
+    #[test]
+    fn foreign_highlight_with_quadpoints_imports_as_quads_not_bounding_rect() {
+        // A Highlight annotation authored by Acrobat/Bluebeam: no /RLGeom tag, but a
+        // standard /QuadPoints array. Must import as Quads geometry (lossless line
+        // shape), not collapse to the bounding /Rect.
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("Highlight"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(72.0), real(686.0), real(500.0), real(712.0)]),
+        );
+        d.set(
+            "QuadPoints",
+            Object::Array(vec![
+                real(72.0), real(712.0), real(500.0), real(712.0),
+                real(72.0), real(700.0), real(500.0), real(700.0),
+            ]),
+        );
+        let m = Markup::from_annotation_dict(&d);
+        assert_eq!(m.markup_type, MarkupType::Highlight);
+        match m.geometry {
+            MarkupGeometry::Quads(q) => {
+                assert_eq!(q.len(), 1);
+                assert_pt_eq(q[0][0], PdfPoint { x: 72.0, y: 712.0 });
+                assert_pt_eq(q[0][3], PdfPoint { x: 500.0, y: 700.0 });
+            }
+            other => panic!("expected Quads from foreign /QuadPoints, got {other:?}"),
+        }
     }
 
     // --- G7.2: base14_da_name unit tests -------------------------------------------

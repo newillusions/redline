@@ -78,6 +78,7 @@ export function boundsOf(m: Markup): Bounds {
   }
   if ("Polyline" in g) return _boundsOfPoints(g.Polyline);
   if ("Ink" in g) return _boundsOfPoints(g.Ink.flat());
+  if ("Quads" in g) return _boundsOfPoints(g.Quads.flat());
   // Point
   return { minX: g.Point.x, minY: g.Point.y, maxX: g.Point.x, maxY: g.Point.y };
 }
@@ -136,6 +137,20 @@ function _hits(m: Markup, p: PdfPoint, tol: number): boolean {
     for (const stroke of g.Ink) {
       for (let i = 0; i < stroke.length - 1; i++) {
         if (_segDistance(p, stroke[i], stroke[i + 1]) <= tol) return true;
+      }
+    }
+    return false;
+  }
+  if ("Quads" in g) {
+    // Hit when inside (or within tol of) any single quad's axis-aligned rect -
+    // quads are always axis-aligned (they come from PDFium's per-line text rects).
+    for (const q of g.Quads) {
+      const xs = q.map((pt) => pt.x);
+      const ys = q.map((pt) => pt.y);
+      const minX = Math.min(...xs), maxX = Math.max(...xs);
+      const minY = Math.min(...ys), maxY = Math.max(...ys);
+      if (p.x >= minX - tol && p.x <= maxX + tol && p.y >= minY - tol && p.y <= maxY + tol) {
+        return true;
       }
     }
     return false;
@@ -210,7 +225,18 @@ export function translateGeometry(g: MarkupGeometry, dx: number, dy: number): Ma
   if ("Ink" in g) {
     return { Ink: g.Ink.map((s) => s.map((p) => ({ x: p.x + dx, y: p.y + dy }))) };
   }
+  if ("Quads" in g) {
+    return { Quads: g.Quads.map((q) => _mapQuad(q, (p) => ({ x: p.x + dx, y: p.y + dy }))) };
+  }
   return { Point: { x: g.Point.x + dx, y: g.Point.y + dy } };
+}
+
+/** Map a 4-point Quad through `fn`, preserving the tuple type (no `as` cast). */
+function _mapQuad(
+  q: [PdfPoint, PdfPoint, PdfPoint, PdfPoint],
+  fn: (p: PdfPoint) => PdfPoint,
+): [PdfPoint, PdfPoint, PdfPoint, PdfPoint] {
+  return [fn(q[0]), fn(q[1]), fn(q[2]), fn(q[3])];
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +307,9 @@ export function scaleGeometryToBounds(g: MarkupGeometry, from: Bounds, to: Bound
   }
   if ("Ink" in g) {
     return { Ink: g.Ink.map((s) => s.map(scaleP)) };
+  }
+  if ("Quads" in g) {
+    return { Quads: g.Quads.map((q) => _mapQuad(q, scaleP)) };
   }
   return { Point: scaleP(g.Point) };
 }

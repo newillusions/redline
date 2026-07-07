@@ -196,6 +196,55 @@ pub fn area_with_cutouts(outer: &[PdfPoint], holes: &[Vec<PdfPoint>]) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Text-selection quads (redline text selection + text-anchored highlight feature)
+//
+// Converts PDFium line-segment rects (one per visual text line, from
+// `PdfPageText::segments_subset`) into PDF `/QuadPoints` quadrilaterals for a
+// Highlight annotation (spec section 6 addendum). Pure PDF-user-space math - no
+// PDFium dependency, so this is unit-testable against manufactured rect data
+// without a PDFium binary or corpus (CI trap obs:he8y7010dlo82k88rocu: anything
+// that actually loads PDFium must self-skip in CI; this code never touches
+// PDFium).
+// ---------------------------------------------------------------------------
+
+/// A single quadrilateral in PDF user space, 4 points ordered
+/// **top-left, top-right, bottom-left, bottom-right**.
+///
+/// This is the de-facto Acrobat/Bluebeam `/QuadPoints` vertex order - NOT the PDF
+/// spec's literal "counterclockwise" wording (ISO 32000-1 section 12.5.6.10,
+/// Figure 8.9). Every mainstream viewer (Acrobat, Bluebeam, pdf.js) implements
+/// the TL/TR/BL/BR "Z" order in practice; a spec-literal CCW ordering renders
+/// highlights mirrored or rotated in Acrobat. Confirmed via an Adobe forum
+/// thread on QuadPoints ordering (Acrobat-authored Highlight annotations use
+/// x1y1 x2y2 x4y4 x3y3 = TL,TR,BL,BR against the spec's own vertex numbering).
+pub type Quad = [PdfPoint; 4];
+
+/// Convert one axis-aligned line-segment rect `[left, bottom, right, top]` (PDF
+/// user space, y-up - the same `[f64; 4]` shape `SearchHit::rect` and PDFium's
+/// `FPDFText_GetRect` use) into a `Quad` in the TL/TR/BL/BR order documented on
+/// [`Quad`].
+pub fn rect_to_quad(rect: [f64; 4]) -> Quad {
+    let [left, bottom, right, top] = rect;
+    [
+        PdfPoint { x: left, y: top },     // top-left
+        PdfPoint { x: right, y: top },    // top-right
+        PdfPoint { x: left, y: bottom },  // bottom-left
+        PdfPoint { x: right, y: bottom }, // bottom-right
+    ]
+}
+
+/// Convert a list of line-segment rects (as returned by PDFium's
+/// `segments_subset` for a character range - one rect per visual text line) into
+/// `Quad`s, preserving order and count. Unlike text-search highlighting (which
+/// merges all segments of a hit into one bounding rect), a text-selection
+/// highlight must carry ONE quad per line so multi-line selections render as
+/// separate translucent bands hugging each line, not one box spanning the gap
+/// between lines.
+pub fn rects_to_quads(rects: &[[f64; 4]]) -> Vec<Quad> {
+    rects.iter().copied().map(rect_to_quad).collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -398,5 +447,51 @@ mod tests {
     #[test]
     fn area_empty_outer_zero() {
         assert_eq!(area_with_cutouts(&[], &[]), 0.0);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Text-selection quads (rect_to_quad / rects_to_quads)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn rect_to_quad_orders_top_left_top_right_bottom_left_bottom_right() {
+        // rect = [left, bottom, right, top]
+        let q = rect_to_quad([10.0, 20.0, 110.0, 35.0]);
+        assert_eq!(q[0], pt(10.0, 35.0), "index 0 must be top-left");
+        assert_eq!(q[1], pt(110.0, 35.0), "index 1 must be top-right");
+        assert_eq!(q[2], pt(10.0, 20.0), "index 2 must be bottom-left");
+        assert_eq!(q[3], pt(110.0, 20.0), "index 3 must be bottom-right");
+    }
+
+    #[test]
+    fn rects_to_quads_returns_one_quad_per_rect_for_multi_line_selection() {
+        // Three line-segment rects, as PDFium's segments_subset would return for a
+        // selection spanning 3 visual lines (top line widest, middle line narrower,
+        // bottom line partial - the classic "drag across 3 lines" shape).
+        let rects = [
+            [72.0, 700.0, 500.0, 712.0], // line 1: full width
+            [72.0, 686.0, 500.0, 698.0], // line 2: full width
+            [72.0, 672.0, 220.0, 684.0], // line 3: partial (selection ends mid-line)
+        ];
+        let quads = rects_to_quads(&rects);
+        assert_eq!(quads.len(), 3, "must return exactly one quad per input rect");
+        // Never merged into a single bounding quad - each retains its own rect.
+        assert_eq!(quads[0][0], pt(72.0, 712.0));
+        assert_eq!(quads[0][1], pt(500.0, 712.0));
+        assert_eq!(quads[2][1], pt(220.0, 684.0), "partial last-line width preserved");
+    }
+
+    #[test]
+    fn rects_to_quads_empty_input_returns_empty() {
+        assert!(rects_to_quads(&[]).is_empty());
+    }
+
+    #[test]
+    fn rect_to_quad_degenerate_zero_height_rect_still_orders_correctly() {
+        // A zero-height rect (e.g. a single-point selection) must not panic and
+        // must still preserve the TL/TR/BL/BR positional contract.
+        let q = rect_to_quad([50.0, 100.0, 50.0, 100.0]);
+        assert_eq!(q[0], pt(50.0, 100.0));
+        assert_eq!(q[3], pt(50.0, 100.0));
     }
 }
