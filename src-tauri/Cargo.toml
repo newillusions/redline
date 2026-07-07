@@ -90,6 +90,9 @@ rstar = "0.12"
 # --- Full-text search (M4 S4) ---
 tantivy = "0.22"
 notify = "6"
+roxmltree = "0.21.1"
+flate2 = "1.1.9"
+zip = { version = "4.2.0", default-features = false, features = ["deflate"] }
 
 # --- Future milestones (feature-gated to keep M1 build lean) ---
 # leptess = { version = "0.14", optional = true }   # OCR — M4

@@ -20,10 +20,14 @@
     getPageSize,
     processRssMb,
     getUserIdentity,
+    composeStampText,
+    nextStampSequence,
     type DocumentInfo,
     type RenderedTile,
     type Markup,
     type UserRef,
+    type PdfPoint,
+    type Tool,
   } from "$lib/ipc";
   import {
     TILE_SIZE_CSS,
@@ -58,6 +62,7 @@
     isMultiClickTool, isInkTool, polylineGeometry, inkGeometry,
     isMultiClickComplete, type MultiClickTool,
     isTextTool, textBoxGeometry, calloutGeometry, DEFAULT_TEXT_FONT,
+    translateToolGeometry,
   } from "$lib/markup-tools";
   import { patchGroup } from "$lib/markup-properties";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
@@ -266,7 +271,8 @@
   /** True when any creation tool is active (all tools except hand/select). */
   const isCreateTool = (t = store.activeTool) =>
     isDrawTool(t) || isMultiClickTool(t) || isInkTool(t) || isTextTool(t) ||
-    t === "calibrate" || t === "MeasurementLength" || t === "MeasurementArea" || t === "MeasurementCount";
+    t === "calibrate" || t === "MeasurementLength" || t === "MeasurementArea" || t === "MeasurementCount" ||
+    t === "placeTool";
 
   /** True when the select tool is active. */
   const isSelectTool = (t = store.activeTool): boolean => t === "select";
@@ -1694,11 +1700,61 @@
     }));
   }
 
+  /**
+   * Tool Chest Drawing-mode placement (spec "Tools & Tool Sets"): drop a translated copy
+   * of `toolDef`'s fixed geometry at `clickPoint`. Dynamic stamps compose their
+   * placement-time text first (auto-fields substituted server-side, spec "Stamps") -
+   * PromptedText fields resolve to an empty string in this MVP (no placement-time prompt
+   * UI yet - a NAMED simplification; `compose_stamp_text` already tolerates missing
+   * prompted values). Static (non-stamp) Drawing-mode tools skip straight to `store.create`.
+   */
+  async function placeToolCopy(toolDef: Tool, clickPoint: PdfPoint) {
+    if (!identity || !toolDef.geometry) return;
+    const geometry = translateToolGeometry(toolDef.geometry, clickPoint);
+
+    let contents: string | null = null;
+    if (toolDef.stamp && "Dynamic" in toolDef.stamp) {
+      const { fields, base_text } = toolDef.stamp.Dynamic;
+      let sequence = 1;
+      for (const field of fields) {
+        if (typeof field === "object" && "SequenceNumber" in field) {
+          sequence = await nextStampSequence(toolDef.id, field.SequenceNumber.scope, docInfo.doc_id);
+          break;
+        }
+      }
+      const documentName = docInfo.path.split(/[\\/]/).at(-1) ?? docInfo.path;
+      contents = await composeStampText(base_text, fields, identity.display_name, documentName, sequence, []);
+    }
+
+    const m = buildMarkup({
+      markupType: toolDef.markup_type,
+      page: pageIndex,
+      geometry,
+      appearance: toolDef.appearance,
+      identity,
+      now: new Date().toISOString(),
+      id: crypto.randomUUID(),
+      contents,
+    });
+    store.create(m);
+  }
+
   // Multi-click tool gesture handlers (click adds vertex, dblclick finishes).
   function onOverlayClick(e: MouseEvent) {
     // Selection is handled by pointer events, not click.
     if (isSelectTool()) return;
     const tool = store.activeTool;
+
+    // Tool Chest Drawing-mode placement: single click drops a translated copy of the
+    // armed tool's fixed geometry (spec "Tools & Tool Sets" - placement modes). Stays
+    // armed after placing (not cleared) so several copies can be dropped in a row,
+    // matching how the drag-draw tools stay selected after creating one shape.
+    if (tool === "placeTool" && store.pendingPlacementTool) {
+      const p = localPdfFromMouse(e);
+      if (!p) return;
+      void placeToolCopy(store.pendingPlacementTool, p);
+      return;
+    }
 
     // MeasurementCount: single click places a count point in the active count set.
     if (tool === "MeasurementCount" && identity) {

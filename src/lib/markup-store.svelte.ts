@@ -4,7 +4,7 @@
  * MirrorOp is drained through an ordered FIFO to the Rust store (the save buffer) via the
  * injected IPC. flush() awaits a full drain — App.svelte calls it before save_document.
  */
-import type { Markup, Appearance, CountSet, CountSymbol } from "./ipc";
+import type { Markup, Appearance, CountSet, CountSymbol, Tool } from "./ipc";
 import { History, CreateCmd, UpdateCmd, DeleteCmd, type MarkupSink, type MirrorOp } from "./markup-commands";
 
 /** Default colour rotation for newly-created count sets (distinct, legible hues). */
@@ -44,7 +44,11 @@ export type ToolKind =
   | "calibrate"
   | "MeasurementLength"
   | "MeasurementArea"
-  | "MeasurementCount";
+  | "MeasurementCount"
+  // Tool Chest Drawing-mode placement (M2): drops an exact, translated copy of
+  // `MarkupStore.pendingPlacementTool`'s fixed geometry on the next click - see
+  // ToolChestPanel.svelte (activation) and Viewport.svelte onOverlayClick (placement).
+  | "placeTool";
 
 const DEFAULT_APPEARANCE: Appearance = {
   color: "#e02424", line_weight: 2, opacity: 1, fill: null, line_style: "Solid", font: null,
@@ -56,6 +60,11 @@ export class MarkupStore implements MarkupSink {
   selectedIds = $state<Set<string>>(new Set());
   activeTool = $state<ToolKind>("hand");
   draftAppearance = $state<Appearance>({ ...DEFAULT_APPEARANCE });
+  /** The Drawing-mode Tool Chest tool armed for the next click, when `activeTool ===
+   *  "placeTool"`. Set by ToolChestPanel's activation handler, consumed (and read, not
+   *  cleared) by Viewport's onOverlayClick - staying armed lets the user place several
+   *  copies in a row, matching how the drag-draw tools stay active after one shape. */
+  pendingPlacementTool = $state<Tool | null>(null);
   mirrorError = $state<string | null>(null);
   /** True when markups have changed since the last save (or since the doc was opened). */
   dirty = $state(false);

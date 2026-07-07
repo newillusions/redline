@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { dragDrawGeometry, buildMarkup, bumpAudit, RECT_TOOLS, isDrawTool, MULTI_CLICK_TOOLS, isMultiClickTool, isInkTool, polylineGeometry, inkGeometry, minVertices, isMultiClickComplete, TEXT_TOOLS, isTextTool, textBoxGeometry, calloutGeometry, DEFAULT_TEXT_FONT } from "./markup-tools";
+import { dragDrawGeometry, buildMarkup, bumpAudit, RECT_TOOLS, isDrawTool, MULTI_CLICK_TOOLS, isMultiClickTool, isInkTool, polylineGeometry, inkGeometry, minVertices, isMultiClickComplete, TEXT_TOOLS, isTextTool, textBoxGeometry, calloutGeometry, DEFAULT_TEXT_FONT, translateToolGeometry } from "./markup-tools";
 import { patchAppearance } from "./markup-properties";
-import type { Appearance, UserRef, PdfPoint } from "./ipc";
+import type { Appearance, UserRef, PdfPoint, MarkupGeometry } from "./ipc";
 
 const AP: Appearance = { color: "#e02424", line_weight: 2, opacity: 1, fill: null, line_style: "Solid", font: null };
 const USER: UserRef = { user_id: "11111111-1111-1111-1111-111111111111", display_name: "Tester" };
@@ -267,5 +267,38 @@ describe("buildMarkup — appearance isolation", () => {
     expect(m1patched.appearance.color).toBe("#0000ff");
     expect(m2.appearance.color).toBe("#e02424"); // m2 is unaffected
     expect(m1.appearance.color).toBe("#e02424"); // original m1 unaffected (patchAppearance is pure)
+  });
+});
+
+// --- (c) placement modes: drawing-mode drops geometry, translated to the click point ---
+
+describe("translateToolGeometry (Tool Chest Drawing-mode placement)", () => {
+  it("Point template: the translated copy lands exactly at the click point", () => {
+    const g = translateToolGeometry({ Point: { x: 5, y: 5 } }, { x: 100, y: 200 });
+    expect(g).toEqual({ Point: { x: 100, y: 200 } });
+  });
+
+  it("Rect template: min corner lands at the click point, size/shape preserved", () => {
+    const template: MarkupGeometry = { Rect: { min: { x: 10, y: 20 }, max: { x: 60, y: 70 } } };
+    const g = translateToolGeometry(template, { x: 100, y: 100 });
+    expect(g).toEqual({ Rect: { min: { x: 100, y: 100 }, max: { x: 150, y: 150 } } });
+  });
+
+  it("Polyline template: bbox min corner lands at the click point, shape preserved", () => {
+    const template: MarkupGeometry = { Polyline: [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 5, y: 10 }] };
+    const g = translateToolGeometry(template, { x: 50, y: 50 });
+    expect(g).toEqual({ Polyline: [{ x: 50, y: 50 }, { x: 60, y: 50 }, { x: 55, y: 60 }] });
+  });
+
+  it("Ink template: bbox min corner across all strokes lands at the click point", () => {
+    const template: MarkupGeometry = { Ink: [[{ x: 2, y: 4 }, { x: 6, y: 4 }], [{ x: 4, y: 8 }]] };
+    const g = translateToolGeometry(template, { x: 0, y: 0 });
+    expect(g).toEqual({ Ink: [[{ x: 0, y: 0 }, { x: 4, y: 0 }], [{ x: 2, y: 4 }]] });
+  });
+
+  it("Polyline template not at the origin still translates correctly (non-zero anchor)", () => {
+    const template: MarkupGeometry = { Polyline: [{ x: 100, y: 200 }, { x: 110, y: 210 }] };
+    const g = translateToolGeometry(template, { x: 0, y: 0 });
+    expect(g).toEqual({ Polyline: [{ x: 0, y: 0 }, { x: 10, y: 10 }] });
   });
 });

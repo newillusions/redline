@@ -736,3 +736,157 @@ export async function comparePages(
     pixelTolerance,
   });
 }
+
+// ---------------------------------------------------------------------------
+// Tool Chest (M2 - spec "Tools & Tool Sets", "Stamps", "Importing Bluebeam Tool Sets")
+// ---------------------------------------------------------------------------
+
+/** Matches Bluebeam's two placement modes (mirrors Rust `PlacementMode`). */
+export type PlacementMode = "Properties" | "Drawing";
+
+/** A stamp's backing visual content (mirrors Rust `StampAsset`). */
+export type StampAsset =
+  | { Svg: string }
+  | { PngBase64: string }
+  | { PdfBase64: string };
+
+/** Dynamic-stamp sequence-counter scope (mirrors Rust `CounterScope`). */
+export type CounterScope = "PerDocument" | "Global";
+
+/** One auto-populated dynamic-stamp field (mirrors Rust `DynamicField`). */
+export type DynamicField =
+  | "Date"
+  | "Time"
+  | "DateTime"
+  | "Username"
+  | "DocumentName"
+  | { SequenceNumber: { scope: CounterScope } }
+  | { PromptedText: { label: string } };
+
+/** Stamp definition attached to a Tool (mirrors Rust `StampDef`). */
+export type StampDef =
+  | { Static: { asset: StampAsset } }
+  | { Dynamic: { asset: StampAsset | null; fields: DynamicField[]; base_text: string } };
+
+/** A reusable markup template (mirrors Rust `Tool`). */
+export interface Tool {
+  id: string;
+  name: string;
+  markup_type: MarkupType;
+  appearance: Appearance;
+  subject: string | null;
+  placement_mode: PlacementMode;
+  /** Fixed geometry template for Drawing-mode tools (symbols/stamps). */
+  geometry: MarkupGeometry | null;
+  stamp: StampDef | null;
+}
+
+/** A named, ordered collection of Tools (mirrors Rust `ToolSet`). */
+export interface ToolSet {
+  id: string;
+  name: string;
+  tools: Tool[];
+}
+
+/** One `.btx` item that failed to import (mirrors Rust `SkippedItem`). */
+export interface SkippedItem {
+  name: string;
+  reason: string;
+}
+
+/** Result of a `.btx` import (mirrors Rust `ImportReport`). */
+export interface ImportReport {
+  tools: Tool[];
+  skipped: SkippedItem[];
+}
+
+/** List every persisted Tool Set. */
+export async function listToolSets(): Promise<ToolSet[]> {
+  return invoke<ToolSet[]>("list_tool_sets");
+}
+
+/** The auto-populated Recent Tools list, most-recently-used first. */
+export async function recentTools(): Promise<Tool[]> {
+  return invoke<Tool[]>("recent_tools");
+}
+
+export async function createToolSet(name: string): Promise<ToolSet> {
+  return invoke<ToolSet>("create_tool_set", { name });
+}
+
+export async function renameToolSet(set_id: string, name: string): Promise<void> {
+  return invoke<void>("rename_tool_set", { setId: set_id, name });
+}
+
+export async function deleteToolSet(set_id: string): Promise<void> {
+  return invoke<void>("delete_tool_set", { setId: set_id });
+}
+
+/**
+ * Serialize `markup`'s type + appearance [+ geometry, for Drawing mode] into a new Tool
+ * and add it to `set_id` ("save current markup as tool").
+ */
+export async function addToolFromMarkup(
+  set_id: string,
+  markup: Markup,
+  name: string,
+  placement_mode: PlacementMode,
+): Promise<Tool> {
+  return invoke<Tool>("add_tool_from_markup", {
+    setId: set_id,
+    markup,
+    name,
+    placementMode: placement_mode,
+  });
+}
+
+export async function deleteTool(set_id: string, tool_id: string): Promise<void> {
+  return invoke<void>("delete_tool", { setId: set_id, toolId: tool_id });
+}
+
+/** Reorder a set's tools to match `tool_ids` (front to back). */
+export async function reorderTools(set_id: string, tool_ids: string[]): Promise<void> {
+  return invoke<void>("reorder_tools", { setId: set_id, toolIds: tool_ids });
+}
+
+/** Record a tool as recently used (move-to-front, de-duplicated, capped). */
+export async function recordRecentTool(tool: Tool): Promise<void> {
+  return invoke<void>("record_recent_tool", { tool });
+}
+
+/**
+ * Import a `.btx` (or `.zip`-wrapped `.btx`) file at `path` as a new Tool Set named after
+ * the file. Malformed items are skipped and reported in `ImportReport.skipped`, never
+ * fatal to the whole import.
+ */
+export async function importBtx(path: string): Promise<ImportReport> {
+  return invoke<ImportReport>("import_btx", { path });
+}
+
+/** Advance and return the next sequence value for a dynamic stamp's auto-number field. */
+export async function nextStampSequence(
+  tool_id: string,
+  scope: CounterScope,
+  doc_id: string,
+): Promise<number> {
+  return invoke<number>("next_stamp_sequence", { toolId: tool_id, scope, docId: doc_id });
+}
+
+/** Compose a dynamic stamp's placement-time text (auto-fields substituted server-side). */
+export async function composeStampText(
+  base_text: string,
+  fields: DynamicField[],
+  username: string,
+  document_name: string,
+  sequence: number,
+  prompted: string[],
+): Promise<string> {
+  return invoke<string>("compose_stamp_text", {
+    baseText: base_text,
+    fields,
+    username,
+    documentName: document_name,
+    sequence,
+    prompted,
+  });
+}

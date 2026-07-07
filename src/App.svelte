@@ -48,6 +48,8 @@
   import type { RecentDoc } from "$lib/recent-docs";
   import SettingsDialog from "./components/SettingsDialog.svelte";
   import UpdateNotification from "./components/UpdateNotification.svelte";
+  import ToolChestPanel from "./components/ToolChestPanel.svelte";
+  import { ToolChestStore } from "$lib/toolchest-store.svelte";
 
   // ---------------------------------------------------------------------------
   // Multi-doc state
@@ -56,6 +58,10 @@
 
   /** Convenience alias for the currently active tab (null when no docs open). */
   const activeTab = $derived(tabStore.activeTab);
+
+  // Tool Chest (spec "Tools & Tool Sets") - workspace-level, not per-document; one
+  // instance lives for the app's lifetime and is shared across every open tab.
+  const toolChestStore = new ToolChestStore();
 
   // Per-operation busy flags (apply to the active tab's document).
   let openError = $state<string | null>(null);
@@ -701,7 +707,16 @@
             />
           </div>
         </div>
-        <!-- Navigator placeholder (M4 — thumbnails/bookmarks/layers) -->
+        <!-- Tool Chest (spec "Tools & Tool Sets") - Tool Sets + Recent Tools; click a
+             tool to make it active. Discoverable here regardless of which doc tab is
+             active (Tool Sets are a workspace resource, not per-document). -->
+        <div class="panel-section panel-section--secondary">
+          <div class="panel-header">Tool Chest</div>
+          <div class="panel-body panel-body-flush">
+            <ToolChestPanel toolChest={toolChestStore} markupStore={activeTab?.store ?? null} />
+          </div>
+        </div>
+        <!-- Navigator placeholder (M4 - thumbnails/bookmarks/layers) -->
         <div class="panel-section panel-section--secondary">
           <div class="panel-header">Navigator</div>
           <div class="panel-body">

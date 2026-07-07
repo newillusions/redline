@@ -3918,6 +3918,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "csv",
+ "flate2",
  "image",
  "log",
  "lopdf",
@@ -3925,6 +3926,7 @@ dependencies = [
  "notify",
  "pdf-diff",
  "pdfium-render",
+ "roxmltree",
  "rstar",
  "rust_xlsxwriter",
  "serde",
@@ -3940,6 +3942,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uuid",
+ "zip 4.6.1",
 ]
 
 [[package]]
@@ -4130,6 +4133,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -7148,8 +7160,10 @@ checksum = "caa8cd6af31c3b31c6631b8f483848b91589021b28fffe50adada48d4f4d2ed1"
 dependencies = [
  "arbitrary",
  "crc32fast",
+ "flate2",
  "indexmap 2.14.0",
  "memchr",
+ "zopfli",
 ]
 
 [[package]]

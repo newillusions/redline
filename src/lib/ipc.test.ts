@@ -4,6 +4,7 @@ import * as ipc from "./ipc";
 import type { Markup, TileRequest } from "./ipc";
 import type { RotatePageArgs, DeletePageArgs, ReorderPagesArgs, InsertBlankPageArgs } from "./ipc";
 import type { FolderSearchHit, IndexStatus } from "./ipc";
+import type { Tool, ToolSet } from "./ipc";
 
 /**
  * Guards the Tauri v2 invoke argument-naming convention: JS passes **camelCase**
@@ -422,5 +423,110 @@ describe("compare ipc wrappers (Tauri v2 camelCase keys)", () => {
   it("comparePages returns PageDiffResult", async () => {
     const result = await ipc.comparePages("/a.pdf", "/b.pdf", 0, 0);
     expect(result).toEqual(SAMPLE_RESULT);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tool Chest ipc wrappers (M2 - spec "Tools & Tool Sets" / "Stamps" / ".btx" import)
+// ---------------------------------------------------------------------------
+
+describe("tool chest ipc wrappers (Tauri v2 camelCase keys)", () => {
+  const mockInvokeToolchest = vi.mocked(invoke);
+
+  beforeEach(() => {
+    mockInvokeToolchest.mockReset();
+    mockInvokeToolchest.mockResolvedValue(undefined as never);
+  });
+
+  it("listToolSets → no args", async () => {
+    mockInvokeToolchest.mockResolvedValue([] as never);
+    await ipc.listToolSets();
+    expect(mockInvokeToolchest).toHaveBeenCalledWith("list_tool_sets");
+  });
+
+  it("recentTools → no args", async () => {
+    mockInvokeToolchest.mockResolvedValue([] as never);
+    await ipc.recentTools();
+    expect(mockInvokeToolchest).toHaveBeenCalledWith("recent_tools");
+  });
+
+  it("createToolSet → name", async () => {
+    mockInvokeToolchest.mockResolvedValue({ id: "s1", name: "Doors", tools: [] } as never);
+    await ipc.createToolSet("Doors");
+    expect(mockInvokeToolchest).toHaveBeenCalledWith("create_tool_set", { name: "Doors" });
+  });
+
+  it("renameToolSet → setId / name", async () => {
+    await ipc.renameToolSet("s1", "New Name");
+    expect(mockInvokeToolchest).toHaveBeenCalledWith("rename_tool_set", { setId: "s1", name: "New Name" });
+  });
+
+  it("deleteToolSet → setId", async () => {
+    await ipc.deleteToolSet("s1");
+    expect(mockInvokeToolchest).toHaveBeenCalledWith("delete_tool_set", { setId: "s1" });
+  });
+
+  it("addToolFromMarkup → setId / markup / name / placementMode", async () => {
+    const m = { id: "m1" } as Markup;
+    mockInvokeToolchest.mockResolvedValue({ id: "t1" } as never);
+    await ipc.addToolFromMarkup("s1", m, "My Tool", "Drawing");
+    expect(mockInvokeToolchest).toHaveBeenCalledWith("add_tool_from_markup", {
+      setId: "s1",
+      markup: m,
+      name: "My Tool",
+      placementMode: "Drawing",
+    });
+  });
+
+  it("deleteTool → setId / toolId", async () => {
+    await ipc.deleteTool("s1", "t1");
+    expect(mockInvokeToolchest).toHaveBeenCalledWith("delete_tool", { setId: "s1", toolId: "t1" });
+  });
+
+  it("reorderTools → setId / toolIds", async () => {
+    await ipc.reorderTools("s1", ["t2", "t1"]);
+    expect(mockInvokeToolchest).toHaveBeenCalledWith("reorder_tools", { setId: "s1", toolIds: ["t2", "t1"] });
+  });
+
+  it("recordRecentTool → tool", async () => {
+    const t = { id: "t1", name: "Fire Door" } as unknown as Tool;
+    await ipc.recordRecentTool(t);
+    expect(mockInvokeToolchest).toHaveBeenCalledWith("record_recent_tool", { tool: t });
+  });
+
+  it("importBtx → path", async () => {
+    mockInvokeToolchest.mockResolvedValue({ tools: [], skipped: [] } as never);
+    await ipc.importBtx("/tmp/tools.btx");
+    expect(mockInvokeToolchest).toHaveBeenCalledWith("import_btx", { path: "/tmp/tools.btx" });
+  });
+
+  it("nextStampSequence → toolId / scope / docId", async () => {
+    mockInvokeToolchest.mockResolvedValue(1 as never);
+    await ipc.nextStampSequence("t1", "PerDocument", "d1");
+    expect(mockInvokeToolchest).toHaveBeenCalledWith("next_stamp_sequence", {
+      toolId: "t1",
+      scope: "PerDocument",
+      docId: "d1",
+    });
+  });
+
+  it("composeStampText → baseText / fields / username / documentName / sequence / prompted", async () => {
+    mockInvokeToolchest.mockResolvedValue("Reviewed by mrobert" as never);
+    await ipc.composeStampText("Reviewed by {0}", ["Username"], "mrobert", "plan.pdf", 1, []);
+    expect(mockInvokeToolchest).toHaveBeenCalledWith("compose_stamp_text", {
+      baseText: "Reviewed by {0}",
+      fields: ["Username"],
+      username: "mrobert",
+      documentName: "plan.pdf",
+      sequence: 1,
+      prompted: [],
+    });
+  });
+
+  it("createToolSet resolves a ToolSet", async () => {
+    const set: ToolSet = { id: "s1", name: "Doors", tools: [] };
+    mockInvokeToolchest.mockResolvedValue(set as never);
+    const result = await ipc.createToolSet("Doors");
+    expect(result).toEqual(set);
   });
 });

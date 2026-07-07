@@ -32,12 +32,14 @@ pub mod search;
 pub mod storage;
 pub mod takeoff;
 pub mod text;
+pub mod toolchest;
 
 use std::sync::Mutex;
 
 use document::store::MarkupStore;
 use render::RenderHandle;
 use takeoff::ScaleStore;
+use toolchest::{SequenceCounters, ToolChestStore};
 
 /// Shared application state threaded through all Tauri commands.
 ///
@@ -52,6 +54,11 @@ pub struct AppState {
     /// Active folder full-text search index (M4 S4). `None` until the
     /// `open_folder_index` command is called.
     pub folder_index: Mutex<Option<search::FolderIndex>>,
+    /// Tool Chest: Tool Sets + Recent Tools, persisted under the app-data dir (M2).
+    pub toolchest: ToolChestStore,
+    /// In-memory dynamic-stamp sequence counters (M2). See `toolchest::sequence` doc
+    /// comment for the named sidecar-persistence deferral.
+    pub sequence_counters: SequenceCounters,
 }
 
 /// Resolve the bundled PDFium library path and export it via `PDFIUM_DYNAMIC_LIB_PATH`
@@ -127,11 +134,22 @@ pub fn run() {
             // must run here, not before the builder.
             resolve_pdfium_path(app);
             let render = RenderHandle::spawn().expect("failed to start render thread");
+            let toolchest = app
+                .path()
+                .app_data_dir()
+                .map_err(|e| e.to_string())
+                .and_then(|dir| ToolChestStore::load(&dir).map_err(|e| e.to_string()))
+                .unwrap_or_else(|e| {
+                    warn!("Tool Chest store failed to load ({e}); starting empty in-memory store");
+                    ToolChestStore::in_memory()
+                });
             app.manage(AppState {
                 render,
                 markups: MarkupStore::default(),
                 scales: Mutex::new(ScaleStore::default()),
                 folder_index: Mutex::new(None),
+                toolchest,
+                sequence_counters: SequenceCounters::new(),
             });
             info!("Redline started");
             Ok(())
@@ -196,6 +214,19 @@ pub fn run() {
             // Application settings (local user preferences)
             commands::settings::load_settings,
             commands::settings::save_settings,
+            // Tool Chest commands (M2)
+            commands::toolchest::list_tool_sets,
+            commands::toolchest::recent_tools,
+            commands::toolchest::create_tool_set,
+            commands::toolchest::rename_tool_set,
+            commands::toolchest::delete_tool_set,
+            commands::toolchest::add_tool_from_markup,
+            commands::toolchest::delete_tool,
+            commands::toolchest::reorder_tools,
+            commands::toolchest::record_recent_tool,
+            commands::toolchest::import_btx,
+            commands::toolchest::next_stamp_sequence,
+            commands::toolchest::compose_stamp_text,
         ])
         .run(tauri::generate_context!())
         .expect("error while running redline");
