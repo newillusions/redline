@@ -43,10 +43,11 @@ function fakeIpc() {
 function makeTab(id: string, path = `/docs/${id}.pdf`): DocTab {
   return {
     docId: id,
-    doc: { doc_id: id, path, page_count: 1 },
+    doc: { doc_id: id, path, page_count: 1, was_encrypted: false },
     store: new MarkupStore(id, fakeIpc()),
     takeoffStore: new TakeoffStore(),
     viewportSnapshot: { zoom: 1, pageIndex: 0, scrollX: 0, scrollY: 0 },
+    isEncrypted: false,
   };
 }
 

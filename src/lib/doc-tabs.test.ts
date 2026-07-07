@@ -11,7 +11,7 @@ import { TakeoffStore } from "./takeoff-store.svelte";
 import type { DocumentInfo } from "./ipc";
 
 function makeDoc(id: string, path = `/docs/${id}.pdf`): DocumentInfo {
-  return { doc_id: id, path, page_count: 5 };
+  return { doc_id: id, path, page_count: 5, was_encrypted: false };
 }
 
 function fakeIpc() {
@@ -62,6 +62,20 @@ describe("DocTabStore", () => {
       const t1 = makeTab("doc1");
       const tab = ts.addTab(t1.doc, t1.store, t1.takeoffStore);
       expect(tab.viewportSnapshot).toEqual(DEFAULT_VIEWPORT_SNAPSHOT);
+    });
+
+    it("isEncrypted defaults to false when omitted", () => {
+      const ts = new DocTabStore();
+      const t1 = makeTab("doc1");
+      const tab = ts.addTab(t1.doc, t1.store, t1.takeoffStore);
+      expect(tab.isEncrypted).toBe(false);
+    });
+
+    it("isEncrypted is true when a password-protected doc is opened", () => {
+      const ts = new DocTabStore();
+      const t1 = makeTab("doc1");
+      const tab = ts.addTab(t1.doc, t1.store, t1.takeoffStore, true);
+      expect(tab.isEncrypted).toBe(true);
     });
   });
 

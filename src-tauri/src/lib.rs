@@ -152,6 +152,8 @@ pub fn run() {
             commands::document::update_markup,
             commands::document::delete_markup,
             commands::document::get_user_identity,
+            commands::document::save_unprotected_copy,
+            commands::document::remember_password,
             // Page operation commands (M4 S1)
             commands::document::rotate_page,
             commands::document::delete_page,

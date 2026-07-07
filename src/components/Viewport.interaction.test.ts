@@ -72,7 +72,7 @@ import * as ipcMocks from "$lib/ipc";
 // Constants
 // ---------------------------------------------------------------------------
 
-const FAKE_DOC = { doc_id: "d1", path: "/fake.pdf", page_count: 1 };
+const FAKE_DOC = { doc_id: "d1", path: "/fake.pdf", page_count: 1, was_encrypted: false };
 const FAKE_IDENTITY = { user_id: "11111111-1111-1111-1111-111111111111", display_name: "T" };
 const FAKE_PAGE_SIZE = { doc_id: "d1", page_index: 0, width_pts: 200, height_pts: 200 };
 

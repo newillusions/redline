@@ -4,8 +4,9 @@ use anyhow::Context as _;
 use std::path::PathBuf;
 use tauri::{Manager, State};
 
+use crate::document::known_passwords;
 use crate::document::page_ops;
-use crate::document::save::{load_markups_from, save_with_markups};
+use crate::document::save::{load_markups_from, save_decrypted_copy, save_with_markups};
 use crate::document::{new_doc_id, DocumentInfo, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD};
 use crate::markup::Markup;
 use crate::render::OpenOutcome;
@@ -14,15 +15,21 @@ use crate::AppState;
 /// Open a PDF file. Returns a `DocumentInfo` with a fresh `doc_id`.
 ///
 /// `password` is `None` on the first attempt for a given file. If the file is
-/// encrypted, this returns `Err(ERR_PASSWORD_REQUIRED)` (no password given) or
-/// `Err(ERR_WRONG_PASSWORD)` (a password was given but didn't decrypt it) - the
-/// frontend re-invokes with the user-entered password on either sentinel. On
-/// success, the password is cached in the markup store (session-only, in-memory)
-/// so `load_markups` can decrypt the same file's existing annotations without
-/// re-prompting.
+/// encrypted and no password was given, the remembered known-password list
+/// (see `document::known_passwords`) is tried automatically, oldest-attempt
+/// cost aside, BEFORE surfacing `ERR_PASSWORD_REQUIRED` to the frontend - this
+/// is what lets a previously-unlocked-elsewhere password skip the prompt
+/// entirely. If a password (given or auto-tried) doesn't decrypt it, this
+/// returns `Err(ERR_WRONG_PASSWORD)` (given) or `Err(ERR_PASSWORD_REQUIRED)`
+/// (auto-try exhausted the list) - the frontend re-invokes with the
+/// user-entered password on either sentinel. On success, the EFFECTIVE
+/// password (whichever one actually worked) is cached in the markup store
+/// (session-only, in-memory) so `load_markups` and later saves/reopens can
+/// decrypt the same file without re-prompting.
 #[tauri::command]
 pub async fn open_document(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
     path: String,
     password: Option<String>,
 ) -> Result<DocumentInfo, String> {
@@ -42,19 +49,120 @@ pub async fn open_document(
         .await
         .map_err(|e| format!("{:#}", e))?;
 
-    let page_count = match outcome {
-        OpenOutcome::Opened(page_count) => page_count,
+    let (page_count, effective_password) = match outcome {
+        OpenOutcome::Opened(page_count) => (page_count, password),
+        // No password was supplied and the file needs one: try remembered
+        // passwords before giving up to the frontend prompt. A password WAS
+        // supplied and still failed (WrongPassword) skips straight to the
+        // error - we never second-guess an explicit user entry with the
+        // known-password list.
+        OpenOutcome::PasswordRequired if password.is_none() => {
+            match try_known_passwords(&state, &app, &path, &doc_id).await? {
+                Some((page_count, pw)) => (page_count, Some(pw)),
+                None => return Err(ERR_PASSWORD_REQUIRED.to_string()),
+            }
+        }
         OpenOutcome::PasswordRequired => return Err(ERR_PASSWORD_REQUIRED.to_string()),
         OpenOutcome::WrongPassword => return Err(ERR_WRONG_PASSWORD.to_string()),
     };
 
-    state.markups.register(&doc_id, path.clone(), password);
+    let was_encrypted = effective_password.is_some();
+    state
+        .markups
+        .register(&doc_id, path.clone(), effective_password);
 
     Ok(DocumentInfo {
         doc_id,
         path: path.to_string_lossy().into_owned(),
         page_count,
+        was_encrypted,
     })
+}
+
+/// Try each remembered password (oldest-first list from `known_passwords`,
+/// already most-recent-first) against `path` under `doc_id`, stopping at the
+/// first one that opens successfully. Returns `Ok(None)` (not an error) if
+/// the list is empty or none of them work - the caller falls back to
+/// prompting. A failed attempt leaves no render-engine state registered (see
+/// `RenderEngine::open_document` doc comment), so retrying under the same
+/// `doc_id` is safe.
+async fn try_known_passwords(
+    state: &State<'_, AppState>,
+    app: &tauri::AppHandle,
+    path: &std::path::Path,
+    doc_id: &str,
+) -> Result<Option<(u32, String)>, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?;
+    let candidates = {
+        let data_dir = data_dir.clone();
+        tokio::task::spawn_blocking(move || known_passwords::list_known_passwords(&data_dir))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("read known-password store: {e}"))?
+    };
+
+    for candidate in candidates {
+        let outcome = state
+            .render
+            .open_document(
+                path.to_path_buf(),
+                doc_id.to_string(),
+                Some(candidate.clone()),
+            )
+            .await
+            .map_err(|e| format!("{:#}", e))?;
+        if let OpenOutcome::Opened(page_count) = outcome {
+            return Ok(Some((page_count, candidate)));
+        }
+    }
+    Ok(None)
+}
+
+/// Save an unprotected (no open password) copy of the currently-open
+/// encrypted document to `dest_path`. Existing content/annotations already
+/// in the file are preserved as-is; this does not flush unsaved in-memory
+/// markup edits (that's `save_document`/`save_document_as` - a different,
+/// still-refused-on-encrypted operation, see `document::save::save_with_markups`).
+/// Errors if the document was not opened with a password.
+#[tauri::command]
+pub async fn save_unprotected_copy(
+    state: State<'_, AppState>,
+    doc_id: String,
+    dest_path: String,
+) -> Result<(), String> {
+    let src = state
+        .markups
+        .path(&doc_id)
+        .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+    let password = state.markups.password(&doc_id).ok_or_else(|| {
+        "This document is not password-protected - there is no protection to remove.".to_string()
+    })?;
+    let dest = PathBuf::from(dest_path);
+
+    tokio::task::spawn_blocking(move || save_decrypted_copy(&src, &dest, &password))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Remember `password` in the obfuscated known-password store (see
+/// `document::known_passwords` for the storage/threat-model contract), for
+/// future `open_document` calls to auto-try before prompting. Called after a
+/// successful MANUAL password entry, only when the user opts in.
+#[tauri::command]
+pub async fn remember_password(app: tauri::AppHandle, password: String) -> Result<(), String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?;
+
+    tokio::task::spawn_blocking(move || known_passwords::remember_password(&data_dir, &password))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e}"))
 }
 
 /// Close an open document and release its resources.

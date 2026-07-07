@@ -40,6 +40,12 @@ export interface DocTab {
   takeoffStore: TakeoffStore;
   /** Last-known viewport state; restored when this tab is re-activated. */
   viewportSnapshot: ViewportSnapshot;
+  /**
+   * True if this document required a password to open (manually entered or
+   * auto-tried from the known-password store). Drives the "Save Unprotected
+   * Copy…" toolbar button's enabled state - never true for a plain PDF.
+   */
+  isEncrypted: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +74,7 @@ export class DocTabStore {
     doc: DocumentInfo,
     store: MarkupStore,
     takeoffStore: TakeoffStore,
+    isEncrypted = false,
   ): DocTab {
     const tab: DocTab = {
       docId: doc.doc_id,
@@ -75,6 +82,7 @@ export class DocTabStore {
       store,
       takeoffStore,
       viewportSnapshot: { ...DEFAULT_VIEWPORT_SNAPSHOT },
+      isEncrypted,
     };
     this.tabs.push(tab);
     this.activeDocId = doc.doc_id;

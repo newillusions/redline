@@ -85,10 +85,47 @@ pub fn save_with_markups(src: &Path, dest: &Path, markups: &[Markup]) -> Result<
     result
 }
 
+/// Save an unprotected copy of an encrypted `src` PDF to `dest`, decrypted
+/// with `password` and carrying no open password at all.
+///
+/// This is the backing implementation for the "save unprotected copy"
+/// capability: it does NOT touch markups (unlike `save_with_markups`) - it
+/// preserves whatever content/annotations already exist in the source file,
+/// exactly as `Document::decrypt` leaves them, and writes that out plain.
+/// Refuses a non-encrypted source (nothing to strip) and a wrong password
+/// (never writes a partial/garbage `dest`).
+pub fn save_decrypted_copy(src: &Path, dest: &Path, password: &str) -> Result<()> {
+    let mut doc = Document::load(src).with_context(|| format!("load {}", src.display()))?;
+    if !doc.is_encrypted() {
+        anyhow::bail!("Source document is not password-protected - nothing to save unprotected.");
+    }
+    doc.decrypt(password)
+        .map_err(|e| anyhow::anyhow!("incorrect password for encrypted PDF: {e}"))?;
+
+    let dir = dest.parent().context("dest has no parent dir")?;
+    let tmp = dir.join(format!(
+        ".redline-tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| -> Result<()> {
+        let f = doc
+            .save(&tmp)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all().context("fsync temp")?;
+        std::fs::rename(&tmp, dest).context("atomic rename")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::annots::tests::{one_page_doc, redline_markup};
+    use crate::document::annots::tests::{encrypted_one_page_doc, one_page_doc, redline_markup};
 
     #[test]
     fn save_with_markups_writes_dest_and_reloads() {
@@ -142,7 +179,11 @@ mod tests {
         doc.save(&path).unwrap();
 
         let got = load_markups_from(&path, Some("redline-pw")).expect("decrypt + read");
-        assert_eq!(got.len(), 1, "existing markup must survive encrypted round-trip");
+        assert_eq!(
+            got.len(),
+            1,
+            "existing markup must survive encrypted round-trip"
+        );
     }
 
     #[test]
@@ -155,7 +196,10 @@ mod tests {
         doc.save(&path).unwrap();
 
         let err = load_markups_from(&path, Some("wrong-password"));
-        assert!(err.is_err(), "wrong password must error, not return garbage");
+        assert!(
+            err.is_err(),
+            "wrong password must error, not return garbage"
+        );
     }
 
     #[test]
@@ -194,6 +238,65 @@ mod tests {
             !dest.exists(),
             "refused save must not leave a partial/unprotected output file"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // save_decrypted_copy: the "save unprotected copy" capability.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn save_decrypted_copy_produces_a_file_openable_with_no_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("protected.pdf");
+        let mut doc = encrypted_one_page_doc("redline-pw", "owner-pw");
+        doc.save(&src).unwrap();
+
+        let dest = dir.path().join("protected_unprotected.pdf");
+        save_decrypted_copy(&src, &dest, "redline-pw").expect("decrypt + save copy");
+
+        // The copy opens with lopdf and reports as NOT encrypted - no password needed.
+        let reopened = Document::load(&dest).unwrap();
+        assert!(
+            !reopened.is_encrypted(),
+            "saved copy must carry no open password"
+        );
+
+        // The original source file is untouched (still encrypted).
+        let original = Document::load(&src).unwrap();
+        assert!(original.is_encrypted(), "source file must be unmodified");
+    }
+
+    #[test]
+    fn save_decrypted_copy_wrong_password_errors_and_leaves_no_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("protected.pdf");
+        let mut doc = encrypted_one_page_doc("redline-pw", "owner-pw");
+        doc.save(&src).unwrap();
+
+        let dest = dir.path().join("out.pdf");
+        let err = save_decrypted_copy(&src, &dest, "wrong-password");
+
+        assert!(err.is_err(), "wrong password must error");
+        assert!(
+            !dest.exists(),
+            "a failed decrypt must not leave a dest file"
+        );
+    }
+
+    #[test]
+    fn save_decrypted_copy_refuses_a_non_encrypted_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("plain.pdf");
+        let (mut doc, _) = one_page_doc();
+        doc.save(&src).unwrap();
+
+        let dest = dir.path().join("out.pdf");
+        let err = save_decrypted_copy(&src, &dest, "irrelevant");
+        assert!(
+            err.is_err(),
+            "a non-encrypted source has nothing to save unprotected"
+        );
+        assert!(!dest.exists());
     }
 
     /// Same fixture as `encrypted_one_page_doc`, but with one redline markup written

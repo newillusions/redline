@@ -55,6 +55,19 @@ describe("ipc invoke argument keys (Tauri v2 camelCase)", () => {
     expect(mockInvoke).toHaveBeenCalledWith("save_document_as", { docId: "d1", newPath: "/tmp/x.pdf" });
   });
 
+  it("save_unprotected_copy → docId / destPath", async () => {
+    await ipc.saveUnprotectedCopy("d1", "/tmp/x_unprotected.pdf");
+    expect(mockInvoke).toHaveBeenCalledWith("save_unprotected_copy", {
+      docId: "d1",
+      destPath: "/tmp/x_unprotected.pdf",
+    });
+  });
+
+  it("remember_password → password (single-word key, casing is a no-op but keep the wrapper covered)", async () => {
+    await ipc.rememberPassword("hunter2");
+    expect(mockInvoke).toHaveBeenCalledWith("remember_password", { password: "hunter2" });
+  });
+
   it("delete_markup → docId / markupId", async () => {
     await ipc.deleteMarkup("d1", "m1");
     expect(mockInvoke).toHaveBeenCalledWith("delete_markup", { docId: "d1", markupId: "m1" });

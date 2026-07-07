@@ -377,4 +377,56 @@ mod tests {
         let result = restore_version(&pdf, "nope123");
         assert!(result.is_err(), "restoring unknown id must error");
     }
+
+    // -----------------------------------------------------------------------
+    // Versioning guard (backlog #9): snapshot/restore must not silently strip
+    // or corrupt an encrypted PDF's password protection.
+    //
+    // Both `save_version_snapshot` and `restore_version` use `fs::copy` -
+    // a raw byte copy, never an lopdf load->save re-serialization. That's
+    // the property this test proves: an encrypted PDF's bytes (and therefore
+    // its `/Encrypt` dict and the password needed to open it) survive a
+    // snapshot + restore round-trip untouched, unlike `save_with_markups`
+    // (document::save), which re-serializes via lopdf and therefore refuses
+    // encrypted sources outright rather than risk silently stripping them.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_and_restore_preserve_encrypted_pdf_password_state() {
+        use crate::document::annots::tests::encrypted_one_page_doc;
+
+        let dir = tempdir().unwrap();
+        let pdf = dir.path().join("protected.pdf");
+
+        let mut doc = encrypted_one_page_doc("redline-pw", "owner-pw");
+        doc.save(&pdf).unwrap();
+        let original_bytes = fs::read(&pdf).unwrap();
+
+        // Snapshot the encrypted file, then overwrite the live path with
+        // different (plain) content - simulating an edit made after the
+        // snapshot was taken.
+        let rec = save_version_snapshot(&pdf, None, 10).unwrap();
+        fs::write(&pdf, b"%PDF overwritten, not encrypted").unwrap();
+
+        // Restore the encrypted snapshot back over the live path.
+        restore_version(&pdf, &rec.id).unwrap();
+
+        // Byte-identical to the original encrypted file - fs::copy, not a
+        // re-parse, so nothing about the /Encrypt dict could have changed.
+        let restored_bytes = fs::read(&pdf).unwrap();
+        assert_eq!(
+            restored_bytes, original_bytes,
+            "restore must byte-for-byte reproduce the encrypted snapshot"
+        );
+
+        // And it still actually decrypts with the original password via lopdf.
+        let mut reloaded = lopdf::Document::load(&pdf).unwrap();
+        assert!(
+            reloaded.is_encrypted(),
+            "restored file must still be encrypted"
+        );
+        reloaded
+            .decrypt("redline-pw")
+            .expect("restored file must decrypt with the original password");
+    }
 }

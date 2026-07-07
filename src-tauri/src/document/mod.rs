@@ -14,6 +14,13 @@ pub struct DocumentInfo {
     pub doc_id: String,
     pub path: String,
     pub page_count: u32,
+    /// True if this open required a password - whether it was passed in
+    /// explicitly, reused from the frontend's session cache, or auto-tried
+    /// from the known-password store (`document::known_passwords`). The
+    /// frontend can't otherwise tell an auto-tried-transparently open apart
+    /// from a plain PDF, and needs to know for the "Save Unprotected Copy"
+    /// button + the on-open save-unprotected-copy prompt.
+    pub was_encrypted: bool,
 }
 
 /// Sentinel error strings returned by the `open_document` command when a PDF is
@@ -27,6 +34,7 @@ pub const ERR_PASSWORD_REQUIRED: &str = "PASSWORD_REQUIRED";
 pub const ERR_WRONG_PASSWORD: &str = "WRONG_PASSWORD";
 
 pub mod annots;
+pub mod known_passwords;
 pub mod page_ops;
 pub mod save;
 pub mod store;

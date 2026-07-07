@@ -14,6 +14,8 @@ export interface DocumentInfo {
   doc_id: string;
   path: string;
   page_count: number;
+  /** True if this open required a password (typed, cached, or auto-tried). */
+  was_encrypted: boolean;
 }
 
 /**
@@ -77,6 +79,25 @@ export async function openDocument(
 
 export async function closeDocument(doc_id: string): Promise<void> {
   return invoke<void>("close_document", { docId: doc_id });
+}
+
+/**
+ * Save an unprotected (no open password) copy of an encrypted document to
+ * `dest_path`. Errors if the document was not opened with a password.
+ */
+export async function saveUnprotectedCopy(
+  doc_id: string,
+  dest_path: string,
+): Promise<void> {
+  return invoke<void>("save_unprotected_copy", { docId: doc_id, destPath: dest_path });
+}
+
+/**
+ * Remember `password` in the obfuscated known-password store so future opens
+ * try it automatically before prompting. Call only after the user opts in.
+ */
+export async function rememberPassword(password: string): Promise<void> {
+  return invoke<void>("remember_password", { password });
 }
 
 // ---------------------------------------------------------------------------

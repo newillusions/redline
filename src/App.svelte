@@ -32,7 +32,8 @@
   import TabBar from "./components/TabBar.svelte";
   import SavePromptDialog from "./components/SavePromptDialog.svelte";
   import PasswordPromptDialog from "./components/PasswordPromptDialog.svelte";
-  import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD } from "$lib/ipc";
+  import ConfirmDialog from "./components/ConfirmDialog.svelte";
+  import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD } from "$lib/ipc";
   import { createPasswordCache, getCachedPassword, setCachedPassword } from "$lib/password-cache";
   import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
@@ -77,6 +78,15 @@
   /** Session-only password cache (never persisted) - avoids re-prompting for a
       file already unlocked earlier in this session. */
   const passwordCache = createPasswordCache();
+
+  // --- Remember-password prompt state (offered after a successful MANUAL
+  //     password entry - never after a cache-reuse or known-list auto-try). ---
+  let rememberPasswordPrompt = $state<{ docId: string; password: string } | null>(null);
+
+  // --- Save-unprotected-copy prompt state (offered whenever an encrypted PDF
+  //     finishes opening - manual entry, cache reuse, or known-list auto-try). ---
+  let unprotectedCopyPromptDocId = $state<string | null>(null);
+  let isSavingUnprotectedCopy = $state(false);
 
   // --- Compare panel state (M6 Phase 1.1) ---
   let compareVisible = $state(false);
@@ -184,10 +194,23 @@
         remove: deleteMarkup,
       });
       const ts = new TakeoffStore();
-      tabStore.addTab(doc, store, ts);
+      tabStore.addTab(doc, store, ts, doc.was_encrypted);
 
       // Record successful open in the MRU history.
       void recordRecentDoc(doc);
+
+      // Encrypted-PDF follow-ups: offer to remember a just-typed password,
+      // then (either way) offer to save an unprotected copy. `password` here
+      // is this function's ARGUMENT (only set on a manual retry submitted
+      // from PasswordPromptDialog) - cache-reuse and known-list auto-try
+      // leave it undefined, so those skip straight to the copy offer.
+      if (doc.was_encrypted) {
+        if (password) {
+          rememberPasswordPrompt = { docId: doc.doc_id, password };
+        } else {
+          unprotectedCopyPromptDocId = doc.doc_id;
+        }
+      }
 
       // Load markups and scales asynchronously (non-blocking).
       loadMarkups(doc.doc_id)
@@ -223,6 +246,73 @@
   function handlePasswordCancel() {
     passwordPromptPath = null;
     passwordPromptError = null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Encrypted-PDF follow-ups: remember-password prompt + save-unprotected-copy
+  // (backlog #10/#9 - save-unprotected-copy + known-password-list).
+  // ---------------------------------------------------------------------------
+
+  /** Remember-password prompt confirmed: persist it, then offer the unprotected-copy save. */
+  async function handleRememberPasswordConfirm() {
+    const pending = rememberPasswordPrompt;
+    rememberPasswordPrompt = null;
+    if (!pending) return;
+    try {
+      await rememberPassword(pending.password);
+    } catch (e) {
+      openError = `Remember password failed: ${e instanceof Error ? e.message : String(e)}`;
+    }
+    unprotectedCopyPromptDocId = pending.docId;
+  }
+
+  /** Remember-password prompt declined: still offer the unprotected-copy save. */
+  function handleRememberPasswordDecline() {
+    const pending = rememberPasswordPrompt;
+    rememberPasswordPrompt = null;
+    if (pending) unprotectedCopyPromptDocId = pending.docId;
+  }
+
+  /**
+   * Shared save-unprotected-copy flow: prompts for a destination (defaulting
+   * to `<name>_unprotected.pdf` next to the source) and saves a decrypted
+   * copy with no open password. Used by both the auto-prompt-on-open and the
+   * toolbar/menu action.
+   */
+  async function saveUnprotectedCopyFor(docId: string) {
+    const tab = tabStore.tabs.find((t) => t.docId === docId);
+    if (!tab) return;
+    const base = tab.doc.path.replace(/\.pdf$/i, "");
+    const defaultPath = `${base}_unprotected.pdf`;
+    const dest = await saveDialog({ defaultPath, filters: [{ name: "PDF", extensions: ["pdf"] }] });
+    if (!dest) return;
+    isSavingUnprotectedCopy = true;
+    openError = null;
+    try {
+      await saveUnprotectedCopy(docId, dest);
+    } catch (e) {
+      openError = `Save Unprotected Copy failed: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      isSavingUnprotectedCopy = false;
+    }
+  }
+
+  /** Auto-prompt on open confirmed: save an unprotected copy now. */
+  function handleUnprotectedCopyPromptConfirm() {
+    const docId = unprotectedCopyPromptDocId;
+    unprotectedCopyPromptDocId = null;
+    if (docId) void saveUnprotectedCopyFor(docId);
+  }
+
+  /** Auto-prompt on open declined. */
+  function handleUnprotectedCopyPromptCancel() {
+    unprotectedCopyPromptDocId = null;
+  }
+
+  /** Toolbar/menu action: save an unprotected copy of the active tab's document. */
+  async function handleSaveUnprotectedCopyMenuAction() {
+    if (!activeTab) return;
+    await saveUnprotectedCopyFor(activeTab.docId);
   }
 
   async function handleOpenFile() {
@@ -498,6 +588,14 @@
         Save As…
       </button>
       <button
+        class="btn-toolbar"
+        onclick={handleSaveUnprotectedCopyMenuAction}
+        disabled={!activeTab?.isEncrypted || isSavingUnprotectedCopy}
+        title="Save a copy of this PDF with its password protection removed"
+      >
+        {isSavingUnprotectedCopy ? "Saving…" : "Save Unprotected Copy…"}
+      </button>
+      <button
         class="btn-toolbar btn-docops"
         onclick={handleFlatten}
         disabled={!activeTab || isFlattening || isSaving}
@@ -698,6 +796,31 @@
       errorHint={passwordPromptError}
       onSubmit={handlePasswordSubmit}
       onCancel={handlePasswordCancel}
+    />
+  {/if}
+
+  <!-- Remember-password prompt - shown after a successful MANUAL password entry -->
+  {#if rememberPasswordPrompt !== null}
+    <ConfirmDialog
+      title="Remember password?"
+      message="Remember this password so future opens of encrypted PDFs try it automatically?"
+      hint="Stored obfuscated on this device - not a secure credential store, but not plaintext either."
+      confirmLabel="Remember"
+      cancelLabel="Not now"
+      onConfirm={handleRememberPasswordConfirm}
+      onCancel={handleRememberPasswordDecline}
+    />
+  {/if}
+
+  <!-- Save-unprotected-copy prompt - shown whenever an encrypted PDF finishes opening -->
+  {#if unprotectedCopyPromptDocId !== null}
+    <ConfirmDialog
+      title="Save an unprotected copy?"
+      message="This PDF is password-protected. Save a copy with no open password?"
+      confirmLabel="Save Copy…"
+      cancelLabel="Not now"
+      onConfirm={handleUnprotectedCopyPromptConfirm}
+      onCancel={handleUnprotectedCopyPromptCancel}
     />
   {/if}
 
