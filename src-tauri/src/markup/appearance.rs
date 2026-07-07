@@ -193,12 +193,21 @@ impl Resources {
         }
     }
 
-    /// Register an ExtGState and return its resource name.
-    fn add_gstate(&mut self, gs: Dictionary) -> &'static str {
-        // At most one ExtGState is ever needed per markup (Highlight's multiply-blend OR a
-        // Text/Callout box fill alpha are mutually exclusive across markup types).
-        self.ext_gstate.set("GS0", Object::Dictionary(gs));
-        "GS0"
+    /// Register an ExtGState and return its (unique, auto-numbered) resource name.
+    ///
+    /// Most shape arms need only one gstate (their whole paint sequence shares one q/gs/Q
+    /// scope - the graphics state tracks /CA and /ca independently per PDF 11.6.4.4, so a
+    /// single scope suffices even when an operator paints both fill and stroke). Callout is
+    /// the exception: the leader/arrowhead (line_gstate - tracks a.opacity for both, since
+    /// the leader has no fill concept of its own) and the synthesized text box
+    /// (shape_gstate - independent a.opacity/a.fill_opacity) can genuinely differ, so each
+    /// needs its OWN resource name - reusing one name would make the second `gs` call's
+    /// dict silently win for both (a PDF's /Resources dict is static, not applied in
+    /// stream order), corrupting the first scope's alpha.
+    fn add_gstate(&mut self, gs: Dictionary) -> String {
+        let gs_name = format!("GS{}", self.ext_gstate.len());
+        self.ext_gstate.set(gs_name.as_str(), Object::Dictionary(gs));
+        gs_name
     }
 
     /// Register the base-14 font used by this markup and return its resource name.
@@ -232,6 +241,39 @@ fn dash_array(style: LineStyle, w: f64) -> Option<(f64, f64)> {
         LineStyle::Solid => None,
         LineStyle::Dashed => Some((w.max(0.1) * 3.0, w.max(0.1) * 2.0)),
         LineStyle::Dotted => Some((w.max(0.1), w.max(0.1) * 2.0)),
+    }
+}
+
+/// Build the per-shape ExtGState dict expressing stroke opacity (`/CA`) and fill opacity
+/// (`/ca`) as two independent alpha constants - the PDF-native mechanism for per-operation
+/// alpha within one content stream (11.6.4.4). Stroking operators (`S`/`s`/`B`/`b`) consult
+/// only `/CA`; non-stroking (fill) operators (`f`/`B`/`b`) consult only `/ca`; a combined
+/// operator like `B` therefore honours each independently from a single `gs` scope.
+///
+/// For shapes with a real, independently-controlled `a.fill` (Rectangle, Ellipse, the
+/// closed-polygon family, Stamp, and the Text/Callout box): `/ca` always uses
+/// `a.fill_opacity` (default fully opaque `1.0`), fully independent of `a.opacity` - this is
+/// the fix for "opacity is global": setting one control no longer moves the other. Use
+/// [`line_gstate`] instead for shapes with no independent fill control (Line/Arrow/
+/// Polyline/Ink/Callout leader/count markers), where any incidental same-colour fill draw
+/// (an arrowhead, a marker interior) should track `a.opacity` too, not `a.fill_opacity`
+/// (which is meaningless for those types - they never set `a.fill`).
+fn shape_gstate(a: &Appearance) -> Dictionary {
+    dictionary! {
+        "CA" => real(a.opacity),
+        "ca" => real(a.fill_opacity.unwrap_or(1.0)),
+    }
+}
+
+/// ExtGState for line-family shapes with no independent fill control (Line, Arrow,
+/// Polyline, Ink, MeasurementCount markers, the Callout leader/arrowhead): both `/CA`
+/// (stroke) and `/ca` (any incidental same-colour fill, e.g. an arrowhead) track `a.opacity`
+/// alone, so the whole shape dims as one control. See [`shape_gstate`] for shapes with a
+/// real, independent fill.
+fn line_gstate(a: &Appearance) -> Dictionary {
+    dictionary! {
+        "CA" => real(a.opacity),
+        "ca" => real(a.opacity),
     }
 }
 
@@ -400,25 +442,23 @@ fn draw_text_block(
     out.push_str("ET\n");
 }
 
-/// Box border + optional fill for Text/Callout, honoring the independent `fill_opacity`.
+/// Box border + optional fill for Text/Callout. Stroke (border) opacity and fill opacity
+/// are fully independent (`shape_gstate`): the box border always honours `a.opacity`, the
+/// fill (when present) always honours `a.fill_opacity` (default fully opaque) - setting
+/// one never moves the other. Both draws share ONE gs scope (the graphics state tracks
+/// `/CA`/`/ca` independently, so `f` and `S` each pick up their own alpha automatically).
+/// The caller draws the actual glyph text SEPARATELY, outside this function's `q`/`Q`
+/// scope, so text is never dimmed by either control (spec: text carries its own alpha).
 fn draw_text_box(out: &mut String, res: &mut Resources, a: &Appearance, rect: [f64; 4]) {
     let outline = a.outline_color.as_deref().unwrap_or(&a.color);
+    let gs_name = res.add_gstate(shape_gstate(a));
+    out.push_str(&format!("q\n/{gs_name} gs\n"));
     if let Some(fill) = &a.fill {
-        if let Some(fo) = a.fill_opacity {
-            let gs_name = res.add_gstate(dictionary! { "ca" => real(fo) });
-            out.push_str(&format!("q\n/{gs_name} gs\n"));
-            fill_color(out, fill);
-            out.push_str(&format!(
-                "{} {} {} {} re\nf\nQ\n",
-                num(rect[0]), num(rect[1]), num(rect[2] - rect[0]), num(rect[3] - rect[1])
-            ));
-        } else {
-            fill_color(out, fill);
-            out.push_str(&format!(
-                "{} {} {} {} re\nf\n",
-                num(rect[0]), num(rect[1]), num(rect[2] - rect[0]), num(rect[3] - rect[1])
-            ));
-        }
+        fill_color(out, fill);
+        out.push_str(&format!(
+            "{} {} {} {} re\nf\n",
+            num(rect[0]), num(rect[1]), num(rect[2] - rect[0]), num(rect[3] - rect[1])
+        ));
     }
     let [r, g, b] = hex_to_rgb(outline);
     out.push_str(&format!(
@@ -427,6 +467,7 @@ fn draw_text_box(out: &mut String, res: &mut Resources, a: &Appearance, rect: [f
         num(a.line_weight.max(0.0)),
         num(rect[0]), num(rect[1]), num(rect[2] - rect[0]), num(rect[3] - rect[1])
     ));
+    out.push_str("Q\n");
 }
 
 /// Build the content-stream operators + resources for `m`. Returns (content, resources).
@@ -438,6 +479,8 @@ fn draw(m: &Markup) -> (String, Dictionary) {
     match (m.markup_type, &m.geometry) {
         // --- Rectangle / Square -------------------------------------------------------
         (MarkupType::Rectangle, MarkupGeometry::Rect { min, max }) => {
+            let gs_name = res.add_gstate(shape_gstate(a));
+            out.push_str(&format!("q\n/{gs_name} gs\n"));
             stroke_preamble(&mut out, a);
             let has_fill = a.fill.is_some();
             if let Some(fill) = &a.fill {
@@ -448,11 +491,13 @@ fn draw(m: &Markup) -> (String, Dictionary) {
                 num(min.x), num(min.y), num(max.x - min.x), num(max.y - min.y)
             ));
             out.push_str(paint_op(has_fill, a.line_weight > 0.0, false));
-            out.push('\n');
+            out.push_str("\nQ\n");
         }
 
         // --- Ellipse / Circle ----------------------------------------------------------
         (MarkupType::Ellipse, MarkupGeometry::Rect { min, max }) => {
+            let gs_name = res.add_gstate(shape_gstate(a));
+            out.push_str(&format!("q\n/{gs_name} gs\n"));
             stroke_preamble(&mut out, a);
             let has_fill = a.fill.is_some();
             if let Some(fill) = &a.fill {
@@ -464,7 +509,7 @@ fn draw(m: &Markup) -> (String, Dictionary) {
             let ry = (max.y - min.y).abs() / 2.0;
             ellipse_path(&mut out, cx, cy, rx, ry);
             out.push_str(paint_op(has_fill, a.line_weight > 0.0, true));
-            out.push('\n');
+            out.push_str("\nQ\n");
         }
 
         // --- Line / Arrow / MeasurementLength / MeasurementRadius -----------------------
@@ -472,6 +517,10 @@ fn draw(m: &Markup) -> (String, Dictionary) {
             MarkupType::Line | MarkupType::Arrow | MarkupType::MeasurementLength | MarkupType::MeasurementRadius,
             MarkupGeometry::Polyline(pts),
         ) if pts.len() >= 2 => {
+            // No independent fill control for these types - line_gstate() uses a.opacity
+            // for the arrowhead's incidental fill too.
+            let gs_name = res.add_gstate(line_gstate(a));
+            out.push_str(&format!("q\n/{gs_name} gs\n"));
             stroke_preamble(&mut out, a);
             let (p0, p1) = (pts[0], pts[1]);
             if m.markup_type == MarkupType::Arrow {
@@ -494,6 +543,7 @@ fn draw(m: &Markup) -> (String, Dictionary) {
                 lineto(&mut out, p1);
                 out.push_str("S\n");
             }
+            out.push_str("Q\n");
         }
 
         // --- Closed polygon family: Polygon / Cloud / Measurement{Perimeter,Area,Volume} -
@@ -505,6 +555,8 @@ fn draw(m: &Markup) -> (String, Dictionary) {
             | MarkupType::MeasurementVolume,
             MarkupGeometry::Polyline(pts),
         ) if pts.len() >= 2 => {
+            let gs_name = res.add_gstate(shape_gstate(a));
+            out.push_str(&format!("q\n/{gs_name} gs\n"));
             stroke_preamble(&mut out, a);
             let has_fill = a.fill.is_some();
             if let Some(fill) = &a.fill {
@@ -513,17 +565,19 @@ fn draw(m: &Markup) -> (String, Dictionary) {
             path_from_points(&mut out, pts);
             out.push('\n');
             out.push_str(paint_op(has_fill, a.line_weight > 0.0, true));
-            out.push('\n');
+            out.push_str("\nQ\n");
         }
 
         // --- Open polyline: PolyLine / MeasurementAngle ---------------------------------
         (MarkupType::Polyline | MarkupType::MeasurementAngle, MarkupGeometry::Polyline(pts))
             if pts.len() >= 2 =>
         {
+            let gs_name = res.add_gstate(line_gstate(a));
+            out.push_str(&format!("q\n/{gs_name} gs\n"));
             stroke_preamble(&mut out, a);
             path_from_points(&mut out, pts);
             out.push('\n');
-            out.push_str("S\n");
+            out.push_str("S\nQ\n");
         }
 
         // --- FreeText: Text ---------------------------------------------------------
@@ -541,6 +595,13 @@ fn draw(m: &Markup) -> (String, Dictionary) {
 
         // --- FreeText: Callout (leader line + synthesized box) --------------------------
         (MarkupType::Callout, MarkupGeometry::Polyline(pts)) if !pts.is_empty() => {
+            // The leader/arrowhead has its own gs scope (line_gstate: a.opacity drives both
+            // the stroke and the arrowhead's incidental fill) - a SEPARATE resource name
+            // from the box's shape_gstate below, since the two can legitimately differ (a
+            // faint leader with an opaque box fill, or vice versa) and /Resources is a
+            // single static dict, not applied in stream order (see Resources::add_gstate).
+            let leader_gs = res.add_gstate(line_gstate(a));
+            out.push_str(&format!("q\n/{leader_gs} gs\n"));
             stroke_preamble(&mut out, a);
             // Leader points AT the target (index 0); the box anchors at the last point.
             let target = pts[0];
@@ -566,6 +627,7 @@ fn draw(m: &Markup) -> (String, Dictionary) {
                     out.push_str("S\n");
                 }
             }
+            out.push_str("Q\n");
             let rect = [
                 anchor.x,
                 anchor.y,
@@ -617,6 +679,8 @@ fn draw(m: &Markup) -> (String, Dictionary) {
 
         // --- Ink: one moveto/lineto subpath per stroke, single stroke paint -------------
         (MarkupType::Ink, MarkupGeometry::Ink(strokes)) if !strokes.is_empty() => {
+            let gs_name = res.add_gstate(line_gstate(a));
+            out.push_str(&format!("q\n/{gs_name} gs\n"));
             stroke_preamble(&mut out, a);
             let mut any = false;
             for stroke in strokes {
@@ -629,10 +693,13 @@ fn draw(m: &Markup) -> (String, Dictionary) {
             if any {
                 out.push_str("S\n");
             }
+            out.push_str("Q\n");
         }
 
         // --- Stamp / StampDynamic: simple bordered box + label (named simplification) ---
         (MarkupType::Stamp | MarkupType::StampDynamic, MarkupGeometry::Rect { min, max }) => {
+            let gs_name = res.add_gstate(shape_gstate(a));
+            out.push_str(&format!("q\n/{gs_name} gs\n"));
             stroke_preamble(&mut out, a);
             if let Some(fill) = &a.fill {
                 fill_color(&mut out, fill);
@@ -642,7 +709,9 @@ fn draw(m: &Markup) -> (String, Dictionary) {
                 num(min.x), num(min.y), num(max.x - min.x), num(max.y - min.y)
             ));
             out.push_str(paint_op(a.fill.is_some(), true, false));
-            out.push('\n');
+            out.push_str("\nQ\n");
+            // Label text is drawn OUTSIDE the gs scope (unaffected by either opacity control -
+            // text always renders fully opaque, matching the Text/Callout convention).
             if let Some(text) = &m.contents {
                 let origin = PdfPoint {
                     x: min.x + 2.0,
@@ -656,6 +725,11 @@ fn draw(m: &Markup) -> (String, Dictionary) {
         (MarkupType::MeasurementCount, MarkupGeometry::Point(p)) => {
             let symbol = m.count_set.as_ref().map_or(super::CountSymbol::Circle, |c| c.symbol);
             let r = COUNT_MARKER_RADIUS;
+            // No independent fill control for count markers - line_gstate() uses a.opacity
+            // for the marker's own-colour interior fill too, so the whole marker dims as
+            // one control (matches Line/Arrow's convention for incidental fills).
+            let gs_name = res.add_gstate(line_gstate(a));
+            out.push_str(&format!("q\n/{gs_name} gs\n"));
             match symbol {
                 super::CountSymbol::Circle => {
                     stroke_preamble(&mut out, a);
@@ -681,6 +755,7 @@ fn draw(m: &Markup) -> (String, Dictionary) {
                     out.push_str("b\n");
                 }
             }
+            out.push_str("Q\n");
         }
 
         // --- Fallback: nothing drawable for this (type, geometry) combination. A named,
@@ -873,7 +948,9 @@ mod tests {
         ]);
         let m = base_markup(MarkupType::Polyline, g);
         let c = content_str(&m);
-        assert!(c.ends_with("S\n"), "open polyline must end on a plain stroke: {c}");
+        // The stroke is scoped in its own gs (opacity independence) - ends on the paint op
+        // immediately followed by the scope's closing Q, not a bare trailing S.
+        assert!(c.contains("S\nQ\n") && c.trim_end().ends_with('Q'), "open polyline must end on a plain stroke inside its gs scope: {c}");
         assert!(!c.contains("f\n"), "open polyline must not fill: {c}");
     }
 
@@ -976,7 +1053,9 @@ mod tests {
         let m = base_markup(MarkupType::Ink, g);
         let c = content_str(&m);
         assert_eq!(c.matches(" m\n").count(), 2, "one moveto per stroke: {c}");
-        assert!(c.trim_end().ends_with('S'), "ink paints one stroke over both subpaths: {c}");
+        // The stroke is scoped in its own gs (opacity independence) - ends on the paint op
+        // immediately followed by the scope's closing Q, not a bare trailing S.
+        assert!(c.contains("S\nQ") && c.trim_end().ends_with('Q'), "ink paints one stroke over both subpaths inside its gs scope: {c}");
     }
 
     // --- Stamp -----------------------------------------------------------------------------
@@ -1067,5 +1146,125 @@ mod tests {
         let m = base_markup(MarkupType::Ink, MarkupGeometry::Ink(vec![]));
         let d = stream_dict_checks(&m);
         assert_valid_form_dict(&d);
+    }
+
+    // --- Opacity independence: stroke opacity, fill opacity, text alpha never couple ------
+
+    fn gs0(m: &Markup) -> Dictionary {
+        let d = stream_dict_checks(m);
+        let resources = d.get(b"Resources").unwrap().as_dict().unwrap().clone();
+        let ext_gstate = resources.get(b"ExtGState").unwrap().as_dict().unwrap();
+        ext_gstate.get(b"GS0").unwrap().as_dict().unwrap().clone()
+    }
+
+    #[test]
+    fn rectangle_stroke_and_fill_opacity_are_independent_in_the_gstate() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 0.0, y: 0.0 },
+            max: PdfPoint { x: 50.0, y: 50.0 },
+        };
+        let mut m = base_markup(MarkupType::Rectangle, g);
+        m.appearance.fill = Some("#00ff00".into());
+        m.appearance.opacity = 0.2; // faint stroke
+        m.appearance.fill_opacity = Some(0.9); // near-opaque fill
+        let gs = gs0(&m);
+        let ca = gs.get(b"CA").unwrap().as_float().unwrap();
+        let ca_fill = gs.get(b"ca").unwrap().as_float().unwrap();
+        assert!((ca - 0.2).abs() < 1e-4, "/CA (stroke) must equal opacity, got {ca}");
+        assert!(
+            (ca_fill - 0.9).abs() < 1e-4,
+            "/ca (fill) must equal fill_opacity, NOT be coupled to the faint stroke opacity, got {ca_fill}"
+        );
+    }
+
+    #[test]
+    fn changing_fill_opacity_alone_does_not_move_stroke_opacity() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 0.0, y: 0.0 },
+            max: PdfPoint { x: 50.0, y: 50.0 },
+        };
+        let mut a = base_markup(MarkupType::Ellipse, g.clone());
+        a.appearance.fill = Some("#0000ff".into());
+        a.appearance.opacity = 0.7;
+        a.appearance.fill_opacity = Some(0.1);
+        let mut b = a.clone();
+        b.appearance.fill_opacity = Some(1.0); // only fill_opacity changes
+        let ca_a = gs0(&a).get(b"CA").unwrap().as_float().unwrap();
+        let ca_b = gs0(&b).get(b"CA").unwrap().as_float().unwrap();
+        assert!((ca_a - ca_b).abs() < 1e-6, "stroke /CA must stay put when only fill_opacity changes: {ca_a} vs {ca_b}");
+    }
+
+    #[test]
+    fn changing_stroke_opacity_alone_does_not_move_fill_opacity() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 0.0, y: 0.0 },
+            max: PdfPoint { x: 50.0, y: 50.0 },
+        };
+        let mut a = base_markup(MarkupType::Rectangle, g);
+        a.appearance.fill = Some("#ff00ff".into());
+        a.appearance.opacity = 0.9;
+        a.appearance.fill_opacity = Some(0.5);
+        let mut b = a.clone();
+        b.appearance.opacity = 0.1; // only stroke opacity changes
+        let ca_fill_a = gs0(&a).get(b"ca").unwrap().as_float().unwrap();
+        let ca_fill_b = gs0(&b).get(b"ca").unwrap().as_float().unwrap();
+        assert!((ca_fill_a - ca_fill_b).abs() < 1e-6, "fill /ca must stay put when only stroke opacity changes: {ca_fill_a} vs {ca_fill_b}");
+    }
+
+    #[test]
+    fn unset_fill_opacity_defaults_to_fully_opaque_regardless_of_stroke_opacity() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 0.0, y: 0.0 },
+            max: PdfPoint { x: 50.0, y: 50.0 },
+        };
+        let mut m = base_markup(MarkupType::Rectangle, g);
+        m.appearance.fill = Some("#123456".into());
+        m.appearance.opacity = 0.05; // near-invisible stroke
+        m.appearance.fill_opacity = None; // unset -> must default to opaque fill
+        let ca_fill = gs0(&m).get(b"ca").unwrap().as_float().unwrap();
+        assert!(
+            (ca_fill - 1.0).abs() < 1e-4,
+            "unset fill_opacity must default to 1.0 even when stroke opacity is tiny, got {ca_fill}"
+        );
+    }
+
+    #[test]
+    fn text_box_glyphs_are_drawn_outside_the_alpha_gs_scope() {
+        // Text carries its own alpha, independent of both stroke and fill opacity: the BT/ET
+        // glyph block must not be nested inside the box's "q /GS0 gs ... Q" scope.
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 0.0, y: 0.0 },
+            max: PdfPoint { x: 100.0, y: 20.0 },
+        };
+        let mut m = base_markup(MarkupType::Text, g);
+        m.contents = Some("dim stroke, opaque text".into());
+        m.appearance.fill = Some("#eeeeee".into());
+        m.appearance.opacity = 0.1;
+        m.appearance.fill_opacity = Some(0.1);
+        let c = content_str(&m);
+        // The box's gs scope closes (Q) strictly before the glyph block opens (BT).
+        let q_pos = c.find("Q\n").expect("box gs scope must close");
+        let bt_pos = c.find("BT\n").expect("glyph block must be present");
+        assert!(q_pos < bt_pos, "text glyphs must be drawn AFTER the box's gs scope closes (outside it): {c}");
+        // No gs operator appears between Q and BT - text picks up the page's default alpha
+        // (1.0), never a value from the box's stroke/fill gstate.
+        assert!(!c[q_pos..bt_pos].contains(" gs"), "no gs operator may apply between the box close and the glyph block: {c}");
+    }
+
+    #[test]
+    fn callout_box_glyphs_are_also_drawn_outside_the_alpha_gs_scope() {
+        let g = MarkupGeometry::Polyline(vec![
+            PdfPoint { x: 0.0, y: 0.0 },
+            PdfPoint { x: 40.0, y: 40.0 },
+        ]);
+        let mut m = base_markup(MarkupType::Callout, g);
+        m.contents = Some("callout text".into());
+        m.appearance.fill = Some("#ffdddd".into());
+        m.appearance.opacity = 0.2;
+        m.appearance.fill_opacity = Some(0.3);
+        let c = content_str(&m);
+        let last_q = c.rfind("Q\n").expect("box gs scope must close");
+        let bt_pos = c.find("BT\n").expect("glyph block must be present");
+        assert!(last_q < bt_pos, "callout text glyphs must be drawn after the box's gs scope closes: {c}");
     }
 }

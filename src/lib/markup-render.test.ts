@@ -128,7 +128,8 @@ describe("markupToSvg geometry", () => {
     if (s.kind !== "quads") throw new Error("kind");
     expect(s.fill).toBe("#00ff00");
     expect(s.stroke).toBe("none");
-    expect(s.opacity).toBeCloseTo(0.35); // opacity(1) * HIGHLIGHT_FILL_ALPHA(0.35)
+    // Highlight has no stroke, so its translucency lives entirely in fillOpacity.
+    expect(s.fillOpacity).toBeCloseTo(0.35); // opacity(1) * HIGHLIGHT_FILL_ALPHA(0.35)
   });
 
   it("quadToScreenPolygon: TL/TR/BL/BR storage order renders as TL,TR,BR,BL winding", () => {
@@ -190,7 +191,27 @@ describe("markupToSvg appearance", () => {
       { line_weight: 3, color: "#00ff00", opacity: 0.5 }), VS);
     expect(s.stroke).toBe("#00ff00");
     expect(s.strokeWidth).toBeCloseTo(6);
-    expect(s.opacity).toBe(0.5);
+    expect(s.strokeOpacity).toBe(0.5);
+  });
+
+  it("stroke opacity and fill opacity are independent - setting one does not move the other", () => {
+    const withFill = markupToSvg(mk({ Rect: { min: { x: 0, y: 0 }, max: { x: 10, y: 10 } } }, "Rectangle",
+      { opacity: 0.1, fill: "#0000ff", fill_opacity: 0.9 }), VS);
+    expect(withFill.strokeOpacity).toBe(0.1);
+    expect(withFill.fillOpacity).toBe(0.9);
+
+    // Changing only fill_opacity must not move strokeOpacity.
+    const fillChanged = markupToSvg(mk({ Rect: { min: { x: 0, y: 0 }, max: { x: 10, y: 10 } } }, "Rectangle",
+      { opacity: 0.1, fill: "#0000ff", fill_opacity: 0.2 }), VS);
+    expect(fillChanged.strokeOpacity).toBe(0.1);
+    expect(fillChanged.fillOpacity).toBe(0.2);
+  });
+
+  it("unset fill_opacity defaults to fully opaque (1), independent of a low stroke opacity", () => {
+    const s = markupToSvg(mk({ Rect: { min: { x: 0, y: 0 }, max: { x: 10, y: 10 } } }, "Rectangle",
+      { opacity: 0.05, fill: "#00ffaa" }), VS);
+    expect(s.strokeOpacity).toBe(0.05);
+    expect(s.fillOpacity).toBe(1);
   });
 
   it("uses 'none' fill when fill is null and the hex when set", () => {
@@ -439,7 +460,7 @@ describe("ellipse rendering", () => {
     if (s.kind !== "rect") throw new Error("kind");
     expect(s.fill).toBe("#ffe600");      // colour wash, not a solid grey/black box
     expect(s.stroke).toBe("none");       // no border (it's a marker, not a text box)
-    expect(s.opacity).toBeLessThan(1);   // translucent
+    expect(s.fillOpacity).toBeLessThan(1);   // translucent (no stroke, so alpha lives in fillOpacity)
     expect(s).not.toHaveProperty("outline"); // text-box outline treatment must NOT apply
   });
 });

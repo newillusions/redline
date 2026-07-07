@@ -407,13 +407,26 @@ impl Markup {
         if let Some(rgb) = hex_to_rgb(&self.appearance.color) {
             d.set("C", Object::Array(rgb.iter().map(|v| real(*v)).collect()));
         }
-        d.set("CA", real(self.appearance.opacity));
+        // /CA (the standard annotation-level constant-opacity key) is fixed at 1.0, NOT
+        // `self.appearance.opacity`. A viewer that honours /AP (PDFium, Acrobat, Bluebeam -
+        // the whole point of appearance.rs) composites the annotation's rendered form using
+        // /CA as a SINGLE blanket group alpha over the ENTIRE painted result, applied on top
+        // of whatever alpha the content stream itself already used. If /CA carried the
+        // stroke opacity here, every AP-consuming viewer would double-dim the stroke (once
+        // via /CA, once via appearance.rs's own ExtGState) and, worse, ALSO dim the fill and
+        // text by the stroke opacity - exactly the "opacity is global" bug this model fixes.
+        // Per-component alpha (stroke via /CA, fill via /ca, both scoped to just the
+        // relevant paint operators, text left unscoped) is applied entirely inside the /AP
+        // content stream (appearance.rs); the real stroke-opacity value is preserved
+        // losslessly for our own round-trip via the private /RLOpacity key below.
+        d.set("CA", real(1.0));
+        d.set("RLOpacity", real(self.appearance.opacity));
         if let Some(fill) = &self.appearance.fill {
             if let Some(rgb) = hex_to_rgb(fill) {
                 d.set("IC", Object::Array(rgb.iter().map(|v| real(*v)).collect()));
             }
         }
-        // Text/Callout box border colour + fill alpha — redline-private, so foreign viewers
+        // Text/Callout box border colour + fill alpha - redline-private, so foreign viewers
         // are unaffected (they keep /C as the annotation colour). Stored as the literal hex
         // string + a real, mirroring the /RL* private-key pattern (spec §6).
         if let Some(outline) = &self.appearance.outline_color {
@@ -573,11 +586,13 @@ impl Markup {
         let line_style = get_name(d, b"RLLineStyle")
             .map(|s| line_style_from_tag(&s))
             .unwrap_or(LineStyle::Solid);
-        let opacity = d
-            .get(b"CA")
-            .ok()
-            .and_then(|o| o.as_float().ok())
-            .map(|f| f as f64)
+        // Prefer the private /RLOpacity key (the real stroke-opacity value, written by this
+        // version of redline - see the /CA comment in to_annotation_dict for why /CA itself
+        // is always 1.0 now). Fall back to /CA for files saved by a pre-/RLOpacity redline
+        // build, or a foreign PDF where /CA is the only opacity signal at all (best-effort
+        // import: a foreign annotation's single blanket /CA becomes our stroke opacity).
+        let opacity = get_real(d, b"RLOpacity")
+            .or_else(|| get_real(d, b"CA"))
             .unwrap_or(1.0);
 
         // Count set: reconstruct from /RLCountSet* keys; the colour comes from /C (== `color`).
@@ -1286,5 +1301,95 @@ mod tests {
         let back = Markup::from_annotation_dict(&d);
         assert!(back.appearance.outline_color.is_none());
         assert!(back.appearance.fill_opacity.is_none());
+    }
+
+    // --- Opacity model: /CA is always 1.0, real stroke opacity lives in /RLOpacity ---
+
+    #[test]
+    fn ca_is_always_1_0_regardless_of_stroke_opacity() {
+        // A viewer that honours /AP composites the WHOLE rendered form using /CA as one
+        // blanket group alpha (see the comment in to_annotation_dict). If /CA carried the
+        // stroke opacity, every AP-consuming viewer would double-dim strokes and, worse,
+        // ALSO dim fill/text by it - the "opacity is global" bug. /CA must stay 1.0 no
+        // matter what stroke opacity the user picks; appearance.rs applies opacity itself.
+        for stroke_opacity in [0.0, 0.1, 0.5, 0.8, 1.0] {
+            let mut m = fixture(
+                MarkupGeometry::Rect {
+                    min: PdfPoint { x: 0.0, y: 0.0 },
+                    max: PdfPoint { x: 10.0, y: 10.0 },
+                },
+                MarkupType::Rectangle,
+            );
+            m.appearance.opacity = stroke_opacity;
+            let d = m.to_annotation_dict();
+            let ca = d.get(b"CA").unwrap().as_float().unwrap();
+            assert!(
+                (ca - 1.0).abs() < 1e-6,
+                "/CA must be 1.0 for stroke_opacity={stroke_opacity}, got {ca}"
+            );
+        }
+    }
+
+    #[test]
+    fn rl_opacity_carries_the_real_stroke_opacity_and_round_trips() {
+        let mut m = fixture(
+            MarkupGeometry::Rect {
+                min: PdfPoint { x: 0.0, y: 0.0 },
+                max: PdfPoint { x: 10.0, y: 10.0 },
+            },
+            MarkupType::Rectangle,
+        );
+        m.appearance.opacity = 0.35;
+        let d = m.to_annotation_dict();
+        let rl_opacity = d.get(b"RLOpacity").unwrap().as_float().unwrap();
+        assert!(
+            (rl_opacity - 0.35).abs() < 1e-4,
+            "/RLOpacity must carry the real stroke opacity, got {rl_opacity}"
+        );
+        let back = Markup::from_annotation_dict(&d);
+        assert!(
+            (back.appearance.opacity - 0.35).abs() < 1e-4,
+            "opacity must round-trip via /RLOpacity, got {}",
+            back.appearance.opacity
+        );
+    }
+
+    #[test]
+    fn legacy_file_with_only_ca_no_rl_opacity_falls_back_to_ca() {
+        // A file saved by a pre-/RLOpacity redline build (or a foreign PDF) only has /CA.
+        // Import must still treat that as the stroke opacity (best-effort backward compat).
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("Square"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(0.0), real(0.0), real(10.0), real(10.0)]),
+        );
+        d.set("CA", real(0.6));
+        let back = Markup::from_annotation_dict(&d);
+        assert!(
+            (back.appearance.opacity - 0.6).abs() < 1e-4,
+            "must fall back to /CA when /RLOpacity is absent, got {}",
+            back.appearance.opacity
+        );
+    }
+
+    #[test]
+    fn rl_opacity_takes_priority_over_a_stale_ca() {
+        // If both keys are present (our own files always write both), /RLOpacity wins -
+        // /CA is always 1.0 on our own output and must never shadow the real value.
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("Square"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(0.0), real(0.0), real(10.0), real(10.0)]),
+        );
+        d.set("CA", real(1.0));
+        d.set("RLOpacity", real(0.42));
+        let back = Markup::from_annotation_dict(&d);
+        assert!(
+            (back.appearance.opacity - 0.42).abs() < 1e-4,
+            "must prefer /RLOpacity over /CA, got {}",
+            back.appearance.opacity
+        );
     }
 }

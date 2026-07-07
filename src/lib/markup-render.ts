@@ -13,8 +13,18 @@ interface SvgStyle {
   id: string;
   stroke: string;
   strokeWidth: number;
-  opacity: number;
+  /**
+   * STROKE/LINE opacity only (`appearance.opacity`, the "Opacity" UI control). Rendered via
+   * the SVG `stroke-opacity` attribute - never applied to fill or text (fixes "opacity is
+   * global": the three controls are independent, see PropertiesPanel.svelte).
+   */
+  strokeOpacity: number;
   fill: string;
+  /**
+   * Fill opacity, fully independent of `strokeOpacity` (`appearance.fill_opacity ?? 1`, the
+   * "Fill opacity" UI control). Rendered via the SVG `fill-opacity` attribute.
+   */
+  fillOpacity: number;
   dashArray?: string;
 }
 
@@ -50,7 +60,7 @@ export type SvgShape =
     })
   | (SvgStyle & {
       kind: "text";
-      /** Box top-left in screen px — also the text origin (one unit: box + glyphs share this). */
+      /** Box top-left in screen px - also the text origin (one unit: box + glyphs share this). */
       x: number;
       y: number;
       /** Box size in screen px, derived from the SAME Rect geometry as the text. */
@@ -58,10 +68,11 @@ export type SvgShape =
       height: number;
       text: string;
       fontPx: number;
-      /** Box border colour (`outline_color ?? color`) — distinct from the glyph `stroke`/colour. */
+      /** Box border colour (`outline_color ?? color`) - distinct from the glyph `stroke`/colour.
+       *  The border is rendered at `strokeOpacity`; the box fill at `fillOpacity` (both
+       *  inherited from SvgStyle) - independent of each other and of the glyph text, which is
+       *  always rendered fully opaque (no opacity attribute at all). */
       outline: string;
-      /** Box fill alpha, applied on top of `opacity` (`fill_opacity ?? 1`). */
-      fillOpacity: number;
     })
   | (SvgStyle & {
       kind: "callout";
@@ -69,7 +80,7 @@ export type SvgShape =
       points: string;
       /** Explicit arrowhead triangle at the leader's pointing (target) end; "" when degenerate. */
       arrowHead: string;
-      /** Text-box top-left in screen px (the leader's anchor end) — box + glyphs share this. */
+      /** Text-box top-left in screen px (the leader's anchor end) - box + glyphs share this. */
       x: number;
       y: number;
       /** Synthesized text-box size in screen px. */
@@ -78,7 +89,6 @@ export type SvgShape =
       text: string;
       fontPx: number;
       outline: string;
-      fillOpacity: number;
     });
 
 /** Screen-space radius (CSS px) of a count marker — half its bounding box. */
@@ -179,8 +189,9 @@ function styleOf(m: Markup, v: ViewportState): SvgStyle {
     id: m.id,
     stroke: m.appearance.color,
     strokeWidth,
-    opacity: m.appearance.opacity,
+    strokeOpacity: m.appearance.opacity,
     fill: m.appearance.fill ?? "none",
+    fillOpacity: m.appearance.fill_opacity ?? 1,
     dashArray: dashFor(m.appearance.line_style, strokeWidth),
   };
 }
@@ -262,11 +273,11 @@ const CALLOUT_BOX_PT = { width: 144, height: 18 } as const;
 /** Highlighter wash alpha — a translucent marker pass over content, never an opaque fill. */
 const HIGHLIGHT_FILL_ALPHA = 0.35;
 
-/** Resolve a text-box's border colour + fill alpha from appearance (with sane fallbacks). */
-function boxStyle(m: Markup): { outline: string; fillOpacity: number } {
+/** Resolve a text-box's border colour from appearance (falls back to the glyph colour).
+ *  Fill alpha comes from the base SvgStyle spread (`styleOf` already reads fill_opacity). */
+function boxStyle(m: Markup): { outline: string } {
   return {
     outline: m.appearance.outline_color ?? m.appearance.color,
-    fillOpacity: m.appearance.fill_opacity ?? 1,
   };
 }
 
@@ -428,11 +439,11 @@ export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
     // markup translates them together (no orphaned/duplicate box).
     const tl = pdfUserSpaceToScreen(g.Rect.min.x, g.Rect.max.y, v); // PDF top-left (y-up)
     const br = pdfUserSpaceToScreen(g.Rect.max.x, g.Rect.min.y, v); // bottom-right
-    const { outline, fillOpacity } = boxStyle(m);
+    const { outline } = boxStyle(m);
     return {
       ...style, kind: "text", x: tl.x, y: tl.y,
       width: Math.abs(br.x - tl.x), height: Math.abs(br.y - tl.y),
-      text: m.contents ?? "", fontPx, outline, fillOpacity,
+      text: m.contents ?? "", fontPx, outline,
     };
   }
   if (m.markup_type === "Callout" && "Polyline" in g) {
@@ -443,12 +454,12 @@ export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
     // The text box sits at the anchor (leader's last point); box + glyphs share this origin.
     const last = g.Polyline[g.Polyline.length - 1] ?? { x: 0, y: 0 };
     const anchor = pdfUserSpaceToScreen(last.x, last.y, v);
-    const { outline, fillOpacity } = boxStyle(m);
+    const { outline } = boxStyle(m);
     return {
       ...style, kind: "callout", points: shortPoints, arrowHead,
       x: anchor.x, y: anchor.y,
       width: CALLOUT_BOX_PT.width * v.zoom, height: CALLOUT_BOX_PT.height * v.zoom,
-      text: m.contents ?? "", fontPx, outline, fillOpacity,
+      text: m.contents ?? "", fontPx, outline,
     };
   }
 
@@ -457,11 +468,13 @@ export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
   // renders as separate bands hugging each line (matches real PDF text-markup annotations,
   // spec section 6 addendum). The rectangle-drag Highlight below (freeform, for non-text
   // areas like scans/drawings) is unchanged and stays available as a separate creation path.
+  // Highlight has no stroke, so its translucency is expressed entirely via fillOpacity
+  // (sourced from appearance.opacity - Highlight has no separate Fill control in the UI).
   if ("Quads" in g && m.markup_type === "Highlight") {
     return {
       ...style, kind: "quads", polygons: g.Quads.map((q) => quadToScreenPolygon(q, v)),
       fill: m.appearance.color, stroke: "none",
-      opacity: m.appearance.opacity * HIGHLIGHT_FILL_ALPHA,
+      fillOpacity: m.appearance.opacity * HIGHLIGHT_FILL_ALPHA,
     };
   }
 
@@ -476,7 +489,7 @@ export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
     return {
       ...style, kind: "rect",
       fill: m.appearance.color, stroke: "none",
-      opacity: m.appearance.opacity * HIGHLIGHT_FILL_ALPHA,
+      fillOpacity: m.appearance.opacity * HIGHLIGHT_FILL_ALPHA,
       x, y, width: Math.abs(b.x - a.x), height: Math.abs(a.y - b.y),
     };
   }
@@ -521,7 +534,7 @@ export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
     return {
       ...style, kind: "quads", polygons: g.Quads.map((q) => quadToScreenPolygon(q, v)),
       fill: m.appearance.color, stroke: "none",
-      opacity: m.appearance.opacity * HIGHLIGHT_FILL_ALPHA,
+      fillOpacity: m.appearance.opacity * HIGHLIGHT_FILL_ALPHA,
     };
   }
   const s = pdfUserSpaceToScreen(g.Point.x, g.Point.y, v);

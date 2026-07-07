@@ -16,8 +16,10 @@ import {
   moveVertex,
   insertVertex,
   deleteVertex,
+  calloutBoxBounds,
   HANDLE_IDS,
 } from "./markup-select";
+import { DEFAULT_TEXT_BOX } from "./markup-tools";
 import type { Bounds, HandleId } from "./markup-select";
 import type { Markup, MarkupGeometry, Appearance, UserRef } from "./ipc";
 
@@ -35,6 +37,10 @@ const WORKFLOW = { status: "None" as const, assignee: null, thread: [] };
 
 function mkMarkup(id: string, geometry: Markup["geometry"]): Markup {
   return { id, markup_type: "Rectangle", page: 1, geometry, appearance: AP, subject: null, layer: null, contents: null, group_id: null, audit: AUDIT, workflow: WORKFLOW, measurement: null };
+}
+
+function mkCallout(id: string, target: { x: number; y: number }, anchor: { x: number; y: number }): Markup {
+  return { id, markup_type: "Callout", page: 1, geometry: { Polyline: [target, anchor] }, appearance: AP, subject: null, layer: null, contents: null, group_id: null, audit: AUDIT, workflow: WORKFLOW, measurement: null };
 }
 
 const rectMarkup = mkMarkup("r1", { Rect: { min: { x: 10, y: 20 }, max: { x: 60, y: 80 } } });
@@ -160,6 +166,66 @@ describe("hitTest", () => {
 
   it("Quads: miss past the shorter second line's right edge, outside tol", () => {
     expect(hitTest([quadsMarkup], { x: 80, y: 75 }, tol)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Callout: synthesized text box is selectable/editable (not just the leader line)
+// ---------------------------------------------------------------------------
+describe("calloutBoxBounds", () => {
+  it("anchors the box at the leader's LAST point, extending +width/-height (top-left convention)", () => {
+    const c = mkCallout("c1", { x: 0, y: 0 }, { x: 100, y: 200 });
+    expect(calloutBoxBounds(c)).toEqual({
+      minX: 100,
+      minY: 200 - DEFAULT_TEXT_BOX.height,
+      maxX: 100 + DEFAULT_TEXT_BOX.width,
+      maxY: 200,
+    });
+  });
+
+  it("returns null for a non-Callout markup", () => {
+    expect(calloutBoxBounds(rectMarkup)).toBeNull();
+  });
+
+  it("returns null for a Callout with empty leader geometry", () => {
+    const c: Markup = { ...mkCallout("c2", { x: 0, y: 0 }, { x: 0, y: 0 }), geometry: { Polyline: [] } };
+    expect(calloutBoxBounds(c)).toBeNull();
+  });
+});
+
+describe("boundsOf: Callout includes the synthesized text box, not just the leader", () => {
+  it("unions the leader's 2-point AABB with the box AABB", () => {
+    // A flat horizontal leader at y=200: the leader's own AABB is minY=maxY=200 (zero
+    // height), so the box - which drops BELOW the anchor by DEFAULT_TEXT_BOX.height -
+    // is what extends the union's minY downward and maxX rightward past the leader alone.
+    const c = mkCallout("c1", { x: 0, y: 200 }, { x: 100, y: 200 });
+    const b = boundsOf(c);
+    expect(b.maxX).toBeCloseTo(100 + DEFAULT_TEXT_BOX.width);
+    expect(b.minY).toBeCloseTo(200 - DEFAULT_TEXT_BOX.height);
+    expect(b.minX).toBe(0); // leader target still the leftmost point here
+    expect(b.maxY).toBe(200); // anchor/leader both sit at the top
+  });
+});
+
+describe("hitTest: Callout box is clickable, not just the thin leader line", () => {
+  const tol = 5;
+
+  it("hits the Callout when clicking well inside the synthesized box, far from the leader", () => {
+    const c = mkCallout("c1", { x: 0, y: 0 }, { x: 100, y: 200 });
+    // Deep inside the box (box spans x:[100,244], y:[182,200] for the default 144x18 box) -
+    // nowhere near the leader segment (0,0)-(100,200).
+    const insideBox = { x: 150, y: 190 };
+    expect(hitTest([c], insideBox, tol)).toBe("c1");
+  });
+
+  it("still hits near the leader line itself (no regression)", () => {
+    const c = mkCallout("c1", { x: 0, y: 0 }, { x: 100, y: 200 });
+    expect(hitTest([c], { x: 50, y: 100 }, tol)).toBe("c1");
+  });
+
+  it("misses when well outside both the leader and the box", () => {
+    const c = mkCallout("c1", { x: 0, y: 0 }, { x: 100, y: 200 });
+    expect(hitTest([c], { x: 500, y: 500 }, tol)).toBeNull();
   });
 });
 

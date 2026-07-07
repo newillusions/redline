@@ -4,6 +4,7 @@
  * space (y-up, origin bottom-left, f64). No DOM, no Svelte, no clocks/UUIDs.
  */
 import type { Markup, MarkupGeometry, PdfPoint } from "./ipc";
+import { DEFAULT_TEXT_BOX } from "./markup-tools";
 
 // ---------------------------------------------------------------------------
 // Bounds + handle types
@@ -76,7 +77,15 @@ export function boundsOf(m: Markup): Bounds {
       maxY: Math.max(g.Rect.min.y, g.Rect.max.y),
     };
   }
-  if ("Polyline" in g) return _boundsOfPoints(g.Polyline);
+  if ("Polyline" in g) {
+    const leader = _boundsOfPoints(g.Polyline);
+    // A Callout's leader is only 2 points (target + anchor) - the rendered text box at the
+    // anchor end is not part of the geometry, so its AABB must be unioned in here or the
+    // box is unselectable/excluded from marquee selection outside a thin band near the
+    // leader itself (the bug: "the text box is stuck and cannot be edited").
+    const box = calloutBoxBounds(m);
+    return box ? _unionBounds(leader, box) : leader;
+  }
   if ("Ink" in g) return _boundsOfPoints(g.Ink.flat());
   if ("Quads" in g) return _boundsOfPoints(g.Quads.flat());
   // Point
@@ -92,6 +101,40 @@ function _boundsOfPoints(pts: PdfPoint[]): Bounds {
     if (p.y > maxY) maxY = p.y;
   }
   return { minX, minY, maxX, maxY };
+}
+
+function _unionBounds(a: Bounds, b: Bounds): Bounds {
+  return {
+    minX: Math.min(a.minX, b.minX),
+    minY: Math.min(a.minY, b.minY),
+    maxX: Math.max(a.maxX, b.maxX),
+    maxY: Math.max(a.maxY, b.maxY),
+  };
+}
+
+/**
+ * AABB of a Callout's synthesized text box, anchored at the leader's LAST polyline point
+ * (the box origin). Mirrors the SVG-preview convention (markup-render.ts markupToSvg
+ * "callout" branch): the anchor is the box's PDF-space top-left (max-Y, min-X) corner, and
+ * the box extends toward lower Y (down-screen) and higher X (right) by DEFAULT_TEXT_BOX.
+ * Returns null for non-Callout markups or degenerate/empty leader geometry.
+ *
+ * Note: appearance.rs's saved-PDF appearance stream anchors the box the OPPOSITE way
+ * (bottom-left, extending up) - a pre-existing mismatch between the live SVG preview and
+ * the exported PDF's visual, out of scope for this fix (which targets interactive
+ * selection/editing, not the appearance-stream geometry). Flagged for a follow-up.
+ */
+export function calloutBoxBounds(m: Markup): Bounds | null {
+  if (m.markup_type !== "Callout" || !("Polyline" in m.geometry)) return null;
+  const pts = m.geometry.Polyline;
+  const anchor = pts[pts.length - 1];
+  if (!anchor) return null;
+  return {
+    minX: anchor.x,
+    minY: anchor.y - DEFAULT_TEXT_BOX.height,
+    maxX: anchor.x + DEFAULT_TEXT_BOX.width,
+    maxY: anchor.y,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +173,13 @@ function _hits(m: Markup, p: PdfPoint, tol: number): boolean {
     const verts = g.Polyline;
     for (let i = 0; i < verts.length - 1; i++) {
       if (_segDistance(p, verts[i], verts[i + 1]) <= tol) return true;
+    }
+    // A Callout's rendered text box is not part of the leader geometry - hit-test it too
+    // so a click anywhere inside the box (not just within `tol` of the thin leader line)
+    // selects the markup (see calloutBoxBounds's doc comment for the box convention).
+    const box = calloutBoxBounds(m);
+    if (box && p.x >= box.minX - tol && p.x <= box.maxX + tol && p.y >= box.minY - tol && p.y <= box.maxY + tol) {
+      return true;
     }
     return false;
   }

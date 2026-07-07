@@ -151,6 +151,9 @@ describe("draft mode (no selection)", () => {
 
   it("changing box outline colour updates draftAppearance.outline_color (distinct from color)", async () => {
     const store = makeStore();
+    // The "Text box border" control only shows for Text/Callout - it is a FreeText box
+    // border, meaningless (and hidden) for other shape types.
+    store.activeTool = "Text";
     const { container } = await mountPanel(store);
 
     const outlineInput = container.querySelector(
@@ -180,9 +183,64 @@ describe("draft mode (no selection)", () => {
     await tick();
 
     expect(store.draftAppearance.fill_opacity).toBeCloseTo(0.3);
-    // Overall opacity is a different control — unchanged.
+    // Overall opacity is a different control - unchanged.
     expect(store.draftAppearance.opacity).toBe(1);
     expect(store.canUndo).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // Bug fix: Fill shown twice / confusing (consolidation + Box outline gating).
+  // -------------------------------------------------------------------------
+
+  it("Text box border is hidden for a non-text shape context (default draft tool)", async () => {
+    const store = makeStore(); // default activeTool is "hand" - not Text/Callout
+    const { container } = await mountPanel(store);
+
+    expect(container.querySelector("input[data-field='outline_color']")).toBeNull();
+  });
+
+  it("Text box border is hidden when the selection is a Rectangle (not Text/Callout)", async () => {
+    const store = makeStore();
+    const m = makeMarkup("m1", { markupType: "Rectangle" });
+    store.seed([m]);
+    store.selectedIds = new Set(["m1"]);
+    const { container } = await mountPanel(store);
+
+    expect(container.querySelector("input[data-field='outline_color']")).toBeNull();
+  });
+
+  it("Text box border shows for a selected Callout and commits outline_color", async () => {
+    const store = makeStore();
+    const m = makeMarkup("m1", {
+      markupType: "Callout",
+      geometry: { Polyline: [{ x: 0, y: 0 }, { x: 10, y: 10 }] },
+    });
+    store.seed([m]);
+    store.selectedIds = new Set(["m1"]);
+    const { container } = await mountPanel(store);
+
+    const outlineInput = container.querySelector(
+      "input[type='color'][data-field='outline_color']"
+    ) as HTMLInputElement;
+    expect(outlineInput).toBeTruthy();
+
+    fireEvent.input(outlineInput, { target: { value: "#00ff00" } });
+    await tick();
+    expect(store.markups[0].appearance.outline_color).toBe("#00ff00");
+  });
+
+  it("fill colour, no-fill toggle, and fill opacity are grouped in ONE consolidated Fill block", async () => {
+    const store = makeStore();
+    const { container } = await mountPanel(store);
+
+    const fillGroup = Array.from(container.querySelectorAll(".prop-subgroup")).find((el) =>
+      el.querySelector("input[data-field='fill_color']"),
+    ) as HTMLElement | undefined;
+    expect(fillGroup).toBeTruthy();
+    // The no-fill toggle and the fill opacity slider live in the SAME group as fill colour -
+    // not scattered across separate top-level rows with Box outline wedged between them.
+    expect(fillGroup!.querySelector("input[data-field='no_fill']")).not.toBeNull();
+    expect(fillGroup!.querySelector("input[data-field='fill_opacity']")).not.toBeNull();
   });
 });
 

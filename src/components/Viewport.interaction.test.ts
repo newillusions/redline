@@ -1408,6 +1408,80 @@ describe("Viewport G6 select", () => {
     expect(poly[1].x).toBeCloseTo(100);
     expect(poly[1].y).toBeCloseTo(100);
   });
+
+  // -------------------------------------------------------------------------
+  // S8: Callout text box is draggable INDEPENDENT of the leader target (bug fix:
+  // "the text box is stuck and cannot be edited/moved").
+  // -------------------------------------------------------------------------
+  it("S8: dragging inside a selected Callout's synthesized text box moves ONLY the anchor, leader target stays put", async () => {
+    const { overlay } = await mountViewport(store);
+    seedCallout(store, "call-a");
+    store.activeTool = "select";
+    await tick();
+
+    // Select the callout via its leader, screen ~(100,100).
+    ptr(overlay, "pointerdown", 100, 100);
+    ptr(overlay, "pointerup", 100, 100);
+    await tick();
+    expect(store.selectedIds.has("call-a")).toBe(true);
+
+    // The synthesized box: anchor PDF(100,100) -> box PDF x:[100,244] y:[82,100] ->
+    // screen x:[100,244] y:[100,118] (pageHeight 200, zoom 1). Pick a point deep inside
+    // the box, well away from the leader segment (50,50)-(100,100): screen (150,110).
+    // The box-drag reuses the same vertex-drag machinery as the target handle (S6) -
+    // ABSOLUTE positioning (the anchor snaps to wherever the pointer currently is, not a
+    // relative offset from the grab point), so the final anchor position is exactly the
+    // PDF point under the pointerup, not the seeded anchor plus a screen delta.
+    ptr(overlay, "pointerdown", 150, 110);
+    ptr(overlay, "pointermove", 170, 120);
+    ptr(overlay, "pointerup", 170, 120);
+    await tick();
+
+    const poly = (store.markups[0].geometry as { Polyline: { x: number; y: number }[] }).Polyline;
+    expect(poly).toHaveLength(2);
+    // Target (index 0) is untouched.
+    expect(poly[0].x).toBeCloseTo(50);
+    expect(poly[0].y).toBeCloseTo(150);
+    // Anchor (index 1) snapped to the pointerup's PDF position: screen(170,120) -> PDF(170,80).
+    expect(poly[1].x).toBeCloseTo(170);
+    expect(poly[1].y).toBeCloseTo(80);
+  });
+
+  // -------------------------------------------------------------------------
+  // S9: Double-clicking an existing Callout opens the inline editor pre-filled
+  // with its contents, and committing UPDATES it (does not create a new markup) -
+  // bug fix: "the text box is stuck and cannot be edited".
+  // -------------------------------------------------------------------------
+  it("S9: dblclick on a selected Callout opens the editor pre-filled with its contents; commit updates, does not create", async () => {
+    const { container, overlay } = await mountViewport(store);
+    seedCallout(store, "call-a"); // contents: "see note"
+    store.activeTool = "select";
+    await tick();
+
+    // Double-click inside the callout's synthesized box (same point as S8).
+    fireEvent.dblClick(overlay, { clientX: 150, clientY: 110 });
+    await tick();
+
+    const textarea = container.querySelector("textarea.text-editor") as HTMLTextAreaElement;
+    expect(textarea).not.toBeNull();
+    expect(textarea.value).toBe("see note");
+
+    textarea.value = "revised note";
+    fireEvent.input(textarea);
+    fireEvent.blur(textarea);
+    await tick();
+
+    // Still exactly one markup (updated, not a second one created).
+    expect(store.markups.length).toBe(1);
+    expect(store.markups[0].id).toBe("call-a");
+    expect(store.markups[0].contents).toBe("revised note");
+    // Geometry (leader + anchor) is untouched by an edit-only commit.
+    const poly = (store.markups[0].geometry as { Polyline: { x: number; y: number }[] }).Polyline;
+    expect(poly[0]).toEqual({ x: 50, y: 150 });
+    expect(poly[1]).toEqual({ x: 100, y: 100 });
+    await waitFor(() => expect(ipc.update).toHaveBeenCalledTimes(1));
+    expect(ipc.add).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------

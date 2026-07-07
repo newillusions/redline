@@ -50,7 +50,7 @@
   import {
     hitTest, marqueeHits, boundsOf, isRectResizable,
     handleAnchors, resizeBounds, translateGeometry, scaleGeometryToBounds,
-    expandSelectionToGroups, moveVertex, insertVertex, deleteVertex,
+    expandSelectionToGroups, moveVertex, insertVertex, deleteVertex, calloutBoxBounds,
     type Bounds, type HandleId,
   } from "$lib/markup-select";
   import {
@@ -214,10 +214,16 @@
   // editor carries placement info; editorText is a separate $state so bind:value
   // never reaches into a potentially-null object (avoids a Svelte runtime crash when
   // commitEditor sets editor=null while the textarea binding is still live).
+  // editingId: set when this editor session is EDITING an existing Text/Callout markup's
+  // contents (opened via dblclick under the select tool) rather than CREATING a new one
+  // (opened via the Text/Callout tool). commitEditor branches on it - editing patches
+  // .contents on the existing markup and leaves geometry untouched; creating builds a
+  // brand-new markup from anchorPdf/leaderPdf as before.
   let editor = $state<{
     screenX: number; screenY: number;
     anchorPdf: { x: number; y: number };
     leaderPdf: { x: number; y: number } | null;
+    editingId: string | null;
   } | null>(null);
   let editorText = $state("");
   let calloutTarget: { x: number; y: number } | null = null; // first Callout click (leader start)
@@ -1092,9 +1098,23 @@
   function commitEditor() {
     if (!editor || !identity) { cancelEditor(); return; }
     const text = editorText.trim();
-    if (!text) { cancelEditor(); return; }
     // Capture all state before canceling (cancelEditor clears editor + editorText).
-    const { anchorPdf, leaderPdf } = editor;
+    const { anchorPdf, leaderPdf, editingId } = editor;
+
+    if (editingId) {
+      // Editing an EXISTING Text/Callout's contents (opened via dblclick under the select
+      // tool): only .contents changes, geometry/leader/box position stay exactly as they
+      // were. Empty text clears .contents to null - mirrors PropertiesPanel's
+      // onContentsInput convention (contents: v || null), never deletes the markup.
+      const existing = store.getById(editingId);
+      cancelEditor();
+      if (!existing) return;
+      const now = new Date().toISOString();
+      store.update(existing, bumpAudit({ ...existing, contents: text || null }, identity, now));
+      return;
+    }
+
+    if (!text) { cancelEditor(); return; }
     const appearance = { ...store.draftAppearance, font: store.draftAppearance.font ?? DEFAULT_TEXT_FONT };
     let markupType: "Text" | "Callout";
     let geometry;
@@ -1299,6 +1319,26 @@
         e.stopPropagation();
         e.preventDefault();
         return;
+      }
+
+      // 1d. Callout text box: dragging anywhere inside the synthesized box (not just a
+      //     handle dot) moves ONLY the anchor (last Polyline point) - independent of the
+      //     leader target, which stays put. Must come before the general hit-test below,
+      //     or a box click would fall through to "move whole callout" instead. Routes
+      //     through the same vertex gesture as 1c, just on the LAST index.
+      if (selectedCallout && "Polyline" in selectedCallout.geometry) {
+        const box = calloutBoxBounds(selectedCallout);
+        const tol = SELECT_GRAB_PX / zoom;
+        if (box && p.x >= box.minX - tol && p.x <= box.maxX + tol && p.y >= box.minY - tol && p.y <= box.maxY + tol) {
+          gesture = "vertex";
+          vertexBefore = selectedCallout;
+          vertexWorking = selectedCallout;
+          vertexIndex = selectedCallout.geometry.Polyline.length - 1;
+          (e.target as Element).setPointerCapture(e.pointerId);
+          e.stopPropagation();
+          e.preventDefault();
+          return;
+        }
       }
 
       // 2. Hit-test markups on this page (topmost wins).
@@ -1726,14 +1766,14 @@
       const screenY = e.clientY - r.top;
       if (tool === "Text") {
         editorText = "";
-        editor = { screenX, screenY, anchorPdf: p, leaderPdf: null };
+        editor = { screenX, screenY, anchorPdf: p, leaderPdf: null, editingId: null };
       } else {
         // Callout: first click sets leader target; second click opens editor
         if (!calloutTarget) {
           calloutTarget = p;
         } else {
           editorText = "";
-          editor = { screenX, screenY, anchorPdf: p, leaderPdf: calloutTarget };
+          editor = { screenX, screenY, anchorPdf: p, leaderPdf: calloutTarget, editingId: null };
           calloutTarget = null;
         }
       }
@@ -1760,9 +1800,43 @@
     }
   }
 
-  function onOverlayDblClick() {
-    // No dblclick action under select tool.
-    if (isSelectTool()) return;
+  function onOverlayDblClick(e: MouseEvent) {
+    // Select tool: dblclick on an existing Text or Callout markup opens the SAME inline
+    // editor used at creation time, pre-filled with its current contents (mirrors the
+    // Text-tool's editor UI; commitEditor() detects editingId and patches .contents on
+    // the existing markup rather than creating a new one). Any other hit, or no hit,
+    // is a no-op - dblclick has no other meaning under select.
+    if (isSelectTool()) {
+      const p = localPdfFromMouse(e);
+      if (!p || !containerEl) return;
+      const pageMarkups = store.markups.filter((m) => m.page === pageIndex);
+      const hit = hitTest(pageMarkups, p, SELECT_GRAB_PX / zoom);
+      if (!hit) return;
+      const m = store.getById(hit);
+      if (!m || (m.markup_type !== "Text" && m.markup_type !== "Callout")) return;
+      // pdfUserSpaceToScreen already returns container-relative px - the same coordinate
+      // space the SVG overlay renders in and the .text-editor's `left/top` CSS consumes
+      // (both positioned against viewport-root's origin) - no further offset needed.
+      editorText = m.contents ?? "";
+      if (m.markup_type === "Callout" && "Polyline" in m.geometry) {
+        const pts = m.geometry.Polyline;
+        const anchor = pts[pts.length - 1];
+        if (!anchor) return;
+        const screen = pdfUserSpaceToScreen(anchor.x, anchor.y, viewState);
+        editor = {
+          screenX: screen.x, screenY: screen.y,
+          anchorPdf: anchor, leaderPdf: pts[0] ?? null, editingId: m.id,
+        };
+      } else if ("Rect" in m.geometry) {
+        const topLeft = { x: m.geometry.Rect.min.x, y: m.geometry.Rect.max.y };
+        const screen = pdfUserSpaceToScreen(topLeft.x, topLeft.y, viewState);
+        editor = {
+          screenX: screen.x, screenY: screen.y,
+          anchorPdf: topLeft, leaderPdf: null, editingId: m.id,
+        };
+      }
+      return;
+    }
     const tool = store.activeTool;
     // The browser fires click→click→dblclick, so the dblclick's two constituent
     // clicks each appended a vertex at ~the same point; drop the duplicate before
@@ -1889,42 +1963,50 @@
         WKWebView (Tauri/macOS) does not reliably bubble events from filled SVG child
         elements to a parent onclick handler — pointer-events:none avoids the issue.
       -->
+      <!--
+        Opacity model (three independent controls - see markup-render.ts SvgStyle docs and
+        Appearance in src-tauri/src/markup/mod.rs): `stroke-opacity` is driven by
+        strokeOpacity (the "Opacity" control), `fill-opacity` by fillOpacity (the "Fill
+        opacity" control, independent), and glyph `<text>` elements carry NO opacity
+        attribute at all - text always renders fully opaque, unaffected by either control.
+      -->
       {#if s.kind === "rect"}
         <rect
           x={s.x} y={s.y} width={s.width} height={s.height}
-          stroke={s.stroke} stroke-width={s.strokeWidth}
-          fill={s.fill} opacity={s.opacity}
+          stroke={s.stroke} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
+          fill={s.fill} fill-opacity={s.fillOpacity}
           stroke-dasharray={s.dashArray ?? undefined}
           pointer-events="none"
         />
       {:else if s.kind === "quads"}
         <!-- Text-anchored Highlight: one translucent polygon per underlying text line
-             (never a single bounding rect - see markup-render.ts markupToSvg). -->
+             (never a single bounding rect - see markup-render.ts markupToSvg). No stroke,
+             so its translucency lives entirely in fill-opacity. -->
         {#each s.polygons as pts, i (i)}
           <polygon points={pts}
             stroke="none"
-            fill={s.fill} opacity={s.opacity}
+            fill={s.fill} fill-opacity={s.fillOpacity}
             pointer-events="none"
           />
         {/each}
       {:else if s.kind === "ellipse"}
         <ellipse
           cx={s.cx} cy={s.cy} rx={s.rx} ry={s.ry}
-          stroke={s.stroke} stroke-width={s.strokeWidth}
-          fill={s.fill} opacity={s.opacity}
+          stroke={s.stroke} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
+          fill={s.fill} fill-opacity={s.fillOpacity}
           stroke-dasharray={s.dashArray ?? undefined}
           pointer-events="none"
         />
       {:else if s.kind === "polygon"}
         <polygon points={s.points}
-          stroke={s.stroke} stroke-width={s.strokeWidth}
-          fill={s.fill} opacity={s.opacity}
+          stroke={s.stroke} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
+          fill={s.fill} fill-opacity={s.fillOpacity}
           stroke-dasharray={s.dashArray ?? undefined}
           pointer-events="none" />
       {:else if s.kind === "cloud"}
         <path d={s.path}
-          stroke={s.stroke} stroke-width={s.strokeWidth}
-          fill={s.fill} opacity={s.opacity}
+          stroke={s.stroke} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
+          fill={s.fill} fill-opacity={s.fillOpacity}
           stroke-dasharray={s.dashArray ?? undefined}
           pointer-events="none" />
       {:else if s.kind === "arrow"}
@@ -1933,87 +2015,93 @@
           fill="context-stroke" on SVG markers is unsupported in macOS WKWebView, so
           the arrowhead is rendered as a plain <polygon> filled with the markup color.
           The polyline ends at the arrowhead base (not the tip) so the shaft does not
-          visually protrude through the head.
+          visually protrude through the head. Arrow has no independent Fill control, so
+          the arrowhead's fill-opacity tracks strokeOpacity too (matches appearance.rs's
+          line_gstate - the whole arrow dims as one control).
         -->
         <polyline points={s.points}
-          stroke={s.stroke} stroke-width={s.strokeWidth}
-          fill="none" opacity={s.opacity}
+          stroke={s.stroke} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
+          fill="none"
           stroke-dasharray={s.dashArray ?? undefined}
           pointer-events="none"
         />
         {#if s.arrowHead}
           <polygon points={s.arrowHead}
-            fill={s.stroke} stroke="none"
-            opacity={s.opacity}
+            fill={s.stroke} fill-opacity={s.strokeOpacity} stroke="none"
             pointer-events="none"
           />
         {/if}
       {:else if s.kind === "polyline"}
         <polyline points={s.points}
-          stroke={s.stroke} stroke-width={s.strokeWidth}
-          fill="none" opacity={s.opacity}
+          stroke={s.stroke} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
+          fill="none"
           stroke-dasharray={s.dashArray ?? undefined}
           pointer-events="none" />
       {:else if s.kind === "ink"}
         {#each s.strokes as stroke, i (i)}
           <polyline points={stroke}
-            stroke={s.stroke} stroke-width={s.strokeWidth}
-            fill="none" opacity={s.opacity}
+            stroke={s.stroke} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
+            fill="none"
             stroke-linecap="round" stroke-linejoin="round"
             pointer-events="none" />
         {/each}
       {:else if s.kind === "point"}
+        <!-- Count markers have no independent Fill control - both stroke and the marker's
+             own-colour interior fill track strokeOpacity (matches appearance.rs's
+             line_gstate: the whole marker dims as one control). -->
         {#if s.render.shape === "circle"}
           <circle cx={s.render.cx} cy={s.render.cy} r={s.render.r}
-            stroke={s.stroke} stroke-width={s.strokeWidth}
-            fill={s.fill === "none" ? s.stroke : s.fill}
-            opacity={s.opacity}
+            stroke={s.stroke} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
+            fill={s.fill === "none" ? s.stroke : s.fill} fill-opacity={s.strokeOpacity}
             pointer-events="none" />
         {:else if s.render.shape === "polygon"}
           <polygon points={s.render.points}
-            stroke={s.stroke} stroke-width={s.strokeWidth}
-            fill={s.fill === "none" ? s.stroke : s.fill}
-            opacity={s.opacity}
+            stroke={s.stroke} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
+            fill={s.fill === "none" ? s.stroke : s.fill} fill-opacity={s.strokeOpacity}
             stroke-linejoin="round"
             pointer-events="none" />
         {:else if s.render.shape === "cross"}
           {#each s.render.lines as ln, i (i)}
             <line x1={ln.x1} y1={ln.y1} x2={ln.x2} y2={ln.y2}
-              stroke={s.stroke} stroke-width={s.strokeWidth}
+              stroke={s.stroke} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
               stroke-linecap="round"
-              opacity={s.opacity}
               pointer-events="none" />
           {/each}
         {/if}
       {:else if s.kind === "text"}
         <!-- Box + glyphs are ONE unit (both derive from the markup's Rect). The box renders
-             BEHIND the text so the fill control is visible; `outline` is the box border (distinct
-             from the glyph colour `stroke`); `fill-opacity` is independent of overall opacity. -->
+             BEHIND the text so the fill control is visible; `outline` is the box border
+             (distinct from the glyph colour `stroke`). Border stroke-opacity and fill
+             fill-opacity are independent of each other; the glyph text carries no opacity
+             attribute at all (always fully opaque - text is never dimmed by either). -->
         <rect x={s.x} y={s.y} width={s.width} height={s.height}
           fill={s.fill} fill-opacity={s.fillOpacity}
-          stroke={s.outline} stroke-width={s.strokeWidth}
+          stroke={s.outline} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
           stroke-dasharray={s.dashArray ?? undefined}
-          opacity={s.opacity} pointer-events="none" />
+          pointer-events="none" />
         <text x={s.x} y={s.y} fill={s.stroke} font-size={s.fontPx}
-          dominant-baseline="hanging" opacity={s.opacity}
+          dominant-baseline="hanging"
           pointer-events="none">{s.text}</text>
       {:else if s.kind === "callout"}
+        <!-- Leader/arrowhead have no independent Fill control - the arrowhead's
+             fill-opacity tracks strokeOpacity too (mirrors the Arrow shape above and
+             appearance.rs's line_gstate for the leader). -->
         <polyline points={s.points} stroke={s.stroke} stroke-width={s.strokeWidth}
-          fill="none" opacity={s.opacity} stroke-dasharray={s.dashArray ?? undefined}
+          stroke-opacity={s.strokeOpacity} fill="none" stroke-dasharray={s.dashArray ?? undefined}
           pointer-events="none" />
         {#if s.arrowHead}
           <!-- Arrowhead at the leader's pointing (target) end. Explicit polygon (WKWebView has
                no fill="context-stroke"), filled with the leader colour; shaft stops at its base. -->
-          <polygon points={s.arrowHead} fill={s.stroke} stroke="none"
-            opacity={s.opacity} pointer-events="none" />
+          <polygon points={s.arrowHead} fill={s.stroke} fill-opacity={s.strokeOpacity} stroke="none"
+            pointer-events="none" />
         {/if}
         <rect x={s.x} y={s.y} width={s.width} height={s.height}
           fill={s.fill} fill-opacity={s.fillOpacity}
-          stroke={s.outline} stroke-width={s.strokeWidth}
+          stroke={s.outline} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
           stroke-dasharray={s.dashArray ?? undefined}
-          opacity={s.opacity} pointer-events="none" />
+          pointer-events="none" />
         <text x={s.x} y={s.y} fill={s.stroke} font-size={s.fontPx}
-          dominant-baseline="hanging" opacity={s.opacity}
+          dominant-baseline="hanging"
           pointer-events="none">{s.text}</text>
       {/if}
     {/snippet}

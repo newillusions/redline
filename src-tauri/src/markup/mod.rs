@@ -144,11 +144,24 @@ pub struct FontSpec {
 }
 
 /// Visual appearance (spec §6): colour / weight / opacity / fill / line-style / font.
-/// Colours are hex strings (`#rrggbb`); opacity is `0.0..=1.0`.
+/// Colours are hex strings (`#rrggbb`).
+///
+/// Opacity model (three independent controls, corrected 2026-07-07 - see the
+/// markup-controls-callout PR): `opacity` is STROKE/LINE alpha only; `fill_opacity` is
+/// fill alpha, fully independent of `opacity`; text glyphs are never dimmed by either and
+/// always render at full alpha. All three are `0.0..=1.0`. The PDF serialisation
+/// ([`appearance::build_ap_stream`]) applies `opacity` and `fill_opacity` as separate
+/// `/CA`/`/ca` ExtGState scopes around just the stroke/fill paint operators respectively,
+/// and leaves text drawing unscoped - see that module's doc comment for why the annotation
+/// dict's own top-level `/CA` can no longer carry this value (a blanket group alpha there
+/// would double-dim/re-couple fill and text, which is exactly the bug this model fixes).
+/// The frontend SVG overlay (`markup-render.ts`) mirrors this with native
+/// `stroke-opacity`/`fill-opacity` attributes instead of a single group `opacity`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Appearance {
     pub color: String,
     pub line_weight: f64,
+    /// STROKE/LINE opacity only (the "Opacity" UI control). Never applied to fill or text.
     pub opacity: f64,
     pub fill: Option<String>,
     pub line_style: LineStyle,
@@ -159,10 +172,10 @@ pub struct Appearance {
     /// `#[serde(default)]` keeps pre-outline JSON (no field) deserialising to `None`.
     #[serde(default)]
     pub outline_color: Option<String>,
-    /// Fill alpha (`0.0..=1.0`) applied to the box interior INDEPENDENTLY of the overall
-    /// `opacity`, so a semi-transparent fill can sit behind solid text + a solid outline.
-    /// `None` ⇒ fully opaque fill (subject only to the overall `opacity`). Persists via the
-    /// private `/RLFillOpacity` key. `#[serde(default)]` keeps pre-field JSON deserialising.
+    /// Fill alpha (`0.0..=1.0`), fully INDEPENDENT of `opacity` (the "Fill opacity" UI
+    /// control) - setting one never moves the other. `None` => fully opaque fill (`1.0`),
+    /// regardless of the stroke `opacity` value. Persists via the private `/RLFillOpacity`
+    /// key. `#[serde(default)]` keeps pre-field JSON deserialising.
     #[serde(default)]
     pub fill_opacity: Option<f64>,
 }

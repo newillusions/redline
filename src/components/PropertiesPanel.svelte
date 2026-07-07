@@ -18,6 +18,17 @@
   const selected = $derived(store.selectedMarkups);
   const mode = $derived(selected.length === 0 ? "draft" : "selection");
 
+  // True only when every relevant markup is a Text or Callout - the ONLY types with a
+  // FreeText box border (`outline_color`), distinct from the glyph colour. Gates the "Box
+  // outline" control so it never shows for shape types where it is meaningless (e.g.
+  // Rectangle has no box border of its own - its border IS its stroke) and can't be
+  // mistaken for a second fill/outline setting on those types.
+  const isTextBoxContext = $derived(
+    mode === "draft"
+      ? store.activeTool === "Text" || store.activeTool === "Callout"
+      : selected.length > 0 && selected.every((m) => m.markup_type === "Text" || m.markup_type === "Callout"),
+  );
+
   // ---------------------------------------------------------------------------
   // Commit helpers
   // ---------------------------------------------------------------------------
@@ -267,7 +278,10 @@
       />
     </div>
 
-    <!-- Opacity -->
+    <!-- Opacity: stroke/line opacity. For shapes with a Fill (below), this is independent
+         of Fill opacity - setting one never moves the other. For line-only shapes with no
+         Fill control (Line/Arrow/Polyline/Ink/Callout leader/count markers), this is the
+         shape's only opacity control. -->
     <div class="prop-row">
       <label for="prop-opacity" class="prop-label">Opacity</label>
       <div class="prop-control opacity-row">
@@ -286,64 +300,79 @@
       </div>
     </div>
 
-    <!-- Fill -->
-    <div class="prop-row">
-      <label for="prop-fill" class="prop-label">Fill</label>
-      <div class="prop-control fill-row">
-        <input
-          id="prop-fill"
-          type="color"
-          data-field="fill_color"
-          value={fillValue()}
-          disabled={noFillChecked()}
-          oninput={onFillColorInput}
-        />
-        <label class="no-fill-label">
+    <!-- Fill group: ONE consolidated block (colour + no-fill toggle + independent fill
+         opacity) - previously split across three separate, confusingly-ordered rows with
+         "Box outline" wedged between the fill colour and its opacity, reading as duplicated
+         fill settings. Box outline (a distinct, FreeText-only concept) lives in its own
+         section below, gated to Text/Callout so it never shows for shapes that have no
+         box of their own. -->
+    <div class="prop-subgroup">
+      <p class="prop-subgroup-title muted">Fill</p>
+
+      <div class="prop-row">
+        <label for="prop-fill" class="prop-label">Colour</label>
+        <div class="prop-control fill-row">
           <input
-            type="checkbox"
-            data-field="no_fill"
-            checked={noFillChecked()}
-            onchange={onNoFillChange}
+            id="prop-fill"
+            type="color"
+            data-field="fill_color"
+            value={fillValue()}
+            disabled={noFillChecked()}
+            oninput={onFillColorInput}
           />
-          No fill
-        </label>
+          <label class="no-fill-label">
+            <input
+              type="checkbox"
+              data-field="no_fill"
+              checked={noFillChecked()}
+              onchange={onNoFillChange}
+            />
+            No fill
+          </label>
+        </div>
+      </div>
+
+      <!-- Fill opacity: independent of the overall/stroke Opacity control above - setting
+           one never moves the other (see Appearance.opacity docs in src-tauri/src/markup/mod.rs). -->
+      <div class="prop-row">
+        <label for="prop-fill-opacity" class="prop-label">Opacity</label>
+        <div class="prop-control opacity-row">
+          <input
+            id="prop-fill-opacity"
+            type="range"
+            data-field="fill_opacity"
+            min="0"
+            max="1"
+            step="0.05"
+            value={fillOpacityValue()}
+            oninput={onFillOpacityInput}
+            class="prop-range"
+          />
+          <span class="opacity-readout muted">{fillOpacityDisplay()}</span>
+        </div>
       </div>
     </div>
 
-    <!-- Box outline (Text/Callout border colour — distinct from the text/glyph colour) -->
-    <div class="prop-row">
-      <label for="prop-outline" class="prop-label">Box outline</label>
-      <div class="prop-control color-row">
-        <div class="color-swatch" style="background: {outlineColorValue() || 'transparent'}"></div>
-        <input
-          id="prop-outline"
-          type="color"
-          data-field="outline_color"
-          data-indeterminate={outlineColorValue() === "" ? "true" : undefined}
-          value={outlineColorValue() || "#000000"}
-          oninput={onOutlineColorInput}
-        />
+    <!-- Text box border (Text/Callout FreeText box border colour - semantically distinct
+         from both the fill above and the glyph/line colour: it is the rectangle drawn
+         around a Text or Callout note. Only shown for those types so it is never mistaken
+         for a second fill/outline setting on shapes that have no box of their own. -->
+    {#if isTextBoxContext}
+      <div class="prop-row">
+        <label for="prop-outline" class="prop-label">Text box border</label>
+        <div class="prop-control color-row">
+          <div class="color-swatch" style="background: {outlineColorValue() || 'transparent'}"></div>
+          <input
+            id="prop-outline"
+            type="color"
+            data-field="outline_color"
+            data-indeterminate={outlineColorValue() === "" ? "true" : undefined}
+            value={outlineColorValue() || "#000000"}
+            oninput={onOutlineColorInput}
+          />
+        </div>
       </div>
-    </div>
-
-    <!-- Fill transparency (box fill alpha, independent of overall opacity) -->
-    <div class="prop-row">
-      <label for="prop-fill-opacity" class="prop-label">Fill opacity</label>
-      <div class="prop-control opacity-row">
-        <input
-          id="prop-fill-opacity"
-          type="range"
-          data-field="fill_opacity"
-          min="0"
-          max="1"
-          step="0.05"
-          value={fillOpacityValue()}
-          oninput={onFillOpacityInput}
-          class="prop-range"
-        />
-        <span class="opacity-readout muted">{fillOpacityDisplay()}</span>
-      </div>
-    </div>
+    {/if}
 
     <!-- Line style -->
     <div class="prop-row">
@@ -501,6 +530,25 @@
     margin: 0 0 var(--space-1) 0;
     text-transform: uppercase;
     letter-spacing: 0.05em;
+  }
+
+  /* Fill subgroup: visually unifies colour + no-fill + opacity as ONE consolidated
+     control (fixes "Fill shown twice" - these previously read as three separate,
+     unrelated rows with Box outline wedged in between). */
+  .prop-subgroup {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-1) var(--space-2);
+    margin: var(--space-1) 0;
+    background: var(--color-bg-active, transparent);
+    border-radius: var(--radius-sm);
+  }
+
+  .prop-subgroup-title {
+    font-size: var(--font-size-sm);
+    font-weight: 500;
+    margin: 0;
   }
 
   .prop-row {
