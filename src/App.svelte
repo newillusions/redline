@@ -50,6 +50,16 @@
   import UpdateNotification from "./components/UpdateNotification.svelte";
   import ToolChestPanel from "./components/ToolChestPanel.svelte";
   import { ToolChestStore } from "$lib/toolchest-store.svelte";
+  import ActivationGate from "./components/ActivationGate.svelte";
+  import { getLicenseStatus, renewLicenseIfDue } from "$lib/license";
+  import type { LicenseState } from "$lib/license";
+
+  // ---------------------------------------------------------------------------
+  // S2b client entitlement gate - null while the initial check is in flight,
+  // then either "valid" (app content renders) or a locked-out reason
+  // (ActivationGate renders instead). See handleActivated / initializeAppContent.
+  // ---------------------------------------------------------------------------
+  let licenseState = $state<LicenseState | null>(null);
 
   // ---------------------------------------------------------------------------
   // Multi-doc state
@@ -132,7 +142,13 @@
     }
   }
 
-  onMount(async () => {
+  /**
+   * Everything that used to run unconditionally in onMount now runs only
+   * once the license gate has passed - either on first mount (already
+   * licensed from a prior activation) or right after ActivationGate reports
+   * a successful activation (handleActivated below).
+   */
+  async function initializeAppContent() {
     // Load the MRU list from the backend (non-blocking; failure is non-fatal).
     loadRecentDocs().then((docs) => { recentDocs = docs; }).catch(() => {});
 
@@ -149,6 +165,26 @@
       for (const pdf of pdfs) {
         await openFilePath(pdf);
       }
+    });
+  }
+
+  /** ActivationGate calls this after a successful activate_license. */
+  async function handleActivated(state: LicenseState) {
+    licenseState = state;
+    if (state.state === "valid") await initializeAppContent();
+  }
+
+  onMount(async () => {
+    licenseState = await getLicenseStatus().catch(
+      (e): LicenseState => ({ state: "invalid", reason: e instanceof Error ? e.message : String(e) }),
+    );
+    if (licenseState.state !== "valid") return;
+
+    await initializeAppContent();
+    // Best-effort renew when within the renew window - never blocks the app;
+    // a failed/offline renew just leaves the current token gating as-is.
+    renewLicenseIfDue(licenseState).then((updated) => {
+      if (updated) licenseState = updated;
     });
   });
 
@@ -579,6 +615,13 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
+{#if licenseState === null}
+  <!-- Initial license check in flight - avoid a flash of the activation gate
+       for the common case (already-activated install). -->
+  <div class="app-shell license-checking"></div>
+{:else if licenseState.state !== "valid"}
+  <ActivationGate licenseState={licenseState} onActivated={handleActivated} />
+{:else}
 <div class="app-shell">
   <!-- Toolbar -->
   <header class="toolbar">
@@ -846,6 +889,7 @@
 
   <UpdateNotification />
 </div>
+{/if}
 
 <style>
   .app-shell {

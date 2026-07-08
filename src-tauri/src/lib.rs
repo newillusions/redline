@@ -20,6 +20,7 @@ mod commands;
 pub mod document;
 pub mod geometry;
 mod identity;
+pub mod license;
 pub mod render;
 pub mod sidecar;
 
@@ -214,6 +215,10 @@ pub fn run() {
             // Application settings (local user preferences)
             commands::settings::load_settings,
             commands::settings::save_settings,
+            // S2b client entitlement (emittiv-staff license consumer)
+            commands::license::license_status,
+            commands::license::activate_license,
+            commands::license::renew_license,
             // Tool Chest commands (M2)
             commands::toolchest::list_tool_sets,
             commands::toolchest::recent_tools,

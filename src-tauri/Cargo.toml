@@ -94,6 +94,18 @@ roxmltree = "0.21.1"
 flate2 = "1.1.9"
 zip = { version = "4.2.0", default-features = false, features = ["deflate"] }
 
+# --- S2b client entitlement (emittiv-staff license consumer) ---
+# Offline Ed25519 verification of the redline entitlement token.
+ed25519-dalek = "2.2"
+# base64url (de)coding of the token's <payload>.<signature> segments and the
+# baked SPKI-DER public key PEM.
+base64 = "0.22"
+# HTTP calls to the emittiv-staff license issue/renew endpoints.
+reqwest = { version = "0.12", features = ["json"] }
+# Object-safe async trait for LicenseClient (dyn dispatch, so the Tauri
+# commands can be tested against a fake without a live HTTP call).
+async-trait = "0.1"
+
 # --- Future milestones (feature-gated to keep M1 build lean) ---
 # leptess = { version = "0.14", optional = true }   # OCR — M4
 
