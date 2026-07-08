@@ -241,6 +241,80 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri:build
 
+      # --- Windows Authenticode signing (self-signed cert, obs:z6byyxo59r0ilt2bq397) ---
+      # `tauri:build` above already produced the NSIS installer AND its Tauri-updater
+      # minisign signature (target/release/bundle/nsis/*-setup.exe.sig) in one shot.
+      # Authenticode-signing the .exe in place after that point would change its bytes
+      # and invalidate that minisign signature (the auto-updater hashes the exact
+      # released file). So: sign first, then REGENERATE the minisign signature over the
+      # now-signed exe (`tauri signer sign`) so the two never go out of sync. Both new
+      # steps no-op cleanly (exit 0, no error) when the signing secrets are absent, so
+      # forks/PRs without the cert still produce an unsigned-but-working build.
+      - name: Check Windows signing secrets
+        id: sign_check
+        shell: bash
+        env:
+          WINDOWS_SIGN_CERT_B64: ${{ secrets.WINDOWS_SIGN_CERT_B64 }}
+          WINDOWS_SIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGN_CERT_PASSWORD }}
+        run: |
+          if [ -n "$WINDOWS_SIGN_CERT_B64" ] && [ -n "$WINDOWS_SIGN_CERT_PASSWORD" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "WINDOWS_SIGN_CERT_B64/WINDOWS_SIGN_CERT_PASSWORD not set - skipping Authenticode signing, build stays unsigned."
+          fi
+
+      - name: Install osslsigncode
+        if: steps.sign_check.outputs.available == 'true'
+        shell: bash
+        run: choco install osslsigncode -y --no-progress
+
+      - name: Sign Windows installer (Authenticode)
+        if: steps.sign_check.outputs.available == 'true'
+        id: sign
+        shell: bash
+        env:
+          WINDOWS_SIGN_CERT_B64: ${{ secrets.WINDOWS_SIGN_CERT_B64 }}
+          WINDOWS_SIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGN_CERT_PASSWORD }}
+        run: |
+          NSIS_PATH=$(find target/release/bundle/nsis -name "*-setup.exe" | head -1)
+          if [ -z "$NSIS_PATH" ]; then
+            echo "No NSIS installer found - nothing to sign."
+            echo "signed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          TMP_PFX="${RUNNER_TEMP}/codesign.pfx"
+          echo "$WINDOWS_SIGN_CERT_B64" | base64 -d > "$TMP_PFX"
+
+          SIGNED_PATH="${NSIS_PATH%.exe}-signed.exe"
+          osslsigncode sign \
+            -pkcs12 "$TMP_PFX" \
+            -pass "$WINDOWS_SIGN_CERT_PASSWORD" \
+            -n "Redline" \
+            -i "https://forge.mms.name/emittiv/redline" \
+            -t "http://timestamp.digicert.com" \
+            -in "$NSIS_PATH" \
+            -out "$SIGNED_PATH"
+
+          mv -f "$SIGNED_PATH" "$NSIS_PATH"
+          rm -f "$TMP_PFX"
+
+          echo "signed=true" >> $GITHUB_OUTPUT
+          echo "Signed $NSIS_PATH"
+
+      - name: Regenerate updater signature (post-Authenticode)
+        if: steps.sign_check.outputs.available == 'true' && steps.sign.outputs.signed == 'true'
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          NSIS_PATH=$(find target/release/bundle/nsis -name "*-setup.exe" | head -1)
+          # Overwrites the stale <NSIS_PATH>.sig (computed pre-Authenticode-signing
+          # by `tauri:build` above) with one that matches the now-signed bytes.
+          npm run tauri -- signer sign -k "$TAURI_SIGNING_PRIVATE_KEY" -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$NSIS_PATH"
+
       - name: Find installers
         id: find_installers
         shell: bash
