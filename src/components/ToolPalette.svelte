@@ -8,12 +8,15 @@
     { kind: "Ellipse", label: "◯", title: "Ellipse" },
     { kind: "Line", label: "╱", title: "Line" },
     { kind: "Arrow", label: "↗", title: "Arrow" },
-    { kind: "Highlight", label: "▬", title: "Highlight" },
+    { kind: "Highlight", label: "▬", title: "Highlight (freeform box - for text, use Select Text)" },
+    // Placed immediately after Highlight (not with the other draw tools) so the
+    // text-anchored alternative is discoverable right where users look for it -
+    // Acrobat/Bluebeam users expect "Highlight" itself to snap to text (redline#29).
+    { kind: "selectText", label: "I", title: "Select Text (drag to select; Enter highlights, Ctrl/Cmd+C copies)" },
     { kind: "Polyline", label: "⋁", title: "Polyline" },
     { kind: "Polygon", label: "⬠", title: "Polygon" },
     { kind: "Cloud", label: "☁", title: "Cloud" },
     { kind: "Ink", label: "✎", title: "Ink (Freehand)" },
-    { kind: "selectText", label: "I", title: "Select Text (drag to select; Enter highlights, Ctrl/Cmd+C copies)" },
     { kind: "Text", label: "A", title: "Text" },
     { kind: "Callout", label: "💬", title: "Callout" },
     { kind: "calibrate", label: "⚖", title: "Calibrate Scale (two-click)" },

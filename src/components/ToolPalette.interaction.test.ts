@@ -54,9 +54,22 @@ describe("ToolPalette", () => {
     await user.click(screen.getByTitle("Rectangle"));
 
     // Every other tool button must report aria-pressed=false
-    for (const title of ["Pan (Hand)", "Select / Pointer (V)", "Ellipse", "Line", "Arrow", "Highlight"]) {
+    for (const title of [
+      "Pan (Hand)", "Select / Pointer (V)", "Ellipse", "Line", "Arrow",
+      "Highlight (freeform box - for text, use Select Text)",
+    ]) {
       expect(screen.getByTitle(title)).toHaveAttribute("aria-pressed", "false");
     }
+  });
+
+  it("Select Text sits immediately after Highlight (redline#29 discoverability fix: " +
+    "Acrobat/Bluebeam users expect Highlight itself to snap to text)", () => {
+    render(ToolPalette, { props: { store } });
+    const buttons = screen.getAllByRole("button");
+    const titles = buttons.map((b) => b.getAttribute("title"));
+    const highlightIdx = titles.findIndex((t) => t?.startsWith("Highlight"));
+    expect(highlightIdx).toBeGreaterThanOrEqual(0);
+    expect(titles[highlightIdx + 1]).toContain("Select Text");
   });
 
   it("switching tools deactivates the previous one", async () => {
