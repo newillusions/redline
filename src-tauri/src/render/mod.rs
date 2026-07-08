@@ -1425,7 +1425,9 @@ fn compute_tile_pixel_dims(req: &TileRequest, page_size: &PageSize) -> (u32, u32
 
 /// Minimal base64 encoding without pulling in a full base64 crate.
 /// Uses the standard alphabet. For M1 this is fine; swap for `base64` crate if needed.
-fn base64_encode(data: &[u8]) -> String {
+/// `pub(crate)` so `markup::appearance`'s tests can reuse it to build PNG-asset fixtures
+/// for the matching `base64_decode` in that module (same alphabet, one canonical encoder).
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     use std::fmt::Write;
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((data.len() * 4 / 3) + 4);

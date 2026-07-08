@@ -28,6 +28,9 @@
     type UserRef,
     type PdfPoint,
     type Tool,
+    type MarkupGeometry,
+    type DynamicField,
+    type StampAsset,
   } from "$lib/ipc";
   import {
     TILE_SIZE_CSS,
@@ -62,7 +65,7 @@
     isMultiClickTool, isInkTool, polylineGeometry, inkGeometry,
     isMultiClickComplete, type MultiClickTool,
     isTextTool, textBoxGeometry, calloutGeometry, DEFAULT_TEXT_FONT,
-    translateToolGeometry,
+    translateToolGeometry, extractPromptedLabels,
   } from "$lib/markup-tools";
   import { patchGroup } from "$lib/markup-properties";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
@@ -70,6 +73,7 @@
   import { addScale, type MeasurementPayload, type SearchHit } from "$lib/ipc";
   import { pdfUserSpaceToScreen } from "$lib/viewport";
   import CalibrationDialog from "./CalibrationDialog.svelte";
+  import StampPromptDialog from "./StampPromptDialog.svelte";
 
   // ---------------------------------------------------------------------------
   // Props
@@ -1701,31 +1705,78 @@
   }
 
   /**
+   * A stamp Drawing-mode placement paused mid-flight to collect `PromptedText` values
+   * (spec "Stamps") - set by `placeToolCopy` when the tool's Dynamic fields include at
+   * least one `PromptedText`, cleared by `finishStampPlacement`/`cancelStampPlacement`.
+   * `StampPromptDialog` renders whenever this is non-null (see the template below).
+   */
+  let pendingStampPrompt = $state<{
+    toolDef: Tool;
+    geometry: MarkupGeometry;
+    fields: DynamicField[];
+    baseText: string;
+    labels: string[];
+  } | null>(null);
+
+  /** The placing Tool's backing visual asset, if any (spec "Stamps" - Static carries a
+   *  required asset, Dynamic an optional one; both mirror onto the placed Markup so the
+   *  backend can render the real stamp graphic - see `appearance::build_ap_stream`). */
+  function stampAssetOf(toolDef: Tool): StampAsset | null {
+    if (!toolDef.stamp) return null;
+    return "Static" in toolDef.stamp ? toolDef.stamp.Static.asset : toolDef.stamp.Dynamic.asset;
+  }
+
+  /**
    * Tool Chest Drawing-mode placement (spec "Tools & Tool Sets"): drop a translated copy
    * of `toolDef`'s fixed geometry at `clickPoint`. Dynamic stamps compose their
-   * placement-time text first (auto-fields substituted server-side, spec "Stamps") -
-   * PromptedText fields resolve to an empty string in this MVP (no placement-time prompt
-   * UI yet - a NAMED simplification; `compose_stamp_text` already tolerates missing
-   * prompted values). Static (non-stamp) Drawing-mode tools skip straight to `store.create`.
+   * placement-time text (auto-fields substituted server-side, spec "Stamps"); when the
+   * fields include a `PromptedText`, placement pauses on `StampPromptDialog` to collect
+   * its value(s) first (`finishStampPlacement` completes it) instead of silently
+   * substituting an empty string. Static (non-stamp) Drawing-mode tools skip straight to
+   * `store.create`.
    */
   async function placeToolCopy(toolDef: Tool, clickPoint: PdfPoint) {
     if (!identity || !toolDef.geometry) return;
     const geometry = translateToolGeometry(toolDef.geometry, clickPoint);
 
-    let contents: string | null = null;
     if (toolDef.stamp && "Dynamic" in toolDef.stamp) {
       const { fields, base_text } = toolDef.stamp.Dynamic;
-      let sequence = 1;
-      for (const field of fields) {
-        if (typeof field === "object" && "SequenceNumber" in field) {
-          sequence = await nextStampSequence(toolDef.id, field.SequenceNumber.scope, docInfo.doc_id);
-          break;
-        }
+      const labels = extractPromptedLabels(fields);
+      if (labels.length > 0) {
+        pendingStampPrompt = { toolDef, geometry, fields, baseText: base_text, labels };
+        return;
       }
-      const documentName = docInfo.path.split(/[\\/]/).at(-1) ?? docInfo.path;
-      contents = await composeStampText(base_text, fields, identity.display_name, documentName, sequence, []);
+      await completeStampPlacement(toolDef, geometry, fields, base_text, []);
+      return;
     }
 
+    createPlacedMarkup(toolDef, geometry, null);
+  }
+
+  /** Compose the dynamic-stamp text (auto-fields + supplied `prompted` values) and create
+   *  the markup. Shared by the no-prompt fast path and `finishStampPlacement`. */
+  async function completeStampPlacement(
+    toolDef: Tool,
+    geometry: MarkupGeometry,
+    fields: DynamicField[],
+    baseText: string,
+    prompted: string[],
+  ) {
+    if (!identity) return;
+    let sequence = 1;
+    for (const field of fields) {
+      if (typeof field === "object" && "SequenceNumber" in field) {
+        sequence = await nextStampSequence(toolDef.id, field.SequenceNumber.scope, docInfo.doc_id);
+        break;
+      }
+    }
+    const documentName = docInfo.path.split(/[\\/]/).at(-1) ?? docInfo.path;
+    const contents = await composeStampText(baseText, fields, identity.display_name, documentName, sequence, prompted);
+    createPlacedMarkup(toolDef, geometry, contents);
+  }
+
+  function createPlacedMarkup(toolDef: Tool, geometry: MarkupGeometry, contents: string | null) {
+    if (!identity) return;
     const m = buildMarkup({
       markupType: toolDef.markup_type,
       page: pageIndex,
@@ -1735,8 +1786,24 @@
       now: new Date().toISOString(),
       id: crypto.randomUUID(),
       contents,
+      stampAsset: stampAssetOf(toolDef),
     });
     store.create(m);
+  }
+
+  /** `StampPromptDialog` submit handler: complete the paused placement with the
+   *  user-supplied values, in label (= field) order. */
+  async function finishStampPlacement(values: string[]) {
+    const pending = pendingStampPrompt;
+    pendingStampPrompt = null;
+    if (!pending) return;
+    await completeStampPlacement(pending.toolDef, pending.geometry, pending.fields, pending.baseText, values);
+  }
+
+  /** `StampPromptDialog` cancel handler: abandon the placement cleanly - nothing is
+   *  created, matching the tool staying armed for another attempt. */
+  function cancelStampPlacement() {
+    pendingStampPrompt = null;
   }
 
   // Multi-click tool gesture handlers (click adds vertex, dblclick finishes).
@@ -2283,6 +2350,16 @@
         takeoffStore.cancelCalibration();
         store.activeTool = "hand";
       }}
+    />
+  {/if}
+
+  <!-- Stamp prompted-text dialog: shown when placing a Dynamic stamp whose fields include
+       a PromptedText - collects its value(s) before the stamp's text is composed. -->
+  {#if pendingStampPrompt}
+    <StampPromptDialog
+      labels={pendingStampPrompt.labels}
+      onSubmit={finishStampPlacement}
+      onCancel={cancelStampPlacement}
     />
   {/if}
 

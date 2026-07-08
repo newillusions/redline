@@ -131,7 +131,25 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
         // annotation dict's /AP /N at it - PDF requires a stream to be an indirect
         // object (it cannot be embedded inline in a dictionary), so this order is
         // required: to_annotation_dict() itself has no Document to allocate an id from.
-        let ap_id = doc.add_object(Object::Stream(appearance::build_ap_stream(m)));
+        //
+        // A PNG-backed Stamp's appearance additionally references an Image XObject
+        // (also stream-typed, also requiring its own indirect object - PDF spec 7.3.8).
+        // `appearance::build_ap_stream` stays Document-free/pure and returns any such
+        // auxiliary images unresolved; THIS is the one place that holds `&mut Document`,
+        // so it resolves them (soft-mask first, since the color image's own dict points
+        // at it) before finishing the Form stream via `finish_ap_stream`.
+        let mut built = appearance::build_ap_stream(m);
+        let mut xobject_refs = Dictionary::new();
+        for aux in std::mem::take(&mut built.image_xobjects) {
+            let mut color = aux.image;
+            if let Some(smask) = aux.smask {
+                let smask_id = doc.add_object(Object::Stream(smask));
+                color.dict.set("SMask", Object::Reference(smask_id));
+            }
+            let image_id = doc.add_object(Object::Stream(color));
+            xobject_refs.set(aux.name, Object::Reference(image_id));
+        }
+        let ap_id = doc.add_object(Object::Stream(appearance::finish_ap_stream(built, xobject_refs)));
         let mut dict = m.to_annotation_dict();
         dict.set("AP", Object::Dictionary(dictionary! { "N" => Object::Reference(ap_id) }));
         let aid = doc.add_object(Object::Dictionary(dict));
@@ -485,6 +503,76 @@ pub(crate) mod tests {
         let bbox = stream.dict.get(b"BBox").unwrap().as_array().unwrap();
         assert_eq!(bbox.len(), 4);
         assert!(!stream.content.is_empty(), "appearance content stream must not be empty");
+    }
+
+    /// Full pipeline: a PNG-backed Stamp markup's `/AP /N` Resources must reference a REAL
+    /// indirect Image XObject in the `Document` (not just an in-memory struct field) - the
+    /// annots.rs-level counterpart to the Document-free unit tests in
+    /// `markup::appearance::tests` (which only check `build_ap_stream`'s return value).
+    #[test]
+    fn write_markups_resolves_a_png_stamp_asset_to_a_real_indirect_image_xobject() {
+        use crate::toolchest::StampAsset;
+        use image::{DynamicImage, ImageBuffer, Rgba};
+
+        // 2x2 RGBA fixture (left column transparent) built the same way the appearance.rs
+        // fixtures are, so this test exercises the real `image` crate decode path.
+        let img = DynamicImage::ImageRgba8(ImageBuffer::from_fn(2, 2, |x, _y| {
+            Rgba([x as u8 * 200, 50, 100, if x == 0 { 0 } else { 255 }])
+        }));
+        let mut png_bytes: Vec<u8> = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .unwrap();
+        let png_b64 = crate::render::base64_encode(&png_bytes);
+
+        let (mut doc, page_id) = one_page_doc();
+        let mut m = Markup::new(
+            MarkupType::Stamp,
+            0,
+            MarkupGeometry::Rect {
+                min: PdfPoint { x: 10.0, y: 10.0 },
+                max: PdfPoint { x: 50.0, y: 30.0 },
+            },
+            Appearance::default(),
+            UserRef { user_id: uuid::Uuid::new_v4(), display_name: "Alice".into() },
+        )
+        .with_stamp_asset(StampAsset::PngBase64(png_b64));
+        m.contents = Some("APPROVED".into());
+
+        write_markups(&mut doc, std::slice::from_ref(&m)).unwrap();
+
+        let annots = page_annots(&doc, page_id).unwrap();
+        assert_eq!(annots.len(), 1);
+        let (_, dict) = &annots[0];
+        let ap_stream = resolve_ap_n_stream(&doc, dict);
+
+        let content = String::from_utf8(ap_stream.content.clone()).unwrap();
+        assert!(content.contains("/Im0 Do\n"), "AP content must paint the image: {content}");
+        assert!(!content.contains(" re\n"), "a real image stamp must not draw the box fallback: {content}");
+
+        let resources = ap_stream.dict.get(b"Resources").unwrap().as_dict().unwrap();
+        let xobjects = resources.get(b"XObject").expect("Resources must carry /XObject").as_dict().unwrap();
+        let image_ref = match xobjects.get(b"Im0").unwrap() {
+            Object::Reference(r) => *r,
+            other => panic!("/XObject /Im0 must be an indirect reference, got {other:?}"),
+        };
+        let image_stream = match doc.get_object(image_ref).unwrap() {
+            Object::Stream(s) => s,
+            other => panic!("/XObject /Im0 must resolve to a Stream, got {other:?}"),
+        };
+        assert_eq!(image_stream.dict.get(b"Subtype").unwrap().as_name().unwrap(), b"Image");
+        assert_eq!(image_stream.dict.get(b"Width").unwrap().as_i64().unwrap(), 2);
+        assert_eq!(image_stream.dict.get(b"Height").unwrap().as_i64().unwrap(), 2);
+
+        // The RGBA source must chain to a real, separately-indirect SMask.
+        let smask_ref = match image_stream.dict.get(b"SMask").unwrap() {
+            Object::Reference(r) => *r,
+            other => panic!("/SMask must be an indirect reference, got {other:?}"),
+        };
+        let smask_stream = match doc.get_object(smask_ref).unwrap() {
+            Object::Stream(s) => s,
+            other => panic!("/SMask must resolve to a Stream, got {other:?}"),
+        };
+        assert_eq!(smask_stream.dict.get(b"ColorSpace").unwrap().as_name().unwrap(), b"DeviceGray");
     }
 
     /// Regression guard: adding `/AP` must not change any of the semantic keys

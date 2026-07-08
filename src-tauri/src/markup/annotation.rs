@@ -649,6 +649,9 @@ impl Markup {
             },
             measurement: None,
             count_set,
+            // Not reconstructed on reopen - see the field doc comment in markup/mod.rs
+            // (the appearance is already baked into the saved /AP /N stream by then).
+            stamp_asset: None,
         }
     }
 }

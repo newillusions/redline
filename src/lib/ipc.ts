@@ -260,6 +260,13 @@ export interface Markup {
   measurement: MeasurementPayload | null;
   /** Count set this marker belongs to (MeasurementCount only). Absent/null for everything else. */
   count_set?: CountSet | null;
+  /**
+   * Snapshot of the placing Tool's backing visual asset (Stamp/StampDynamic only; mirrors
+   * Rust `Markup.stamp_asset`). Set once at placement time so the backend can render the
+   * real stamp graphic instead of the bordered-box fallback - see `StampAsset` below.
+   * Absent/null for every other markup type and for stamps placed without an asset.
+   */
+  stamp_asset?: StampAsset | null;
 }
 
 // ---------------------------------------------------------------------------

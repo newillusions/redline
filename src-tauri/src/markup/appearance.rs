@@ -23,12 +23,18 @@
 //!
 //! # Known simplifications (named, not silently dropped - see PR description)
 //! - Cloud draws a plain closed polygon, not the scalloped revision-cloud arcs.
-//! - Stamp/StampDynamic draws a bordered box + label text, not the full stamp graphic.
+//! - Stamp/StampDynamic with a `StampAsset::PngBase64` asset draws a REAL Image XObject
+//!   (see `decode_png_stamp_image` + `StampImageXObject`) - this is the v0.3.1 fix. A
+//!   `Svg` or `PdfBase64` asset, or a malformed/undecodable PNG, still falls back to the
+//!   v0.3.0 bordered-box + label text (named deferral - vector-SVG-to-PDF-operator
+//!   conversion and embedded-PDF content-stream splicing are both out of scope for this
+//!   pass; box+label is a valid, already-shipped appearance, not a broken one).
 
 use lopdf::{dictionary, Dictionary, Object, Stream};
 
 use super::{Appearance, LineStyle, Markup, MarkupGeometry, MarkupType};
 use crate::geometry::PdfPoint;
+use crate::toolchest::StampAsset;
 
 // --- small helpers (deliberately local - annotation.rs's are private to that module) ----------
 
@@ -104,20 +110,60 @@ const ELLIPSE_KAPPA: f64 = 0.552_284_75;
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Build the `/AP /N` Form XObject (as a not-yet-indirect [`Stream`]) for `m`. The caller
-/// (`document::annots::write_markups`) adds it to the `Document` and points the annotation
-/// dict's `/AP /N` at the resulting indirect reference.
-pub(crate) fn build_ap_stream(m: &Markup) -> Stream {
+/// A PNG-backed stamp's Image XObject, not yet added to a `Document` (streams must be
+/// indirect objects - PDF spec 7.3.8 - and only the caller holds the `&mut Document`
+/// needed to allocate ids; see `finish_ap_stream`).
+pub(crate) struct StampImageXObject {
+    /// Resource name the Form's content stream references via its `Do` operator (e.g.
+    /// `"Im0"`) - decided up front, independent of the eventual indirect object id.
+    pub name: String,
+    /// The color (or grayscale) image stream itself.
+    pub image: Stream,
+    /// Optional soft-mask (alpha channel) stream. If present, the caller must add THIS
+    /// one to the `Document` first and point `image`'s own `/SMask` at the resulting id
+    /// before adding `image` (see `finish_ap_stream`).
+    pub smask: Option<Stream>,
+}
+
+/// The un-finished result of building `m`'s `/AP /N` appearance: everything that can be
+/// computed WITHOUT a `Document` (pure, and what this module's own tests exercise
+/// directly), plus any auxiliary Image XObjects the content stream references. Call
+/// [`finish_ap_stream`] once the caller has resolved `image_xobjects` into real indirect
+/// references.
+pub(crate) struct ApBuild {
+    bbox: [f64; 4],
+    content: String,
+    resources: Dictionary,
+    pub image_xobjects: Vec<StampImageXObject>,
+}
+
+/// Build `m`'s `/AP /N` appearance (pure - no `Document` access, so this module's tests
+/// can call it directly). The caller (`document::annots::write_markups`) resolves
+/// `image_xobjects` (if any) into real indirect objects and calls [`finish_ap_stream`] to
+/// get the final `Stream` it then adds to the `Document`.
+pub(crate) fn build_ap_stream(m: &Markup) -> ApBuild {
     let bbox = ap_bbox(m);
-    let (content, resources) = draw(m);
+    let (content, resources, image_xobjects) = draw(m);
+    ApBuild { bbox, content, resources, image_xobjects }
+}
+
+/// Assemble the final Form XObject `Stream` from an [`ApBuild`] plus the resolved
+/// `/XObject` resource dictionary (name -> indirect reference; empty when the markup has
+/// no auxiliary images). Kept as a separate step from [`build_ap_stream`] specifically so
+/// that step stays `Document`-free and unit-testable on its own.
+pub(crate) fn finish_ap_stream(built: ApBuild, xobject_refs: Dictionary) -> Stream {
+    let mut resources = built.resources;
+    if !xobject_refs.is_empty() {
+        resources.set("XObject", Object::Dictionary(xobject_refs));
+    }
     let stream_dict = dictionary! {
         "Type" => "XObject",
         "Subtype" => "Form",
         "FormType" => 1,
-        "BBox" => Object::Array(bbox.iter().map(|v| real(*v)).collect()),
+        "BBox" => Object::Array(built.bbox.iter().map(|v| real(*v)).collect()),
         "Resources" => Object::Dictionary(resources),
     };
-    Stream::new(stream_dict, content.into_bytes())
+    Stream::new(stream_dict, built.content.into_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -470,10 +516,150 @@ fn draw_text_box(out: &mut String, res: &mut Resources, a: &Appearance, rect: [f
     out.push_str("Q\n");
 }
 
-/// Build the content-stream operators + resources for `m`. Returns (content, resources).
-fn draw(m: &Markup) -> (String, Dictionary) {
+/// Stamp/StampDynamic fallback: a bordered box + label text (the v0.3.0 behaviour),
+/// unchanged - used whenever there is no decodable `StampAsset::PngBase64` (no asset at
+/// all, an `Svg`/`PdfBase64` asset, or a malformed one - see the module doc comment).
+fn draw_stamp_box_and_label(
+    out: &mut String,
+    res: &mut Resources,
+    m: &Markup,
+    a: &Appearance,
+    min: PdfPoint,
+    max: PdfPoint,
+) {
+    let gs_name = res.add_gstate(shape_gstate(a));
+    out.push_str(&format!("q\n/{gs_name} gs\n"));
+    stroke_preamble(out, a);
+    if let Some(fill) = &a.fill {
+        fill_color(out, fill);
+    }
+    out.push_str(&format!(
+        "{} {} {} {} re\n",
+        num(min.x), num(min.y), num(max.x - min.x), num(max.y - min.y)
+    ));
+    out.push_str(paint_op(a.fill.is_some(), true, false));
+    out.push_str("\nQ\n");
+    // Label text is drawn OUTSIDE the gs scope (unaffected by either opacity control -
+    // text always renders fully opaque, matching the Text/Callout convention).
+    if let Some(text) = &m.contents {
+        let origin = PdfPoint {
+            x: min.x + 2.0,
+            y: (min.y + max.y) / 2.0 - 5.0,
+        };
+        draw_text_block(out, res, text, &a.color, origin, a.font.as_ref());
+    }
+}
+
+/// Draw a decoded stamp image filling `[min, max]`: scale the unit-square Image XObject
+/// coordinate space (always `[0,1]x[0,1]` per PDF spec 8.9.5.1) up to the Rect's width/
+/// height via the `cm` operator, then paint it with the `Do` operator. Scoped in its own
+/// `gs` (shape_gstate: `/ca` = `a.fill_opacity` - an image paints as a non-stroking
+/// operation, so only `/ca` is meaningful; `/CA` is included too for scope consistency
+/// with every other shape's ExtGState, but has no effect on `Do`).
+fn draw_stamp_image(out: &mut String, res: &mut Resources, a: &Appearance, min: PdfPoint, max: PdfPoint, name: &str) {
+    let gs_name = res.add_gstate(shape_gstate(a));
+    let (sx, sy) = (max.x - min.x, max.y - min.y);
+    out.push_str(&format!(
+        "q\n/{gs_name} gs\n{} 0 0 {} {} {} cm\n/{name} Do\nQ\n",
+        num(sx), num(sy), num(min.x), num(min.y)
+    ));
+}
+
+/// Decode a base64 PNG stamp asset into a color Image XObject stream + optional soft-mask
+/// (alpha channel) stream. Returns `None` on ANY failure (malformed base64, undecodable
+/// image bytes, zero-size image) rather than erroring - callers fall back to the
+/// box+label appearance, so a corrupt asset degrades gracefully instead of breaking the
+/// whole markup's appearance.
+fn decode_png_stamp_image(b64: &str) -> Option<(Stream, Option<Stream>)> {
+    let bytes = base64_decode(b64)?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        return None;
+    }
+
+    let color_dict = dictionary! {
+        "Type" => "XObject",
+        "Subtype" => "Image",
+        "Width" => w as i64,
+        "Height" => h as i64,
+        "ColorSpace" => "DeviceRGB",
+        "BitsPerComponent" => 8,
+    };
+    let mut color_stream = Stream::new(color_dict, img.to_rgb8().into_raw());
+    let _ = color_stream.compress();
+
+    let smask = if img.color().has_alpha() {
+        let alpha: Vec<u8> = img.to_rgba8().pixels().map(|p| p.0[3]).collect();
+        let smask_dict = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "ColorSpace" => "DeviceGray",
+            "BitsPerComponent" => 8,
+        };
+        let mut smask_stream = Stream::new(smask_dict, alpha);
+        let _ = smask_stream.compress();
+        Some(smask_stream)
+    } else {
+        None
+    };
+
+    Some((color_stream, smask))
+}
+
+/// Minimal base64 DECODING (standard alphabet, matches `render::base64_encode`) - avoids
+/// pulling in the `base64` crate for the one decode call site this module needs (stamp
+/// PNG assets arrive as base64 over IPC, mirroring how render tiles are base64-ENCODED
+/// for the trip the other way). Returns `None` on any malformed input (invalid character,
+/// truncated final group) rather than panicking.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let trimmed = s.trim().trim_end_matches('=');
+    let mut out = Vec::with_capacity(trimmed.len() * 3 / 4 + 3);
+    let mut chunk = [0u8; 4];
+    let mut n = 0;
+    for b in trimmed.bytes() {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        chunk[n] = val(b)?;
+        n += 1;
+        if n == 4 {
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+            out.push((chunk[2] << 6) | chunk[3]);
+            n = 0;
+        }
+    }
+    match n {
+        0 => {}
+        2 => out.push((chunk[0] << 2) | (chunk[1] >> 4)),
+        3 => {
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+        }
+        _ => return None, // a single leftover base64 char is malformed
+    }
+    Some(out)
+}
+
+/// Build the content-stream operators + resources for `m`. Returns (content, resources,
+/// auxiliary image xobjects - empty except for a PNG-backed Stamp/StampDynamic).
+fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>) {
     let mut out = String::new();
     let mut res = Resources::new();
+    let mut image_xobjects: Vec<StampImageXObject> = Vec::new();
     let a = &m.appearance;
 
     match (m.markup_type, &m.geometry) {
@@ -696,28 +882,30 @@ fn draw(m: &Markup) -> (String, Dictionary) {
             out.push_str("Q\n");
         }
 
-        // --- Stamp / StampDynamic: simple bordered box + label (named simplification) ---
+        // --- Stamp / StampDynamic: real Image XObject when a decodable PNG asset is
+        // present, else the bordered-box + label fallback (named simplification for
+        // Svg/PdfBase64 assets and malformed PNGs - see the module doc comment) ---
         (MarkupType::Stamp | MarkupType::StampDynamic, MarkupGeometry::Rect { min, max }) => {
-            let gs_name = res.add_gstate(shape_gstate(a));
-            out.push_str(&format!("q\n/{gs_name} gs\n"));
-            stroke_preamble(&mut out, a);
-            if let Some(fill) = &a.fill {
-                fill_color(&mut out, fill);
-            }
-            out.push_str(&format!(
-                "{} {} {} {} re\n",
-                num(min.x), num(min.y), num(max.x - min.x), num(max.y - min.y)
-            ));
-            out.push_str(paint_op(a.fill.is_some(), true, false));
-            out.push_str("\nQ\n");
-            // Label text is drawn OUTSIDE the gs scope (unaffected by either opacity control -
-            // text always renders fully opaque, matching the Text/Callout convention).
-            if let Some(text) = &m.contents {
-                let origin = PdfPoint {
-                    x: min.x + 2.0,
-                    y: (min.y + max.y) / 2.0 - 5.0,
-                };
-                draw_text_block(&mut out, &mut res, text, &a.color, origin, a.font.as_ref());
+            let png_image = match &m.stamp_asset {
+                Some(StampAsset::PngBase64(b64)) => decode_png_stamp_image(b64),
+                _ => None,
+            };
+            if let Some((color, smask)) = png_image {
+                let name = "Im0".to_string();
+                draw_stamp_image(&mut out, &mut res, a, *min, *max, &name);
+                image_xobjects.push(StampImageXObject { name, image: color, smask });
+                // Dynamic-stamp overlay text (e.g. composed date/user on a static asset
+                // background) draws OUTSIDE any alpha scope, same convention as the
+                // box+label fallback and Text/Callout - text always renders fully opaque.
+                if let Some(text) = &m.contents {
+                    let origin = PdfPoint {
+                        x: min.x + 2.0,
+                        y: (min.y + max.y) / 2.0 - 5.0,
+                    };
+                    draw_text_block(&mut out, &mut res, text, &a.color, origin, a.font.as_ref());
+                }
+            } else {
+                draw_stamp_box_and_label(&mut out, &mut res, m, a, *min, *max);
             }
         }
 
@@ -764,7 +952,7 @@ fn draw(m: &Markup) -> (String, Dictionary) {
         _ => {}
     }
 
-    (out, res.finish())
+    (out, res.finish(), image_xobjects)
 }
 
 #[cfg(test)]
@@ -806,16 +994,23 @@ mod tests {
             },
             measurement: None,
             count_set: None,
+            stamp_asset: None,
         }
     }
 
+    /// Finish an `ApBuild` with no resolved image xobject references - what every test
+    /// that doesn't care about a stamp's embedded image wants. Tests that DO care call
+    /// `build_ap_stream(m).image_xobjects` directly instead (Document-free).
+    fn full_stream(m: &Markup) -> Stream {
+        finish_ap_stream(build_ap_stream(m), Dictionary::new())
+    }
+
     fn content_str(m: &Markup) -> String {
-        let s = build_ap_stream(m);
-        String::from_utf8(s.content).unwrap()
+        String::from_utf8(full_stream(m).content).unwrap()
     }
 
     fn stream_dict_checks(m: &Markup) -> Dictionary {
-        build_ap_stream(m).dict
+        full_stream(m).dict
     }
 
     fn assert_valid_form_dict(d: &Dictionary) {
@@ -1073,6 +1268,140 @@ mod tests {
         let c = content_str(&m);
         assert!(c.contains(" re\n"), "stamp must draw a bordered box: {c}");
         assert!(c.contains("Tj\n"), "stamp must render its label: {c}");
+    }
+
+    #[test]
+    fn stamp_without_a_stamp_asset_has_no_image_xobjects() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 0.0, y: 0.0 },
+            max: PdfPoint { x: 80.0, y: 30.0 },
+        };
+        let m = base_markup(MarkupType::Stamp, g);
+        assert!(build_ap_stream(&m).image_xobjects.is_empty());
+    }
+
+    // --- Stamp: PNG-backed real Image XObject (v0.3.1) ---------------------------------------
+
+    /// Build a tiny in-memory PNG (via the `image` crate, already a project dependency)
+    /// and base64-encode it with the project's own encoder (`render::base64_encode`) - so
+    /// the fixture round-trips through the exact same code path a real Tool Chest stamp
+    /// asset would, rather than a hand-crafted base64 literal.
+    fn tiny_png_base64(w: u32, h: u32, with_alpha: bool) -> String {
+        use image::{DynamicImage, ImageBuffer, Rgb, Rgba};
+        let img = if with_alpha {
+            DynamicImage::ImageRgba8(ImageBuffer::from_fn(w, h, |x, y| {
+                let a: u8 = if x == 0 { 0 } else { 255 }; // left column transparent
+                Rgba([(x * 50) as u8, (y * 50) as u8, 128, a])
+            }))
+        } else {
+            DynamicImage::ImageRgb8(ImageBuffer::from_fn(w, h, |x, y| {
+                Rgb([(x * 50) as u8, (y * 50) as u8, 128])
+            }))
+        };
+        let mut bytes: Vec<u8> = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .expect("encode fixture png");
+        crate::render::base64_encode(&bytes)
+    }
+
+    fn png_stamp_markup(w: u32, h: u32, with_alpha: bool) -> Markup {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 10.0, y: 10.0 },
+            max: PdfPoint { x: 90.0, y: 40.0 },
+        };
+        let mut m = base_markup(MarkupType::Stamp, g);
+        m.stamp_asset = Some(StampAsset::PngBase64(tiny_png_base64(w, h, with_alpha)));
+        m
+    }
+
+    #[test]
+    fn png_stamp_asset_emits_one_image_xobject_with_matching_dimensions() {
+        let m = png_stamp_markup(4, 3, false);
+        let built = build_ap_stream(&m);
+        assert_eq!(built.image_xobjects.len(), 1, "exactly one aux image for a PNG stamp");
+        let img = &built.image_xobjects[0];
+        assert_eq!(img.name, "Im0");
+        assert_eq!(img.image.dict.get(b"Subtype").unwrap().as_name().unwrap(), b"Image");
+        assert_eq!(img.image.dict.get(b"Width").unwrap().as_i64().unwrap(), 4);
+        assert_eq!(img.image.dict.get(b"Height").unwrap().as_i64().unwrap(), 3);
+        assert_eq!(img.image.dict.get(b"ColorSpace").unwrap().as_name().unwrap(), b"DeviceRGB");
+        assert_eq!(img.image.dict.get(b"BitsPerComponent").unwrap().as_i64().unwrap(), 8);
+        assert!(img.smask.is_none(), "opaque RGB source must not get an SMask");
+    }
+
+    #[test]
+    fn png_stamp_content_stream_draws_a_do_operator_scaled_to_the_rect_no_border() {
+        let m = png_stamp_markup(4, 3, false);
+        let c = content_str(&m);
+        assert!(c.contains("/Im0 Do\n"), "must paint the image xobject: {c}");
+        // Scaled by the Rect's width/height (80 x 30) via the cm operator.
+        assert!(c.contains("80 0 0 30 10 10 cm\n"), "cm matrix must map the unit square to the Rect: {c}");
+        assert!(!c.contains(" re\n"), "a real image stamp must not also draw the bordered-box fallback: {c}");
+    }
+
+    #[test]
+    fn png_stamp_with_alpha_channel_gets_an_smask_image() {
+        let m = png_stamp_markup(2, 2, true);
+        let built = build_ap_stream(&m);
+        let img = &built.image_xobjects[0];
+        let smask = img.smask.as_ref().expect("RGBA source must produce an SMask");
+        assert_eq!(smask.dict.get(b"ColorSpace").unwrap().as_name().unwrap(), b"DeviceGray");
+        assert_eq!(smask.dict.get(b"Width").unwrap().as_i64().unwrap(), 2);
+        assert_eq!(smask.dict.get(b"Height").unwrap().as_i64().unwrap(), 2);
+    }
+
+    #[test]
+    fn dynamic_png_stamp_draws_image_plus_overlay_text() {
+        let mut m = png_stamp_markup(4, 3, false);
+        m.markup_type = MarkupType::StampDynamic;
+        m.contents = Some("2026-07-07".into());
+        let c = content_str(&m);
+        assert!(c.contains("/Im0 Do\n"), "dynamic stamp must still draw the image: {c}");
+        assert!(c.contains("Tj\n"), "dynamic stamp must draw the composed overlay text: {c}");
+        let do_pos = c.find("Do\n").unwrap();
+        let bt_pos = c.find("BT\n").unwrap();
+        assert!(do_pos < bt_pos, "overlay text must be drawn after (on top of) the image: {c}");
+    }
+
+    #[test]
+    fn stamp_with_svg_asset_falls_back_to_box_and_label_named_deferral() {
+        // Named deferral (module doc comment): vector-SVG-to-PDF-operator conversion is
+        // out of scope for this pass - an Svg asset keeps the pre-existing appearance.
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 0.0, y: 0.0 },
+            max: PdfPoint { x: 80.0, y: 30.0 },
+        };
+        let mut m = base_markup(MarkupType::Stamp, g);
+        m.stamp_asset = Some(StampAsset::Svg("<svg><rect/></svg>".into()));
+        let built = build_ap_stream(&m);
+        assert!(built.image_xobjects.is_empty(), "Svg asset must not produce an image xobject");
+        assert!(String::from_utf8(finish_ap_stream(built, Dictionary::new()).content).unwrap().contains(" re\n"));
+    }
+
+    #[test]
+    fn stamp_with_malformed_png_base64_falls_back_gracefully_no_panic() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 0.0, y: 0.0 },
+            max: PdfPoint { x: 80.0, y: 30.0 },
+        };
+        let mut m = base_markup(MarkupType::Stamp, g);
+        m.stamp_asset = Some(StampAsset::PngBase64("not valid base64 png data!!".into()));
+        let built = build_ap_stream(&m);
+        assert!(built.image_xobjects.is_empty(), "malformed asset must not produce an image xobject");
+        let c = String::from_utf8(finish_ap_stream(built, Dictionary::new()).content).unwrap();
+        assert!(c.contains(" re\n"), "must fall back to the bordered-box appearance, not an empty stream: {c}");
+    }
+
+    #[test]
+    fn base64_decode_round_trips_with_base64_encode() {
+        let data = b"the quick brown fox jumps over the lazy dog 0123456789!";
+        let encoded = crate::render::base64_encode(data);
+        assert_eq!(base64_decode(&encoded).unwrap(), data);
+    }
+
+    #[test]
+    fn base64_decode_rejects_invalid_characters() {
+        assert!(base64_decode("not base64 at all!!").is_none());
     }
 
     // --- MeasurementCount --------------------------------------------------------------------

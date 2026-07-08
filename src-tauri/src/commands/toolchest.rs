@@ -3,7 +3,7 @@
 //! add/delete/reorder Tools, Recent Tools, `.btx` import, and dynamic-stamp field
 //! composition.
 
-use chrono::Utc;
+use chrono::Local;
 use tauri::State;
 use uuid::Uuid;
 
@@ -129,7 +129,10 @@ pub fn next_stamp_sequence(
 
 /// Compose a dynamic stamp's placement-time text (spec "Stamps" - auto-fields substituted
 /// at placement, never via embedded PDF JavaScript). `now` is read here (the one place
-/// wall-clock access belongs) and handed to the pure composer.
+/// wall-clock/OS-timezone access belongs) as the OS LOCAL time - `Local::now()` resolves
+/// the machine's timezone, `.fixed_offset()` freezes it to a self-contained
+/// `DateTime<FixedOffset>` before handing off to the pure composer (which stays
+/// deterministic/testable - see `toolchest::stamp::compose_dynamic_text`'s doc comment).
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn compose_stamp_text(
@@ -140,5 +143,6 @@ pub fn compose_stamp_text(
     sequence: u32,
     prompted: Vec<String>,
 ) -> String {
-    compose_dynamic_text(&base_text, &fields, Utc::now(), &username, &document_name, sequence, &prompted)
+    let now = Local::now().fixed_offset();
+    compose_dynamic_text(&base_text, &fields, now, &username, &document_name, sequence, &prompted)
 }

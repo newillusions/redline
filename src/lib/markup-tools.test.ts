@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { dragDrawGeometry, buildMarkup, bumpAudit, RECT_TOOLS, isDrawTool, MULTI_CLICK_TOOLS, isMultiClickTool, isInkTool, polylineGeometry, inkGeometry, minVertices, isMultiClickComplete, TEXT_TOOLS, isTextTool, textBoxGeometry, calloutGeometry, DEFAULT_TEXT_FONT, translateToolGeometry } from "./markup-tools";
+import { dragDrawGeometry, buildMarkup, bumpAudit, RECT_TOOLS, isDrawTool, MULTI_CLICK_TOOLS, isMultiClickTool, isInkTool, polylineGeometry, inkGeometry, minVertices, isMultiClickComplete, TEXT_TOOLS, isTextTool, textBoxGeometry, calloutGeometry, DEFAULT_TEXT_FONT, translateToolGeometry, extractPromptedLabels } from "./markup-tools";
 import { patchAppearance } from "./markup-properties";
-import type { Appearance, UserRef, PdfPoint, MarkupGeometry } from "./ipc";
+import type { Appearance, UserRef, PdfPoint, MarkupGeometry, DynamicField } from "./ipc";
 
 const AP: Appearance = { color: "#e02424", line_weight: 2, opacity: 1, fill: null, line_style: "Solid", font: null };
 const USER: UserRef = { user_id: "11111111-1111-1111-1111-111111111111", display_name: "Tester" };
@@ -53,6 +53,42 @@ describe("buildMarkup", () => {
     expect(m.subject).toBeNull();
     expect(m.contents).toBeNull();
     expect(m.measurement).toBeNull();
+  });
+
+  it("defaults stamp_asset to null when not supplied", () => {
+    const m = buildMarkup({
+      markupType: "Rectangle", page: 0,
+      geometry: { Rect: { min: { x: 0, y: 0 }, max: { x: 1, y: 1 } } },
+      appearance: AP, identity: USER, now: "2026-06-14T00:00:00Z", id: "abc",
+    });
+    expect(m.stamp_asset).toBeNull();
+  });
+
+  it("carries a supplied stampAsset through onto stamp_asset", () => {
+    const m = buildMarkup({
+      markupType: "Stamp", page: 0,
+      geometry: { Rect: { min: { x: 0, y: 0 }, max: { x: 80, y: 30 } } },
+      appearance: AP, identity: USER, now: "2026-06-14T00:00:00Z", id: "abc",
+      stampAsset: { PngBase64: "aGVsbG8=" },
+    });
+    expect(m.stamp_asset).toEqual({ PngBase64: "aGVsbG8=" });
+  });
+});
+
+describe("extractPromptedLabels", () => {
+  it("returns an empty array when there are no PromptedText fields", () => {
+    const fields: DynamicField[] = ["Date", "Username"];
+    expect(extractPromptedLabels(fields)).toEqual([]);
+  });
+
+  it("extracts labels in field order, ignoring non-PromptedText fields", () => {
+    const fields: DynamicField[] = [
+      "Date",
+      { PromptedText: { label: "Reason" } },
+      "Username",
+      { PromptedText: { label: "Ref #" } },
+    ];
+    expect(extractPromptedLabels(fields)).toEqual(["Reason", "Ref #"]);
   });
 });
 

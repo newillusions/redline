@@ -296,6 +296,17 @@ pub struct Markup {
     /// annotation. `#[serde(default)]` keeps pre-count-set JSON deserialising to `None`.
     #[serde(default)]
     pub count_set: Option<CountSet>,
+    /// Snapshot of the placing Tool's backing visual asset, for `MarkupType::Stamp` /
+    /// `StampDynamic` markups only (spec "Stamps"). Set once at placement time
+    /// (`Markup::with_stamp_asset`) so `appearance::build_ap_stream` can render the real
+    /// stamp graphic instead of the bordered-box fallback. Deliberately NOT reconstructed
+    /// by `from_annotation_dict` on reopen - the appearance is already baked into the
+    /// saved `/AP /N` stream by then, so there is nothing to recover this field FROM (the
+    /// asset itself is never persisted as a separate private key - that would duplicate
+    /// the image bytes already sitting in the appearance stream). `#[serde(default)]`
+    /// keeps pre-this-field JSON deserialising to `None`.
+    #[serde(default)]
+    pub stamp_asset: Option<crate::toolchest::StampAsset>,
 }
 
 impl Markup {
@@ -331,6 +342,7 @@ impl Markup {
             workflow: Workflow::default(),
             measurement: None,
             count_set: None,
+            stamp_asset: None,
         }
     }
 
@@ -343,6 +355,14 @@ impl Markup {
     /// markup types, but not enforced here — callers set type + payload together.
     pub fn with_measurement(mut self, m: Measurement) -> Self {
         self.measurement = Some(m);
+        self
+    }
+
+    /// Attach a stamp's backing visual asset (builder-style, spec "Stamps"). Only
+    /// meaningful for `MarkupType::Stamp`/`StampDynamic`, but not enforced here - callers
+    /// set type + asset together at placement time.
+    pub fn with_stamp_asset(mut self, asset: crate::toolchest::StampAsset) -> Self {
+        self.stamp_asset = Some(asset);
         self
     }
 

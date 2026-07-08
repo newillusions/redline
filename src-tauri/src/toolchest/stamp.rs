@@ -10,7 +10,7 @@
 //! Once placed, the substituted values bake into a static appearance, so the placed
 //! markup round-trips and flattens cleanly like any other markup (spec section 8).
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 
 /// A stamp's backing visual content. Vector/PDF sources stay crisp at any zoom (preferred,
@@ -78,14 +78,17 @@ pub enum StampDef {
 /// among `fields` (i.e. `prompted[0]` answers the first `PromptedText`, `prompted[1]` the
 /// second, and so on) - missing entries substitute an empty string rather than panicking.
 ///
-/// SIMPLIFICATION (named): date/time fields format in UTC, not the OS local timezone -
-/// keeps this function deterministic and machine-independent (no environment-dependent
-/// timezone database lookups). Local-timezone display is a named follow-up.
+/// `now` is already resolved to the OS local wall-clock time as a `DateTime<FixedOffset>`
+/// (the caller - `commands::toolchest::compose_stamp_text` - reads `chrono::Local::now()`
+/// and converts via `.fixed_offset()`, the one place wall-clock/OS-timezone access
+/// belongs). Taking a `FixedOffset` instant here rather than calling `Local::now()`
+/// directly keeps this function pure/deterministic and testable: a test can construct any
+/// fixed offset it likes without depending on the machine's actual timezone.
 #[allow(clippy::too_many_arguments)]
 pub fn compose_dynamic_text(
     base_text: &str,
     fields: &[DynamicField],
-    now: DateTime<Utc>,
+    now: DateTime<FixedOffset>,
     username: &str,
     document_name: &str,
     sequence: u32,
@@ -113,9 +116,16 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    fn fixed_now() -> DateTime<Utc> {
-        // 2026-07-07 14:30 UTC - a stable fixture instant.
-        Utc.with_ymd_and_hms(2026, 7, 7, 14, 30, 0).unwrap()
+    fn fixed_now() -> DateTime<FixedOffset> {
+        // 2026-07-07 14:30 in a fixed +04:00 offset (Dubai) - a stable fixture instant.
+        // `compose_dynamic_text` just formats whatever offset it's handed, so existing
+        // assertions below (which predate the local-tz fix and assert these same
+        // y/m/d/h/m/s values) still hold; `local_offset_is_honored_not_utc_naive` below is
+        // the dedicated regression test proving the offset is actually applied.
+        FixedOffset::east_opt(4 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(2026, 7, 7, 14, 30, 0)
+            .unwrap()
     }
 
     #[test]
@@ -189,6 +199,31 @@ mod tests {
             &[],
         );
         assert_eq!(text, "L-101 Lighting Plan.pdf / 2026-07-07 14:30");
+    }
+
+    /// Regression test for the local-timezone fix: the SAME absolute instant, handed in
+    /// with a +04:00 offset, must format using the LOCAL wall-clock date/time (which rolls
+    /// over to the next day here), not the UTC date/time - proving the offset is actually
+    /// applied by `.format()`, not silently dropped.
+    #[test]
+    fn local_offset_is_honored_not_utc_naive() {
+        use chrono::Utc;
+        let utc_instant = Utc.with_ymd_and_hms(2026, 7, 7, 22, 30, 0).unwrap();
+        let local = utc_instant.with_timezone(&FixedOffset::east_opt(4 * 3600).unwrap());
+        // Local wall-clock: 2026-07-08 02:30 (rolled to the next day past UTC midnight).
+        let text = compose_dynamic_text(
+            "{0}",
+            &[DynamicField::DateTime],
+            local,
+            "mrobert",
+            "plan-set.pdf",
+            1,
+            &[],
+        );
+        assert_eq!(
+            text, "2026-07-08 02:30",
+            "must format the LOCAL date/time (post-midnight rollover), not the UTC one"
+        );
     }
 
     #[test]

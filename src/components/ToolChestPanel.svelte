@@ -13,6 +13,7 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import { ToolChestStore } from "$lib/toolchest-store.svelte";
   import { activateTool } from "$lib/toolchest-activation";
+  import { reorderAfterDrag } from "$lib/toolchest-reorder";
   import type { MarkupStore } from "$lib/markup-store.svelte";
   import type { Tool, ToolSet, PlacementMode, MarkupType } from "$lib/ipc";
 
@@ -143,6 +144,36 @@
   async function handleDeleteSet(set: ToolSet) {
     await toolChest.deleteSet(set.id);
   }
+
+  // ---------------------------------------------------------------------------
+  // Drag-to-reorder tools within a set (spec "Tools & Tool Sets" - the backend
+  // `reorder_tools` command already exists/is tested; this is just the drag UI).
+  // Deliberately dataTransfer-free: the dragged tool's id lives in local component
+  // state, set on dragstart and read back on drop - same-page reordering doesn't need
+  // the DataTransfer payload, and avoiding it keeps this trivially testable in jsdom.
+  // ---------------------------------------------------------------------------
+  let draggedToolId = $state<string | null>(null);
+
+  function handleDragStart(toolId: string) {
+    draggedToolId = toolId;
+  }
+
+  function handleDragOver(e: DragEvent) {
+    e.preventDefault(); // required to allow a drop
+  }
+
+  async function handleDrop(set: ToolSet, targetToolId: string) {
+    const dragged = draggedToolId;
+    draggedToolId = null;
+    if (!dragged || dragged === targetToolId) return;
+    const currentIds = set.tools.map((t) => t.id);
+    const nextIds = reorderAfterDrag(currentIds, dragged, targetToolId);
+    await toolChest.reorderTools(set.id, nextIds);
+  }
+
+  function handleDragEnd() {
+    draggedToolId = null;
+  }
 </script>
 
 <div class="toolchest-panel" aria-label="Tool Chest">
@@ -198,7 +229,16 @@
           {:else}
             <ul class="tc-tool-list">
               {#each set.tools as tool (tool.id)}
-                <li class="tc-tool-row">
+                <li
+                  class="tc-tool-row"
+                  class:tc-tool-row-dragging={draggedToolId === tool.id}
+                  draggable="true"
+                  ondragstart={() => handleDragStart(tool.id)}
+                  ondragover={handleDragOver}
+                  ondrop={(e) => { e.preventDefault(); void handleDrop(set, tool.id); }}
+                  ondragend={handleDragEnd}
+                >
+                  <span class="tc-drag-handle" aria-hidden="true" title="Drag to reorder">⠿</span>
                   <button
                     class="tc-tool-btn"
                     title="{tool.name} ({tool.placement_mode})"
@@ -395,6 +435,19 @@
     align-items: center;
     justify-content: space-between;
     padding-left: var(--space-3);
+    cursor: grab;
+  }
+
+  .tc-tool-row-dragging {
+    opacity: 0.5;
+  }
+
+  .tc-drag-handle {
+    color: var(--color-text-muted);
+    font-size: var(--font-size-sm);
+    flex-shrink: 0;
+    margin-right: var(--space-1);
+    cursor: grab;
   }
 
   .tc-tool-btn {

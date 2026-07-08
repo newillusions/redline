@@ -4,7 +4,17 @@
  * passes `id` + `now` so this stays deterministic and unit-testable. Viewport.svelte does
  * the screen→PDF conversion (via the tested `screenToPdfUserSpace`) before calling these.
  */
-import type { Markup, MarkupType, MarkupGeometry, Appearance, UserRef, PdfPoint, CountSet } from "./ipc";
+import type {
+  Markup,
+  MarkupType,
+  MarkupGeometry,
+  Appearance,
+  UserRef,
+  PdfPoint,
+  CountSet,
+  StampAsset,
+  DynamicField,
+} from "./ipc";
 import type { ToolKind } from "./markup-store.svelte";
 
 /** The drag-draw tools — a subset of MarkupType (so no cast is needed at the call site). */
@@ -144,6 +154,18 @@ export function translateToolGeometry(template: MarkupGeometry, clickPoint: PdfP
   return template; // Quads - see doc comment.
 }
 
+/**
+ * Extract the `label`s of every `PromptedText` field in `fields`, in order (spec "Stamps" -
+ * a dynamic stamp's placement-time prompt UI collects one value per `PromptedText` field,
+ * in the same order `compose_stamp_text`'s `prompted` array expects them back). Pure/no-DOM
+ * so the placement-time prompt-or-skip decision is unit-testable without a rendered dialog.
+ */
+export function extractPromptedLabels(fields: DynamicField[]): string[] {
+  return fields
+    .filter((f): f is { PromptedText: { label: string } } => typeof f === "object" && "PromptedText" in f)
+    .map((f) => f.PromptedText.label);
+}
+
 function bboxMin(pts: PdfPoint[]): PdfPoint {
   if (pts.length === 0) return { x: 0, y: 0 };
   return { x: Math.min(...pts.map((p) => p.x)), y: Math.min(...pts.map((p) => p.y)) };
@@ -173,6 +195,8 @@ export function buildMarkup(opts: {
   contents?: string | null;
   /** Count set assignment (MeasurementCount only). Embedded so it round-trips via the PDF. */
   countSet?: CountSet | null;
+  /** Stamp's backing visual asset snapshot (Stamp/StampDynamic placement only). */
+  stampAsset?: StampAsset | null;
 }): Markup {
   return {
     id: opts.id,
@@ -202,6 +226,7 @@ export function buildMarkup(opts: {
     workflow: { status: "None", assignee: null, thread: [] },
     measurement: null,
     count_set: opts.countSet ? { ...opts.countSet } : null,
+    stamp_asset: opts.stampAsset ?? null,
   };
 }
 
