@@ -691,4 +691,361 @@ pub(crate) mod tests {
         d.get(key).ok()?.as_str().ok().map(|b| String::from_utf8_lossy(b).into_owned())
             .or_else(|| d.get(key).ok()?.as_name().ok().map(|b| String::from_utf8_lossy(b).into_owned()))
     }
+
+    // -----------------------------------------------------------------------
+    // Full-type-matrix round-trip fidelity harness.
+    //
+    // Builds one Markup per MarkupType with non-default values in every applicable
+    // field, writes the whole set into a real lopdf Document via write_markups, reads
+    // it back via read_markups, and asserts field-by-field equality. Then writes the
+    // REREAD set again and confirms a second reread is a fixed point (idempotence) -
+    // no further drift beyond the first write's expected f32/PDF-date rounding.
+    //
+    // This is the harness that caught two real drift bugs (see PR description):
+    // the Measurement payload being dropped entirely on read, and >2-point Polyline
+    // geometry on a Line-subtype markup (Line/Arrow/MeasurementLength/
+    // MeasurementRadius) being truncated to 2 points by the /L write path.
+    // -----------------------------------------------------------------------
+
+    mod fidelity_matrix {
+        use super::*;
+        use crate::markup::{
+            CountSet, CountSymbol, FontSpec, LineStyle, MarkupStatus, Measurement, Origin, Reply,
+        };
+        use chrono::{DateTime, TimeZone, Utc};
+
+        fn user(name: &str) -> UserRef {
+            UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: name.to_string(),
+            }
+        }
+
+        fn fixed_ts(secs_offset: i64) -> DateTime<Utc> {
+            Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap() + chrono::Duration::seconds(secs_offset)
+        }
+
+        fn full_appearance() -> Appearance {
+            Appearance {
+                color: "#3366ff".into(),
+                line_weight: 2.5,
+                opacity: 0.8,
+                fill: Some("#ffeecc".into()),
+                line_style: LineStyle::Dashed,
+                font: None,
+                outline_color: Some("#112233".into()),
+                fill_opacity: Some(0.4),
+            }
+        }
+
+        /// Common non-default envelope: subject/contents/layer/status/origin/audit, all
+        /// set to values distinct from every field's default.
+        fn matrix_markup(t: MarkupType, geometry: MarkupGeometry, creator: UserRef) -> Markup {
+            let mut m = Markup::new(t, 0, geometry, full_appearance(), creator);
+            m.subject = Some(format!("{t:?} subject"));
+            m.contents = Some(format!("{t:?} contents - non-default note text"));
+            m.layer = Some("A-TEST".into());
+            m.touch(user("Modifier"));
+            m.audit.created_at = fixed_ts(0);
+            m.audit.modified_at = fixed_ts(60);
+            m.audit.origin = Origin::FieldApp;
+            m.workflow.status = MarkupStatus::Accepted;
+            m
+        }
+
+        fn measurement(depth: Option<f64>, count_value: Option<u32>) -> Measurement {
+            let mut cols = std::collections::BTreeMap::new();
+            cols.insert("cost_code".to_string(), "03-30-00".to_string());
+            cols.insert("trade".to_string(), "electrical".to_string());
+            Measurement {
+                scale_ref: Some("scale-1/8in=1ft".to_string()),
+                raw_measure: 1234.5678,
+                unit: "sf".to_string(),
+                computed_quantity: 987.654321,
+                depth,
+                count_value,
+                custom_columns: cols,
+            }
+        }
+
+        /// One Markup per `MarkupType` variant (20 total), each with non-default values
+        /// in every field that type applies to. `stamp_asset` is deliberately left unset
+        /// on the Stamp/StampDynamic fixtures - it is a documented, already-tested
+        /// exception (see the field's doc comment in markup/mod.rs and
+        /// `write_markups_resolves_a_png_stamp_asset_to_a_real_indirect_image_xobject`),
+        /// not something this harness re-litigates.
+        fn full_fixture_set() -> Vec<Markup> {
+            let creator = user("Alice");
+            let group_a = uuid::Uuid::new_v4();
+
+            let rect = || MarkupGeometry::Rect {
+                min: PdfPoint { x: 12.25, y: 34.5 },
+                max: PdfPoint { x: 212.75, y: 134.125 },
+            };
+            let line2 = || {
+                MarkupGeometry::Polyline(vec![
+                    PdfPoint { x: 5.0, y: 5.0 },
+                    PdfPoint { x: 305.0, y: 205.0 },
+                ])
+            };
+            // >2 points on a Line-subtype markup - exercises the /L-truncation fix.
+            let line3 = || {
+                MarkupGeometry::Polyline(vec![
+                    PdfPoint { x: 0.0, y: 0.0 },
+                    PdfPoint { x: 100.0, y: 40.0 },
+                    PdfPoint { x: 220.0, y: 10.0 },
+                ])
+            };
+            let poly3 = || {
+                MarkupGeometry::Polyline(vec![
+                    PdfPoint { x: 0.0, y: 0.0 },
+                    PdfPoint { x: 80.0, y: 0.0 },
+                    PdfPoint { x: 40.0, y: 60.0 },
+                ])
+            };
+            let poly4 = || {
+                MarkupGeometry::Polyline(vec![
+                    PdfPoint { x: 0.0, y: 0.0 },
+                    PdfPoint { x: 100.0, y: 0.0 },
+                    PdfPoint { x: 100.0, y: 60.0 },
+                    PdfPoint { x: 0.0, y: 60.0 },
+                ])
+            };
+            let ink = || {
+                MarkupGeometry::Ink(vec![
+                    vec![
+                        PdfPoint { x: 1.0, y: 1.0 },
+                        PdfPoint { x: 6.0, y: 9.0 },
+                        PdfPoint { x: 11.0, y: 3.0 },
+                    ],
+                    vec![PdfPoint { x: 20.0, y: 20.0 }, PdfPoint { x: 25.0, y: 30.0 }],
+                ])
+            };
+            let quads = || {
+                MarkupGeometry::Quads(vec![
+                    [
+                        PdfPoint { x: 72.0, y: 712.0 },
+                        PdfPoint { x: 500.0, y: 712.0 },
+                        PdfPoint { x: 72.0, y: 700.0 },
+                        PdfPoint { x: 500.0, y: 700.0 },
+                    ],
+                    [
+                        PdfPoint { x: 72.0, y: 698.0 },
+                        PdfPoint { x: 220.0, y: 698.0 },
+                        PdfPoint { x: 72.0, y: 686.0 },
+                        PdfPoint { x: 220.0, y: 686.0 },
+                    ],
+                ])
+            };
+            let point = || MarkupGeometry::Point(PdfPoint { x: 55.5, y: 66.25 });
+
+            let mut out = Vec::new();
+
+            let mut text = matrix_markup(MarkupType::Text, rect(), creator.clone());
+            text.appearance.font = Some(FontSpec { family: "Helvetica".into(), size_pt: 14.0 });
+            out.push(text);
+
+            let mut callout = matrix_markup(MarkupType::Callout, poly3(), creator.clone());
+            callout.appearance.font = Some(FontSpec { family: "Times New Roman".into(), size_pt: 11.0 });
+            out.push(callout);
+
+            out.push(matrix_markup(MarkupType::Cloud, poly4(), creator.clone()));
+
+            let mut r1 = matrix_markup(MarkupType::Rectangle, rect(), creator.clone());
+            r1.group_id = Some(group_a);
+            out.push(r1);
+
+            let mut r2 = matrix_markup(MarkupType::Ellipse, rect(), creator.clone());
+            r2.group_id = Some(group_a); // shares the group with Rectangle above
+            out.push(r2);
+
+            out.push(matrix_markup(MarkupType::Polygon, poly3(), creator.clone()));
+            out.push(matrix_markup(MarkupType::Line, line3(), creator.clone()));
+            out.push(matrix_markup(MarkupType::Arrow, line2(), creator.clone()));
+            out.push(matrix_markup(MarkupType::Polyline, poly3(), creator.clone()));
+            out.push(matrix_markup(MarkupType::Highlight, quads(), creator.clone()));
+            out.push(matrix_markup(MarkupType::Ink, ink(), creator.clone()));
+            out.push(matrix_markup(MarkupType::Stamp, rect(), creator.clone()));
+            out.push(matrix_markup(MarkupType::StampDynamic, rect(), creator.clone()));
+
+            let mut ml = matrix_markup(MarkupType::MeasurementLength, line2(), creator.clone());
+            ml.measurement = Some(measurement(None, None));
+            out.push(ml);
+
+            let mut mp = matrix_markup(MarkupType::MeasurementPerimeter, poly4(), creator.clone());
+            mp.measurement = Some(measurement(None, None));
+            out.push(mp);
+
+            let mut ma = matrix_markup(MarkupType::MeasurementArea, poly4(), creator.clone());
+            ma.measurement = Some(measurement(None, None));
+            out.push(ma);
+
+            let mut mv = matrix_markup(MarkupType::MeasurementVolume, poly4(), creator.clone());
+            mv.measurement = Some(measurement(Some(8.25), None));
+            out.push(mv);
+
+            let mut mc = matrix_markup(MarkupType::MeasurementCount, point(), creator.clone());
+            mc.measurement = Some(measurement(None, Some(7)));
+            mc.count_set = Some(CountSet {
+                id: uuid::Uuid::new_v4(),
+                name: "Type-A fixture".into(),
+                color: mc.appearance.color.clone(),
+                symbol: CountSymbol::Star,
+            });
+            out.push(mc);
+
+            let mut mang = matrix_markup(MarkupType::MeasurementAngle, poly3(), creator.clone());
+            mang.measurement = Some(measurement(None, None));
+            out.push(mang);
+
+            let mut mr = matrix_markup(MarkupType::MeasurementRadius, line2(), creator.clone());
+            mr.measurement = Some(measurement(None, None));
+            // Exercise the workflow assignee + comment-thread round-trip (RLWorkflowExtra)
+            // on this one markup - no need to repeat it on every fixture.
+            mr.workflow.assignee = Some(user("Reviewer"));
+            mr.workflow.thread.push(Reply {
+                id: uuid::Uuid::new_v4(),
+                author: user("Commenter"),
+                at: fixed_ts(120),
+                contents: "please confirm radius".into(),
+            });
+            out.push(mr);
+
+            out
+        }
+
+        fn assert_pt_close(a: PdfPoint, b: PdfPoint, ctx: &str) {
+            assert!(
+                (a.x - b.x).abs() < 0.01 && (a.y - b.y).abs() < 0.01,
+                "{ctx}: point {a:?} != {b:?}"
+            );
+        }
+
+        fn assert_geometry_close(a: &MarkupGeometry, b: &MarkupGeometry, ctx: &str) {
+            match (a, b) {
+                (MarkupGeometry::Point(p), MarkupGeometry::Point(q)) => assert_pt_close(*p, *q, ctx),
+                (MarkupGeometry::Rect { min, max }, MarkupGeometry::Rect { min: m2, max: x2 }) => {
+                    assert_pt_close(*min, *m2, ctx);
+                    assert_pt_close(*max, *x2, ctx);
+                }
+                (MarkupGeometry::Polyline(u), MarkupGeometry::Polyline(v)) => {
+                    assert_eq!(u.len(), v.len(), "{ctx}: polyline point count {} != {}", u.len(), v.len());
+                    for (p, q) in u.iter().zip(v) {
+                        assert_pt_close(*p, *q, ctx);
+                    }
+                }
+                (MarkupGeometry::Ink(u), MarkupGeometry::Ink(v)) => {
+                    assert_eq!(u.len(), v.len(), "{ctx}: ink stroke count");
+                    for (s, t) in u.iter().zip(v) {
+                        assert_eq!(s.len(), t.len(), "{ctx}: ink stroke point count");
+                        for (p, q) in s.iter().zip(t) {
+                            assert_pt_close(*p, *q, ctx);
+                        }
+                    }
+                }
+                (MarkupGeometry::Quads(u), MarkupGeometry::Quads(v)) => {
+                    assert_eq!(u.len(), v.len(), "{ctx}: quad count");
+                    for (qa, qb) in u.iter().zip(v) {
+                        for (p, q) in qa.iter().zip(qb) {
+                            assert_pt_close(*p, *q, ctx);
+                        }
+                    }
+                }
+                _ => panic!("{ctx}: geometry variant mismatch: {a:?} vs {b:?}"),
+            }
+        }
+
+        /// Field-by-field fidelity check. Numeric fields that pass through a PDF `/Real`
+        /// (lopdf f32) use an epsilon; everything else (strings, enums, ids, the JSON-blob
+        /// Measurement/workflow-extra fields) must be exactly equal.
+        fn assert_markup_fidelity(orig: &Markup, got: &Markup) {
+            let ctx = format!("{:?} (id {})", orig.markup_type, orig.id());
+
+            assert_eq!(got.id(), orig.id(), "{ctx}: id");
+            assert_eq!(got.markup_type, orig.markup_type, "{ctx}: markup_type");
+            assert_eq!(got.page, orig.page, "{ctx}: page");
+            assert_geometry_close(&orig.geometry, &got.geometry, &ctx);
+            assert_eq!(got.subject, orig.subject, "{ctx}: subject");
+            assert_eq!(got.contents, orig.contents, "{ctx}: contents");
+            assert_eq!(got.layer, orig.layer, "{ctx}: layer");
+            assert_eq!(got.group_id, orig.group_id, "{ctx}: group_id");
+
+            assert_eq!(got.appearance.color, orig.appearance.color, "{ctx}: appearance.color");
+            assert!(
+                (got.appearance.line_weight - orig.appearance.line_weight).abs() < 0.01,
+                "{ctx}: line_weight {} != {}",
+                got.appearance.line_weight,
+                orig.appearance.line_weight
+            );
+            assert!(
+                (got.appearance.opacity - orig.appearance.opacity).abs() < 0.01,
+                "{ctx}: opacity {} != {}",
+                got.appearance.opacity,
+                orig.appearance.opacity
+            );
+            assert_eq!(got.appearance.fill, orig.appearance.fill, "{ctx}: fill");
+            assert_eq!(got.appearance.line_style, orig.appearance.line_style, "{ctx}: line_style");
+            assert_eq!(got.appearance.font, orig.appearance.font, "{ctx}: font");
+            assert_eq!(
+                got.appearance.outline_color, orig.appearance.outline_color,
+                "{ctx}: outline_color"
+            );
+            match (got.appearance.fill_opacity, orig.appearance.fill_opacity) {
+                (Some(g), Some(o)) => {
+                    assert!((g - o).abs() < 0.01, "{ctx}: fill_opacity {g} != {o}")
+                }
+                (g, o) => assert_eq!(g, o, "{ctx}: fill_opacity"),
+            }
+
+            assert_eq!(got.workflow.status, orig.workflow.status, "{ctx}: workflow.status");
+            assert_eq!(got.workflow.assignee, orig.workflow.assignee, "{ctx}: workflow.assignee");
+            assert_eq!(got.workflow.thread, orig.workflow.thread, "{ctx}: workflow.thread");
+
+            assert_eq!(got.audit.created_by, orig.audit.created_by, "{ctx}: audit.created_by");
+            assert_eq!(got.audit.modified_by, orig.audit.modified_by, "{ctx}: audit.modified_by");
+            assert_eq!(got.audit.created_at, orig.audit.created_at, "{ctx}: audit.created_at");
+            assert_eq!(got.audit.modified_at, orig.audit.modified_at, "{ctx}: audit.modified_at");
+            assert_eq!(got.audit.revision, orig.audit.revision, "{ctx}: audit.revision");
+            assert_eq!(got.audit.origin, orig.audit.origin, "{ctx}: audit.origin");
+
+            assert_eq!(got.measurement, orig.measurement, "{ctx}: measurement");
+            assert_eq!(got.count_set, orig.count_set, "{ctx}: count_set");
+        }
+
+        #[test]
+        fn full_type_matrix_round_trips_every_field_and_is_idempotent_on_a_second_write() {
+            let originals = full_fixture_set();
+            assert_eq!(originals.len(), 20, "fixture set must cover all 20 MarkupType variants");
+
+            // First write -> real Document -> read back.
+            let (mut doc1, _page_id) = one_page_doc();
+            write_markups(&mut doc1, &originals).unwrap();
+            let reread1 = read_markups(&doc1).unwrap();
+            assert_eq!(reread1.len(), originals.len(), "every fixture must survive the round-trip");
+            for orig in &originals {
+                let got = reread1
+                    .iter()
+                    .find(|m| m.id() == orig.id())
+                    .unwrap_or_else(|| {
+                        panic!("{:?} (id {}) missing after round-trip", orig.markup_type, orig.id())
+                    });
+                assert_markup_fidelity(orig, got);
+            }
+
+            // Idempotence: write the REREAD set again into a fresh document and reread.
+            // A second reread must be a fixed point of the first - no further drift
+            // beyond the (already-applied) f32/PDF-date rounding from the first write.
+            let (mut doc2, _page_id2) = one_page_doc();
+            write_markups(&mut doc2, &reread1).unwrap();
+            let reread2 = read_markups(&doc2).unwrap();
+            assert_eq!(reread2.len(), reread1.len());
+            for m1 in &reread1 {
+                let m2 = reread2
+                    .iter()
+                    .find(|m| m.id() == m1.id())
+                    .unwrap_or_else(|| panic!("{:?} (id {}) missing on second write", m1.markup_type, m1.id()));
+                assert_markup_fidelity(m1, m2);
+            }
+        }
+    }
 }

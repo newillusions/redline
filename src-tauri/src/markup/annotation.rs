@@ -11,10 +11,11 @@
 //!
 //! Scope of this slice: the §6 envelope + geometry + the universal appearance bits
 //! (colour / opacity / weight / fill / line-style) + font (for FreeText annotations:
-//! written to `/DA` for interop and `/RLFontFamily`+`/RLFontSize` for lossless round-trip).
-//! NOT yet mapped here (they live in the sidecar via serde, or land in a later slice):
-//! the measurement payload, comment thread/replies, and assignee. PDF reals are f32
-//! (lopdf), so geometry in the annotation is the interop copy — the canonical f64
+//! written to `/DA` for interop and `/RLFontFamily`+`/RLFontSize` for lossless round-trip),
+//! plus the measurement payload (`/RLMeasure`, opaque JSON) and the reserved workflow
+//! assignee/thread (`/RLWorkflowExtra`, opaque JSON). Both are private keys, ignored by
+//! foreign viewers, round-tripped losslessly for redline's own reopen. PDF reals are f32
+//! (lopdf), so geometry in the annotation is the interop copy - the canonical f64
 //! geometry stays in the app model / sidecar (spec §5/§6).
 
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -22,7 +23,7 @@ use lopdf::{Dictionary, Object};
 
 use super::{
     Appearance, Audit, CountSet, CountSymbol, FontSpec, LineStyle, Markup, MarkupGeometry,
-    MarkupStatus, MarkupType, Origin, UserRef, Workflow,
+    MarkupStatus, MarkupType, Measurement, Origin, Reply, UserRef, Workflow,
 };
 use crate::geometry::{PdfPoint, Quad};
 
@@ -359,6 +360,18 @@ impl Markup {
             MarkupGeometry::Polyline(pts) => {
                 if matches!(pdf_subtype(t), "Line") && pts.len() >= 2 {
                     d.set("L", flatten(&pts[..2]));
+                    // A standard PDF Line annotation is spec-defined as exactly 2 points
+                    // (/L takes only 4 numbers), so any vertices beyond the first two have
+                    // nowhere to go on the interop key. Without this, a >2-point Polyline
+                    // on a Line-subtype markup (Line/Arrow/MeasurementLength/
+                    // MeasurementRadius) silently lost every point past the first two on
+                    // save - write(read(write(x))) != write(x). Also emit /Vertices with
+                    // the FULL point list so our own reread (which checks /Vertices before
+                    // /L - see geometry_from_dict) recovers everything losslessly; foreign
+                    // viewers still get a valid 2-point /Line from the anchor+tip.
+                    if pts.len() > 2 {
+                        d.set("Vertices", flatten(pts));
+                    }
                 } else if matches!(t, MarkupType::Callout) {
                     d.set("CL", flatten(pts)); // callout leader line (spec §19.2)
                 } else {
@@ -515,6 +528,32 @@ impl Markup {
             d.set("RLCountSetName", Object::string_literal(cs.name.clone()));
             d.set("RLCountSymbol", name(count_symbol_tag(cs.symbol)));
         }
+
+        // Measurement payload (spec §7): a single opaque JSON blob, not hand-mapped keys
+        // like CountSet - the shape varies by measurement kind and carries an open
+        // `custom_columns` map, so JSON is exact and doesn't need a decoder update every
+        // time the payload grows. Previously this field was dropped entirely on read
+        // (hardcoded `measurement: None` in from_annotation_dict) - every
+        // MeasurementLength/Area/Perimeter/Volume/Count/Angle/Radius markup lost its
+        // quantity data on save -> reopen.
+        if let Some(meas) = &self.measurement {
+            if let Ok(json) = serde_json::to_string(meas) {
+                d.set("RLMeasure", Object::string_literal(json));
+            }
+        }
+
+        // Reserved workflow fields not carried by /RLStatus: assignee + comment thread
+        // (spec §6 decision f). No v1 UI surfaces these yet, but they are real fields on
+        // every Markup and must round-trip rather than silently reset to empty on reopen.
+        // Omitted when both are at their empty defaults so a plain markup's dict is
+        // unchanged from before this field existed.
+        if self.workflow.assignee.is_some() || !self.workflow.thread.is_empty() {
+            if let Ok(json) =
+                serde_json::to_string(&(&self.workflow.assignee, &self.workflow.thread))
+            {
+                d.set("RLWorkflowExtra", Object::string_literal(json));
+            }
+        }
         d
     }
 
@@ -642,12 +681,18 @@ impl Markup {
                     _ => Origin::Desktop,
                 },
             },
-            workflow: Workflow {
-                status: status_from_tag(&get_name(d, b"RLStatus").unwrap_or_default()),
-                assignee: None,
-                thread: Vec::new(),
+            workflow: {
+                let (assignee, thread) = get_string(d, b"RLWorkflowExtra")
+                    .and_then(|s| serde_json::from_str::<(Option<UserRef>, Vec<Reply>)>(&s).ok())
+                    .unwrap_or((None, Vec::new()));
+                Workflow {
+                    status: status_from_tag(&get_name(d, b"RLStatus").unwrap_or_default()),
+                    assignee,
+                    thread,
+                }
             },
-            measurement: None,
+            measurement: get_string(d, b"RLMeasure")
+                .and_then(|s| serde_json::from_str::<Measurement>(&s).ok()),
             count_set,
             // Not reconstructed on reopen - see the field doc comment in markup/mod.rs
             // (the appearance is already baked into the saved /AP /N stream by then).
