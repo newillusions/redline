@@ -239,6 +239,11 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Compile-time default for the S2b license-gate base URL (src-tauri/src/license/
+          # client.rs's resolve_base_url) - lets a released Windows binary activate the
+          # entitlement gate with no user-set REDLINE_LICENSE_API_URL env var. The runtime
+          # env var still overrides this at call time if ever set.
+          REDLINE_LICENSE_API_URL_DEFAULT: https://staff.emittiv.studio
         run: npm run tauri:build
 
       # --- Windows Authenticode signing (self-signed cert, obs:z6byyxo59r0ilt2bq397) ---
