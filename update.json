@@ -1,15 +1,15 @@
 {
-  "version": "0.3.2",
-  "notes": "Release v0.3.2",
-  "pub_date": "2026-07-11T14:55:30Z",
+  "version": "0.3.1",
+  "notes": "Release v0.3.1",
+  "pub_date": "2026-07-08T02:27:32Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTbTN6SDFvSTVnWnhIRmxiS3lqMCtTbGZ4WmVmdlRwUGZwTGNXNG96K290amlrY1ZjNHI3R212UGtBcDJ4UndIaEdkaFR5OGFXNlF4MU1TZjd3a0c5d0JPbzNWeGRNdmd3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNzgxMjcwCWZpbGU6UmVkbGluZS5hcHAudGFyLmd6ClNkSDJINXFvOTNKZFJhblJzZjVSN3hLSWNCdjRSM254V3J1cWRkYnRtTzhGMU5UeHplc21FRFgwbjZBNWxpMWpBRVhHOEI3S0VTMWtjQ3FTZkJEbUJBPT0K",
-      "url": "https://forge.mms.name/emittiv/redline/releases/download/v0.3.2/Redline_0.3.2_aarch64.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTbTN6SDFvSTVnWjVsc0FvdVFMUkhhdm1VTTR2UVJ3cmJUdVp5QUlaVU1yamJjc2dZeWJoSUZEeXQxNlkxWEc1V1BHYnYvYU9UMlZESVpqenhLRUF4TERNZnd6WFJrMXdnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNDc3MzY2CWZpbGU6UmVkbGluZS5hcHAudGFyLmd6CjZhdldXNXhBaWMyOXgvVW1ybDM4YUZjT0o3MWtjR2p5Zk5YRHc0QUx3ampZcjd6VHZ3dllUdzYyWFFMeW9MVUpDNjhZQ25BMWRpT0F1SVorQmlwa0FRPT0K",
+      "url": "https://forge.mms.name/emittiv/redline/releases/download/v0.3.1/Redline_0.3.1_aarch64.app.tar.gz"
     },
     "windows-x86_64": {
-      "signature": "",
-      "url": "https://forge.mms.name/emittiv/redline/releases/download/v0.3.2/Redline_0.3.2_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTbTN6SDFvSTVnWjlmaUlLTkVyWlB1UUdRMUFqYkhHSGZxb3REYU1udTN4YUJQNDU5NkkvVHBQdHgxRnlrYW5jUURpYjlDcEhxclRkYkQySTFERFEvdUU2dE82S3EzZ0FFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNDc3NjM4CWZpbGU6UmVkbGluZV8wLjMuMV94NjQtc2V0dXAuZXhlCnFjYWtxbTRidnBBcTd0b1hobDFKK0dqVnJDUXBzbG1EMjZmWTVSM0l4Uyt4cCt4WGJzK3RQbWhiVTl5QUtUczNxU0E5NWhNYytlM3NBVTZ2dndjTkNnPT0K",
+      "url": "https://forge.mms.name/emittiv/redline/releases/download/v0.3.1/Redline_0.3.1_x64-setup.exe"
     }
   }
 }
