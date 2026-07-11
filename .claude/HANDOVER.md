@@ -3,12 +3,89 @@
 ## Current Status
 
 **M1-M6 + Phase 1.1 (compare) + Windows-distribution infra + Tool Chest v0.3.1 polish
-(PR #48) + S2b client entitlement (PR #49) + docops/highlight bugfix batch (PR #50) all
-merged to `main`. 0 open PRs.**
+(PR #48) + S2b client entitlement (PR #49) + docops/highlight bugfix batch (PR #50) +
+markup round-trip fidelity fix (PR #52) + license API URL compile-time default (PR #53)
+all merged to `main` (`db11e2b`). 0 open PRs. v0.3.2 release now sequenced only behind
+an orchestrator-side Authelia bypass rule + activation-code creation, then the tag.**
 
 ## Last Session
 
-**Date**: 2026-07-08 (PR #50, dispatched by the orchestrator - 4-bug live-use batch)
+**Date**: 2026-07-11 (PR #53, dispatched by the orchestrator - follow-up to PR #52)
+**Summary**: Baked a compile-time default for the S2b license API base URL so a released
+Windows build activates the entitlement gate with no user-set `REDLINE_LICENSE_API_URL`
+env var. `resolve_base_url` (new, `src-tauri/src/license/client.rs`) checks three tiers:
+runtime env var (unchanged, always wins - keeps dev/test override) -> compile-time
+`option_env!("REDLINE_LICENSE_API_URL_DEFAULT")` -> `NotConfigured` as before. The
+function takes both values as plain arguments rather than reading them internally, so
+it's a pure, unit-testable function - avoids racing on the real process env var under
+Rust's parallel test runner. Wired `REDLINE_LICENSE_API_URL_DEFAULT:
+https://staff.emittiv.studio` into **only the Windows job** of
+`.github/workflows/build-releases.yml` (`build-windows` -> "Build Tauri app" env block),
+matching the dispatch scope ("Windows machines"); the macOS job (`build-macos`) was NOT
+touched, so a macOS release build still needs the runtime env var - flagged as a possible
+follow-up if macOS should get the same treatment. Also extracted the base+path join into
+`license_url()` and added regression tests for its trailing-slash handling (was already
+correct - `trim_end_matches('/')` - no behavior change there, just test coverage that
+didn't exist before). Verified the `option_env!` wiring end-to-end with a temporary
+scratch test (confirmed `Some(url)` vs `None` with/without the build-time env var set,
+then removed it - not part of the diff). Verified: `cargo test --lib` 390 passed/1
+pre-existing ignored (9 new), `cargo clippy --all-targets` 0 new warnings (same
+pre-existing `redundant_closure` in `commands/docops.rs`). No frontend files touched.
+**PR #53 squash-merged** as `db11e2b`: `https://forge.mms.name/emittiv/redline/pulls/53`,
+branch `fix/license-url-default` (source head `4b869876ff84bafd690077881223774a4150ebec`).
+**Not touched** (per dispatch constraints): `gate.rs`, `token.rs`, `store.rs` - only URL
+resolution + workflow env.
+**Owed**: now that PR #53 has merged, once the orchestrator clears the Authelia bypass
+rule + activation-code creation, cut the `v0.3.2` tag (see Next Steps below - this
+supersedes the older `v0.2.0` tag-push item, which predates PR #52/#53 and the current
+version).
+
+### Previous session (2026-07-11, PR #52, dispatched by the orchestrator - Martin
+reported markups "changing a bit" after saving and reopening a file)
+
+**Date**: 2026-07-11 (PR #52, dispatched by the orchestrator - Martin reported markups
+"changing a bit" after saving and reopening a file)
+**Summary**: Built a full-type-matrix round-trip fidelity test harness
+(`document::annots::tests::fidelity_matrix`, new in `src-tauri/src/document/annots.rs`):
+one non-default-valued `Markup` per all 20 `MarkupType` variants, written into a real
+in-memory PDF via `write_markups`, reread via `read_markups`, checked field-by-field
+(epsilon for expected f32 `/Real` rounding, exact everywhere else), then written a SECOND
+time to confirm idempotence. Verified the harness catches real regressions (reverted the
+fix, reran, it failed immediately on the Line-truncation bug below). Found and fixed two
+real drift bugs:
+1. **`Markup::measurement` was hardcoded to `None` on every read** (`from_annotation_dict`)
+   - every `MeasurementLength/Perimeter/Area/Volume/Count/Angle/Radius` markup silently
+   lost its entire quantity payload (`raw_measure`, `unit`, `computed_quantity`, `depth`,
+   `count_value`, `custom_columns`) on save -> reopen. This is the most likely cause of
+   Martin's report for anyone using takeoff/measurement tools. Fixed via a new private
+   `/RLMeasure` JSON-blob key (mirrors the existing `/RLType` tag pattern).
+2. **Polyline geometry on a Line-subtype markup was truncated to its first 2 points on
+   write** (`to_annotation_dict` only ever wrote the standard 2-point `/L` key for
+   Line/Arrow/MeasurementLength/MeasurementRadius). Any additional vertex was silently
+   dropped. Fixed by also writing `/Vertices` with the full point list when there are
+   more than 2 points (`geometry_from_dict` already preferred `/Vertices` over `/L` on
+   read, so no read-side change was needed). Not reachable via the current UI
+   (`MeasurementLength` is always drag-drawn as exactly 2 points today) but a real,
+   silent data-loss bug in the general write/read path.
+Also persisted the reserved `workflow.assignee`/`workflow.thread` fields (previously
+reset to empty on every reopen) via a new `/RLWorkflowExtra` JSON-blob key - same class
+of bug, no v1 UI surfaces them yet but they're real fields that shouldn't silently reset.
+No visual-only (`/AP`-rendering) drift was found - everything flagged was stored-data
+drift in the annotation dictionary. Verified: `cargo test` 381 passed/1 pre-existing
+ignored (1 new harness test), `cargo clippy --all-targets` 0 new warnings (1 pre-existing
+`redundant_closure` in `commands/docops.rs`, confirmed present on `main` before this
+branch). No frontend files touched - `Markup`'s IPC-visible shape is unchanged; this is
+entirely a Rust PDF-annotation-dictionary mapping fix.
+**PR #52 opened** (not merged - orchestrator owns merge/deploy per dispatch scope):
+`https://forge.mms.name/emittiv/redline/pulls/52`, branch
+`fix/markup-roundtrip-fidelity`, head `a6f62d457463c1f90ac61b34e5d600579f727ca2`.
+**Owed**: live re-verify in the real app once merged - place a MeasurementLength/Area/etc
+markup with real quantities, save, close and reopen the file (not just re-focus the
+window), confirm the takeoff panel still shows the quantity. The automated harness proves
+the PDF bytes round-trip correctly; a human GUI pass on the actual reported symptom is
+still the final word.
+
+### Previous session (2026-07-08, PR #50, dispatched by the orchestrator - 4-bug live-use batch)
 **Summary**: Root-caused and fixed 3 of 4 reported live-use defects, all traced to one
 ordering bug in `apply_page_edit` (`commands/document.rs`): it called
 `write_markups(doc, markups)` AFTER `op(doc)`, not before. This defeated
@@ -77,6 +154,17 @@ still owed to a human session. Detail: `obs:e1tujicl7p4uck906rxa`.
 
 ## Next Steps
 
+**v0.3.2 release (current priority):** PR #52 and PR #53 are both merged. Remaining,
+orchestrator-side: clear the Authelia bypass rule + create the activation code, then cut
+the `v0.3.2` tag - this supersedes item 6 below, which is stale (references the
+long-superseded `v0.2.0`; current version is 0.3.1+ per `Cargo.toml`/git log).
+
+0. **PR #52 (markup round-trip fidelity fix)** [DONE - merged `de0d9fd`]. Still owed,
+   live-verify: place a
+   MeasurementLength/Area/Perimeter/Volume/Count/Angle/Radius markup with real
+   quantities, save, fully close and reopen the file, confirm the takeoff panel still
+   shows the correct quantity (not reset/blank). Also worth a spot-check: draw a Line or
+   Arrow, save/reopen, confirm it didn't change shape.
 1. **Live-verify PR #50's docops/highlight fixes**: click Flatten, Optimize, and Apply
    Redactions in the real app on a document with markups (including one moved but not
    explicitly saved before flattening) and confirm the visible fix; confirm the toolbar
@@ -105,8 +193,12 @@ Before the first tagged Windows/macOS release:
    an explicit call from Martin/orchestrator.
 8. **§20 definitive floor-machine run** (16 GB RAM, Windows + macOS) - the formal M1
    Go/No-Go, still owed, blocked on hardware access. Procedure: `bench/RUNBOOK-S20.md`.
-9. **G9 human visual check** - regenerate the sample via `cd src-tauri && cargo test
-   g9_emit_sample -- --ignored --nocapture`, open in Acrobat AND Bluebeam. Owed since M2.
+9. **G9 human visual check** - sample regenerated 2026-07-10 (dispatched task, read-only:
+   `cd src-tauri && cargo test g9_emit_sample -- --ignored --nocapture`, test passed,
+   artifact `/tmp/redline-g9-sample.pdf`, 2915 bytes, handed to orchestrator scratchpad for
+   Martin). Still owed: actually open it in Acrobat AND Bluebeam and confirm font +
+   annotation-group interop - that visual check itself is owner-gated and unchanged by this
+   session. Owed since M2.
 10. **Project direction beyond polish** (pause / registration fast-follow / next milestone)
     is an owner-gated decision on Martin's business backlog - not yet made, don't infer one.
 
@@ -121,13 +213,15 @@ Before the first tagged Windows/macOS release:
 | Item | Value |
 |------|-------|
 | Remote | `git@ssh.forge.mms.name:emittiv/redline.git` |
-| Main branch | `main` @ `02a4e5d` (M1-M6 + Phase 1.1 + Windows-dist infra + Tool Chest polish + S2b + docops/highlight bugfix batch merged) |
+| Main branch | `main` @ `db11e2b` (M1-M6 + Phase 1.1 + Windows-dist infra + Tool Chest polish + S2b + docops/highlight bugfix batch + markup round-trip fidelity fix + license URL default merged) |
 | KB mission record | `project:q8gm8dv3k7smld12rm25` (stage: stabilizing, health: on_track) |
 | Ship pipeline | `.claude/skills/sendit/SKILL.md` |
 | Judgment rules | `.claude/rules/judgment.md` (2026-07-02 - incident/decision distillation) |
 | PR #48 | `https://forge.mms.name/emittiv/redline/pulls/48` (Tool Chest v0.3.1 polish - merged `7f4a36b`) |
 | PR #49 | `https://forge.mms.name/emittiv/redline/pulls/49` (S2b client entitlement - merged `de1f8c2`) |
 | PR #50 | `https://forge.mms.name/emittiv/redline/pulls/50` (docops write-markups-ordering + highlight discoverability fix - merged `02a4e5d`) |
+| PR #52 | `https://forge.mms.name/emittiv/redline/pulls/52` (markup save/reopen round-trip fidelity fix - MERGED `de0d9fd`) |
+| PR #53 | `https://forge.mms.name/emittiv/redline/pulls/53` (license API URL compile-time default for Windows release builds - MERGED `db11e2b`) |
 | S2b license contract | `emittiv-staff/src/lib/server/license.ts` (authoritative token shape - do not change without a hub message) |
 
 ## Key Gotchas (carry forward)
@@ -163,6 +257,22 @@ Before the first tagged Windows/macOS release:
   just baked or compressed. This was reversed until PR #50 (2026-07-08) - the bug and its
   full root-cause chain are documented there and in `obs:mwen68znlue4jfrzewxb`.
 - Tests: `npm run test` (vitest, mixed node+jsdom). Rust: `cargo test` from `src-tauri/` (not project root)
+- **`Markup::measurement` and `workflow.assignee`/`workflow.thread` now round-trip
+  through the PDF** via private JSON-blob keys `/RLMeasure` and `/RLWorkflowExtra`
+  (`markup/annotation.rs`, PR #52) - do not reintroduce a hardcoded `None`/empty on
+  `from_annotation_dict`, that's exactly the bug PR #52 fixed.
+- **A "Line"-subtype markup's `/L` key only ever holds 2 points** (PDF spec constraint).
+  `to_annotation_dict` now ALSO writes `/Vertices` with the full point list whenever a
+  Line/Arrow/MeasurementLength/MeasurementRadius geometry has more than 2 points, so
+  redline's own reread (`geometry_from_dict` checks `/Vertices` before `/L`) recovers
+  everything losslessly. Don't remove this without re-checking
+  `document::annots::tests::fidelity_matrix`.
+- **License API base URL resolves in 3 tiers** (`license/client.rs::resolve_base_url`,
+  PR #53): runtime `REDLINE_LICENSE_API_URL` env var wins > compile-time
+  `REDLINE_LICENSE_API_URL_DEFAULT` (baked via `option_env!`, set only in the
+  `build-windows` job of `.github/workflows/build-releases.yml`) > `NotConfigured`. The
+  macOS release job does NOT bake a default yet - a macOS release build still needs the
+  runtime env var to activate the S2b gate.
 
 ---
-*Updated: 2026-07-08 (docops/highlight bugfix batch, PR #50)*
+*Updated: 2026-07-11 (PR #52 + PR #53 both merged - v0.3.2 staging)*
