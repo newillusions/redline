@@ -949,6 +949,22 @@ impl RenderEngine {
             let render_config = PdfRenderConfig::new()
                 .set_fixed_size(tile_w as i32, tile_h as i32)
                 .render_form_data(false) // required: matrix path only applies when form data is off
+                // pdfium-render's own default for this flag is `true` (verified against
+                // the pinned 0.8.37 source, render_config.rs::new() -
+                // do_set_flag_render_annotations: true), which sets PDFium's native
+                // FPDF_ANNOT flag and paints every annotation's /AP /N appearance stream
+                // straight into the page raster. redline's own viewer already draws every
+                // markup itself as a live SVG overlay (Viewport.svelte's `pageShapes`,
+                // glued to the in-session Svelte store) - the /AP stream exists solely for
+                // external Bluebeam/Acrobat interop (markup/appearance.rs header comment).
+                // Leaving PDFium's copy on double-renders every markup: a frozen "first
+                // drawn" ghost baked from whatever was last saved to disk (raster) behind
+                // the live, possibly-moved copy (overlay), and - since the /AP Form's
+                // /BBox is deliberately padded larger than the annotation's own /Rect for
+                // stroke/arrowhead room (appearance::ap_bbox) - PDFium's copy also renders
+                // visibly smaller than the overlay's (PDF spec 12.5.5 BBox-to-Rect fit).
+                // See render::tests::tile_render_bakes_annotation_fill_into_raster_reproduces_double_render_bug.
+                .render_annotations(false)
                 .apply_matrix(matrix) // config starts at IDENTITY, so apply == set here
                 .context("failed to set tile transformation matrix")?;
 
@@ -1573,6 +1589,103 @@ pub(crate) mod tests {
             .open_document(path, "pw-test".into(), Some("unused-password"))
             .expect("open should succeed regardless of the unused password arg");
         assert_eq!(outcome, OpenOutcome::Opened(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Markup double-render regression (Martin's ghost/duplicate report, 2026-07-11).
+    //
+    // Root cause: the tile `PdfRenderConfig` built above never calls
+    // `.render_annotations(false)`. pdfium-render 0.8.37's own default for that flag
+    // (`do_set_flag_render_annotations`) is `true` (verified against the pinned crate
+    // source, `~/.cargo/registry/.../pdfium-render-0.8.37/src/pdf/document/page/
+    // render_config.rs::new()` - the docs.rs prose is ambiguous/version-drifted on this,
+    // the source is ground truth), so every tile render sets the native `FPDF_ANNOT`
+    // flag and PDFium paints each annotation's `/AP /N` appearance stream (written by
+    // `markup::appearance`, PR #44 "generate /AP for Bluebeam interop") straight into
+    // the page raster. redline's OWN frontend viewer (`Viewport.svelte`'s `pageShapes`)
+    // ALSO draws every markup as an independent SVG overlay unconditionally - so every
+    // markup with a saved `/AP` renders TWICE: once baked into the tile (reflecting
+    // whatever was last written to disk - stale after an in-session move, since a plain
+    // move/resize only updates the Svelte store, not the on-disk file, until the next
+    // `save_document`), once live via the overlay. The `/AP` Form's `/BBox` is also
+    // deliberately PADDED beyond the annotation's own tight `/Rect` (`appearance::
+    // ap_bbox`, for stroke/arrowhead room) - per PDF spec 12.5.5 a viewer maps a
+    // larger BBox down to fit the tighter Rect, so PDFium's baked copy renders visibly
+    // SMALLER than the overlay's correctly-sized copy. That's the two symptoms Martin
+    // reported: a frozen "first drawn" ghost after edit/move, and a slightly
+    // scaled-down duplicate for geometry markups - one shared mechanism, both symptoms.
+    #[test]
+    fn tile_render_bakes_annotation_fill_into_raster_reproduces_double_render_bug() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+
+        let (mut doc, _page_id) = crate::document::annots::tests::one_page_doc();
+        let markup = crate::markup::Markup::new(
+            crate::markup::MarkupType::Rectangle,
+            0,
+            crate::markup::MarkupGeometry::Rect {
+                min: crate::geometry::PdfPoint { x: 200.0, y: 300.0 },
+                max: crate::geometry::PdfPoint { x: 300.0, y: 400.0 },
+            },
+            crate::markup::Appearance {
+                fill: Some("#FF0000".to_string()),
+                ..crate::markup::Appearance::default()
+            },
+            crate::markup::UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: "Test".to_string(),
+            },
+        );
+        // Exactly what `save_document` does on every save: bake the markup's `/AP` into
+        // the file the render engine then (re)opens.
+        crate::document::annots::write_markups(&mut doc, std::slice::from_ref(&markup))
+            .expect("write_markups");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("annot.pdf");
+        doc.save(&path).expect("save fixture");
+
+        let mut e = RenderEngine::new().expect("pdfium");
+        e.open_document(path, "t".into(), None)
+            .and_then(OpenOutcome::into_page_count)
+            .expect("open fixture");
+
+        // One tile, unzoomed, large enough to cover the whole 612x792pt page.
+        let req = TileRequest {
+            doc_id: "t".into(),
+            page_index: 0,
+            tile_size_css: 800,
+            tile_x: 0,
+            tile_y: 0,
+            zoom: 1.0,
+            dpr: 1.0,
+        };
+        let tile = e.render_tile(&req).expect("render tile");
+
+        use base64::Engine as _;
+        let png_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&tile.png_base64)
+            .expect("valid base64");
+        let img = image::load_from_memory(&png_bytes)
+            .expect("valid PNG")
+            .into_rgba8();
+
+        let has_red_pixel = img.pixels().any(|p| {
+            let [r, g, b, a] = p.0;
+            a > 0 && r > 180 && g < 100 && b < 100
+        });
+
+        assert!(
+            !has_red_pixel,
+            "tile raster contains the markup's own fill colour (#FF0000) - PDFium baked \
+             the /AP annotation appearance into the page raster because render_annotations \
+             was left at pdfium-render's default of true. redline's own frontend already \
+             draws this same markup as a live SVG overlay, so this is the ghost/double-\
+             render bug: the tile PdfRenderConfig must explicitly disable annotation \
+             rendering (.render_annotations(false))."
+        );
     }
 
     // -----------------------------------------------------------------------
