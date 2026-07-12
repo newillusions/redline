@@ -79,7 +79,10 @@ fn type_from_tag(tag: &str) -> Option<MarkupType> {
 /// PDF standard `/Subtype` for interop rendering.
 fn pdf_subtype(t: MarkupType) -> &'static str {
     match t {
-        MarkupType::MeasurementCount => "Text",
+        // A count marker renders via its /AP; "Stamp" is the interop subtype a foreign viewer
+        // draws from the appearance stream (a zero-size FreeText was dropped by Bluebeam - G9
+        // defect 5). redline recovers the MeasurementCount type from /RLType on read.
+        MarkupType::MeasurementCount => "Stamp",
         MarkupType::Text | MarkupType::Callout => "FreeText",
         MarkupType::Cloud
         | MarkupType::Polygon
@@ -275,10 +278,17 @@ fn geometry_from_dict(d: &Dictionary) -> MarkupGeometry {
     let tag = get_name(d, b"RLGeom");
     match tag.as_deref() {
         Some("point") => {
+            // A count marker stores its point as the CENTRE of a symbol-sized /Rect (so a
+            // foreign viewer has a non-zero rect to render). Recover the centre; a legacy
+            // zero-size /Rect ([x y x y]) yields the same (x, y).
             let r = get_reals(d, b"Rect").unwrap_or_default();
+            let x0 = r.first().copied().unwrap_or(0.0);
+            let y0 = r.get(1).copied().unwrap_or(0.0);
+            let x1 = r.get(2).copied().unwrap_or(x0);
+            let y1 = r.get(3).copied().unwrap_or(y0);
             MarkupGeometry::Point(PdfPoint {
-                x: r.first().copied().unwrap_or(0.0),
-                y: r.get(1).copied().unwrap_or(0.0),
+                x: (x0 + x1) / 2.0,
+                y: (y0 + y1) / 2.0,
             })
         }
         Some("poly") => {
@@ -353,8 +363,12 @@ impl Markup {
         d.set("Type", name("Annot"));
         d.set("Subtype", name(pdf_subtype(t)));
 
-        // Bounding box (always) + per-shape geometry.
-        let bb = bbox(&self.geometry);
+        // Bounding box + per-shape geometry. For FreeText (Text/Callout) and count markers
+        // the /Rect must equal the /AP /BBox (see appearance::interop_rect) so a strict
+        // foreign viewer maps the appearance identically instead of rescaling it (resized
+        // FreeText) or dropping a zero-size rect (count markers). Every other type keeps the
+        // tight geometry bbox.
+        let bb = super::appearance::interop_rect(self).unwrap_or_else(|| bbox(&self.geometry));
         d.set("Rect", Object::Array(bb.iter().map(|v| real(*v)).collect()));
         match &self.geometry {
             MarkupGeometry::Polyline(pts) => {
@@ -404,8 +418,13 @@ impl Markup {
         if let Some(s) = &self.subject {
             d.set("Subj", Object::string_literal(s.clone()));
         }
+        // Only emit /Contents for a real, non-empty user note. An empty or whitespace-only
+        // note must not leak: Bluebeam renders any /Contents as an attached comment note, so
+        // a blank one shows up as a stray note on every line/arrow (G9 defect 4).
         if let Some(c) = &self.contents {
-            d.set("Contents", Object::string_literal(c.clone()));
+            if !c.trim().is_empty() {
+                d.set("Contents", Object::string_literal(c.clone()));
+            }
         }
         d.set(
             "CreationDate",
@@ -432,7 +451,20 @@ impl Markup {
         // relevant paint operators, text left unscoped) is applied entirely inside the /AP
         // content stream (appearance.rs); the real stroke-opacity value is preserved
         // losslessly for our own round-trip via the private /RLOpacity key below.
-        d.set("CA", real(1.0));
+        // Highlight is the one exception to the /CA == 1.0 rule: a strict viewer (Bluebeam)
+        // REGENERATES the highlight wash from /C + /CA + /QuadPoints and ignores our /AP, so
+        // without the real opacity on /CA it renders a fully opaque, unreadable fill (G9
+        // defect 3). The Highlight /AP paints fully opaque under a Multiply blend and lets
+        // this /CA supply the wash as a group alpha, so /AP-honouring viewers (Acrobat) match
+        // the regenerated result with no double-dim.
+        d.set(
+            "CA",
+            real(if matches!(t, MarkupType::Highlight) {
+                self.appearance.opacity
+            } else {
+                1.0
+            }),
+        );
         d.set("RLOpacity", real(self.appearance.opacity));
         if let Some(fill) = &self.appearance.fill {
             if let Some(rgb) = hex_to_rgb(fill) {
@@ -459,6 +491,18 @@ impl Markup {
             }),
         );
         d.set("BS", Object::Dictionary(bs));
+
+        // Revision cloud: the standard /BE border effect (Cloudy, /S /C) + /IT PolygonCloud
+        // intent. Bluebeam/Acrobat regenerate the scalloped arcs from the polygon /Vertices
+        // plus this /BE; without it a foreign viewer draws the raw straight-edged polygon
+        // (the "coarse zigzag" G9 defect 2). Only Cloud gets it - a plain Polygon stays sharp.
+        if matches!(t, MarkupType::Cloud) {
+            let mut be = Dictionary::new();
+            be.set("S", name("C")); // Cloudy border style
+            be.set("I", real(2.0)); // intensity (0..2); 2 = standard revision-cloud amplitude
+            d.set("BE", Object::Dictionary(be));
+            d.set("IT", name("PolygonCloud"));
+        }
 
         // Font: FreeText /DA (interop) + lossless /RLFont* round-trip (spec §6).
         //
@@ -668,7 +712,9 @@ impl Markup {
             },
             subject: get_string(d, b"Subj"),
             layer: get_string(d, b"RLLayer"),
-            contents: get_string(d, b"Contents"),
+            // Normalise an empty / whitespace-only /Contents to None so a foreign or legacy
+            // blank note does not re-leak on the next redline save (G9 defect 4, read side).
+            contents: get_string(d, b"Contents").filter(|s| !s.trim().is_empty()),
             group_id: get_string(d, b"RLGroup").and_then(|s| uuid::Uuid::parse_str(&s).ok()),
             audit: Audit {
                 created_by,
@@ -984,7 +1030,7 @@ mod tests {
 
     // --- Text-anchored Highlight: /QuadPoints round-trip -----------------------------
 
-    fn sample_quads() -> Vec<super::Quad>{
+    fn sample_quads() -> Vec<super::Quad> {
         vec![
             [
                 PdfPoint { x: 72.0, y: 712.0 },
@@ -1012,7 +1058,10 @@ mod tests {
             Some("Highlight"),
             "text-anchored highlight must use the standard /Highlight subtype"
         );
-        assert!(d.has(b"QuadPoints"), "Highlight from a text selection must emit /QuadPoints");
+        assert!(
+            d.has(b"QuadPoints"),
+            "Highlight from a text selection must emit /QuadPoints"
+        );
         // /Rect (the bounding box) is still required on every annotation - a viewer with
         // no QuadPoints support at least shows the right area.
         assert!(d.has(b"Rect"), "/Rect bounding box must still be present");
@@ -1052,8 +1101,14 @@ mod tests {
         d.set(
             "QuadPoints",
             Object::Array(vec![
-                real(72.0), real(712.0), real(500.0), real(712.0),
-                real(72.0), real(700.0), real(500.0), real(700.0),
+                real(72.0),
+                real(712.0),
+                real(500.0),
+                real(712.0),
+                real(72.0),
+                real(700.0),
+                real(500.0),
+                real(700.0),
             ]),
         );
         let m = Markup::from_annotation_dict(&d);
@@ -1438,6 +1493,223 @@ mod tests {
             (back.appearance.opacity - 0.42).abs() < 1e-4,
             "must prefer /RLOpacity over /CA, got {}",
             back.appearance.opacity
+        );
+    }
+
+    // --- G9 Bluebeam-interop regression suite (2026-07-12) --------------------------------
+    //
+    // Each test asserts the STANDARD annotation-dict keys a strict foreign viewer (Bluebeam
+    // Revu) regenerates its appearance from, inspecting the raw lopdf `Dictionary` produced
+    // by `to_annotation_dict` directly (NOT via `from_annotation_dict`, so the assertion is
+    // independent of redline's own reader). Screenshots + root causes: G9 dispatch 2026-07-12.
+
+    /// Defect 2: a revision cloud must carry the standard /BE border-effect + /IT intent so
+    /// Bluebeam regenerates the scalloped arcs from the polygon vertices. Without them BB
+    /// draws the raw straight-edged polygon (the "coarse zigzag" defect).
+    #[test]
+    fn cloud_emits_border_effect_and_polygon_cloud_intent() {
+        let g = MarkupGeometry::Polyline(vec![
+            PdfPoint { x: 0.0, y: 0.0 },
+            PdfPoint { x: 100.0, y: 0.0 },
+            PdfPoint { x: 100.0, y: 80.0 },
+            PdfPoint { x: 0.0, y: 80.0 },
+        ]);
+        let d = fixture(g, MarkupType::Cloud).to_annotation_dict();
+        assert_eq!(get_name(&d, b"Subtype").as_deref(), Some("Polygon"));
+        assert!(d.has(b"Vertices"), "cloud must carry the polygon /Vertices");
+        let be = d
+            .get(b"BE")
+            .expect("cloud must emit a /BE border effect")
+            .as_dict()
+            .expect("/BE is a dictionary");
+        assert_eq!(
+            be.get(b"S").unwrap().as_name().unwrap(),
+            b"C",
+            "/BE /S must be Cloudy"
+        );
+        let i = be
+            .get(b"I")
+            .expect("/BE /I intensity present")
+            .as_float()
+            .unwrap();
+        assert!(
+            i > 0.0,
+            "/BE /I must be a positive cloud intensity, got {i}"
+        );
+        assert_eq!(
+            get_name(&d, b"IT").as_deref(),
+            Some("PolygonCloud"),
+            "cloud must declare /IT PolygonCloud so viewers treat the polygon as a cloud"
+        );
+        // A plain (non-cloud) polygon must NOT get a border effect.
+        let plain = fixture(
+            MarkupGeometry::Polyline(vec![
+                PdfPoint { x: 0.0, y: 0.0 },
+                PdfPoint { x: 10.0, y: 0.0 },
+                PdfPoint { x: 10.0, y: 10.0 },
+            ]),
+            MarkupType::Polygon,
+        )
+        .to_annotation_dict();
+        assert!(
+            !plain.has(b"BE"),
+            "a plain Polygon must not carry a /BE cloud effect"
+        );
+    }
+
+    /// Defect 3: a Highlight must publish its real opacity on the STANDARD /CA key so a
+    /// viewer that regenerates the highlight (Bluebeam) renders a translucent wash. Every
+    /// other markup keeps /CA == 1.0 (opacity lives inside the /AP; see the /CA comment in
+    /// to_annotation_dict) so /AP-honouring viewers do not double-dim.
+    #[test]
+    fn highlight_ca_carries_real_opacity_other_shapes_stay_opaque() {
+        let quads = vec![[
+            PdfPoint { x: 0.0, y: 10.0 },
+            PdfPoint { x: 40.0, y: 10.0 },
+            PdfPoint { x: 0.0, y: 0.0 },
+            PdfPoint { x: 40.0, y: 0.0 },
+        ]];
+        let mut hl = fixture(MarkupGeometry::Quads(quads), MarkupType::Highlight);
+        hl.appearance.opacity = 0.35;
+        let d = hl.to_annotation_dict();
+        let ca = d.get(b"CA").unwrap().as_float().unwrap();
+        assert!(
+            (ca - 0.35).abs() < 1e-4,
+            "Highlight /CA must carry the real opacity for foreign viewers, got {ca}"
+        );
+
+        let mut rect = fixture(
+            MarkupGeometry::Rect {
+                min: PdfPoint { x: 0.0, y: 0.0 },
+                max: PdfPoint { x: 10.0, y: 10.0 },
+            },
+            MarkupType::Rectangle,
+        );
+        rect.appearance.opacity = 0.35;
+        let cad = rect
+            .to_annotation_dict()
+            .get(b"CA")
+            .unwrap()
+            .as_float()
+            .unwrap();
+        assert!(
+            (cad - 1.0).abs() < 1e-6,
+            "non-highlight /CA must stay 1.0, got {cad}"
+        );
+    }
+
+    /// Defect 4: a Line/Arrow with no user-typed note must NOT leak a /Contents or /Popup
+    /// (Bluebeam renders any /Contents as an attached comment note). An empty / whitespace
+    /// note counts as no note. A real note is still emitted.
+    #[test]
+    fn line_without_note_emits_no_contents_or_popup() {
+        let geom = || {
+            MarkupGeometry::Polyline(vec![
+                PdfPoint { x: 0.0, y: 0.0 },
+                PdfPoint { x: 50.0, y: 50.0 },
+            ])
+        };
+        let mut m = Markup::new(
+            MarkupType::Line,
+            0,
+            geom(),
+            Appearance::default(),
+            user("Alice"),
+        );
+        m.contents = None;
+        let d = m.to_annotation_dict();
+        assert!(
+            !d.has(b"Contents"),
+            "a line with no note must not emit /Contents"
+        );
+        assert!(!d.has(b"Popup"), "redline must never emit a /Popup object");
+
+        m.contents = Some("   ".into());
+        assert!(
+            !m.to_annotation_dict().has(b"Contents"),
+            "a whitespace-only note must be treated as no note"
+        );
+
+        m.contents = Some("check clearance".into());
+        assert_eq!(
+            get_string(&m.to_annotation_dict(), b"Contents").as_deref(),
+            Some("check clearance"),
+            "a real user note is still emitted on /Contents"
+        );
+    }
+
+    /// Defect 4 (read side): a foreign / legacy annotation carrying an empty /Contents ()
+    /// must import as no note, so a redline re-save does not re-leak it.
+    #[test]
+    fn empty_contents_imports_as_none() {
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("Line"));
+        d.set("Contents", Object::string_literal(""));
+        assert!(
+            Markup::from_annotation_dict(&d).contents.is_none(),
+            "an empty /Contents must import as None"
+        );
+    }
+
+    /// Defect 5: a count marker must serialise with a subtype a foreign viewer renders via
+    /// its /AP (Stamp) and a NON-ZERO /Rect around the point - the previous FreeText subtype
+    /// with a zero-size /Rect was dropped entirely by Bluebeam. redline still recovers the
+    /// MeasurementCount type (via /RLType) and the exact point (from the /Rect centre).
+    #[test]
+    fn count_marker_uses_stamp_subtype_and_nonzero_centred_rect() {
+        let g = MarkupGeometry::Point(PdfPoint { x: 42.0, y: 99.0 });
+        let d = fixture(g, MarkupType::MeasurementCount).to_annotation_dict();
+        assert_eq!(
+            get_name(&d, b"Subtype").as_deref(),
+            Some("Stamp"),
+            "count markers must use a subtype foreign viewers render from /AP"
+        );
+        let r = get_reals(&d, b"Rect").expect("/Rect present");
+        assert_eq!(r.len(), 4);
+        assert!(
+            (r[2] - r[0]).abs() > 1.0 && (r[3] - r[1]).abs() > 1.0,
+            "count /Rect must be non-degenerate so Bluebeam renders it, got {r:?}"
+        );
+        assert!(
+            ((r[0] + r[2]) / 2.0 - 42.0).abs() < 1e-6 && ((r[1] + r[3]) / 2.0 - 99.0).abs() < 1e-6,
+            "the point must sit at the /Rect centre, got {r:?}"
+        );
+        // Round-trips back to the exact point + MeasurementCount type.
+        let back = Markup::from_annotation_dict(&d);
+        assert_eq!(back.markup_type, MarkupType::MeasurementCount);
+        match back.geometry {
+            MarkupGeometry::Point(p) => {
+                assert!(
+                    (p.x - 42.0).abs() < 1e-6 && (p.y - 99.0).abs() < 1e-6,
+                    "point centre round-trips"
+                );
+            }
+            other => panic!("count marker must reload as a Point, got {other:?}"),
+        }
+    }
+
+    /// Defect 1 (dict side): the annotation /Rect for a Callout must include the synthesized
+    /// text box (which sits beyond the leader vertices), so it matches the /AP /BBox and a
+    /// strict viewer does not scale the appearance. The plain leader bbox omits the box.
+    #[test]
+    fn callout_rect_includes_the_synthesized_text_box() {
+        let g = MarkupGeometry::Polyline(vec![
+            PdfPoint { x: 0.0, y: 0.0 },   // target
+            PdfPoint { x: 50.0, y: 60.0 }, // anchor (box origin)
+        ]);
+        let r = get_reals(
+            &fixture(g, MarkupType::Callout).to_annotation_dict(),
+            b"Rect",
+        )
+        .expect("/Rect present");
+        // Anchor is (50,60); the box extends right + up from it, so the rect must reach past it.
+        assert!(
+            r[2] > 50.0,
+            "/Rect right edge must include the callout box width, got {r:?}"
+        );
+        assert!(
+            r[3] > 60.0,
+            "/Rect top edge must include the callout box height, got {r:?}"
         );
     }
 }
