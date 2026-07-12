@@ -37,6 +37,12 @@ fn real(v: f64) -> Object {
     Object::Real(v as f32)
 }
 
+/// Highlighter wash factor: the fraction of `appearance.opacity` a Highlight is actually
+/// painted at. Mirrors `HIGHLIGHT_FILL_ALPHA` in `src/lib/markup-render.ts` (redline's own
+/// viewer renders a highlight at `opacity * 0.35`), so the exported `/CA` matches what the
+/// user sees on screen instead of a fully opaque fill (G9 defect 3).
+const HIGHLIGHT_WASH_ALPHA: f64 = 0.35;
+
 fn get_string(d: &Dictionary, key: &[u8]) -> Option<String> {
     d.get(key)
         .ok()?
@@ -453,14 +459,16 @@ impl Markup {
         // losslessly for our own round-trip via the private /RLOpacity key below.
         // Highlight is the one exception to the /CA == 1.0 rule: a strict viewer (Bluebeam)
         // REGENERATES the highlight wash from /C + /CA + /QuadPoints and ignores our /AP, so
-        // without the real opacity on /CA it renders a fully opaque, unreadable fill (G9
-        // defect 3). The Highlight /AP paints fully opaque under a Multiply blend and lets
-        // this /CA supply the wash as a group alpha, so /AP-honouring viewers (Acrobat) match
-        // the regenerated result with no double-dim.
+        // without the real wash alpha on /CA it renders a fully opaque, unreadable fill (G9
+        // defect 3). The wash alpha is `opacity * HIGHLIGHT_WASH_ALPHA` - the exact fraction
+        // redline's own viewer paints (markup-render.ts), NOT the raw opacity. The Highlight
+        // /AP paints fully opaque under a Multiply blend and lets this /CA supply the wash as
+        // a group alpha, so /AP-honouring viewers (Acrobat) match the regenerated result with
+        // no double-dim.
         d.set(
             "CA",
             real(if matches!(t, MarkupType::Highlight) {
-                self.appearance.opacity
+                self.appearance.opacity * HIGHLIGHT_WASH_ALPHA
             } else {
                 1.0
             }),
@@ -1557,12 +1565,13 @@ mod tests {
         );
     }
 
-    /// Defect 3: a Highlight must publish its real opacity on the STANDARD /CA key so a
-    /// viewer that regenerates the highlight (Bluebeam) renders a translucent wash. Every
-    /// other markup keeps /CA == 1.0 (opacity lives inside the /AP; see the /CA comment in
-    /// to_annotation_dict) so /AP-honouring viewers do not double-dim.
+    /// Defect 3: a Highlight must publish its real WASH alpha (opacity * HIGHLIGHT_WASH_ALPHA,
+    /// the fraction redline's own viewer paints) on the STANDARD /CA key so a viewer that
+    /// regenerates the highlight (Bluebeam) renders the same translucent wash - not a fully
+    /// opaque fill, and not the raw opacity. Every other markup keeps /CA == 1.0 (opacity
+    /// lives inside the /AP; see the /CA comment in to_annotation_dict).
     #[test]
-    fn highlight_ca_carries_real_opacity_other_shapes_stay_opaque() {
+    fn highlight_ca_carries_real_wash_alpha_other_shapes_stay_opaque() {
         let quads = vec![[
             PdfPoint { x: 0.0, y: 10.0 },
             PdfPoint { x: 40.0, y: 10.0 },
@@ -1570,12 +1579,17 @@ mod tests {
             PdfPoint { x: 40.0, y: 0.0 },
         ]];
         let mut hl = fixture(MarkupGeometry::Quads(quads), MarkupType::Highlight);
-        hl.appearance.opacity = 0.35;
+        hl.appearance.opacity = 0.8;
         let d = hl.to_annotation_dict();
-        let ca = d.get(b"CA").unwrap().as_float().unwrap();
+        let ca = d.get(b"CA").unwrap().as_float().unwrap() as f64;
+        let expected = 0.8 * HIGHLIGHT_WASH_ALPHA; // 0.28 - matches the on-screen wash
         assert!(
-            (ca - 0.35).abs() < 1e-4,
-            "Highlight /CA must carry the real opacity for foreign viewers, got {ca}"
+            (ca - expected).abs() < 1e-4,
+            "Highlight /CA must carry the wash alpha (opacity*{HIGHLIGHT_WASH_ALPHA}={expected}), got {ca}"
+        );
+        assert!(
+            ca < 0.8,
+            "wash /CA must be dimmer than raw opacity, got {ca}"
         );
 
         let mut rect = fixture(

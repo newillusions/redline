@@ -82,6 +82,14 @@ fn nm_of(d: &Dictionary) -> Option<String> {
         .map(|b| String::from_utf8_lossy(b).into_owned())
 }
 
+/// The `/Parent` object reference of an annotation (a `/Popup`'s owning markup), if present.
+fn parent_ref(d: &Dictionary) -> Option<ObjectId> {
+    match d.get(b"Parent").ok()? {
+        Object::Reference(r) => Some(*r),
+        _ => None,
+    }
+}
+
 /// True if redline owns this annotation (replace-on-save).
 ///
 /// INTENTIONAL ownership stance: any /RLType-bearing annotation is treated as
@@ -104,14 +112,33 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
     let mut kept: std::collections::BTreeMap<ObjectId, Vec<Object>> =
         std::collections::BTreeMap::new();
     for page_id in pages.values() {
+        let annots = page_annots(doc, *page_id)?;
+        // Object ids of the foreign annotations a /Popup may legitimately parent to: kept
+        // (not redline-managed) and not themselves popups. A redline-owned markup is
+        // rewritten to a FRESH object on every save, so a foreign /Popup still parented to
+        // one (e.g. a Bluebeam-added popup on a redline arrow) is orphaned and must be
+        // dropped - otherwise it shows as a phantom comment note in Bluebeam (G9 defect 4).
+        let valid_popup_parents: std::collections::HashSet<ObjectId> = annots
+            .iter()
+            .filter(|(oid, d)| {
+                oid.is_some() && !is_managed(d, &ids) && subtype(d).as_deref() != Some("Popup")
+            })
+            .filter_map(|(oid, _)| *oid)
+            .collect();
         let mut keep = Vec::new();
-        for (oid, dict) in page_annots(doc, *page_id)? {
-            if !is_managed(&dict, &ids) {
-                keep.push(match oid {
-                    Some(rid) => Object::Reference(rid),
-                    None => Object::Dictionary(dict),
-                });
+        for (oid, dict) in annots {
+            if is_managed(&dict, &ids) {
+                continue;
             }
+            if subtype(&dict).as_deref() == Some("Popup")
+                && !parent_ref(&dict).is_some_and(|p| valid_popup_parents.contains(&p))
+            {
+                continue; // orphaned popup - its owning markup is gone or being rewritten
+            }
+            keep.push(match oid {
+                Some(rid) => Object::Reference(rid),
+                None => Object::Dictionary(dict),
+            });
         }
         kept.insert(*page_id, keep);
     }
@@ -149,9 +176,15 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
             let image_id = doc.add_object(Object::Stream(color));
             xobject_refs.set(aux.name, Object::Reference(image_id));
         }
-        let ap_id = doc.add_object(Object::Stream(appearance::finish_ap_stream(built, xobject_refs)));
+        let ap_id = doc.add_object(Object::Stream(appearance::finish_ap_stream(
+            built,
+            xobject_refs,
+        )));
         let mut dict = m.to_annotation_dict();
-        dict.set("AP", Object::Dictionary(dictionary! { "N" => Object::Reference(ap_id) }));
+        dict.set(
+            "AP",
+            Object::Dictionary(dictionary! { "N" => Object::Reference(ap_id) }),
+        );
         let aid = doc.add_object(Object::Dictionary(dict));
         // Invariant: phase 1 inserted an entry for every page id in `pages`, and
         // `page_id` came from `pages`, so the lookup cannot miss.
@@ -374,6 +407,76 @@ pub(crate) mod tests {
             .any(|(_, d)| subtype(d).as_deref() == Some("Link")));
     }
 
+    /// G9 defect 4: a foreign /Popup parented to a redline markup is orphaned when the markup
+    /// is rewritten on save (redline gives it a fresh object id), so it must be dropped -
+    /// otherwise it renders as a phantom comment note in Bluebeam (which is where the popup
+    /// came from - BB auto-creates one per markup). A /Popup parented to a surviving FOREIGN
+    /// annotation is kept (its link stays valid).
+    #[test]
+    fn orphaned_popup_on_a_managed_markup_is_dropped_foreign_popup_kept() {
+        let (mut doc, page_id) = one_page_doc();
+
+        // A foreign Link + its own foreign Popup (both must survive - the link is not rewritten).
+        let link_id = doc.add_object(Object::Dictionary(link_dict()));
+        let link_popup = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Popup", "Parent" => link_id,
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+        }));
+        doc.get_dictionary_mut(page_id).unwrap().set(
+            "Annots",
+            Object::Array(vec![link_id.into(), link_popup.into()]),
+        );
+
+        // Write a redline markup, then find the object id it was assigned.
+        let m = redline_markup(0);
+        write_markups(&mut doc, std::slice::from_ref(&m)).unwrap();
+        let managed_id = page_annots(&doc, page_id)
+            .unwrap()
+            .into_iter()
+            .find(|(_, d)| d.has(b"RLType"))
+            .and_then(|(oid, _)| oid)
+            .expect("managed markup has an object id");
+
+        // Bluebeam-style: a Popup parented to the redline markup (16-char NM, no /RLType).
+        let bb_popup = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Popup", "Parent" => managed_id,
+            "NM" => Object::string_literal("RMCTWBEQGCYHWCHZ"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+        }));
+        let mut arr = match doc.get_dictionary(page_id).unwrap().get(b"Annots").unwrap() {
+            Object::Array(a) => a.clone(),
+            other => panic!("unexpected /Annots: {other:?}"),
+        };
+        arr.push(bb_popup.into());
+        doc.get_dictionary_mut(page_id)
+            .unwrap()
+            .set("Annots", Object::Array(arr));
+
+        // Re-save: the managed markup is rewritten to a NEW object -> its popup is orphaned.
+        write_markups(&mut doc, std::slice::from_ref(&m)).unwrap();
+
+        let annots = page_annots(&doc, page_id).unwrap();
+        let popups = annots
+            .iter()
+            .filter(|(_, d)| subtype(d).as_deref() == Some("Popup"))
+            .count();
+        assert_eq!(
+            popups, 1,
+            "only the foreign-parented popup survives, got {annots:?}"
+        );
+        assert!(
+            annots
+                .iter()
+                .any(|(_, d)| subtype(d).as_deref() == Some("Link")),
+            "the foreign Link is kept"
+        );
+        assert_eq!(
+            annots.iter().filter(|(_, d)| d.has(b"RLType")).count(),
+            1,
+            "the redline markup is still present (once)"
+        );
+    }
+
     #[test]
     fn second_write_replaces_not_duplicates() {
         let (mut doc, page_id) = one_page_doc();
@@ -472,12 +575,19 @@ pub(crate) mod tests {
     /// with a precise message at every step that can fail (missing key, wrong variant,
     /// dangling reference) so a broken wiring shows exactly where it broke.
     fn resolve_ap_n_stream<'a>(doc: &'a Document, dict: &Dictionary) -> &'a lopdf::Stream {
-        let ap = dict.get(b"AP").expect("/AP must be present").as_dict().expect("/AP must be a dict");
+        let ap = dict
+            .get(b"AP")
+            .expect("/AP must be present")
+            .as_dict()
+            .expect("/AP must be a dict");
         let n_ref = match ap.get(b"N").expect("/AP /N must be present") {
             Object::Reference(r) => *r,
             other => panic!("/AP /N must be an INDIRECT reference (PDF streams cannot be inline), got {other:?}"),
         };
-        match doc.get_object(n_ref).expect("/AP /N reference must resolve") {
+        match doc
+            .get_object(n_ref)
+            .expect("/AP /N reference must resolve")
+        {
             Object::Stream(s) => s,
             other => panic!("/AP /N must resolve to a Stream, got {other:?}"),
         }
@@ -499,10 +609,16 @@ pub(crate) mod tests {
             b"Form",
             "/AP /N must be a Form XObject"
         );
-        assert_eq!(stream.dict.get(b"Type").unwrap().as_name().unwrap(), b"XObject");
+        assert_eq!(
+            stream.dict.get(b"Type").unwrap().as_name().unwrap(),
+            b"XObject"
+        );
         let bbox = stream.dict.get(b"BBox").unwrap().as_array().unwrap();
         assert_eq!(bbox.len(), 4);
-        assert!(!stream.content.is_empty(), "appearance content stream must not be empty");
+        assert!(
+            !stream.content.is_empty(),
+            "appearance content stream must not be empty"
+        );
     }
 
     /// Full pipeline: a PNG-backed Stamp markup's `/AP /N` Resources must reference a REAL
@@ -520,8 +636,11 @@ pub(crate) mod tests {
             Rgba([x as u8 * 200, 50, 100, if x == 0 { 0 } else { 255 }])
         }));
         let mut png_bytes: Vec<u8> = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
-            .unwrap();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
         let png_b64 = crate::render::base64_encode(&png_bytes);
 
         let (mut doc, page_id) = one_page_doc();
@@ -533,7 +652,10 @@ pub(crate) mod tests {
                 max: PdfPoint { x: 50.0, y: 30.0 },
             },
             Appearance::default(),
-            UserRef { user_id: uuid::Uuid::new_v4(), display_name: "Alice".into() },
+            UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: "Alice".into(),
+            },
         )
         .with_stamp_asset(StampAsset::PngBase64(png_b64));
         m.contents = Some("APPROVED".into());
@@ -546,11 +668,21 @@ pub(crate) mod tests {
         let ap_stream = resolve_ap_n_stream(&doc, dict);
 
         let content = String::from_utf8(ap_stream.content.clone()).unwrap();
-        assert!(content.contains("/Im0 Do\n"), "AP content must paint the image: {content}");
-        assert!(!content.contains(" re\n"), "a real image stamp must not draw the box fallback: {content}");
+        assert!(
+            content.contains("/Im0 Do\n"),
+            "AP content must paint the image: {content}"
+        );
+        assert!(
+            !content.contains(" re\n"),
+            "a real image stamp must not draw the box fallback: {content}"
+        );
 
         let resources = ap_stream.dict.get(b"Resources").unwrap().as_dict().unwrap();
-        let xobjects = resources.get(b"XObject").expect("Resources must carry /XObject").as_dict().unwrap();
+        let xobjects = resources
+            .get(b"XObject")
+            .expect("Resources must carry /XObject")
+            .as_dict()
+            .unwrap();
         let image_ref = match xobjects.get(b"Im0").unwrap() {
             Object::Reference(r) => *r,
             other => panic!("/XObject /Im0 must be an indirect reference, got {other:?}"),
@@ -559,9 +691,23 @@ pub(crate) mod tests {
             Object::Stream(s) => s,
             other => panic!("/XObject /Im0 must resolve to a Stream, got {other:?}"),
         };
-        assert_eq!(image_stream.dict.get(b"Subtype").unwrap().as_name().unwrap(), b"Image");
-        assert_eq!(image_stream.dict.get(b"Width").unwrap().as_i64().unwrap(), 2);
-        assert_eq!(image_stream.dict.get(b"Height").unwrap().as_i64().unwrap(), 2);
+        assert_eq!(
+            image_stream
+                .dict
+                .get(b"Subtype")
+                .unwrap()
+                .as_name()
+                .unwrap(),
+            b"Image"
+        );
+        assert_eq!(
+            image_stream.dict.get(b"Width").unwrap().as_i64().unwrap(),
+            2
+        );
+        assert_eq!(
+            image_stream.dict.get(b"Height").unwrap().as_i64().unwrap(),
+            2
+        );
 
         // The RGBA source must chain to a real, separately-indirect SMask.
         let smask_ref = match image_stream.dict.get(b"SMask").unwrap() {
@@ -572,7 +718,15 @@ pub(crate) mod tests {
             Object::Stream(s) => s,
             other => panic!("/SMask must resolve to a Stream, got {other:?}"),
         };
-        assert_eq!(smask_stream.dict.get(b"ColorSpace").unwrap().as_name().unwrap(), b"DeviceGray");
+        assert_eq!(
+            smask_stream
+                .dict
+                .get(b"ColorSpace")
+                .unwrap()
+                .as_name()
+                .unwrap(),
+            b"DeviceGray"
+        );
     }
 
     /// Regression guard: adding `/AP` must not change any of the semantic keys
@@ -593,7 +747,10 @@ pub(crate) mod tests {
             0,
             MarkupGeometry::Quads(quads),
             Appearance::default(),
-            UserRef { user_id: uuid::Uuid::new_v4(), display_name: "Alice".into() },
+            UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: "Alice".into(),
+            },
         );
         let expected = m.to_annotation_dict();
 
@@ -602,7 +759,9 @@ pub(crate) mod tests {
         let (_, got) = &annots[0];
 
         for (key, expected_val) in expected.iter() {
-            let got_val = got.get(key).unwrap_or_else(|_| panic!("missing semantic key {:?}", String::from_utf8_lossy(key)));
+            let got_val = got.get(key).unwrap_or_else(|_| {
+                panic!("missing semantic key {:?}", String::from_utf8_lossy(key))
+            });
             assert_eq!(
                 format!("{got_val:?}"),
                 format!("{expected_val:?}"),
@@ -612,7 +771,10 @@ pub(crate) mod tests {
         }
         // /AP is the ONLY new key relative to to_annotation_dict()'s own output.
         assert!(got.has(b"AP"), "/AP must be added");
-        assert!(!expected.has(b"AP"), "to_annotation_dict() itself still never sets /AP directly");
+        assert!(
+            !expected.has(b"AP"),
+            "to_annotation_dict() itself still never sets /AP directly"
+        );
     }
 
     /// Coverage sweep: one representative markup per shape family gets a non-empty `/AP`.
@@ -620,7 +782,10 @@ pub(crate) mod tests {
     #[test]
     fn write_markups_gives_every_shape_family_a_non_empty_appearance() {
         fn user() -> UserRef {
-            UserRef { user_id: uuid::Uuid::new_v4(), display_name: "Alice".into() }
+            UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: "Alice".into(),
+            }
         }
         fn markup(t: MarkupType, g: MarkupGeometry) -> Markup {
             Markup::new(t, 0, g, Appearance::default(), user())
@@ -676,7 +841,9 @@ pub(crate) mod tests {
         for id in ids {
             let (_, dict) = annots
                 .iter()
-                .find(|(_, d)| get_string_for_test(d, b"NM").as_deref() == Some(id.to_string().as_str()))
+                .find(|(_, d)| {
+                    get_string_for_test(d, b"NM").as_deref() == Some(id.to_string().as_str())
+                })
                 .expect("every markup must be present");
             let stream = resolve_ap_n_stream(&doc, dict);
             assert!(
@@ -688,8 +855,18 @@ pub(crate) mod tests {
     }
 
     fn get_string_for_test(d: &Dictionary, key: &[u8]) -> Option<String> {
-        d.get(key).ok()?.as_str().ok().map(|b| String::from_utf8_lossy(b).into_owned())
-            .or_else(|| d.get(key).ok()?.as_name().ok().map(|b| String::from_utf8_lossy(b).into_owned()))
+        d.get(key)
+            .ok()?
+            .as_str()
+            .ok()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .or_else(|| {
+                d.get(key)
+                    .ok()?
+                    .as_name()
+                    .ok()
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+            })
     }
 
     // -----------------------------------------------------------------------
@@ -722,7 +899,8 @@ pub(crate) mod tests {
         }
 
         fn fixed_ts(secs_offset: i64) -> DateTime<Utc> {
-            Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap() + chrono::Duration::seconds(secs_offset)
+            Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap()
+                + chrono::Duration::seconds(secs_offset)
         }
 
         fn full_appearance() -> Appearance {
@@ -780,7 +958,10 @@ pub(crate) mod tests {
 
             let rect = || MarkupGeometry::Rect {
                 min: PdfPoint { x: 12.25, y: 34.5 },
-                max: PdfPoint { x: 212.75, y: 134.125 },
+                max: PdfPoint {
+                    x: 212.75,
+                    y: 134.125,
+                },
             };
             let line2 = || {
                 MarkupGeometry::Polyline(vec![
@@ -842,11 +1023,17 @@ pub(crate) mod tests {
             let mut out = Vec::new();
 
             let mut text = matrix_markup(MarkupType::Text, rect(), creator.clone());
-            text.appearance.font = Some(FontSpec { family: "Helvetica".into(), size_pt: 14.0 });
+            text.appearance.font = Some(FontSpec {
+                family: "Helvetica".into(),
+                size_pt: 14.0,
+            });
             out.push(text);
 
             let mut callout = matrix_markup(MarkupType::Callout, poly3(), creator.clone());
-            callout.appearance.font = Some(FontSpec { family: "Times New Roman".into(), size_pt: 11.0 });
+            callout.appearance.font = Some(FontSpec {
+                family: "Times New Roman".into(),
+                size_pt: 11.0,
+            });
             out.push(callout);
 
             out.push(matrix_markup(MarkupType::Cloud, poly4(), creator.clone()));
@@ -862,11 +1049,23 @@ pub(crate) mod tests {
             out.push(matrix_markup(MarkupType::Polygon, poly3(), creator.clone()));
             out.push(matrix_markup(MarkupType::Line, line3(), creator.clone()));
             out.push(matrix_markup(MarkupType::Arrow, line2(), creator.clone()));
-            out.push(matrix_markup(MarkupType::Polyline, poly3(), creator.clone()));
-            out.push(matrix_markup(MarkupType::Highlight, quads(), creator.clone()));
+            out.push(matrix_markup(
+                MarkupType::Polyline,
+                poly3(),
+                creator.clone(),
+            ));
+            out.push(matrix_markup(
+                MarkupType::Highlight,
+                quads(),
+                creator.clone(),
+            ));
             out.push(matrix_markup(MarkupType::Ink, ink(), creator.clone()));
             out.push(matrix_markup(MarkupType::Stamp, rect(), creator.clone()));
-            out.push(matrix_markup(MarkupType::StampDynamic, rect(), creator.clone()));
+            out.push(matrix_markup(
+                MarkupType::StampDynamic,
+                rect(),
+                creator.clone(),
+            ));
 
             let mut ml = matrix_markup(MarkupType::MeasurementLength, line2(), creator.clone());
             ml.measurement = Some(measurement(None, None));
@@ -923,13 +1122,21 @@ pub(crate) mod tests {
 
         fn assert_geometry_close(a: &MarkupGeometry, b: &MarkupGeometry, ctx: &str) {
             match (a, b) {
-                (MarkupGeometry::Point(p), MarkupGeometry::Point(q)) => assert_pt_close(*p, *q, ctx),
+                (MarkupGeometry::Point(p), MarkupGeometry::Point(q)) => {
+                    assert_pt_close(*p, *q, ctx)
+                }
                 (MarkupGeometry::Rect { min, max }, MarkupGeometry::Rect { min: m2, max: x2 }) => {
                     assert_pt_close(*min, *m2, ctx);
                     assert_pt_close(*max, *x2, ctx);
                 }
                 (MarkupGeometry::Polyline(u), MarkupGeometry::Polyline(v)) => {
-                    assert_eq!(u.len(), v.len(), "{ctx}: polyline point count {} != {}", u.len(), v.len());
+                    assert_eq!(
+                        u.len(),
+                        v.len(),
+                        "{ctx}: polyline point count {} != {}",
+                        u.len(),
+                        v.len()
+                    );
                     for (p, q) in u.iter().zip(v) {
                         assert_pt_close(*p, *q, ctx);
                     }
@@ -970,7 +1177,10 @@ pub(crate) mod tests {
             assert_eq!(got.layer, orig.layer, "{ctx}: layer");
             assert_eq!(got.group_id, orig.group_id, "{ctx}: group_id");
 
-            assert_eq!(got.appearance.color, orig.appearance.color, "{ctx}: appearance.color");
+            assert_eq!(
+                got.appearance.color, orig.appearance.color,
+                "{ctx}: appearance.color"
+            );
             assert!(
                 (got.appearance.line_weight - orig.appearance.line_weight).abs() < 0.01,
                 "{ctx}: line_weight {} != {}",
@@ -984,7 +1194,10 @@ pub(crate) mod tests {
                 orig.appearance.opacity
             );
             assert_eq!(got.appearance.fill, orig.appearance.fill, "{ctx}: fill");
-            assert_eq!(got.appearance.line_style, orig.appearance.line_style, "{ctx}: line_style");
+            assert_eq!(
+                got.appearance.line_style, orig.appearance.line_style,
+                "{ctx}: line_style"
+            );
             assert_eq!(got.appearance.font, orig.appearance.font, "{ctx}: font");
             assert_eq!(
                 got.appearance.outline_color, orig.appearance.outline_color,
@@ -997,15 +1210,39 @@ pub(crate) mod tests {
                 (g, o) => assert_eq!(g, o, "{ctx}: fill_opacity"),
             }
 
-            assert_eq!(got.workflow.status, orig.workflow.status, "{ctx}: workflow.status");
-            assert_eq!(got.workflow.assignee, orig.workflow.assignee, "{ctx}: workflow.assignee");
-            assert_eq!(got.workflow.thread, orig.workflow.thread, "{ctx}: workflow.thread");
+            assert_eq!(
+                got.workflow.status, orig.workflow.status,
+                "{ctx}: workflow.status"
+            );
+            assert_eq!(
+                got.workflow.assignee, orig.workflow.assignee,
+                "{ctx}: workflow.assignee"
+            );
+            assert_eq!(
+                got.workflow.thread, orig.workflow.thread,
+                "{ctx}: workflow.thread"
+            );
 
-            assert_eq!(got.audit.created_by, orig.audit.created_by, "{ctx}: audit.created_by");
-            assert_eq!(got.audit.modified_by, orig.audit.modified_by, "{ctx}: audit.modified_by");
-            assert_eq!(got.audit.created_at, orig.audit.created_at, "{ctx}: audit.created_at");
-            assert_eq!(got.audit.modified_at, orig.audit.modified_at, "{ctx}: audit.modified_at");
-            assert_eq!(got.audit.revision, orig.audit.revision, "{ctx}: audit.revision");
+            assert_eq!(
+                got.audit.created_by, orig.audit.created_by,
+                "{ctx}: audit.created_by"
+            );
+            assert_eq!(
+                got.audit.modified_by, orig.audit.modified_by,
+                "{ctx}: audit.modified_by"
+            );
+            assert_eq!(
+                got.audit.created_at, orig.audit.created_at,
+                "{ctx}: audit.created_at"
+            );
+            assert_eq!(
+                got.audit.modified_at, orig.audit.modified_at,
+                "{ctx}: audit.modified_at"
+            );
+            assert_eq!(
+                got.audit.revision, orig.audit.revision,
+                "{ctx}: audit.revision"
+            );
             assert_eq!(got.audit.origin, orig.audit.origin, "{ctx}: audit.origin");
 
             assert_eq!(got.measurement, orig.measurement, "{ctx}: measurement");
@@ -1015,19 +1252,31 @@ pub(crate) mod tests {
         #[test]
         fn full_type_matrix_round_trips_every_field_and_is_idempotent_on_a_second_write() {
             let originals = full_fixture_set();
-            assert_eq!(originals.len(), 20, "fixture set must cover all 20 MarkupType variants");
+            assert_eq!(
+                originals.len(),
+                20,
+                "fixture set must cover all 20 MarkupType variants"
+            );
 
             // First write -> real Document -> read back.
             let (mut doc1, _page_id) = one_page_doc();
             write_markups(&mut doc1, &originals).unwrap();
             let reread1 = read_markups(&doc1).unwrap();
-            assert_eq!(reread1.len(), originals.len(), "every fixture must survive the round-trip");
+            assert_eq!(
+                reread1.len(),
+                originals.len(),
+                "every fixture must survive the round-trip"
+            );
             for orig in &originals {
                 let got = reread1
                     .iter()
                     .find(|m| m.id() == orig.id())
                     .unwrap_or_else(|| {
-                        panic!("{:?} (id {}) missing after round-trip", orig.markup_type, orig.id())
+                        panic!(
+                            "{:?} (id {}) missing after round-trip",
+                            orig.markup_type,
+                            orig.id()
+                        )
                     });
                 assert_markup_fidelity(orig, got);
             }
@@ -1043,7 +1292,13 @@ pub(crate) mod tests {
                 let m2 = reread2
                     .iter()
                     .find(|m| m.id() == m1.id())
-                    .unwrap_or_else(|| panic!("{:?} (id {}) missing on second write", m1.markup_type, m1.id()));
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{:?} (id {}) missing on second write",
+                            m1.markup_type,
+                            m1.id()
+                        )
+                    });
                 assert_markup_fidelity(m1, m2);
             }
         }
