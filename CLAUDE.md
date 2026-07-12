@@ -46,6 +46,18 @@ Gotchas: `default-run = "redline"` is set (the headless `bench` bin otherwise br
 `cargo run`). The §20 corpus is machine-local and gitignored (`bench/corpus/`). Benchmark
 procedure: `bench/RUNBOOK-S20.md`.
 
+## Releasing (desktop, auto-updater)
+
+Windows + macOS installers build on **GitHub-hosted runners** (`.github/workflows/build-releases.yml`); the Forgejo self-hosted runner is Linux-only and cannot produce them. Two git remotes, both configured: `origin` (Forgejo, source of truth + container/CI) and `github` (`newillusions/redline`, the desktop build runner). A release fires on a `v*` tag pushed to **GitHub** (the tag drives the manifest version and artifact filenames; the `update-manifest` job commits `update.json` back to GitHub `main`).
+
+**Bump the source version BEFORE tagging - this is load-bearing.** The workflow derives `update.json`'s advertised version and the artifact filenames from the git tag, but the built app reports its *own* version from the source fields. If they disagree, the in-app updater offers the "new" version on every launch forever (installed `<` advertised, but installing never changes the installed number). Incident 2026-07-11: v0.3.2 was tagged on a docs commit with the source still at 0.3.1 → infinite update loop; fixed by shipping 0.3.3 with the bump. (obs:uxwsluoras8c1hir86wx)
+
+Release steps:
+1. Bump **all** version carriers to the target: `src-tauri/tauri.conf.json` (`version`), `src-tauri/Cargo.toml` (`[package] version`), `package.json` (`version`), then `cargo update -p redline --precise <ver>` to sync `Cargo.lock`. Commit (`chore(release): bump version to <ver>`).
+2. Tag `v<ver>` on the bump commit and push the tag to **both** remotes (`git push origin v<ver>` and `git push github v<ver>`). The `github` push triggers the build.
+3. After the build: verify not just `update.json`'s `version` field but the **built artifact** - decode a platform signature's trusted-comment (`file:<name>`); it embeds the real built filename and reveals a version mismatch the manifest field hides.
+4. Re-releasing under a fresh number (e.g. burn a bad tag, ship the next patch) is cleaner than force-rewriting a tag when an auto-updater is in play.
+
 ## Build Order (milestones)
 M1 shell + tiled render (large-file perf is the make-or-break test - validate on 300 MB+ sets early) → M2 markup + Tool Sets + `.btx` importer → M3 takeoff → M4 Sets/versioning + page ops + search/OCR → M5 `docops` baseline → M6 (Phase 1.1) compare. Full detail in spec §13.
 
