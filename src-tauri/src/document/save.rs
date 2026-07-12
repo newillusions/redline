@@ -489,6 +489,147 @@ mod tests {
         eprintln!("G9 sample PDF written to: {out}");
     }
 
+    /// One markup per G9 Bluebeam-interop defect (2026-07-12 fix), for the human
+    /// Acrobat/Bluebeam re-check. Run on demand:
+    ///   cargo test g9_emit_interop_sample -- --ignored --nocapture
+    /// Writes to `$REDLINE_G9_INTEROP_SAMPLE` (default `/tmp/redline-g9-interop-sample.pdf`).
+    #[test]
+    #[ignore]
+    fn g9_emit_interop_sample_pdf_for_external_viewer_check() {
+        use crate::geometry::PdfPoint;
+        use crate::markup::{
+            Appearance, CountSet, CountSymbol, FontSpec, MarkupGeometry, MarkupType, UserRef,
+        };
+
+        let out = std::env::var("REDLINE_G9_INTEROP_SAMPLE")
+            .unwrap_or_else(|_| "/tmp/redline-g9-interop-sample.pdf".to_string());
+        let user = UserRef {
+            user_id: uuid::Uuid::new_v4(),
+            display_name: "Alice".into(),
+        };
+        let mk = |t, g, a: Appearance| Markup::new(t, 0, g, a, user.clone());
+
+        let mut markups: Vec<Markup> = Vec::new();
+
+        // Defect 1: a wide, short resized FreeText box (the padded-BBox rescale case).
+        let mut ft = mk(
+            MarkupType::Text,
+            MarkupGeometry::Rect {
+                min: PdfPoint { x: 60.0, y: 690.0 },
+                max: PdfPoint { x: 430.0, y: 730.0 },
+            },
+            Appearance {
+                color: "#cc3300".into(),
+                fill: Some("#ddeeff".into()),
+                outline_color: Some("#0044aa".into()),
+                font: Some(FontSpec {
+                    family: "Helvetica".into(),
+                    size_pt: 22.0,
+                }),
+                ..Appearance::default()
+            },
+        );
+        ft.contents = Some("Resized FreeText - should stay this size in Bluebeam".into());
+        markups.push(ft);
+
+        // Defect 2: a revision cloud (should show scallops, not a zigzag).
+        markups.push(mk(
+            MarkupType::Cloud,
+            MarkupGeometry::Polyline(vec![
+                PdfPoint { x: 70.0, y: 560.0 },
+                PdfPoint { x: 300.0, y: 600.0 },
+                PdfPoint { x: 320.0, y: 470.0 },
+                PdfPoint { x: 90.0, y: 450.0 },
+            ]),
+            Appearance {
+                color: "#cc0000".into(),
+                line_weight: 2.0,
+                ..Appearance::default()
+            },
+        ));
+
+        // Defect 3: a translucent highlight over count-set text (must stay readable).
+        markups.push(mk(
+            MarkupType::Highlight,
+            MarkupGeometry::Quads(vec![[
+                PdfPoint { x: 70.0, y: 410.0 },
+                PdfPoint { x: 360.0, y: 410.0 },
+                PdfPoint { x: 70.0, y: 392.0 },
+                PdfPoint { x: 360.0, y: 392.0 },
+            ]]),
+            Appearance {
+                color: "#ffdd00".into(),
+                opacity: 0.4,
+                ..Appearance::default()
+            },
+        ));
+
+        // Defect 4: a plain line + arrow with NO note (must carry no comment in Bluebeam).
+        markups.push(mk(
+            MarkupType::Line,
+            MarkupGeometry::Polyline(vec![
+                PdfPoint { x: 70.0, y: 350.0 },
+                PdfPoint { x: 300.0, y: 350.0 },
+            ]),
+            Appearance {
+                color: "#008800".into(),
+                line_weight: 2.0,
+                ..Appearance::default()
+            },
+        ));
+        markups.push(mk(
+            MarkupType::Arrow,
+            MarkupGeometry::Polyline(vec![
+                PdfPoint { x: 70.0, y: 320.0 },
+                PdfPoint { x: 300.0, y: 300.0 },
+            ]),
+            Appearance {
+                color: "#008800".into(),
+                line_weight: 2.0,
+                ..Appearance::default()
+            },
+        ));
+
+        // Defect 5: count markers (must appear in Bluebeam, not vanish).
+        for (i, (sym, color)) in [
+            (CountSymbol::Circle, "#ee0000"),
+            (CountSymbol::Square, "#0000ee"),
+            (CountSymbol::Triangle, "#008800"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut c = mk(
+                MarkupType::MeasurementCount,
+                MarkupGeometry::Point(PdfPoint {
+                    x: 400.0 + (i as f64) * 40.0,
+                    y: 300.0,
+                }),
+                Appearance {
+                    color: color.into(),
+                    ..Appearance::default()
+                },
+            );
+            c.count_set = Some(CountSet {
+                id: uuid::Uuid::new_v4(),
+                name: format!("Count-{i}"),
+                color: color.into(),
+                symbol: sym,
+            });
+            markups.push(c);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.pdf");
+        let (mut doc, _) = one_page_doc();
+        doc.save(&src).unwrap();
+        save_with_markups(&src, std::path::Path::new(&out), &markups).unwrap();
+        eprintln!(
+            "G9 interop sample PDF ({} markups) written to: {out}",
+            markups.len()
+        );
+    }
+
     /// Bluebeam interop ship gate: a saved markup's `/AP /N` appearance stream survives a
     /// REAL file save -> reopen (not just dict<->dict) as a resolvable indirect Form
     /// XObject with a non-empty content stream. This is what makes redline-authored PDFs
@@ -512,7 +653,9 @@ mod tests {
         let page = reopened.get_dictionary(page_id).unwrap();
         let annots = match page.get(b"Annots").unwrap() {
             lopdf::Object::Array(a) => a.clone(),
-            lopdf::Object::Reference(r) => reopened.get_object(*r).unwrap().as_array().unwrap().clone(),
+            lopdf::Object::Reference(r) => {
+                reopened.get_object(*r).unwrap().as_array().unwrap().clone()
+            }
             other => panic!("unexpected /Annots shape: {other:?}"),
         };
         assert_eq!(annots.len(), 1);
@@ -521,7 +664,11 @@ mod tests {
             other => panic!("expected an indirect annotation, got {other:?}"),
         };
 
-        let ap = annot_dict.get(b"AP").expect("/AP must survive the file round-trip").as_dict().unwrap();
+        let ap = annot_dict
+            .get(b"AP")
+            .expect("/AP must survive the file round-trip")
+            .as_dict()
+            .unwrap();
         let n_ref = match ap.get(b"N").expect("/AP /N must be present") {
             lopdf::Object::Reference(r) => *r,
             other => panic!("/AP /N must be an indirect reference, got {other:?}"),
@@ -530,8 +677,14 @@ mod tests {
             lopdf::Object::Stream(s) => s,
             other => panic!("/AP /N must resolve to a Stream, got {other:?}"),
         };
-        assert_eq!(stream.dict.get(b"Subtype").unwrap().as_name().unwrap(), b"Form");
-        assert!(!stream.content.is_empty(), "appearance content must survive the file round-trip");
+        assert_eq!(
+            stream.dict.get(b"Subtype").unwrap().as_name().unwrap(),
+            b"Form"
+        );
+        assert!(
+            !stream.content.is_empty(),
+            "appearance content must survive the file round-trip"
+        );
     }
 
     #[test]
@@ -603,5 +756,164 @@ mod tests {
             tile.width_px > 0 && tile.height_px > 0,
             "tile dimensions must be non-zero"
         );
+    }
+
+    // --- G9 Bluebeam-interop: /AP /BBox must equal the annotation /Rect ------------------
+    //
+    // A strict viewer (Bluebeam) maps the appearance Form's /BBox into the annotation /Rect
+    // (ISO 32000-1 12.5.5). When they disagree the whole appearance is scaled - the G9
+    // "resized FreeText renders tiny" and "count markers vanish" defects. These tests save a
+    // real PDF and re-parse it with lopdf (independent of redline's own reader), walking
+    // /Annots -> /AP -> /N, and assert /BBox == /Rect for the affected subtypes.
+
+    /// Re-parse `dest` and return every managed annotation's (subtype, /Rect, /AP /N /BBox).
+    fn annot_rect_and_bbox(dest: &std::path::Path) -> Vec<(String, [f64; 4], [f64; 4])> {
+        let doc = Document::load(dest).unwrap();
+        let mut out = Vec::new();
+        for page_id in doc.get_pages().values() {
+            let page = doc.get_dictionary(*page_id).unwrap();
+            let annots = match page.get(b"Annots") {
+                Ok(lopdf::Object::Array(a)) => a.clone(),
+                Ok(lopdf::Object::Reference(r)) => {
+                    doc.get_object(*r).unwrap().as_array().unwrap().clone()
+                }
+                _ => continue,
+            };
+            for entry in annots {
+                let dict = match &entry {
+                    lopdf::Object::Reference(r) => doc.get_dictionary(*r).unwrap(),
+                    lopdf::Object::Dictionary(d) => d,
+                    _ => continue,
+                };
+                let Ok(subtype) = dict.get(b"Subtype").and_then(|o| o.as_name()) else {
+                    continue;
+                };
+                let subtype = String::from_utf8_lossy(subtype).into_owned();
+                let reals = |o: &lopdf::Object| -> [f64; 4] {
+                    let a = o.as_array().unwrap();
+                    [
+                        a[0].as_float().unwrap() as f64,
+                        a[1].as_float().unwrap() as f64,
+                        a[2].as_float().unwrap() as f64,
+                        a[3].as_float().unwrap() as f64,
+                    ]
+                };
+                let rect = reals(dict.get(b"Rect").unwrap());
+                let ap = dict.get(b"AP").unwrap().as_dict().unwrap();
+                let n_ref = match ap.get(b"N").unwrap() {
+                    lopdf::Object::Reference(r) => *r,
+                    _ => panic!("/AP /N must be indirect"),
+                };
+                let stream = match doc.get_object(n_ref).unwrap() {
+                    lopdf::Object::Stream(s) => s,
+                    _ => panic!("/AP /N must be a stream"),
+                };
+                let bbox = reals(stream.dict.get(b"BBox").unwrap());
+                out.push((subtype, rect, bbox));
+            }
+        }
+        out
+    }
+
+    fn approx_eq(a: [f64; 4], b: [f64; 4]) -> bool {
+        a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-3)
+    }
+
+    /// Defect 1: a resized FreeText's /AP /BBox must equal its /Rect (identity map, no
+    /// Bluebeam down-scaling). Uses a wide, short box - the geometry the old padded BBox
+    /// distorted most.
+    #[test]
+    fn g9_freetext_ap_bbox_equals_rect() {
+        use crate::geometry::PdfPoint;
+        use crate::markup::{Appearance, FontSpec, MarkupGeometry, MarkupType, UserRef};
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.pdf");
+        let (mut doc, _) = one_page_doc();
+        doc.save(&src).unwrap();
+
+        let mut m = Markup::new(
+            MarkupType::Text,
+            0,
+            MarkupGeometry::Rect {
+                min: PdfPoint { x: 100.0, y: 500.0 },
+                max: PdfPoint { x: 420.0, y: 540.0 },
+            },
+            Appearance {
+                font: Some(FontSpec {
+                    family: "Helvetica".into(),
+                    size_pt: 24.0,
+                }),
+                ..Appearance::default()
+            },
+            UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: "Alice".into(),
+            },
+        );
+        m.contents = Some("Resized callout text".into());
+
+        let dest = dir.path().join("out.pdf");
+        save_with_markups(&src, &dest, std::slice::from_ref(&m)).unwrap();
+
+        let found = annot_rect_and_bbox(&dest);
+        let ft = found
+            .iter()
+            .find(|(s, ..)| s == "FreeText")
+            .expect("a FreeText annot");
+        assert!(
+            approx_eq(ft.1, ft.2),
+            "FreeText /Rect {:?} must equal /AP /BBox {:?} so Bluebeam does not rescale it",
+            ft.1,
+            ft.2
+        );
+    }
+
+    /// Defect 5: a count marker must save with a non-zero /Rect, a Stamp subtype, and an
+    /// /AP whose /BBox equals that /Rect - so a strict viewer renders it instead of dropping
+    /// the old zero-rect FreeText.
+    #[test]
+    fn g9_count_marker_saves_with_stamp_ap_and_matching_bbox() {
+        use crate::geometry::PdfPoint;
+        use crate::markup::{Appearance, MarkupGeometry, MarkupType, UserRef};
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.pdf");
+        let (mut doc, _) = one_page_doc();
+        doc.save(&src).unwrap();
+
+        let m = Markup::new(
+            MarkupType::MeasurementCount,
+            0,
+            MarkupGeometry::Point(PdfPoint { x: 300.0, y: 400.0 }),
+            Appearance::default(),
+            UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: "Alice".into(),
+            },
+        );
+
+        let dest = dir.path().join("out.pdf");
+        save_with_markups(&src, &dest, std::slice::from_ref(&m)).unwrap();
+
+        let found = annot_rect_and_bbox(&dest);
+        let (subtype, rect, bbox) = found
+            .iter()
+            .find(|(s, ..)| s == "Stamp")
+            .expect("a Stamp annot for the count marker");
+        assert_eq!(subtype, "Stamp");
+        assert!(
+            (rect[2] - rect[0]).abs() > 1.0 && (rect[3] - rect[1]).abs() > 1.0,
+            "non-zero count /Rect, got {rect:?}"
+        );
+        assert!(
+            approx_eq(*rect, *bbox),
+            "count /Rect {rect:?} must equal /AP /BBox {bbox:?}"
+        );
+
+        // And it still reloads as a MeasurementCount at the original point.
+        let back = load_markups_from(&dest, None).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].markup_type, MarkupType::MeasurementCount);
     }
 }

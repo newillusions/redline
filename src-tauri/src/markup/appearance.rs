@@ -144,7 +144,12 @@ pub(crate) struct ApBuild {
 pub(crate) fn build_ap_stream(m: &Markup) -> ApBuild {
     let bbox = ap_bbox(m);
     let (content, resources, image_xobjects) = draw(m);
-    ApBuild { bbox, content, resources, image_xobjects }
+    ApBuild {
+        bbox,
+        content,
+        resources,
+        image_xobjects,
+    }
 }
 
 /// Assemble the final Form XObject `Stream` from an [`ApBuild`] plus the resolved
@@ -170,11 +175,66 @@ pub(crate) fn finish_ap_stream(built: ApBuild, xobject_refs: Dictionary) -> Stre
 // BBox - independent of the annotation's semantic /Rect (that one stays untouched).
 // ---------------------------------------------------------------------------
 
-/// The Form's own bounding box: the geometry's tight bounds, padded so strokes, arrowheads,
-/// glyph ascenders/descenders, and count-marker symbols never clip against the edge. Point
-/// geometry (count markers) has a zero-size tight bound, so it gets a fixed radius-based pad
-/// instead of a proportional one.
+/// The annotation `/Rect` AND the `/AP` Form `/BBox` for the shapes where the two MUST be
+/// identical for a strict foreign viewer (Bluebeam) to render the appearance at the authored
+/// size. A strict viewer maps the transformed appearance `/BBox` into the annotation `/Rect`
+/// (ISO 32000-1 12.5.5); when they disagree the whole appearance is scaled/distorted. For
+/// these types the rect is the exact bounds of what the appearance draws, so `annotation.rs`
+/// uses it for `/Rect` and [`ap_bbox`] uses it for `/BBox`, giving an identity map:
+///  - `Text`: the geometry `Rect` (box == text bounds).
+///  - `Callout`: the leader bounds UNIONED with the synthesized text box, which sits beyond
+///    the leader vertices (the plain geometry bbox omits it - the "resized callout tiny in
+///    Bluebeam" G9 defect).
+///  - `MeasurementCount`: the symbol's bounds around the point. The zero-size Point geometry
+///    otherwise yields a zero `/Rect` that Bluebeam drops entirely (the "counts absent" G9
+///    defect); the point is recovered from the `/Rect` centre on read.
+///
+/// Returns `None` for every other type, whose `/Rect` stays the tight geometry bbox and whose
+/// `/BBox` keeps its stroke-padded bounds - Bluebeam regenerates those from the geometry keys
+/// and ignores the `/AP`, so the two need not match and the stroke pad avoids clipping in
+/// `/AP`-honouring viewers (Acrobat/PDFium).
+pub(crate) fn interop_rect(m: &Markup) -> Option<[f64; 4]> {
+    match (m.markup_type, &m.geometry) {
+        (MarkupType::Text, MarkupGeometry::Rect { min, max }) => Some([
+            min.x.min(max.x),
+            min.y.min(max.y),
+            min.x.max(max.x),
+            min.y.max(max.y),
+        ]),
+        (MarkupType::Callout, MarkupGeometry::Polyline(pts)) if !pts.is_empty() => {
+            let anchor = *pts.last().unwrap();
+            let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+            for p in pts {
+                x0 = x0.min(p.x);
+                y0 = y0.min(p.y);
+                x1 = x1.max(p.x);
+                y1 = y1.max(p.y);
+            }
+            // Union with the synthesized text box (anchor .. anchor + CALLOUT_BOX), which the
+            // Callout appearance draws beyond the leader vertices.
+            Some([
+                x0.min(anchor.x),
+                y0.min(anchor.y),
+                x1.max(anchor.x + CALLOUT_BOX.0),
+                y1.max(anchor.y + CALLOUT_BOX.1),
+            ])
+        }
+        (MarkupType::MeasurementCount, MarkupGeometry::Point(p)) => {
+            let pad = COUNT_MARKER_RADIUS + 4.0;
+            Some([p.x - pad, p.y - pad, p.x + pad, p.y + pad])
+        }
+        _ => None,
+    }
+}
+
+/// The Form's own bounding box: for the interop-critical types ([`interop_rect`]) it equals
+/// the annotation `/Rect` exactly (identity map, no viewer rescale); for every other type
+/// it is the geometry's tight bounds, padded so strokes, arrowheads, and glyph ascenders/
+/// descenders never clip against the edge.
 fn ap_bbox(m: &Markup) -> [f64; 4] {
+    if let Some(rect) = interop_rect(m) {
+        return rect;
+    }
     let pts: Vec<PdfPoint> = match &m.geometry {
         MarkupGeometry::Point(p) => vec![*p],
         MarkupGeometry::Rect { min, max } => vec![*min, *max],
@@ -210,7 +270,11 @@ fn ap_bbox(m: &Markup) -> [f64; 4] {
             // Callout leader can extend well past the vertex bounds once the synthesized
             // text box is placed at the anchor end; Text just needs room for the font's
             // ascent/descent beyond the tight Rect.
-            let font_pt = m.appearance.font.as_ref().map_or(DEFAULT_FONT_SIZE, |f| f.size_pt);
+            let font_pt = m
+                .appearance
+                .font
+                .as_ref()
+                .map_or(DEFAULT_FONT_SIZE, |f| f.size_pt);
             pad = pad.max(font_pt).max(CALLOUT_BOX.0.max(CALLOUT_BOX.1) + 8.0);
         }
         MarkupType::Arrow => pad = pad.max(m.appearance.line_weight.max(0.0) * 4.0 + 8.0),
@@ -252,7 +316,8 @@ impl Resources {
     /// stream order), corrupting the first scope's alpha.
     fn add_gstate(&mut self, gs: Dictionary) -> String {
         let gs_name = format!("GS{}", self.ext_gstate.len());
-        self.ext_gstate.set(gs_name.as_str(), Object::Dictionary(gs));
+        self.ext_gstate
+            .set(gs_name.as_str(), Object::Dictionary(gs));
         gs_name
     }
 
@@ -273,7 +338,8 @@ impl Resources {
 
     fn finish(mut self) -> Dictionary {
         if !self.ext_gstate.is_empty() {
-            self.dict.set("ExtGState", Object::Dictionary(self.ext_gstate));
+            self.dict
+                .set("ExtGState", Object::Dictionary(self.ext_gstate));
         }
         if !self.fonts.is_empty() {
             self.dict.set("Font", Object::Dictionary(self.fonts));
@@ -360,9 +426,9 @@ fn path_from_points(out: &mut String, pts: &[PdfPoint]) {
 /// operator semantics (`f`/`S`/`B`, `h` = close path first).
 fn paint_op(has_fill: bool, has_stroke: bool, close: bool) -> &'static str {
     match (has_fill, has_stroke, close) {
-        (true, true, true) => "b",   // close, fill (nonzero), stroke
-        (true, true, false) => "B",  // fill, stroke (no close - open path already painted as-is)
-        (true, false, true) => "f",  // close is implicit for fill
+        (true, true, true) => "b",  // close, fill (nonzero), stroke
+        (true, true, false) => "B", // fill, stroke (no close - open path already painted as-is)
+        (true, false, true) => "f", // close is implicit for fill
         (true, false, false) => "f",
         (false, true, true) => "s",  // close + stroke
         (false, true, false) => "S", // stroke only
@@ -416,10 +482,22 @@ fn count_symbol_points(kind: super::CountSymbol, cx: f64, cy: f64, r: f64) -> Ve
     };
     match kind {
         Square => vec![
-            PdfPoint { x: cx - r, y: cy - r },
-            PdfPoint { x: cx + r, y: cy - r },
-            PdfPoint { x: cx + r, y: cy + r },
-            PdfPoint { x: cx - r, y: cy + r },
+            PdfPoint {
+                x: cx - r,
+                y: cy - r,
+            },
+            PdfPoint {
+                x: cx + r,
+                y: cy - r,
+            },
+            PdfPoint {
+                x: cx + r,
+                y: cy + r,
+            },
+            PdfPoint {
+                x: cx - r,
+                y: cy + r,
+            },
         ],
         Triangle => ngon(3, std::f64::consts::FRAC_PI_2, r),
         Diamond => vec![
@@ -431,7 +509,11 @@ fn count_symbol_points(kind: super::CountSymbol, cx: f64, cy: f64, r: f64) -> Ve
         Hexagon => ngon(6, std::f64::consts::FRAC_PI_2, r),
         Star => {
             let outer = ngon(5, std::f64::consts::FRAC_PI_2, r);
-            let inner = ngon(5, std::f64::consts::FRAC_PI_2 + std::f64::consts::PI / 5.0, r * 0.4);
+            let inner = ngon(
+                5,
+                std::f64::consts::FRAC_PI_2 + std::f64::consts::PI / 5.0,
+                r * 0.4,
+            );
             let mut pts = Vec::with_capacity(10);
             for i in 0..5 {
                 pts.push(outer[i]);
@@ -451,19 +533,39 @@ fn ellipse_path(out: &mut String, cx: f64, cy: f64, rx: f64, ry: f64) {
     out.push_str(&format!("{} {} m\n", n(cx + rx), n(cy)));
     out.push_str(&format!(
         "{} {} {} {} {} {} c\n",
-        n(cx + rx), n(cy + ky), n(cx + kx), n(cy + ry), n(cx), n(cy + ry)
+        n(cx + rx),
+        n(cy + ky),
+        n(cx + kx),
+        n(cy + ry),
+        n(cx),
+        n(cy + ry)
     ));
     out.push_str(&format!(
         "{} {} {} {} {} {} c\n",
-        n(cx - kx), n(cy + ry), n(cx - rx), n(cy + ky), n(cx - rx), n(cy)
+        n(cx - kx),
+        n(cy + ry),
+        n(cx - rx),
+        n(cy + ky),
+        n(cx - rx),
+        n(cy)
     ));
     out.push_str(&format!(
         "{} {} {} {} {} {} c\n",
-        n(cx - rx), n(cy - ky), n(cx - kx), n(cy - ry), n(cx), n(cy - ry)
+        n(cx - rx),
+        n(cy - ky),
+        n(cx - kx),
+        n(cy - ry),
+        n(cx),
+        n(cy - ry)
     ));
     out.push_str(&format!(
         "{} {} {} {} {} {} c\n",
-        n(cx + kx), n(cy - ry), n(cx + rx), n(cy - ky), n(cx + rx), n(cy)
+        n(cx + kx),
+        n(cy - ry),
+        n(cx + rx),
+        n(cy - ky),
+        n(cx + rx),
+        n(cy)
     ));
     out.push_str("h\n");
 }
@@ -503,15 +605,23 @@ fn draw_text_box(out: &mut String, res: &mut Resources, a: &Appearance, rect: [f
         fill_color(out, fill);
         out.push_str(&format!(
             "{} {} {} {} re\nf\n",
-            num(rect[0]), num(rect[1]), num(rect[2] - rect[0]), num(rect[3] - rect[1])
+            num(rect[0]),
+            num(rect[1]),
+            num(rect[2] - rect[0]),
+            num(rect[3] - rect[1])
         ));
     }
     let [r, g, b] = hex_to_rgb(outline);
     out.push_str(&format!(
         "{} {} {} RG\n{} w\n{} {} {} {} re\nS\n",
-        num(r), num(g), num(b),
+        num(r),
+        num(g),
+        num(b),
         num(a.line_weight.max(0.0)),
-        num(rect[0]), num(rect[1]), num(rect[2] - rect[0]), num(rect[3] - rect[1])
+        num(rect[0]),
+        num(rect[1]),
+        num(rect[2] - rect[0]),
+        num(rect[3] - rect[1])
     ));
     out.push_str("Q\n");
 }
@@ -535,7 +645,10 @@ fn draw_stamp_box_and_label(
     }
     out.push_str(&format!(
         "{} {} {} {} re\n",
-        num(min.x), num(min.y), num(max.x - min.x), num(max.y - min.y)
+        num(min.x),
+        num(min.y),
+        num(max.x - min.x),
+        num(max.y - min.y)
     ));
     out.push_str(paint_op(a.fill.is_some(), true, false));
     out.push_str("\nQ\n");
@@ -556,12 +669,22 @@ fn draw_stamp_box_and_label(
 /// `gs` (shape_gstate: `/ca` = `a.fill_opacity` - an image paints as a non-stroking
 /// operation, so only `/ca` is meaningful; `/CA` is included too for scope consistency
 /// with every other shape's ExtGState, but has no effect on `Do`).
-fn draw_stamp_image(out: &mut String, res: &mut Resources, a: &Appearance, min: PdfPoint, max: PdfPoint, name: &str) {
+fn draw_stamp_image(
+    out: &mut String,
+    res: &mut Resources,
+    a: &Appearance,
+    min: PdfPoint,
+    max: PdfPoint,
+    name: &str,
+) {
     let gs_name = res.add_gstate(shape_gstate(a));
     let (sx, sy) = (max.x - min.x, max.y - min.y);
     out.push_str(&format!(
         "q\n/{gs_name} gs\n{} 0 0 {} {} {} cm\n/{name} Do\nQ\n",
-        num(sx), num(sy), num(min.x), num(min.y)
+        num(sx),
+        num(sy),
+        num(min.x),
+        num(min.y)
     ));
 }
 
@@ -674,7 +797,10 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>) {
             }
             out.push_str(&format!(
                 "{} {} {} {} re\n",
-                num(min.x), num(min.y), num(max.x - min.x), num(max.y - min.y)
+                num(min.x),
+                num(min.y),
+                num(max.x - min.x),
+                num(max.y - min.y)
             ));
             out.push_str(paint_op(has_fill, a.line_weight > 0.0, false));
             out.push_str("\nQ\n");
@@ -700,7 +826,10 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>) {
 
         // --- Line / Arrow / MeasurementLength / MeasurementRadius -----------------------
         (
-            MarkupType::Line | MarkupType::Arrow | MarkupType::MeasurementLength | MarkupType::MeasurementRadius,
+            MarkupType::Line
+            | MarkupType::Arrow
+            | MarkupType::MeasurementLength
+            | MarkupType::MeasurementRadius,
             MarkupGeometry::Polyline(pts),
         ) if pts.len() >= 2 => {
             // No independent fill control for these types - line_gstate() uses a.opacity
@@ -833,9 +962,15 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>) {
 
         // --- Highlight: text-anchored quads ---------------------------------------------
         (MarkupType::Highlight, MarkupGeometry::Quads(quads)) if !quads.is_empty() => {
+            // Opacity is published on the annotation-level /CA (see to_annotation_dict): a
+            // strict viewer (Bluebeam) regenerates the highlight from /C + /CA and ignores
+            // this /AP, while an /AP-honouring viewer (Acrobat) applies /CA as a group alpha
+            // over this whole form - so the form itself paints fully opaque (ca = 1.0) under
+            // the Multiply blend and lets /CA supply the wash, keeping both views identical
+            // (no double-dim).
             let gs_name = res.add_gstate(dictionary! {
                 "BM" => "Multiply",
-                "ca" => real(a.opacity),
+                "ca" => real(1.0),
             });
             out.push_str(&format!("q\n/{gs_name} gs\n"));
             fill_color(&mut out, &a.color);
@@ -851,15 +986,24 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>) {
 
         // --- Highlight: freeform rectangle drag (non-text areas) -------------------------
         (MarkupType::Highlight, MarkupGeometry::Rect { min, max }) => {
+            // Opacity is published on the annotation-level /CA (see to_annotation_dict): a
+            // strict viewer (Bluebeam) regenerates the highlight from /C + /CA and ignores
+            // this /AP, while an /AP-honouring viewer (Acrobat) applies /CA as a group alpha
+            // over this whole form - so the form itself paints fully opaque (ca = 1.0) under
+            // the Multiply blend and lets /CA supply the wash, keeping both views identical
+            // (no double-dim).
             let gs_name = res.add_gstate(dictionary! {
                 "BM" => "Multiply",
-                "ca" => real(a.opacity),
+                "ca" => real(1.0),
             });
             out.push_str(&format!("q\n/{gs_name} gs\n"));
             fill_color(&mut out, &a.color);
             out.push_str(&format!(
                 "{} {} {} {} re\nf\nQ\n",
-                num(min.x), num(min.y), num(max.x - min.x), num(max.y - min.y)
+                num(min.x),
+                num(min.y),
+                num(max.x - min.x),
+                num(max.y - min.y)
             ));
         }
 
@@ -893,7 +1037,11 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>) {
             if let Some((color, smask)) = png_image {
                 let name = "Im0".to_string();
                 draw_stamp_image(&mut out, &mut res, a, *min, *max, &name);
-                image_xobjects.push(StampImageXObject { name, image: color, smask });
+                image_xobjects.push(StampImageXObject {
+                    name,
+                    image: color,
+                    smask,
+                });
                 // Dynamic-stamp overlay text (e.g. composed date/user on a static asset
                 // background) draws OUTSIDE any alpha scope, same convention as the
                 // box+label fallback and Text/Callout - text always renders fully opaque.
@@ -911,7 +1059,10 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>) {
 
         // --- MeasurementCount: symbol marker at a point ----------------------------------
         (MarkupType::MeasurementCount, MarkupGeometry::Point(p)) => {
-            let symbol = m.count_set.as_ref().map_or(super::CountSymbol::Circle, |c| c.symbol);
+            let symbol = m
+                .count_set
+                .as_ref()
+                .map_or(super::CountSymbol::Circle, |c| c.symbol);
             let r = COUNT_MARKER_RADIUS;
             // No independent fill control for count markers - line_gstate() uses a.opacity
             // for the marker's own-colour interior fill too, so the whole marker dims as
@@ -927,11 +1078,35 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>) {
                 }
                 super::CountSymbol::Cross => {
                     stroke_preamble(&mut out, a);
-                    moveto(&mut out, PdfPoint { x: p.x - r, y: p.y - r });
-                    lineto(&mut out, PdfPoint { x: p.x + r, y: p.y + r });
+                    moveto(
+                        &mut out,
+                        PdfPoint {
+                            x: p.x - r,
+                            y: p.y - r,
+                        },
+                    );
+                    lineto(
+                        &mut out,
+                        PdfPoint {
+                            x: p.x + r,
+                            y: p.y + r,
+                        },
+                    );
                     out.push_str("S\n");
-                    moveto(&mut out, PdfPoint { x: p.x - r, y: p.y + r });
-                    lineto(&mut out, PdfPoint { x: p.x + r, y: p.y - r });
+                    moveto(
+                        &mut out,
+                        PdfPoint {
+                            x: p.x - r,
+                            y: p.y + r,
+                        },
+                    );
+                    lineto(
+                        &mut out,
+                        PdfPoint {
+                            x: p.x + r,
+                            y: p.y - r,
+                        },
+                    );
                     out.push_str("S\n");
                 }
                 other => {
@@ -958,7 +1133,9 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markup::{Audit, CountSet, CountSymbol, FontSpec, MarkupStatus, Origin, UserRef, Workflow};
+    use crate::markup::{
+        Audit, CountSet, CountSymbol, FontSpec, MarkupStatus, Origin, UserRef, Workflow,
+    };
 
     fn user() -> UserRef {
         UserRef {
@@ -1047,7 +1224,10 @@ mod tests {
         assert_valid_form_dict(&d);
         let c = content_str(&m);
         assert!(c.contains(" re\n"), "rectangle must draw with re: {c}");
-        assert!(c.contains("S\n") || c.contains("B\n"), "must paint a stroke: {c}");
+        assert!(
+            c.contains("S\n") || c.contains("B\n"),
+            "must paint a stroke: {c}"
+        );
     }
 
     #[test]
@@ -1059,7 +1239,10 @@ mod tests {
         let mut m = base_markup(MarkupType::Rectangle, g);
         m.appearance.fill = Some("#ffcc00".into());
         let c = content_str(&m);
-        assert!(c.contains("B\n"), "filled rect with a stroke must use B: {c}");
+        assert!(
+            c.contains("B\n"),
+            "filled rect with a stroke must use B: {c}"
+        );
     }
 
     // --- Ellipse / Circle -------------------------------------------------------------
@@ -1074,7 +1257,10 @@ mod tests {
         let d = stream_dict_checks(&m);
         assert_valid_form_dict(&d);
         let c = content_str(&m);
-        assert!(c.matches(" c\n").count() >= 4, "ellipse needs 4 bezier segments: {c}");
+        assert!(
+            c.matches(" c\n").count() >= 4,
+            "ellipse needs 4 bezier segments: {c}"
+        );
     }
 
     // --- Line / Arrow -------------------------------------------------------------------
@@ -1088,7 +1274,10 @@ mod tests {
         let m = base_markup(MarkupType::Line, g);
         let c = content_str(&m);
         assert!(c.contains(" m\n") && c.contains(" l\n") && c.contains("S\n"));
-        assert!(!c.contains("h\nf\n"), "plain Line must not draw an arrowhead");
+        assert!(
+            !c.contains("h\nf\n"),
+            "plain Line must not draw an arrowhead"
+        );
     }
 
     #[test]
@@ -1100,7 +1289,10 @@ mod tests {
         let m = base_markup(MarkupType::Arrow, g);
         let c = content_str(&m);
         assert!(c.contains("S\n"), "shaft must be stroked: {c}");
-        assert!(c.contains("h\nf\n"), "arrowhead must be a filled closed triangle: {c}");
+        assert!(
+            c.contains("h\nf\n"),
+            "arrowhead must be a filled closed triangle: {c}"
+        );
     }
 
     // --- Closed polygon family ----------------------------------------------------------
@@ -1128,7 +1320,10 @@ mod tests {
         ]);
         let m = base_markup(MarkupType::Cloud, g);
         let c = content_str(&m);
-        assert!(!c.contains(" c\n"), "simplified cloud must not use bezier arcs");
+        assert!(
+            !c.contains(" c\n"),
+            "simplified cloud must not use bezier arcs"
+        );
         assert!(c.contains(" m\n") && c.contains(" l\n"));
     }
 
@@ -1145,7 +1340,10 @@ mod tests {
         let c = content_str(&m);
         // The stroke is scoped in its own gs (opacity independence) - ends on the paint op
         // immediately followed by the scope's closing Q, not a bare trailing S.
-        assert!(c.contains("S\nQ\n") && c.trim_end().ends_with('Q'), "open polyline must end on a plain stroke inside its gs scope: {c}");
+        assert!(
+            c.contains("S\nQ\n") && c.trim_end().ends_with('Q'),
+            "open polyline must end on a plain stroke inside its gs scope: {c}"
+        );
         assert!(!c.contains("f\n"), "open polyline must not fill: {c}");
     }
 
@@ -1159,14 +1357,23 @@ mod tests {
         };
         let mut m = base_markup(MarkupType::Text, g);
         m.contents = Some("verify fire rating".into());
-        m.appearance.font = Some(FontSpec { family: "Helvetica".into(), size_pt: 12.0 });
+        m.appearance.font = Some(FontSpec {
+            family: "Helvetica".into(),
+            size_pt: 12.0,
+        });
         let d = stream_dict_checks(&m);
         assert_valid_form_dict(&d);
         assert!(d.has(b"Resources"));
         let resources = d.get(b"Resources").unwrap().as_dict().unwrap();
-        assert!(resources.has(b"Font"), "FreeText appearance must declare a /Font resource");
+        assert!(
+            resources.has(b"Font"),
+            "FreeText appearance must declare a /Font resource"
+        );
         let c = content_str(&m);
-        assert!(c.contains("BT\n") && c.contains("ET\n"), "must have a text object: {c}");
+        assert!(
+            c.contains("BT\n") && c.contains("ET\n"),
+            "must have a text object: {c}"
+        );
         assert!(c.contains("Tj\n"), "must show text via Tj: {c}");
         assert!(c.contains(" re\n"), "must draw the text box border: {c}");
     }
@@ -1179,10 +1386,16 @@ mod tests {
         ]);
         let mut m = base_markup(MarkupType::Callout, g);
         m.contents = Some("note".into());
-        m.appearance.font = Some(FontSpec { family: "Times New Roman".into(), size_pt: 14.0 });
+        m.appearance.font = Some(FontSpec {
+            family: "Times New Roman".into(),
+            size_pt: 14.0,
+        });
         let c = content_str(&m);
         assert!(c.contains("Tj\n"), "callout must render its text: {c}");
-        assert!(c.contains("h\nf\n"), "callout leader must end in a filled arrowhead: {c}");
+        assert!(
+            c.contains("h\nf\n"),
+            "callout leader must end in a filled arrowhead: {c}"
+        );
     }
 
     #[test]
@@ -1222,7 +1435,10 @@ mod tests {
         assert_eq!(gs0.get(b"BM").unwrap().as_name().unwrap(), b"Multiply");
         let c = content_str(&m);
         assert!(c.contains("f\n"), "highlight quads must be filled: {c}");
-        assert!(c.contains("/GS0 gs"), "highlight must apply the multiply ExtGState: {c}");
+        assert!(
+            c.contains("/GS0 gs"),
+            "highlight must apply the multiply ExtGState: {c}"
+        );
     }
 
     #[test]
@@ -1250,7 +1466,10 @@ mod tests {
         assert_eq!(c.matches(" m\n").count(), 2, "one moveto per stroke: {c}");
         // The stroke is scoped in its own gs (opacity independence) - ends on the paint op
         // immediately followed by the scope's closing Q, not a bare trailing S.
-        assert!(c.contains("S\nQ") && c.trim_end().ends_with('Q'), "ink paints one stroke over both subpaths inside its gs scope: {c}");
+        assert!(
+            c.contains("S\nQ") && c.trim_end().ends_with('Q'),
+            "ink paints one stroke over both subpaths inside its gs scope: {c}"
+        );
     }
 
     // --- Stamp -----------------------------------------------------------------------------
@@ -1299,8 +1518,11 @@ mod tests {
             }))
         };
         let mut bytes: Vec<u8> = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
-            .expect("encode fixture png");
+        img.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("encode fixture png");
         crate::render::base64_encode(&bytes)
     }
 
@@ -1318,15 +1540,41 @@ mod tests {
     fn png_stamp_asset_emits_one_image_xobject_with_matching_dimensions() {
         let m = png_stamp_markup(4, 3, false);
         let built = build_ap_stream(&m);
-        assert_eq!(built.image_xobjects.len(), 1, "exactly one aux image for a PNG stamp");
+        assert_eq!(
+            built.image_xobjects.len(),
+            1,
+            "exactly one aux image for a PNG stamp"
+        );
         let img = &built.image_xobjects[0];
         assert_eq!(img.name, "Im0");
-        assert_eq!(img.image.dict.get(b"Subtype").unwrap().as_name().unwrap(), b"Image");
+        assert_eq!(
+            img.image.dict.get(b"Subtype").unwrap().as_name().unwrap(),
+            b"Image"
+        );
         assert_eq!(img.image.dict.get(b"Width").unwrap().as_i64().unwrap(), 4);
         assert_eq!(img.image.dict.get(b"Height").unwrap().as_i64().unwrap(), 3);
-        assert_eq!(img.image.dict.get(b"ColorSpace").unwrap().as_name().unwrap(), b"DeviceRGB");
-        assert_eq!(img.image.dict.get(b"BitsPerComponent").unwrap().as_i64().unwrap(), 8);
-        assert!(img.smask.is_none(), "opaque RGB source must not get an SMask");
+        assert_eq!(
+            img.image
+                .dict
+                .get(b"ColorSpace")
+                .unwrap()
+                .as_name()
+                .unwrap(),
+            b"DeviceRGB"
+        );
+        assert_eq!(
+            img.image
+                .dict
+                .get(b"BitsPerComponent")
+                .unwrap()
+                .as_i64()
+                .unwrap(),
+            8
+        );
+        assert!(
+            img.smask.is_none(),
+            "opaque RGB source must not get an SMask"
+        );
     }
 
     #[test]
@@ -1335,8 +1583,14 @@ mod tests {
         let c = content_str(&m);
         assert!(c.contains("/Im0 Do\n"), "must paint the image xobject: {c}");
         // Scaled by the Rect's width/height (80 x 30) via the cm operator.
-        assert!(c.contains("80 0 0 30 10 10 cm\n"), "cm matrix must map the unit square to the Rect: {c}");
-        assert!(!c.contains(" re\n"), "a real image stamp must not also draw the bordered-box fallback: {c}");
+        assert!(
+            c.contains("80 0 0 30 10 10 cm\n"),
+            "cm matrix must map the unit square to the Rect: {c}"
+        );
+        assert!(
+            !c.contains(" re\n"),
+            "a real image stamp must not also draw the bordered-box fallback: {c}"
+        );
     }
 
     #[test]
@@ -1344,8 +1598,14 @@ mod tests {
         let m = png_stamp_markup(2, 2, true);
         let built = build_ap_stream(&m);
         let img = &built.image_xobjects[0];
-        let smask = img.smask.as_ref().expect("RGBA source must produce an SMask");
-        assert_eq!(smask.dict.get(b"ColorSpace").unwrap().as_name().unwrap(), b"DeviceGray");
+        let smask = img
+            .smask
+            .as_ref()
+            .expect("RGBA source must produce an SMask");
+        assert_eq!(
+            smask.dict.get(b"ColorSpace").unwrap().as_name().unwrap(),
+            b"DeviceGray"
+        );
         assert_eq!(smask.dict.get(b"Width").unwrap().as_i64().unwrap(), 2);
         assert_eq!(smask.dict.get(b"Height").unwrap().as_i64().unwrap(), 2);
     }
@@ -1356,11 +1616,20 @@ mod tests {
         m.markup_type = MarkupType::StampDynamic;
         m.contents = Some("2026-07-07".into());
         let c = content_str(&m);
-        assert!(c.contains("/Im0 Do\n"), "dynamic stamp must still draw the image: {c}");
-        assert!(c.contains("Tj\n"), "dynamic stamp must draw the composed overlay text: {c}");
+        assert!(
+            c.contains("/Im0 Do\n"),
+            "dynamic stamp must still draw the image: {c}"
+        );
+        assert!(
+            c.contains("Tj\n"),
+            "dynamic stamp must draw the composed overlay text: {c}"
+        );
         let do_pos = c.find("Do\n").unwrap();
         let bt_pos = c.find("BT\n").unwrap();
-        assert!(do_pos < bt_pos, "overlay text must be drawn after (on top of) the image: {c}");
+        assert!(
+            do_pos < bt_pos,
+            "overlay text must be drawn after (on top of) the image: {c}"
+        );
     }
 
     #[test]
@@ -1374,8 +1643,15 @@ mod tests {
         let mut m = base_markup(MarkupType::Stamp, g);
         m.stamp_asset = Some(StampAsset::Svg("<svg><rect/></svg>".into()));
         let built = build_ap_stream(&m);
-        assert!(built.image_xobjects.is_empty(), "Svg asset must not produce an image xobject");
-        assert!(String::from_utf8(finish_ap_stream(built, Dictionary::new()).content).unwrap().contains(" re\n"));
+        assert!(
+            built.image_xobjects.is_empty(),
+            "Svg asset must not produce an image xobject"
+        );
+        assert!(
+            String::from_utf8(finish_ap_stream(built, Dictionary::new()).content)
+                .unwrap()
+                .contains(" re\n")
+        );
     }
 
     #[test]
@@ -1387,9 +1663,15 @@ mod tests {
         let mut m = base_markup(MarkupType::Stamp, g);
         m.stamp_asset = Some(StampAsset::PngBase64("not valid base64 png data!!".into()));
         let built = build_ap_stream(&m);
-        assert!(built.image_xobjects.is_empty(), "malformed asset must not produce an image xobject");
+        assert!(
+            built.image_xobjects.is_empty(),
+            "malformed asset must not produce an image xobject"
+        );
         let c = String::from_utf8(finish_ap_stream(built, Dictionary::new()).content).unwrap();
-        assert!(c.contains(" re\n"), "must fall back to the bordered-box appearance, not an empty stream: {c}");
+        assert!(
+            c.contains(" re\n"),
+            "must fall back to the bordered-box appearance, not an empty stream: {c}"
+        );
     }
 
     #[test]
@@ -1408,7 +1690,10 @@ mod tests {
 
     #[test]
     fn count_marker_circle_draws_filled_stroked_circle() {
-        let m = base_markup(MarkupType::MeasurementCount, MarkupGeometry::Point(PdfPoint { x: 42.0, y: 99.0 }));
+        let m = base_markup(
+            MarkupType::MeasurementCount,
+            MarkupGeometry::Point(PdfPoint { x: 42.0, y: 99.0 }),
+        );
         let d = stream_dict_checks(&m);
         assert_valid_form_dict(&d);
         let c = content_str(&m);
@@ -1418,7 +1703,10 @@ mod tests {
 
     #[test]
     fn count_marker_cross_draws_two_open_strokes_not_filled() {
-        let mut m = base_markup(MarkupType::MeasurementCount, MarkupGeometry::Point(PdfPoint { x: 0.0, y: 0.0 }));
+        let mut m = base_markup(
+            MarkupType::MeasurementCount,
+            MarkupGeometry::Point(PdfPoint { x: 0.0, y: 0.0 }),
+        );
         m.count_set = Some(CountSet {
             id: uuid::Uuid::new_v4(),
             name: "Type-A".into(),
@@ -1426,13 +1714,20 @@ mod tests {
             symbol: CountSymbol::Cross,
         });
         let c = content_str(&m);
-        assert_eq!(c.matches("S\n").count(), 2, "cross draws two separate strokes: {c}");
+        assert_eq!(
+            c.matches("S\n").count(),
+            2,
+            "cross draws two separate strokes: {c}"
+        );
         assert!(!c.contains("f\n"), "cross is never filled: {c}");
     }
 
     #[test]
     fn count_marker_diamond_draws_filled_polygon() {
-        let mut m = base_markup(MarkupType::MeasurementCount, MarkupGeometry::Point(PdfPoint { x: 0.0, y: 0.0 }));
+        let mut m = base_markup(
+            MarkupType::MeasurementCount,
+            MarkupGeometry::Point(PdfPoint { x: 0.0, y: 0.0 }),
+        );
         m.count_set = Some(CountSet {
             id: uuid::Uuid::new_v4(),
             name: "Type-B".into(),
@@ -1440,16 +1735,25 @@ mod tests {
             symbol: CountSymbol::Diamond,
         });
         let c = content_str(&m);
-        assert!(c.contains("b\n"), "polygon symbols close+fill+stroke via b: {c}");
+        assert!(
+            c.contains("b\n"),
+            "polygon symbols close+fill+stroke via b: {c}"
+        );
     }
 
     // --- BBox padding for degenerate (Point) geometry ------------------------------------
 
     #[test]
     fn point_geometry_bbox_is_padded_not_zero_size() {
-        let m = base_markup(MarkupType::MeasurementCount, MarkupGeometry::Point(PdfPoint { x: 5.0, y: 5.0 }));
+        let m = base_markup(
+            MarkupType::MeasurementCount,
+            MarkupGeometry::Point(PdfPoint { x: 5.0, y: 5.0 }),
+        );
         let bbox = ap_bbox(&m);
-        assert!(bbox[2] - bbox[0] > 0.0 && bbox[3] - bbox[1] > 0.0, "bbox must be non-degenerate: {bbox:?}");
+        assert!(
+            bbox[2] - bbox[0] > 0.0 && bbox[3] - bbox[1] > 0.0,
+            "bbox must be non-degenerate: {bbox:?}"
+        );
         // Independent of the annotation's own /Rect (which IS zero-size for Point geometry -
         // that key is untouched by this module; see annotation::bbox).
     }
@@ -1463,7 +1767,10 @@ mod tests {
         let mut m = base_markup(MarkupType::Rectangle, g);
         m.appearance.line_weight = 4.0;
         let bbox = ap_bbox(&m);
-        assert!(bbox[0] < 10.0 && bbox[1] < 10.0 && bbox[2] > 50.0 && bbox[3] > 30.0, "bbox must pad past the tight bounds: {bbox:?}");
+        assert!(
+            bbox[0] < 10.0 && bbox[1] < 10.0 && bbox[2] > 50.0 && bbox[3] > 30.0,
+            "bbox must pad past the tight bounds: {bbox:?}"
+        );
     }
 
     // --- Unrecognised (type, geometry) pair: never returns an invalid empty stream --------
@@ -1499,7 +1806,10 @@ mod tests {
         let gs = gs0(&m);
         let ca = gs.get(b"CA").unwrap().as_float().unwrap();
         let ca_fill = gs.get(b"ca").unwrap().as_float().unwrap();
-        assert!((ca - 0.2).abs() < 1e-4, "/CA (stroke) must equal opacity, got {ca}");
+        assert!(
+            (ca - 0.2).abs() < 1e-4,
+            "/CA (stroke) must equal opacity, got {ca}"
+        );
         assert!(
             (ca_fill - 0.9).abs() < 1e-4,
             "/ca (fill) must equal fill_opacity, NOT be coupled to the faint stroke opacity, got {ca_fill}"
@@ -1520,7 +1830,10 @@ mod tests {
         b.appearance.fill_opacity = Some(1.0); // only fill_opacity changes
         let ca_a = gs0(&a).get(b"CA").unwrap().as_float().unwrap();
         let ca_b = gs0(&b).get(b"CA").unwrap().as_float().unwrap();
-        assert!((ca_a - ca_b).abs() < 1e-6, "stroke /CA must stay put when only fill_opacity changes: {ca_a} vs {ca_b}");
+        assert!(
+            (ca_a - ca_b).abs() < 1e-6,
+            "stroke /CA must stay put when only fill_opacity changes: {ca_a} vs {ca_b}"
+        );
     }
 
     #[test]
@@ -1537,7 +1850,10 @@ mod tests {
         b.appearance.opacity = 0.1; // only stroke opacity changes
         let ca_fill_a = gs0(&a).get(b"ca").unwrap().as_float().unwrap();
         let ca_fill_b = gs0(&b).get(b"ca").unwrap().as_float().unwrap();
-        assert!((ca_fill_a - ca_fill_b).abs() < 1e-6, "fill /ca must stay put when only stroke opacity changes: {ca_fill_a} vs {ca_fill_b}");
+        assert!(
+            (ca_fill_a - ca_fill_b).abs() < 1e-6,
+            "fill /ca must stay put when only stroke opacity changes: {ca_fill_a} vs {ca_fill_b}"
+        );
     }
 
     #[test]
@@ -1574,10 +1890,16 @@ mod tests {
         // The box's gs scope closes (Q) strictly before the glyph block opens (BT).
         let q_pos = c.find("Q\n").expect("box gs scope must close");
         let bt_pos = c.find("BT\n").expect("glyph block must be present");
-        assert!(q_pos < bt_pos, "text glyphs must be drawn AFTER the box's gs scope closes (outside it): {c}");
+        assert!(
+            q_pos < bt_pos,
+            "text glyphs must be drawn AFTER the box's gs scope closes (outside it): {c}"
+        );
         // No gs operator appears between Q and BT - text picks up the page's default alpha
         // (1.0), never a value from the box's stroke/fill gstate.
-        assert!(!c[q_pos..bt_pos].contains(" gs"), "no gs operator may apply between the box close and the glyph block: {c}");
+        assert!(
+            !c[q_pos..bt_pos].contains(" gs"),
+            "no gs operator may apply between the box close and the glyph block: {c}"
+        );
     }
 
     #[test]
@@ -1594,6 +1916,9 @@ mod tests {
         let c = content_str(&m);
         let last_q = c.rfind("Q\n").expect("box gs scope must close");
         let bt_pos = c.find("BT\n").expect("glyph block must be present");
-        assert!(last_q < bt_pos, "callout text glyphs must be drawn after the box's gs scope closes: {c}");
+        assert!(
+            last_q < bt_pos,
+            "callout text glyphs must be drawn after the box's gs scope closes: {c}"
+        );
     }
 }
