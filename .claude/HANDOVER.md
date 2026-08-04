@@ -2,15 +2,46 @@
 
 ## Current Status
 
-**M1-M6 + Phase 1.1 (compare) + Windows-distribution infra + Tool Chest v0.3.1 polish
-(PR #48) + S2b client entitlement (PR #49) + docops/highlight bugfix batch (PR #50) +
-markup round-trip fidelity fix (PR #52) + license API URL compile-time default (PR #53)
-all merged to `main` (`db11e2b`). 0 open PRs. v0.3.2 release now sequenced only behind
-an orchestrator-side Authelia bypass rule + activation-code creation, then the tag.**
+**main is at `ce849c7` (v0.3.6). 0 open PRs - PR #58 (crossbeam-epoch RUSTSEC-2026-0204
+fix) has since merged (this reconciliation pass corrects the "NOT merged" status the
+2026-07-15 session below left behind). Releases through v0.3.6 and PRs #54-#58
+(double-render G9 fix, happy-dom/playwright security bump, crossbeam-epoch bump)
+landed via sessions that did not update this file - reconcile against
+`git log --oneline` before trusting anything below this line; the KB mission record
+(`project:q8gm8dv3k7smld12rm25`) is more current than this file's older "Previous
+session" entries. lopdf (RUSTSEC-2026-0187, high) and quick-xml
+(RUSTSEC-2026-0195/0194) remain open, deferred advisories - see PR-B in the
+2026-08-04 wave dispatch (below) for the lopdf migration attempt.**
 
 ## Last Session
 
-**Date**: 2026-07-11 (PR #53, dispatched by the orchestrator - follow-up to PR #52)
+**Date**: 2026-07-15 (RUSTSEC dependency sweep, dispatched by the orchestrator)
+**Summary**: `cargo audit` baseline found 4 vulnerabilities. Fixed
+`crossbeam-epoch` 0.9.18 -> 0.9.20 (RUSTSEC-2026-0204, invalid pointer deref in
+`fmt::Pointer`) via `cargo update -p crossbeam-epoch` - transitive via rayon,
+resolved within the existing `^0.9` range, Cargo.lock only, no code changes.
+Attempted `lopdf` 0.36 -> `>=0.42` (RUSTSEC-2026-0187, high 7.5) via
+`cargo update -p lopdf --precise 0.42.0` - failed immediately, pinned outside the
+`^0.36` range declared in `src-tauri/Cargo.toml` + `crates/pdf-diff/Cargo.toml`.
+**Deferred**: lopdf is a direct dep with this repo's own documented 0.36 API
+landmines (`.as_float()` vs `.as_f32()`, see Key Gotchas below) - a 6-minor-version
+jump needs its own scoped migration PR + test pass, not a forced bump alongside an
+unrelated sweep. `quick-xml` 0.39 -> `>=0.41` (RUSTSEC-2026-0195/0194) also
+deferred - pinned transitively by the Tauri/wry/tao chain, fixing it means forcing
+a Tauri major. `cargo build --workspace` clean, `cargo test --workspace` 400
+passed/0 failed/2 ignored. **PR #58 opened**, CI green (Forgejo run #155, commit
+`221f7ac8`): `https://forge.mms.name/emittiv/redline/pulls/58`, branch
+`fix/dep-security-2026-07`. **Since merged as `ce849c7`** (status corrected in this
+reconciliation pass - was still open when this session ended).
+**Also found**: an orphaned uncommitted `.claude/HANDOVER.md` edit (documenting the
+PR #57 happy-dom/playwright session + PR #54 double-render-bug fix, neither of
+which had made it into this file) was sitting on the already-merged
+`fix/security-deps-happydom-playwright` branch. Stashed rather than discarded or
+committed into the security PR (out of that PR's scope) - `git stash list` on this
+repo has it (`"pre-existing HANDOVER edit, unrelated to RUSTSEC dep fix"`). Next
+session should pop it and fold its content in, then drop the stash entry.
+
+### Previous session (2026-07-11, PR #53, dispatched by the orchestrator - follow-up to PR #52)
 **Summary**: Baked a compile-time default for the S2b license API base URL so a released
 Windows build activates the entitlement gate with no user-set `REDLINE_LICENSE_API_URL`
 env var. `resolve_base_url` (new, `src-tauri/src/license/client.rs`) checks three tiers:
@@ -154,10 +185,15 @@ still owed to a human session. Detail: `obs:e1tujicl7p4uck906rxa`.
 
 ## Next Steps
 
-**v0.3.2 release (current priority):** PR #52 and PR #53 are both merged. Remaining,
-orchestrator-side: clear the Authelia bypass rule + create the activation code, then cut
-the `v0.3.2` tag - this supersedes item 6 below, which is stale (references the
-long-superseded `v0.2.0`; current version is 0.3.1+ per `Cargo.toml`/git log).
+**Immediate**: PR #58 (RUSTSEC crossbeam-epoch fix) has merged (`ce849c7`). lopdf
+(RUSTSEC-2026-0187, high) and quick-xml (RUSTSEC-2026-0195/0194) remain open
+advisories needing scoped migration PRs - see the 2026-08-04 wave dispatch PR-B
+below for the lopdf migration attempt.
+
+**Stale below this line** (dated 2026-07-11, predates PRs #54-#58 - v0.3.2 release
+sequencing described here is superseded; main is already at v0.3.6 per Current
+Status above). Kept for the still-owed live-verification items, which remain valid
+regardless of version number.
 
 0. **PR #52 (markup round-trip fidelity fix)** [DONE - merged `de0d9fd`]. Still owed,
    live-verify: place a
@@ -222,6 +258,8 @@ Before the first tagged Windows/macOS release:
 | PR #50 | `https://forge.mms.name/emittiv/redline/pulls/50` (docops write-markups-ordering + highlight discoverability fix - merged `02a4e5d`) |
 | PR #52 | `https://forge.mms.name/emittiv/redline/pulls/52` (markup save/reopen round-trip fidelity fix - MERGED `de0d9fd`) |
 | PR #53 | `https://forge.mms.name/emittiv/redline/pulls/53` (license API URL compile-time default for Windows release builds - MERGED `db11e2b`) |
+| PR #57 | `https://forge.mms.name/emittiv/redline/pulls/57` (happy-dom + playwright security bump - MERGED `610ba66`) |
+| PR #58 | `https://forge.mms.name/emittiv/redline/pulls/58` (crossbeam-epoch RUSTSEC-2026-0204 fix - MERGED `ce849c7`) |
 | S2b license contract | `emittiv-staff/src/lib/server/license.ts` (authoritative token shape - do not change without a hub message) |
 
 ## Key Gotchas (carry forward)
