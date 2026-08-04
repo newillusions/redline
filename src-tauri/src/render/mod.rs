@@ -236,6 +236,12 @@ struct OpenDoc {
     access_tick: u64,
     /// Max number of pages kept loaded at once (LRU cap). Bounds steady RSS.
     max_pages: usize,
+    /// Snap-target index per page (spec §5, v1 — endpoints/midpoints only), built
+    /// once on first request and cached until this document closes. A page's
+    /// vector content never changes without a full reopen in this app (docops
+    /// mutations replace the doc_id's `OpenDoc` wholesale via close+open, not
+    /// in-place edits), so there is no separate invalidation path to wire.
+    snap_cache: HashMap<u32, std::sync::Arc<crate::geometry::PageGeometry>>,
     /// The PDFium document handle. MUST drop after `page_cache`, before `_backing`.
     document: PdfDocument<'static>,
     /// Backing store the document borrows from. `None` for the streaming
@@ -261,6 +267,7 @@ impl OpenDoc {
             page_access: HashMap::new(),
             access_tick: 0,
             max_pages,
+            snap_cache: HashMap::new(),
             document,
             _backing: backing,
             path,
@@ -799,6 +806,91 @@ impl RenderEngine {
         Ok(TextRangeSelection { quads, text })
     }
 
+    /// Build (or return the cached) snap-target index for a page — the PDFium-
+    /// touching half of `geometry::build_snap_index` (spec §5). Iterates the page's
+    /// path objects via PDFium's *transformed* segment API so Form XObject CTMs
+    /// compose correctly (bare/untransformed coordinates collapse to ~(0,0) for
+    /// nested paths — see the geometry module doc comment).
+    ///
+    /// Cached per (open document, page) — see `OpenDoc::snap_cache` for why no
+    /// separate invalidation path is needed.
+    pub fn page_snap_index(
+        &mut self,
+        doc_id: &str,
+        page_index: u32,
+    ) -> Result<std::sync::Arc<crate::geometry::PageGeometry>> {
+        let doc = self
+            .documents
+            .get_mut(doc_id)
+            .with_context(|| format!("Unknown doc_id: {doc_id}"))?;
+
+        if let Some(cached) = doc.snap_cache.get(&page_index) {
+            return Ok(std::sync::Arc::clone(cached));
+        }
+
+        let page = doc.page(page_index)?;
+
+        let mut subpaths: Vec<crate::geometry::Subpath> = Vec::new();
+        let mut current: Vec<crate::geometry::PdfPoint> = Vec::new();
+        let mut current_closed = false;
+
+        for obj in page.objects().iter() {
+            let Some(path_obj) = obj.as_path_object() else {
+                continue;
+            };
+            // Objects with a degenerate/unreadable transform are skipped rather
+            // than erroring the whole extraction — one malformed object shouldn't
+            // deny snapping on an otherwise-good page.
+            let Ok(matrix) = path_obj.matrix() else {
+                continue;
+            };
+
+            for seg in path_obj.segments().transform(matrix).iter() {
+                let (x, y) = seg.point();
+                let pt = crate::geometry::PdfPoint {
+                    x: x.value as f64,
+                    y: y.value as f64,
+                };
+
+                match seg.segment_type() {
+                    PdfPathSegmentType::MoveTo => {
+                        if !current.is_empty() {
+                            subpaths.push(crate::geometry::Subpath {
+                                points: std::mem::take(&mut current),
+                                closed: current_closed,
+                            });
+                        }
+                        current_closed = false;
+                        current.push(pt);
+                    }
+                    PdfPathSegmentType::LineTo | PdfPathSegmentType::BezierTo => {
+                        current.push(pt);
+                    }
+                    PdfPathSegmentType::Unknown => {}
+                }
+
+                if seg.is_close() {
+                    current_closed = true;
+                }
+            }
+
+            // Flush the path object's final pending sub-path before moving to the
+            // next page object — a new object never continues the previous one's
+            // sub-path even without an explicit leading MoveTo.
+            if !current.is_empty() {
+                subpaths.push(crate::geometry::Subpath {
+                    points: std::mem::take(&mut current),
+                    closed: current_closed,
+                });
+                current_closed = false;
+            }
+        }
+
+        let geom = std::sync::Arc::new(crate::geometry::build_snap_index(page_index, &subpaths));
+        doc.snap_cache.insert(page_index, std::sync::Arc::clone(&geom));
+        Ok(geom)
+    }
+
     /// Return the number of pages for an open document.
     pub fn page_count(&self, doc_id: &str) -> Option<u32> {
         self.documents.get(doc_id).map(|d| d.page_count)
@@ -1117,6 +1209,13 @@ pub enum RenderCmd {
         end: usize,
         reply: oneshot::Sender<Result<TextRangeSelection>>,
     },
+    /// Build (or return the cached) snap-target index for a page, flattened to a
+    /// plain `Vec` for the IPC boundary. See `RenderEngine::page_snap_index`.
+    PageSnapIndex {
+        doc_id: String,
+        page_index: u32,
+        reply: oneshot::Sender<Result<Vec<crate::geometry::SnapTarget>>>,
+    },
 }
 
 /// A `Send + Sync` handle to the render thread.
@@ -1219,6 +1318,16 @@ impl RenderHandle {
                             reply,
                         } => {
                             let _ = reply.send(engine.text_range_selection(&doc_id, page_index, start, end));
+                        }
+                        RenderCmd::PageSnapIndex {
+                            doc_id,
+                            page_index,
+                            reply,
+                        } => {
+                            let result = engine.page_snap_index(&doc_id, page_index).map(|geom| {
+                                geom.snap_index.iter().cloned().collect::<Vec<_>>()
+                            });
+                            let _ = reply.send(result);
                         }
                     }
                 }
@@ -1389,6 +1498,26 @@ impl RenderHandle {
             .await
             .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
     }
+
+    /// Return the page's snap-target index (spec §5, v1 — endpoints/midpoints).
+    /// See [`RenderEngine::page_snap_index`].
+    pub async fn page_snap_index(
+        &self,
+        doc_id: String,
+        page_index: u32,
+    ) -> Result<Vec<crate::geometry::SnapTarget>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(RenderCmd::PageSnapIndex {
+                doc_id,
+                page_index,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("render thread gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
+    }
 }
 
 /// Send an init-error reply to any command that arrived before PDFium loaded.
@@ -1417,6 +1546,9 @@ fn send_init_error(cmd: RenderCmd, err: &anyhow::Error) {
             let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
         }
         RenderCmd::TextRangeSelection { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+        }
+        RenderCmd::PageSnapIndex { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
         }
     }
@@ -1686,6 +1818,128 @@ pub(crate) mod tests {
              render bug: the tile PdfRenderConfig must explicitly disable annotation \
              rendering (.render_annotations(false))."
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // page_snap_index integration tests (spec §5, v1). Corpus-free — builds a
+    // synthetic fixture with a real path-drawing content stream directly (same
+    // "build a tiny lopdf doc, save, open via RenderEngine" pattern as the
+    // double-render-bug test above), so these self-skip in CI on the same
+    // PDFIUM_DYNAMIC_LIB_PATH gate without needing the (gitignored) bench corpus.
+    // -----------------------------------------------------------------------
+
+    /// Build a one-page fixture whose content stream draws two real vector paths
+    /// via explicit `m`/`l`/`h`/`S` operators (not the `re` shorthand, so the
+    /// segment types are unambiguous):
+    /// - an OPEN 2-point line: (72,100) -> (300,100)
+    /// - a CLOSED triangle: (100,200) -> (200,200) -> (100,300) -> closed
+    fn two_path_fixture() -> std::path::PathBuf {
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let content = b"72 100 m 300 100 l S 100 200 m 200 200 l 100 300 l h S".to_vec();
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => content_id,
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap-fixture.pdf");
+        doc.save(&path).expect("save fixture");
+        // Leak the tempdir so the file survives past this function - acceptable in
+        // a test process (mirrors the existing corpus-test lifetime pattern).
+        std::mem::forget(dir);
+        path
+    }
+
+    fn near(targets: &[crate::geometry::SnapTarget], x: f64, y: f64, kind: crate::geometry::SnapKind) -> bool {
+        targets
+            .iter()
+            .any(|t| t.kind == kind && (t.point.x - x).abs() < 1e-6 && (t.point.y - y).abs() < 1e-6)
+    }
+
+    #[test]
+    fn page_snap_index_extracts_endpoints_and_midpoints_from_real_content_stream() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip page_snap_index: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+
+        let path = two_path_fixture();
+        let mut e = RenderEngine::new().expect("pdfium");
+        e.open_document(path, "t".into(), None)
+            .and_then(OpenOutcome::into_page_count)
+            .expect("open fixture");
+
+        let targets = e.page_snap_index("t", 0).expect("page_snap_index");
+        let flat: Vec<crate::geometry::SnapTarget> = targets.snap_index.iter().cloned().collect();
+
+        use crate::geometry::SnapKind;
+
+        // Open line endpoints.
+        assert!(near(&flat, 72.0, 100.0, SnapKind::Endpoint), "missing open-line start endpoint");
+        assert!(near(&flat, 300.0, 100.0, SnapKind::Endpoint), "missing open-line end endpoint");
+        // Open line midpoint - no closing edge, so exactly this one midpoint from it.
+        assert!(near(&flat, 186.0, 100.0, SnapKind::Midpoint), "missing open-line midpoint");
+
+        // Triangle endpoints.
+        assert!(near(&flat, 100.0, 200.0, SnapKind::Endpoint), "missing triangle vertex 1");
+        assert!(near(&flat, 200.0, 200.0, SnapKind::Endpoint), "missing triangle vertex 2");
+        assert!(near(&flat, 100.0, 300.0, SnapKind::Endpoint), "missing triangle vertex 3");
+        // Triangle midpoints, including the closing edge back to the start vertex.
+        assert!(near(&flat, 150.0, 200.0, SnapKind::Midpoint), "missing triangle edge 1 midpoint");
+        assert!(near(&flat, 150.0, 250.0, SnapKind::Midpoint), "missing triangle edge 2 midpoint");
+        assert!(near(&flat, 100.0, 250.0, SnapKind::Midpoint), "missing triangle closing-edge midpoint");
+
+        // No Intersection/ArcCenter targets in v1 (see geometry module doc comment).
+        assert!(
+            flat.iter().all(|t| matches!(t.kind, SnapKind::Endpoint | SnapKind::Midpoint)),
+            "v1 must not populate Intersection/ArcCenter"
+        );
+    }
+
+    #[test]
+    fn page_snap_index_is_cached_across_calls() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip page_snap_index cache: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+        let path = two_path_fixture();
+        let mut e = RenderEngine::new().expect("pdfium");
+        e.open_document(path, "t".into(), None)
+            .and_then(OpenOutcome::into_page_count)
+            .expect("open fixture");
+
+        let first = e.page_snap_index("t", 0).expect("first call");
+        let second = e.page_snap_index("t", 0).expect("second call");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "second call should return the cached Arc, not rebuild"
+        );
+    }
+
+    #[test]
+    fn page_snap_index_unknown_doc_id_errors() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip page_snap_index unknown-doc: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+        let mut e = RenderEngine::new().expect("pdfium");
+        assert!(e.page_snap_index("nonexistent-doc", 0).is_err());
     }
 
     // -----------------------------------------------------------------------

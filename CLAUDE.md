@@ -13,13 +13,15 @@ The authoritative v1 technical specification lives at `docs/bluebeam-alternative
 - **UI docking:** `dockview-core` (MIT); `svelte-splitpanes` as the lighter fallback
 - **Render engine:** PDFium via `pdfium-render` 0.8.x (BSD) - display only
 - **Low-level PDF ops:** `lopdf`
-- **OCR:** Tesseract (Apache-2.0) via `leptess`
+- **OCR:** deferred, not integrated (decided-but-unbuilt Tesseract via `leptess` - see "Deferred: OCR" under Key Decisions)
 - **Full-text search:** Tantivy (MIT) - folder/library index
 - **Doc-surgery backend:** trait-based, swappable - free baseline for v1; MuPDF/Apryse pluggable later
 - **Targets:** Windows x64, macOS Apple Silicon only (Intel dropped per decision:boujy4d42i8w7zovifts, 2026-06-29)
 
 ## Architecture (Rust core modules)
-`render` (tiled rasterization, display only) · `geometry` (vector path extraction + snap-target spatial index, PDF user space) · `document` (parse/model, page manipulation) · `text` (extraction + search) · `ocr` (invisible text layer) · `search` (Tantivy folder index) · `markup` (annotation model → standard PDF annotations) · `takeoff` (calibration, measurement, quantity calc, f64 user space) · `docops` *(swappable trait: flatten/optimize/redact)* · `compare` (Phase 1.1) · `storage` (local-first + version hooks).
+`render` (tiled rasterization, display only) · `geometry` (vector path extraction + snap-target spatial index, PDF user space) · `document` (parse/model, page manipulation) · `text` (extraction + search) · `search` (Tantivy folder index) · `markup` (annotation model → standard PDF annotations) · `takeoff` (calibration, measurement, quantity calc, f64 user space) · `docops` *(swappable trait: flatten/optimize/redact)* · `compare` (Phase 1.1) · `storage` (local-first + version hooks).
+
+No `ocr` module - deferred (see "Deferred: OCR" under Key Decisions); `pub mod ocr` and its stub file were removed 2026-08-04 rather than kept as inert scaffolding.
 
 **Precision-critical invariant:** display (raster tiles) and geometry (vector snap targets) are two independent layers. Snapping/measurement NEVER read the raster - all math runs in PDF user space at f64. See spec §5.
 
@@ -59,11 +61,14 @@ Release steps:
 4. Re-releasing under a fresh number (e.g. burn a bad tag, ship the next patch) is cleaner than force-rewriting a tag when an auto-updater is in play.
 
 ## Build Order (milestones)
-M1 shell + tiled render (large-file perf is the make-or-break test - validate on 300 MB+ sets early) → M2 markup + Tool Sets + `.btx` importer → M3 takeoff → M4 Sets/versioning + page ops + search/OCR → M5 `docops` baseline → M6 (Phase 1.1) compare. Full detail in spec §13.
+M1 shell + tiled render (large-file perf is the make-or-break test - validate on 300 MB+ sets early) → M2 markup + Tool Sets + `.btx` importer → M3 takeoff → M4 Sets/versioning + page ops + search (OCR deferred, see below) → M5 `docops` baseline → M6 (Phase 1.1) compare. Full detail in spec §13.
 
 **Current phase (2026-07-02): M1-M6 + Phase 1.1 all shipped to `main`, 0 open PRs.** Work since has been small polish/fix PRs on the takeoff + markup panels (see git log). Two verification gates remain owed, not yet closed:
 - **§20 definitive floor-machine run** (16 GB, Windows + macOS) - the formal M1 Go/No-Go. The current §20 verdict is only the *indicative* Apple-Silicon/headless pass; blocked on hardware access. Do not represent M1 as formally gated-through until this runs. `bench/RUNBOOK-S20.md`.
 - **G9 human visual check** - open a sample PDF in Acrobat/Bluebeam to confirm font + group rendering interop (owed since M2, 2026-06-16).
+
+One M4 scope item was NOT actually shipped despite the above: **OCR** was decided (leptess/Tesseract) but never built - see "Deferred: OCR" under Key Decisions. Everything else M4 named (Sets/versioning, page ops, in-doc/Set text search, folder full-text index) is real and tested.
+
 Project direction beyond polish (pause / registration fast-follow / next milestone) is an owner-gated decision, not yet made - don't infer one.
 
 ## Key Decisions
@@ -75,6 +80,11 @@ Project direction beyond polish (pause / registration fast-follow / next milesto
 - M2 proceeded ahead of the definitive §20 floor-machine run (2026-06): the indicative §20 PASS on Apple Silicon stands in; the floor run (16 GB, Windows + macOS, `bench/RUNBOOK-S20.md`) remains the formal Go/No-Go and is still owed.
 - Annotations persist as standard PDF annotation objects per the spec §6 persistence map (M2) - interop with Bluebeam/Acrobat, no sidecar format.
 - Shipping flow is `/sendit` (background pipeline agent, Forgejo REST, squash-merge). Background pipeline agents need `mode: "bypassPermissions"` or they stall on Bash. See `.claude/skills/sendit/SKILL.md`.
+- **Deferred: OCR** (investigated + descoped 2026-08-04, wave-2 portfolio review). Tesseract via `leptess` was decided for M4 (decision:tntyyjau94smf6r6jitq, 2026-06-25) but never built - `ocr/mod.rs` had sat as a 9-line stub with the dependency and Cargo `ocr` feature both commented out since M1, and the M4/"shipped" claims above never flagged the gap. Removed the stub module rather than leave it as dead scaffolding (`pub mod ocr` deleted from `lib.rs`, `src/ocr/` deleted). NOT a "not needed" call - it's real spec-mandated v1 scope (spec §14, §219) with no engineering blocker on the code itself, but three real release-pipeline blockers found this session, none yet addressed:
+  1. Forgejo CI (`.forgejo/workflows/ci.yml`, `ubuntu-latest`) has no `tesseract-ocr`/`libtesseract-dev`/`libleptonica-dev` apt step - `--features ocr` wouldn't compile in CI today (cheapest to fix - plain apt packages on Linux).
+  2. `.github/workflows/build-releases.yml`'s `build-macos` job has no `brew install tesseract` (or vendored equivalent) step.
+  3. `build-windows` has no vcpkg/tesseract bootstrap at all - `leptess` on Windows is the hard case (static-vs-dynamic linking, `VCPKG_ROOT`/`TESSDATA_PREFIX` env wiring), unverified in this repo.
+  Also unstaged: `eng.traineddata` (~12MB tessdata) isn't in `tauri.bundle.resources` anywhere. Re-enabling needs all four addressed IN ORDER (Linux CI first, cheapest signal) - each verified by an actual green CI/release run, not a local compile, since the whole point of the gap is that a local Linux build can look fine while both release legs are broken. See the `Cargo.toml` comment above the commented-out `leptess` line for the same detail inline with the code.
 - (Add decisions here as made; log architectural ones via `kb_decision_create`.)
 
 ## Session Workflow

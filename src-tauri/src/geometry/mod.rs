@@ -9,9 +9,39 @@
 //! parent matrices correctly. Paths nested in Form XObjects otherwise return coordinates
 //! near (0,0) — the transformed variant accounts for the full CTM stack. (spec §5, §20 invariant 3)
 //!
-//! # M1 scope
-//! Stub — structure and types only. Full extraction + rstar spatial index lands in M2
-//! alongside the markup overlay (snap is needed for accurate markup placement).
+//! # Extraction split: pure math here, PDFium I/O on the render thread
+//! This module builds a page's snap index from already-extracted [`Subpath`] point
+//! data ([`build_snap_index`]) — pure math, no PDFium dependency, unit-testable
+//! without a PDFium binary or corpus (same split as the text-selection quad helpers
+//! below: `rect_to_quad`/`rects_to_quads`). The PDFium-touching half — walking
+//! `page.objects().iter()`, filtering path objects, and reading their *transformed*
+//! segments — lives in `render::RenderEngine::page_snap_index`, because PDFium access
+//! must happen on the dedicated render thread (the `RenderCmd`/`RenderHandle`
+//! architecture; PDFium keeps process-global C state and isn't safe to touch from
+//! any other thread). A free `fn extract_page_geometry(page_index) -> PageGeometry`
+//! can never work as a standalone function in this module for that reason — it
+//! needs an open `PdfPage` handle, which only the render thread may hold.
+//!
+//! # v1 scope (build_snap_index)
+//! Populates [`SnapKind::Endpoint`] (every distinct vertex) and [`SnapKind::Midpoint`]
+//! (every segment midpoint, including a sub-path's closing segment). Deliberately
+//! does NOT populate `Intersection` or `ArcCenter`:
+//! - `Intersection`: naive pairwise segment-intersection is O(n²) in the segment
+//!   count. redline's own stated target use case (spec: "very large construction
+//!   plan sets") routinely produces pages with thousands of path segments (see the
+//!   §20 C4 "dense A0" bench corpus) — an unaccelerated O(n²) pass risks becoming a
+//!   real interaction-latency regression exactly on the documents this app cares
+//!   most about. Doing it properly needs a spatial-accelerated sweep (e.g. bucket
+//!   candidate segments via the same rstar index before testing pairs), which is a
+//!   scoped v2 effort, not a bounded add-on to this pass.
+//! - `ArcCenter`: PDFium reports circles/arcs as a sequence of `BezierTo` segments
+//!   (see `PdfPagePathObject::circle_to`/`ellipse_to` in pdfium-render — four Bézier
+//!   curves approximating the shape), not as a first-class circle primitive. Finding
+//!   an arc's center therefore needs curve-fitting heuristics over consecutive
+//!   Bézier segments, which is unbuilt. `Subpath` only carries segment *destination*
+//!   points (Bézier control points aren't exposed by pdfium-render's segment API —
+//!   see `PdfPageObjectPrivate::try_copy_impl`'s `BezierControlPointsNotCopyable`
+//!   guard), so there isn't yet enough data flowing through this module to derive it.
 
 use rstar::{PointDistance, RTree, RTreeObject, AABB};
 use serde::{Deserialize, Serialize};
@@ -90,20 +120,67 @@ impl PageGeometry {
 }
 
 // ---------------------------------------------------------------------------
-// Stub: extraction (M2)
+// Snap-index construction (pure math half — see module doc comment)
 // ---------------------------------------------------------------------------
 
-/// Extract snap targets from a PDF page via PDFium transformed path iteration.
-///
-/// TODO (M2): implement using `page.objects().iter()` + transformed segment extraction.
-/// Key: use the *transformed* variant of path segment iteration to correctly compose
-/// Form XObject CTM stacks — bare path coordinates collapse to ~(0,0) otherwise.
-/// See spec §5 and pdfium-render docs for `PdfPagePathObject::transform()`.
-#[allow(dead_code)]
-pub fn extract_page_geometry(_page_index: u32) -> PageGeometry {
+/// One sub-path (contiguous polyline) extracted from a PDFium path page object's
+/// *transformed* segments — one entry per `MoveTo`-delimited run. `closed` is set
+/// when PDFium reported an explicit path-close (`FPDFPathSegment_GetClose`) on the
+/// sub-path's final segment. `points` holds each segment's *destination* point only
+/// (Bézier control points aren't exposed by pdfium-render's segment API), so a
+/// curved sub-path is approximated here by its Bézier endpoints, not its true curve.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Subpath {
+    pub points: Vec<PdfPoint>,
+    pub closed: bool,
+}
+
+/// Build a page's snap-target spatial index from its extracted vector sub-paths
+/// (spec §5, M2/v1). See the module doc comment for exactly which `SnapKind`s this
+/// populates and why `Intersection`/`ArcCenter` are deferred.
+pub fn build_snap_index(page_index: u32, subpaths: &[Subpath]) -> PageGeometry {
+    let mut targets = Vec::new();
+
+    for sub in subpaths {
+        let pts = &sub.points;
+        if pts.is_empty() {
+            continue;
+        }
+
+        for p in pts {
+            targets.push(SnapTarget {
+                point: *p,
+                kind: SnapKind::Endpoint,
+            });
+        }
+
+        for w in pts.windows(2) {
+            targets.push(midpoint_target(w[0], w[1]));
+        }
+
+        // Closing segment (last point back to first), only when PDFium marked the
+        // sub-path closed and it isn't already degenerate (single point, or the
+        // last point already coincides with the first — no distinct closing edge).
+        let first = pts[0];
+        let last = *pts.last().unwrap();
+        if sub.closed && pts.len() > 1 && first != last {
+            targets.push(midpoint_target(last, first));
+        }
+    }
+
     PageGeometry {
-        page_index: _page_index,
-        snap_index: RTree::new(),
+        page_index,
+        snap_index: RTree::bulk_load(targets),
+    }
+}
+
+fn midpoint_target(a: PdfPoint, b: PdfPoint) -> SnapTarget {
+    SnapTarget {
+        point: PdfPoint {
+            x: (a.x + b.x) / 2.0,
+            y: (a.y + b.y) / 2.0,
+        },
+        kind: SnapKind::Midpoint,
     }
 }
 
@@ -298,6 +375,158 @@ mod tests {
         };
         let result = geom.nearest_snap(PdfPoint { x: 0.0, y: 0.0 }, 10.0);
         assert!(result.is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // build_snap_index (v1 snap-target extraction — pure half)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn build_snap_index_open_polyline_endpoints_and_midpoints() {
+        // A single open 3-point polyline: (0,0) -> (10,0) -> (10,10).
+        let subpaths = vec![Subpath {
+            points: vec![
+                PdfPoint { x: 0.0, y: 0.0 },
+                PdfPoint { x: 10.0, y: 0.0 },
+                PdfPoint { x: 10.0, y: 10.0 },
+            ],
+            closed: false,
+        }];
+        let geom = build_snap_index(0, &subpaths);
+
+        let endpoints: Vec<_> = geom
+            .snap_index
+            .iter()
+            .filter(|t| t.kind == SnapKind::Endpoint)
+            .collect();
+        assert_eq!(endpoints.len(), 3, "one Endpoint per vertex");
+
+        let midpoints: Vec<_> = geom
+            .snap_index
+            .iter()
+            .filter(|t| t.kind == SnapKind::Midpoint)
+            .collect();
+        // Open polyline: 2 segments, no closing edge -> exactly 2 midpoints.
+        assert_eq!(midpoints.len(), 2, "no closing-segment midpoint on an open sub-path");
+        assert!(midpoints
+            .iter()
+            .any(|t| (t.point.x - 5.0).abs() < 1e-9 && (t.point.y - 0.0).abs() < 1e-9));
+        assert!(midpoints
+            .iter()
+            .any(|t| (t.point.x - 10.0).abs() < 1e-9 && (t.point.y - 5.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn build_snap_index_closed_subpath_adds_closing_midpoint() {
+        // A closed triangle: (0,0) -> (10,0) -> (0,10), closed back to (0,0).
+        let subpaths = vec![Subpath {
+            points: vec![
+                PdfPoint { x: 0.0, y: 0.0 },
+                PdfPoint { x: 10.0, y: 0.0 },
+                PdfPoint { x: 0.0, y: 10.0 },
+            ],
+            closed: true,
+        }];
+        let geom = build_snap_index(0, &subpaths);
+        let midpoints = geom
+            .snap_index
+            .iter()
+            .filter(|t| t.kind == SnapKind::Midpoint)
+            .count();
+        // 2 interior segments + 1 closing segment = 3 midpoints.
+        assert_eq!(midpoints, 3, "closed sub-path adds a midpoint for the closing edge");
+    }
+
+    #[test]
+    fn build_snap_index_closed_but_degenerate_last_equals_first_no_extra_midpoint() {
+        // PDFium reported `closed`, but the point list already round-trips back to
+        // its start (no distinct closing edge to add).
+        let subpaths = vec![Subpath {
+            points: vec![
+                PdfPoint { x: 0.0, y: 0.0 },
+                PdfPoint { x: 10.0, y: 0.0 },
+                PdfPoint { x: 0.0, y: 0.0 },
+            ],
+            closed: true,
+        }];
+        let geom = build_snap_index(0, &subpaths);
+        let midpoints = geom
+            .snap_index
+            .iter()
+            .filter(|t| t.kind == SnapKind::Midpoint)
+            .count();
+        assert_eq!(midpoints, 2, "no extra closing midpoint when last already equals first");
+    }
+
+    #[test]
+    fn build_snap_index_multiple_subpaths_are_independent() {
+        let subpaths = vec![
+            Subpath {
+                points: vec![PdfPoint { x: 0.0, y: 0.0 }, PdfPoint { x: 1.0, y: 0.0 }],
+                closed: false,
+            },
+            Subpath {
+                points: vec![PdfPoint { x: 100.0, y: 100.0 }, PdfPoint { x: 101.0, y: 100.0 }],
+                closed: false,
+            },
+        ];
+        let geom = build_snap_index(0, &subpaths);
+        assert_eq!(
+            geom.snap_index
+                .iter()
+                .filter(|t| t.kind == SnapKind::Endpoint)
+                .count(),
+            4
+        );
+        assert_eq!(
+            geom.snap_index
+                .iter()
+                .filter(|t| t.kind == SnapKind::Midpoint)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn build_snap_index_empty_and_single_point_subpaths_produce_no_midpoints() {
+        let subpaths = vec![
+            Subpath { points: vec![], closed: false },
+            Subpath {
+                points: vec![PdfPoint { x: 5.0, y: 5.0 }],
+                closed: true,
+            },
+        ];
+        let geom = build_snap_index(0, &subpaths);
+        assert_eq!(
+            geom.snap_index
+                .iter()
+                .filter(|t| t.kind == SnapKind::Endpoint)
+                .count(),
+            1,
+            "the single-point sub-path still yields one Endpoint"
+        );
+        assert_eq!(
+            geom.snap_index
+                .iter()
+                .filter(|t| t.kind == SnapKind::Midpoint)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn build_snap_index_nearest_snap_finds_extracted_endpoint() {
+        // Round-trip through PageGeometry::nearest_snap to prove the built index is
+        // actually queryable, not just structurally correct.
+        let subpaths = vec![Subpath {
+            points: vec![PdfPoint { x: 50.0, y: 50.0 }, PdfPoint { x: 150.0, y: 50.0 }],
+            closed: false,
+        }];
+        let geom = build_snap_index(3, &subpaths);
+        assert_eq!(geom.page_index, 3);
+        let hit = geom.nearest_snap(PdfPoint { x: 51.0, y: 50.0 }, 5.0);
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().kind, SnapKind::Endpoint);
     }
 
     // ---------------------------------------------------------------------------

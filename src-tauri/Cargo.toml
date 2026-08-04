@@ -113,13 +113,29 @@ reqwest = { version = "0.12", features = ["json"] }
 # commands can be tested against a fake without a live HTTP call).
 async-trait = "0.1"
 
-# --- Future milestones (feature-gated to keep M1 build lean) ---
-# leptess = { version = "0.14", optional = true }   # OCR — M4
+# --- Deferred: OCR (decision:tntyyjau94smf6r6jitq chose leptess 0.14, 2026-06-25;
+# investigated + formally descoped 2026-08-04, wave-2 portfolio review; the `ocr`
+# module + this feature stub were removed rather than left as dead scaffolding).
+# NOT a "not needed" call - it's a real spec-mandated v1 feature (spec §14, §219)
+# with no engineering blocker on Linux, but three real blockers found on the
+# actual release path before it can ship:
+#   1. Forgejo CI (.forgejo/workflows/ci.yml, ubuntu-latest) has no
+#      tesseract-ocr/libtesseract-dev/libleptonica-dev apt step - `--features ocr`
+#      would not even compile in CI today.
+#   2. .github/workflows/build-releases.yml's build-macos job has no
+#      `brew install tesseract` (or vendored equivalent) step.
+#   3. build-windows has no vcpkg/tesseract bootstrap at all - leptess on Windows
+#      is the hard case (static vs dynamic linking, VCPKG_ROOT/TESSDATA_PREFIX env
+#      wiring) and untested in this repo.
+# Plus tessdata (eng.traineddata, ~12MB) is not staged anywhere for
+# tauri.bundle.resources. Re-enabling needs all four addressed, in that order
+# (Linux CI first - cheapest signal), each verified by an actual green CI/release
+# run, not just a local compile. See CLAUDE.md "Deferred: OCR" for the full note.
+# leptess = { version = "0.14", optional = true }
 
 [features]
 default = []
-# Uncomment when milestone work begins:
-# ocr = ["dep:leptess"]
+# ocr = ["dep:leptess"]  # see the Deferred: OCR note above before re-enabling
 
 [dev-dependencies]
 tempfile = "3"

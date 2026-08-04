@@ -216,7 +216,7 @@ All v1 open decisions are now locked. (Date noted so later changes stay visible.
 Gap review against Bluebeam Revu, split by cost. These augment the milestones above (most slot into M2/M4/M5).
 
 ### Low-cost — recommended in v1
-- **OCR** — searchable scanned/image PDFs. Tesseract (Apache-2.0) via `leptess`: rasterize → OCR → write an *invisible* text layer. On-demand/batch (per-page cost is non-trivial); imperfect on drawings; adds native tesseract + leptonica deps to bundle.
+- **OCR** — searchable scanned/image PDFs. Tesseract (Apache-2.0) via `leptess`: rasterize → OCR → write an *invisible* text layer. On-demand/batch (per-page cost is non-trivial); imperfect on drawings; adds native tesseract + leptonica deps to bundle. **STATUS (2026-08-04): decided but not built - descoped for now, see CLAUDE.md "Deferred: OCR" for the release-pipeline blockers (Forgejo CI + macOS + Windows all lack the native tesseract dependency wiring).**
 - **Text search (in-doc, Set, and folder/library)** — within a document and across a Set via `pdfium-render`; and **across whole folders/libraries via a persistent full-text index (Tantivy, MIT)** — a flagship requested feature. Background/incremental indexing of extracted + OCR'd text (file watcher for changes); results give file + page + snippet, click to open at the page. First-time indexing of a large library is a background job; OCR makes it slower (best as an optional background pass).
 - **Page manipulation** — insert/delete/rotate/reorder/extract/crop/split/merge. Free via PDFium + `lopdf`.
 - **PDF layers (OCG) show/hide** — high-value on construction drawings; free via PDFium (`/OC` already appears in `.btx` raw, so it ties into import).

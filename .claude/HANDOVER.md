@@ -2,20 +2,145 @@
 
 ## Current Status
 
-**main is at `ce849c7` (v0.3.6). 0 open PRs - PR #58 (crossbeam-epoch RUSTSEC-2026-0204
-fix) has since merged (this reconciliation pass corrects the "NOT merged" status the
-2026-07-15 session below left behind). Releases through v0.3.6 and PRs #54-#58
-(double-render G9 fix, happy-dom/playwright security bump, crossbeam-epoch bump)
-landed via sessions that did not update this file - reconcile against
-`git log --oneline` before trusting anything below this line; the KB mission record
-(`project:q8gm8dv3k7smld12rm25`) is more current than this file's older "Previous
-session" entries. lopdf (RUSTSEC-2026-0187, high) and quick-xml
-(RUSTSEC-2026-0195/0194) remain open, deferred advisories - see PR-B in the
-2026-08-04 wave dispatch (below) for the lopdf migration attempt.**
+**main was at `8d84754c` (post-v0.3.6) before this session's PR. Wave-2 resolved two
+spec-vs-reality gaps flagged by the 2026-08-04 portfolio review: geometry/snap
+(BUILT a real v1) and OCR (DESCOPED, formally). See Last Session below for detail and
+`.claude/rules/judgment.md` for the carried-forward gotchas both touch. One residual
+RUSTSEC finding, NOT fixable from this repo: rkyv 0.7.46 (RUSTSEC-2026-0235) is an
+unactivated optional feature of a transitive dep (rust_decimal, pulled in via
+tauri-plugin-log -> byte-unit) - confirmed non-exploitable (`cargo tree -i rkyv
+--target all` = zero reachable packages), blocked on an upstream rust_decimal release
+compatible with rkyv 0.8. Detail: `obs:w3mm0ublu2xu1t8y8tyv`.**
 
 ## Last Session
 
-**Date**: 2026-07-15 (RUSTSEC dependency sweep, dispatched by the orchestrator)
+**Date**: 2026-08-04 (wave-2, dispatched by the orchestrator - "resolve the two
+spec-vs-reality gaps found in the portfolio review, with authority to decide on
+engineering evidence")
+
+**Summary**: Two independent decisions, both made on evidence rather than punted.
+
+**1. Geometry/snap - BUILT a real v1** (`geometry::extract_page_geometry(page_index)`
+was a dead M2-era stub with the wrong signature - it could never work standalone,
+since PDFium access must happen on the render thread, per this repo's own
+`RenderCmd`/`RenderHandle` architecture). Split the fix the same way the existing
+text-selection quad helpers already do: `geometry::build_snap_index()` is pure math
+(sub-paths in, `Endpoint`+`Midpoint` `SnapTarget`s out via the existing `rstar` RTree -
+no PDFium dependency, unit-tested without a binary); `RenderEngine::page_snap_index()`
+(new, `render/mod.rs`) is the PDFium-touching half - walks `page.objects().iter()`,
+filters path objects, reads their *transformed* segments (composes Form XObject CTMs
+correctly, the exact trap the old stub's doc comment warned about), and caches the
+result per (open doc, page) in a new `OpenDoc.snap_cache` field. New
+`RenderCmd::PageSnapIndex` + `RenderHandle::page_snap_index()` follow the identical
+plumbing pattern as `SearchPage`/`CharIndexAtPoint`. New Tauri command
+`get_page_snap_targets` (`commands/geometry.rs`, own file per this repo's
+concurrent-branch convention) returns the whole page's targets in one call - the
+frontend does nearest-neighbour lookup client-side (`src/lib/snap.ts`,
+`findNearestSnap`) so a drag gesture never pays an IPC round-trip per pointer-move.
+Wired into `Viewport.svelte`'s `clientToPdf()` - the single choke point every
+point-capture flow already calls through (drag-draw start, multi-click vertices,
+calibration clicks) - gated by a new `SNAP_ELIGIBLE_TOOLS` set (calibrate +
+Line/Arrow/Polyline/Polygon/Cloud + all Measurement* tools; deliberately excludes
+select/pan/text-select/rect-drag/text/stamp tools) so every non-eligible tool/gesture
+is completely unaffected (`snapTargets` stays empty, `clientToPdf` is a pure
+passthrough). Added a screen-space ring indicator (`.snap-indicator`, design-token
+styled) so snapping is visible feedback, not a silent cursor jump.
+
+DELIBERATELY NOT built in v1: `Intersection` and `ArcCenter` snap kinds (the enum
+variants exist, unpopulated). Documented at length in the `geometry` module doc
+comment - `Intersection` needs a spatially-accelerated pairwise check, not a naive
+O(n²) pass, because this app's own target use case (very large construction plan
+sets, e.g. the §20 "dense A0" corpus) routinely produces thousands of path segments
+per page; `ArcCenter` needs Bézier-arc-fitting heuristics PDFium doesn't expose
+control points for. Both are real, scoped v2 work, not silently dropped.
+
+Tests: 7 new pure `geometry::tests::build_snap_index_*` cases (open/closed/degenerate
+sub-paths, multi-subpath independence, empty/single-point edge cases, a
+`nearest_snap` round-trip) - all run in plain `cargo test --lib`, no PDFium needed.
+3 new PDFium-gated integration tests in `render::tests` (`page_snap_index_*`) build a
+synthetic fixture via a REAL lopdf content stream (`m`/`l`/`h`/`S` operators drawing
+an open line + closed triangle, same "build a tiny doc, save, open via RenderEngine"
+pattern as the existing double-render-bug test) and prove extraction end-to-end,
+caching (`Arc::ptr_eq` on repeat calls), and the unknown-doc-id error path - these
+self-skip without `PDFIUM_DYNAMIC_LIB_PATH` (CI), confirmed passing under
+`PDFIUM_DYNAMIC_LIB_PATH=... cargo test --release --lib -- --test-threads=1` (the
+documented invocation - plain debug-mode `cargo test` with the PDFium env set hits a
+PRE-EXISTING (confirmed via `git stash`, not introduced this session) PDFium
+thread-safe-binding panic when many `RenderEngine::new()` calls happen in one debug
+test binary; `--release` is the only mode this repo's own PDFium tests are meant to
+run in together). 11 new `src/lib/snap.test.ts` cases (cache identity/per-page
+isolation/in-flight dedup/invalidation, `findNearestSnap` boundary cases). Fixed one
+real bug found by the frontend suite: `getPageSnapTargets` originally chained
+`.catch()` directly on `invoke()`'s return value, which threw when a test-mocked
+`invoke` returned `undefined` synchronously (`Viewport.interaction.test.ts`'s
+`afterEach(() => vi.restoreAllMocks())` resets `vi.fn()`-based mocks to no
+implementation, unlike `vi.clearAllMocks()`) - wrapped in `Promise.resolve(...)` so a
+non-promise return can't crash an uncaught async effect.
+
+Docs corrected: `CLAUDE.md`'s Architecture module list already described geometry's
+PURPOSE generically enough to still be true once built - no false claim there to
+fix. No architecture-doc correction was needed for this half (the OCR half below did
+need one).
+
+**2. OCR - DESCOPED, formally** (was never actually built despite M4/"shipped"
+framing implying otherwise). `ocr/mod.rs` was a 9-line stub, `leptess` and the `ocr`
+Cargo feature were both commented out since M1, and per `decision:tntyyjau94smf6r6jitq`
+(2026-06-25) OCR-via-leptess was DECIDED for M4 but the decision was never executed -
+nobody had previously flagged that gap. Verified rather than assumed the "bounded
+effort" bias the dispatch suggested: `.forgejo/workflows/ci.yml` (Linux, Forgejo) has
+no `tesseract-ocr`/`libtesseract-dev`/`libleptonica-dev` apt step, so `--features ocr`
+wouldn't even compile in CI today; `.github/workflows/build-releases.yml`'s
+`build-macos` job has no `brew install tesseract` step; `build-windows` has NO
+vcpkg/tesseract bootstrap at all (the hard platform for `leptess` - static/dynamic
+linking + `VCPKG_ROOT`/`TESSDATA_PREFIX` wiring, unverified in this repo); and
+`eng.traineddata` (~12MB tessdata) isn't staged in `tauri.bundle.resources` anywhere.
+All three release-pipeline legs need work before OCR could ship, and this dispatch's
+hard constraints (no releases/tags/deploys) meant I couldn't verify a working
+Windows/macOS release build even if I wrote the Rust code - so BUILDING it now would
+have meant shipping an unverified critical platform leg, which the verification-gate
+standard doesn't allow. Removed the stub as dead scaffolding rather than leaving it
+(`pub mod ocr` + `src/ocr/` deleted from `lib.rs`/the tree) and documented the real
+gap in three places so it's discoverable rather than silently re-appearing as a
+"shipped" claim: `CLAUDE.md` Tech Stack line, a new "Deferred: OCR" entry under Key
+Decisions (the blocker list + what re-enabling needs, in order, cheapest-first), and
+the Build Order + "Current phase" lines (which previously implied M4's OCR item had
+shipped). Also annotated `docs/bluebeam-alternative-v1-spec.md`'s OCR bullet
+(§14/§219) with the same status note, and left an inline comment in `Cargo.toml`
+above the still-commented `leptess` line with the identical blocker list, so the
+detail lives next to the code as well as in CLAUDE.md.
+
+Verified: `cargo test --lib` 415/415 (18 new: 7 pure `geometry` + 3 PDFium-gated
+`render` + 8 existing takeoff/geometry unaffected), `cargo test --release --lib --
+--test-threads=1` under `PDFIUM_DYNAMIC_LIB_PATH` also 415/415 (0 failed - confirms
+the debug-mode PDFium panic bucket is pre-existing and unrelated), `cargo clippy
+--all-targets` 1 pre-existing unrelated warning (`commands/docops.rs` redundant
+closure, present on `main` before this branch), `npm run check` 0 errors, `npm test`
+673/673 (11 new in `src/lib/snap.test.ts`).
+
+**Not touched**: `gate.rs`/`token.rs`/`store.rs` (license), `docops`, `takeoff` -
+scope was geometry + OCR only per dispatch.
+
+### Previous session (2026-08-04, wave-1 PR-C resume, dispatched by the orchestrator)
+**Summary**: Resumed a stopped wave-1 dispatch. PR-A/PR-B were already merged (#59,
+#60) by a prior agent run. Completed PR-C: found an unpushed local branch
+(`feat/toolpalette-measurements-status-crashguard`) already had the four measurement
+tools' draw-tool wiring done (model/IPC/render support predated it - only entry points
+were missing); added the markup workflow-status dropdown in `PropertiesPanel`
+(`patchStatus` existed as a pure function with zero UI wiring until now), a Rust panic
+hook (`src-tauri/src/panic_guard.rs`) routing any-thread panics through the `log` crate
+into the existing file log, a frontend uncaught-error/unhandledrejection surface
+(`src/lib/error-surface.ts` + `src/components/ErrorBanner.svelte`, mounted outside the
+license gate in `App.svelte`), and the macOS `REDLINE_LICENSE_API_URL_DEFAULT` build-
+workflow fix. Verified: `cargo test --lib` 406/406 (6 new), `npm test` 662/662 (13
+new), `npm run check` 0 errors, `cargo clippy` 1 pre-existing unrelated warning. CI
+green (Forgejo run/action_run 2998, both `test-rust` + `test-frontend` success). **PR
+#61 opened + merged** (squash `8d84754c`):
+`https://forge.mms.name/emittiv/redline/pulls/61`. Method note: `cargo fmt -p redline
+-- <file>` does NOT restrict to that file - it reformats the whole package; caught via
+`git status` before committing, reverted with `git checkout --`. Use `rustfmt <file>`
+directly for a single-file format in a workspace member.
+
+### Previous session (2026-07-15, RUSTSEC dependency sweep, dispatched by the orchestrator)
 **Summary**: `cargo audit` baseline found 4 vulnerabilities. Fixed
 `crossbeam-epoch` 0.9.18 -> 0.9.20 (RUSTSEC-2026-0204, invalid pointer deref in
 `fmt::Pointer`) via `cargo update -p crossbeam-epoch` - transitive via rayon,
@@ -185,13 +310,29 @@ still owed to a human session. Detail: `obs:e1tujicl7p4uck906rxa`.
 
 ## Next Steps
 
-**Immediate**: PR #58 (RUSTSEC crossbeam-epoch fix) has merged (`ce849c7`). lopdf
-(RUSTSEC-2026-0187, high) and quick-xml (RUSTSEC-2026-0195/0194) remain open
-advisories needing scoped migration PRs - see the 2026-08-04 wave dispatch PR-B
-below for the lopdf migration attempt.
+**Immediate**: none from wave-2. Live-verify item added: place a measurement or draw
+a Line/Arrow/Polyline near an existing vector line in a real (non-scanned) PDF and
+confirm the cursor snaps to its endpoint/midpoint with the ring indicator showing -
+the automated tests prove the extraction+plumbing is correct, but a human GUI pass on
+the actual interaction feel (tolerance, snap "stickiness") is still the final word,
+same class of gap as every other GUI-affecting change in this repo's history.
+Follow-up worth scoping later (not blocking, not requested this dispatch):
+`Intersection`/`ArcCenter` snap kinds (v2, needs a spatially-accelerated pairwise
+check + Bézier-arc-fitting respectively - see the `geometry` module doc comment), and
+re-enabling OCR (see "Deferred: OCR" under Key Decisions in CLAUDE.md for the
+ordered blocker list - Linux CI apt step is the cheapest first step).
 
-**Stale below this line** (dated 2026-07-11, predates PRs #54-#58 - v0.3.2 release
-sequencing described here is superseded; main is already at v0.3.6 per Current
+**Previously immediate, now historical**: the wave-1 3-PR plan (docs, security deps, UX unlock) is
+complete, all merged to main. The one remaining RUSTSEC finding (rkyv, see Current
+Status) is not actionable from this repo. New live-verify items from this session:
+place a Perimeter/Volume/Angle/Radius measurement, confirm the workflow-status
+dropdown in the Properties panel persists status across save/reopen (round-trips via
+`/RLWorkflowExtra`, PR #52), and confirm a forced JS error surfaces the crash-guard
+banner in a real `cargo tauri dev` session (only unit/component-tested so far, not
+GUI-verified).
+
+**Stale below this line** (dated 2026-07-11, predates PRs #54-#61 - v0.3.2 release
+sequencing described here is superseded; main is already past v0.3.6 per Current
 Status above). Kept for the still-owed live-verification items, which remain valid
 regardless of version number.
 
@@ -249,7 +390,7 @@ Before the first tagged Windows/macOS release:
 | Item | Value |
 |------|-------|
 | Remote | `git@ssh.forge.mms.name:emittiv/redline.git` |
-| Main branch | `main` @ `db11e2b` (M1-M6 + Phase 1.1 + Windows-dist infra + Tool Chest polish + S2b + docops/highlight bugfix batch + markup round-trip fidelity fix + license URL default merged) |
+| Main branch | `main` @ `8d84754c` (M1-M6 + Phase 1.1 + Windows-dist infra + Tool Chest polish + S2b + docops/highlight bugfix batch + markup round-trip fidelity fix + license URL default (both platforms) + measurement tools + workflow status UI + crash-guard, all merged) |
 | KB mission record | `project:q8gm8dv3k7smld12rm25` (stage: stabilizing, health: on_track) |
 | Ship pipeline | `.claude/skills/sendit/SKILL.md` |
 | Judgment rules | `.claude/rules/judgment.md` (2026-07-02 - incident/decision distillation) |
@@ -260,6 +401,9 @@ Before the first tagged Windows/macOS release:
 | PR #53 | `https://forge.mms.name/emittiv/redline/pulls/53` (license API URL compile-time default for Windows release builds - MERGED `db11e2b`) |
 | PR #57 | `https://forge.mms.name/emittiv/redline/pulls/57` (happy-dom + playwright security bump - MERGED `610ba66`) |
 | PR #58 | `https://forge.mms.name/emittiv/redline/pulls/58` (crossbeam-epoch RUSTSEC-2026-0204 fix - MERGED `ce849c7`) |
+| PR #59 | `https://forge.mms.name/emittiv/redline/pulls/59` (docs/HANDOVER reconciliation through PR#58 - MERGED `941c1e0`) |
+| PR #60 | `https://forge.mms.name/emittiv/redline/pulls/60` (lopdf 0.36->0.44 + quick-xml 0.39->0.41, RUSTSEC-2026-0187/0194/0195 - MERGED `ced6a4a`) |
+| PR #61 | `https://forge.mms.name/emittiv/redline/pulls/61` (measurement tools + markup status UI + crash-guard + macOS license-URL fix - MERGED `8d84754c`) |
 | S2b license contract | `emittiv-staff/src/lib/server/license.ts` (authoritative token shape - do not change without a hub message) |
 
 ## Key Gotchas (carry forward)
@@ -307,10 +451,48 @@ Before the first tagged Windows/macOS release:
   `document::annots::tests::fidelity_matrix`.
 - **License API base URL resolves in 3 tiers** (`license/client.rs::resolve_base_url`,
   PR #53): runtime `REDLINE_LICENSE_API_URL` env var wins > compile-time
-  `REDLINE_LICENSE_API_URL_DEFAULT` (baked via `option_env!`, set only in the
-  `build-windows` job of `.github/workflows/build-releases.yml`) > `NotConfigured`. The
-  macOS release job does NOT bake a default yet - a macOS release build still needs the
-  runtime env var to activate the S2b gate.
+  `REDLINE_LICENSE_API_URL_DEFAULT` (baked via `option_env!`) > `NotConfigured`. Both
+  `build-windows` and `build-macos` jobs of `.github/workflows/build-releases.yml` now
+  set this (PR #53 shipped Windows only; PR #61, 2026-08-04, closed the macOS gap) -
+  a release build on either platform activates the S2b gate with no runtime env var.
+- **Rust panic hook + frontend crash-guard** (PR #61, 2026-08-04):
+  `src-tauri/src/panic_guard.rs::install_panic_hook()` (called first thing in
+  `lib.rs::run()`, before the render thread spawns) routes any-thread panics through
+  `log::error!` into the same persistent file log the auto-updater uses -
+  `eprintln!`s too, doesn't change unwind/abort behavior. Frontend mirror:
+  `src/lib/error-surface.ts` (`window.onerror`/`unhandledrejection` -> formatted
+  string) + `src/components/ErrorBanner.svelte` (dismissible banner, logs via
+  `@tauri-apps/plugin-log`, mounted in `App.svelte` OUTSIDE the license-gate `{#if}`
+  so it's live even during license checks).
+- **`Markup.workflow.status` now has a UI surface** (`PropertiesPanel.svelte`
+  "Workflow" section, PR #61): dropdown over `patchStatus()`
+  (`markup-properties.ts`) - the model function existed since an earlier PR but had
+  zero UI wiring until this one. Assignee/thread remain unedited (no UI yet).
+- **rkyv 0.7.46 (RUSTSEC-2026-0235) is a known, non-exploitable Cargo.lock entry** -
+  do not try to "fix" it with a routine `cargo update`. It's an optional feature of
+  `rust_decimal` (transitive via `tauri-plugin-log` -> `byte-unit`), never activated
+  anywhere in this repo's own `Cargo.toml` files (`cargo tree -i rkyv --target all` =
+  0 reachable packages). `cargo update -p rkyv --precise 0.8.17` fails: `rust_decimal`
+  1.42.0 requires `rkyv ^0.7.46` for that optional feature and no compatible release
+  exists yet. Blocked on upstream `rust_decimal`, not actionable here.
+- **Vector snap (spec §5, v1, wave-2)**: `geometry::build_snap_index` is the pure
+  half (subpaths in, `SnapTarget`s out - `Endpoint`/`Midpoint` only, v2 owes
+  `Intersection`/`ArcCenter`); `RenderEngine::page_snap_index` is the PDFium half
+  and is the ONLY place allowed to touch `page.objects()` for this feature (PDFium
+  access must stay on the render thread). Frontend point-capture snapping is wired
+  through ONE choke point, `Viewport.svelte`'s `clientToPdf()`, gated by
+  `SNAP_ELIGIBLE_TOOLS` - do not add snapping logic at individual `localPdf`/
+  `localPdfFromMouse` call sites, it belongs in `clientToPdf` so every tool that
+  should NOT snap (select/pan/text-select/stamp/text) stays correctly unaffected
+  by construction rather than by an per-call-site exclusion list.
+- **PDFium tests in plain `cargo test --lib` (debug, no `--release`) can panic when
+  many run together in one binary** - confirmed PRE-EXISTING on `main` via
+  `git stash` before wave-2's snap tests existed (11 failures on main alone, debug
+  mode). This repo's own documented invocation
+  (`REDLINE_BENCH_TESTS=1 cargo test --release -- --test-threads=1`, see CLAUDE.md
+  Commands) is not just a speed suggestion - it's required for the PDFium tests to
+  pass reliably together. Plain `cargo test --lib` with no `PDFIUM_DYNAMIC_LIB_PATH`
+  set (the CI path) is unaffected - every PDFium test self-skips via that env check.
 
 ---
-*Updated: 2026-07-11 (PR #52 + PR #53 both merged - v0.3.2 staging)*
+*Updated: 2026-08-04 (wave-2: vector snap v1 built, OCR formally descoped)*

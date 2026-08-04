@@ -5,13 +5,19 @@
 //!   document  — PDF parse/model, open/save, page manipulation (M1 shell, M2+)
 //!   geometry  — vector path extraction + spatial snap-target index (M1 shell, M2+)
 //!   text      — text extraction + search (M4)
-//!   ocr       — Tesseract invisible-text layer (M4)
 //!   search    — Tantivy folder/library index (M4)
 //!   markup    — annotation model + PDF serialisation (M2)
 //!   takeoff   — scale calibration, measurement, quantity (M3)
 //!   docops    — flatten/optimize/redact trait (M5)
 //!   compare   — page-pair diff rendering (M6 / Phase 1.1)
 //!   storage   — local-first file + version management (M4)
+//!
+//! No `ocr` module: Tesseract-via-leptess OCR was decided (decision:
+//! tntyyjau94smf6r6jitq) but never built, and was formally descoped 2026-08-04
+//! after investigation found the release pipeline unready on all three legs
+//! (Forgejo CI, macOS build, Windows build - see CLAUDE.md "Deferred: OCR" and
+//! the Cargo.toml `leptess`/`ocr`-feature comment for the specifics). Re-add the
+//! module when re-enabling, not before.
 
 use log::{info, warn};
 use tauri::Manager;
@@ -29,7 +35,6 @@ pub mod sidecar;
 pub mod compare;
 pub mod docops;
 pub mod markup;
-pub mod ocr;
 pub mod search;
 pub mod storage;
 pub mod takeoff;
@@ -200,6 +205,8 @@ pub fn run() {
             // Text selection commands (I-beam tool: text selection + text-anchored highlight)
             commands::text_select::char_index_at_point,
             commands::text_select::get_text_selection,
+            // Vector snap-target index (spec §5, v1)
+            commands::geometry::get_page_snap_targets,
             // Version snapshot commands (M4 S2)
             commands::versioning::snapshot_version,
             commands::versioning::list_document_versions,

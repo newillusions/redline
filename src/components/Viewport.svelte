@@ -72,6 +72,7 @@
   import { measureLength, measureArea, measurePerimeter, measureAngleDegrees } from "$lib/measurement-tools";
   import { addScale, type MeasurementPayload, type SearchHit } from "$lib/ipc";
   import { pdfUserSpaceToScreen } from "$lib/viewport";
+  import { getPageSnapTargets, findNearestSnap, type SnapTarget } from "$lib/snap";
   import CalibrationDialog from "./CalibrationDialog.svelte";
   import StampPromptDialog from "./StampPromptDialog.svelte";
 
@@ -295,6 +296,57 @@
    *  text-selection tool (not a create/select tool in the drawn-shape sense, but
    *  still needs pointer capture for its own drag gesture). */
   const overlayActive = $derived(isCreateTool() || isSelectTool() || store.activeTool === "selectText");
+
+  // --- Vector snap (spec §5, v1) ---
+  /**
+   * Tools whose point-capture benefits from snapping to vector geometry
+   * (endpoints/midpoints - see `$lib/snap` + Rust `geometry` module doc
+   * comment for what's populated). Deliberately narrower than `isCreateTool`:
+   * excludes rect-drag shapes (Rectangle/Ellipse/Highlight), text tools, and
+   * stamp placement, where snapping to nearby line geometry isn't the expected
+   * behaviour. Calibration is included - snapping the two calibration clicks to
+   * a known dimension line's endpoints is exactly the case this exists for.
+   */
+  const SNAP_ELIGIBLE_TOOLS: ReadonlySet<string> = new Set([
+    "calibrate", "Line", "Arrow", "Polyline", "Polygon", "Cloud",
+    "MeasurementLength", "MeasurementRadius", "MeasurementAngle",
+    "MeasurementArea", "MeasurementPerimeter", "MeasurementVolume",
+  ]);
+  /** Screen-pixel snap tolerance (converted to PDF points via SNAP_TOLERANCE_PX / zoom,
+   *  same idiom as SELECT_GRAB_PX). Slightly larger than SELECT_GRAB_PX - snapping is
+   *  an active user aid, not a hit-test, so a slightly more generous catch radius helps
+   *  more than it causes unwanted jumps. */
+  const SNAP_TOLERANCE_PX = 8;
+  /** Snap-target cache for the CURRENT page, prefetched (once, via `$lib/snap`'s own
+   *  cache) whenever a snap-eligible tool is active. Empty ⇒ clientToPdf is a no-op
+   *  passthrough, so every other tool/gesture is completely unaffected. */
+  let snapTargets: SnapTarget[] = $state([]);
+  /** The target actually snapped to on the last clientToPdf call - screen-space
+   *  indicator only, cleared whenever a call doesn't snap. */
+  let activeSnapHit: SnapTarget | null = $state(null);
+
+  $effect(() => {
+    const tool = store.activeTool;
+    if (!docInfo || !SNAP_ELIGIBLE_TOOLS.has(tool)) {
+      snapTargets = [];
+      activeSnapHit = null;
+      return;
+    }
+    const docId = docInfo.doc_id;
+    const pg = pageIndex;
+    void getPageSnapTargets(docId, pg)
+      .then((targets) => {
+        // Guard against a stale response landing after the doc/page/tool moved on.
+        if (docInfo?.doc_id === docId && pageIndex === pg && SNAP_ELIGIBLE_TOOLS.has(store.activeTool)) {
+          snapTargets = targets;
+        }
+      })
+      .catch(() => {
+        // Snapping is an aid, not a requirement - a failed fetch just means no
+        // snap targets this page (e.g. corrupt/exotic path content); the
+        // create-tool flow itself must keep working unsnapped.
+      });
+  });
 
   // --- Calibration dialog state ---
   let showCalibDialog = $state(false);
@@ -974,11 +1026,34 @@
   // Draw gesture — overlay pointer capture (drag-draw tools)
   // ---------------------------------------------------------------------------
 
-  /** Shared screen-to-PDF conversion from any clientX/Y (pointer or mouse). */
+  /**
+   * Shared screen-to-PDF conversion from any clientX/Y (pointer or mouse).
+   *
+   * When a snap-eligible tool (`SNAP_ELIGIBLE_TOOLS`) is active and the current
+   * page's snap targets are loaded, the raw point is overridden by the nearest
+   * loaded target within `SNAP_TOLERANCE_PX` (spec §5, v1 - endpoints/midpoints).
+   * This is the single choke point for point capture across the whole component
+   * (drag-draw start, multi-click vertices, calibration clicks all call through
+   * here), so every one of those flows gets snapping automatically without its
+   * own call site needing to know about it - and every OTHER tool (select,
+   * pan, text-select, stamp placement, text/callout entry) is completely
+   * unaffected, since `SNAP_ELIGIBLE_TOOLS` never matches their tool id and
+   * `activeSnapHit` only ever gets set here, on this path.
+   */
   function clientToPdf(clientX: number, clientY: number): { x: number; y: number } | null {
     if (!containerEl) return null;
     const r = containerEl.getBoundingClientRect();
-    return screenToPdfUserSpace(clientX - r.left, clientY - r.top, viewState);
+    const p = screenToPdfUserSpace(clientX - r.left, clientY - r.top, viewState);
+    if (!p) return p;
+    if (SNAP_ELIGIBLE_TOOLS.has(store.activeTool) && snapTargets.length > 0) {
+      const hit = findNearestSnap(snapTargets, p, SNAP_TOLERANCE_PX / zoom);
+      if (hit) {
+        activeSnapHit = hit;
+        return { x: hit.point.x, y: hit.point.y };
+      }
+    }
+    activeSnapHit = null;
+    return p;
   }
 
   /** Convert a pointer event to container-local PDF user space. */
@@ -2395,6 +2470,21 @@
       />
     {/if}
 
+    <!-- Vector snap indicator (spec §5, v1): a ring at the point clientToPdf just
+         snapped to, so snapping is visible feedback rather than a silent cursor
+         jump. pointer-events:none - purely decorative, same idiom as every other
+         overlay handle. Only rendered while a snap-eligible tool is active and a
+         snap actually occurred on the most recent point capture. -->
+    {#if activeSnapHit && SNAP_ELIGIBLE_TOOLS.has(store.activeTool)}
+      {@const s = pdfUserSpaceToScreen(activeSnapHit.point.x, activeSnapHit.point.y, viewState)}
+      <circle
+        class="snap-indicator"
+        class:snap-indicator-midpoint={activeSnapHit.kind === "Midpoint"}
+        cx={s.x} cy={s.y} r={7}
+        pointer-events="none"
+      />
+    {/if}
+
     <!-- Marquee drag preview. -->
     {#if marquee}
       <rect
@@ -2616,6 +2706,19 @@
     fill-opacity: 0.4;
     stroke: var(--color-primary);
     stroke-width: 1px;
+  }
+
+  /* Vector snap indicator (spec §5, v1) — hollow ring, open circle so it reads
+     as "snapped to a point" distinctly from the filled vertex-edit handles. */
+  :global(.markup-overlay .snap-indicator) {
+    fill: none;
+    stroke: var(--color-primary);
+    stroke-width: 2px;
+  }
+  /* Midpoint snaps get a lighter ring — same distinction Bluebeam/Acrobat draw
+     between a vertex-snap and a mid-segment snap. */
+  :global(.markup-overlay .snap-indicator-midpoint) {
+    stroke-opacity: 0.6;
   }
 
   /* Marquee drag preview (dashed, no fill). */
