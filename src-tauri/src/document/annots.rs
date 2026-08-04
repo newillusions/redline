@@ -286,6 +286,16 @@ pub(crate) mod tests {
         })
         .expect("build encryption state for test fixture");
         doc.encrypt(&state).expect("encrypt test fixture");
+        // lopdf 0.44.0 upstream bug: Document::save()'s default cross-reference
+        // TYPE for a version-1.5+ doc is a compressed CrossReferenceStream, and
+        // reloading a saved *encrypted* PDF that used one loses every object
+        // except the /Encrypt dict itself (the stream's offset table comes back
+        // unreadable - a cross-reference stream must never itself be encrypted
+        // per PDF spec §7.5.8.2, and lopdf's reader/writer mishandle that
+        // exemption for encrypted docs). Forcing the classic plaintext xref
+        // TABLE sidesteps the bug entirely; unencrypted fixtures are unaffected
+        // and keep the (working) default. See PR body / HANDOVER for detail.
+        doc.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
         doc
     }
 

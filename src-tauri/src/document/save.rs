@@ -16,16 +16,19 @@ use crate::markup::Markup;
 
 /// Read the markup set from a PDF on disk.
 ///
-/// If the PDF is encrypted, `password` decrypts it first (lopdf's `Document::load`
-/// does NOT auto-decrypt - it leaves streams/strings as ciphertext). Returns an
-/// error rather than silently reading garbled ciphertext as annotation content if
-/// decryption fails or no password was supplied for an encrypted file.
+/// If the PDF is encrypted, `password` decrypts it. Uses `Document::load_with_password`
+/// rather than the older load-then-`.decrypt()` two-step: as of lopdf 0.44 the plain
+/// `Document::load` on an encrypted file, given no password up front, takes a
+/// short-circuit path that parses ONLY the `/Encrypt` dictionary and never populates
+/// the rest of the object graph - a later `.decrypt(password)` call then has nothing
+/// to decrypt (silently "succeeds" against zero objects). Supplying the password at
+/// load time is the only path that actually reads and decrypts the object graph.
+/// Passing an empty password against a non-empty-password-protected file, or a wrong
+/// password, both correctly error rather than silently reading garbled ciphertext -
+/// verified in the encrypted-PDF test suite below.
 pub fn load_markups_from(path: &Path, password: Option<&str>) -> Result<Vec<Markup>> {
-    let mut doc = Document::load(path).with_context(|| format!("load {}", path.display()))?;
-    if doc.is_encrypted() {
-        doc.decrypt(password.unwrap_or(""))
-            .map_err(|e| anyhow::anyhow!("incorrect password for encrypted PDF: {e}"))?;
-    }
+    let doc = Document::load_with_password(path, password.unwrap_or(""))
+        .map_err(|e| anyhow::anyhow!("could not open {} (wrong password?): {e}", path.display()))?;
     read_markups(&doc)
 }
 
@@ -91,16 +94,23 @@ pub fn save_with_markups(src: &Path, dest: &Path, markups: &[Markup]) -> Result<
 /// This is the backing implementation for the "save unprotected copy"
 /// capability: it does NOT touch markups (unlike `save_with_markups`) - it
 /// preserves whatever content/annotations already exist in the source file,
-/// exactly as `Document::decrypt` leaves them, and writes that out plain.
+/// exactly as decryption leaves them, and writes that out plain.
 /// Refuses a non-encrypted source (nothing to strip) and a wrong password
 /// (never writes a partial/garbage `dest`).
+///
+/// Uses `Document::load_with_password` (password supplied at load time, not a
+/// subsequent `.decrypt()` call) - see `load_markups_from`'s doc comment for
+/// why the two-step pattern no longer works on lopdf 0.44. `was_encrypted()`
+/// (not `is_encrypted()`) is the correct post-load check here: a successful
+/// password-authenticated load already strips `/Encrypt` from the trailer, so
+/// `is_encrypted()` would read false for every successfully-opened file
+/// regardless of whether it originated encrypted.
 pub fn save_decrypted_copy(src: &Path, dest: &Path, password: &str) -> Result<()> {
-    let mut doc = Document::load(src).with_context(|| format!("load {}", src.display()))?;
-    if !doc.is_encrypted() {
+    let mut doc = Document::load_with_password(src, password)
+        .map_err(|e| anyhow::anyhow!("could not open {} (wrong password?): {e}", src.display()))?;
+    if !doc.was_encrypted() {
         anyhow::bail!("Source document is not password-protected - nothing to save unprotected.");
     }
-    doc.decrypt(password)
-        .map_err(|e| anyhow::anyhow!("incorrect password for encrypted PDF: {e}"))?;
 
     let dir = dest.parent().context("dest has no parent dir")?;
     let tmp = dir.join(format!(
@@ -322,6 +332,10 @@ mod tests {
         })
         .expect("build encryption state for test fixture");
         doc.encrypt(&state).expect("encrypt test fixture");
+        // See the matching comment in annots::tests::encrypted_one_page_doc -
+        // lopdf 0.44.0 loses every object but /Encrypt on reload of an
+        // encrypted PDF saved with the default CrossReferenceStream xref type.
+        doc.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
         doc
     }
 

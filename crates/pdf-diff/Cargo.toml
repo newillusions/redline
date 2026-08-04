@@ -17,7 +17,12 @@ image         = { version = "0.25", features = ["png"] }
 anyhow        = "1"
 log           = "0.4"
 memmap2       = "0.9.10"
-lopdf         = "0.36"
+# default-features minus "time" - see src-tauri/Cargo.toml for why (upstream
+# lopdf 0.44.0 bug against this workspace's resolved `time` crate version;
+# feature must be dropped here too since workspace feature unification would
+# otherwise re-enable it from this crate). Must stay in sync with
+# src-tauri/Cargo.toml's lopdf line.
+lopdf         = { version = "0.44", default-features = false, features = ["chrono", "jiff", "rayon"] }
 serde         = { version = "1.0", features = ["derive"] }
 serde_json    = "1.0"
 

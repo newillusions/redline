@@ -61,7 +61,14 @@ pdf-diff = { path = "../crates/pdf-diff" }
 pdfium-render = { version = "0.8.28", features = ["thread_safe", "image"] }
 
 # --- Low-level PDF ops ---
-lopdf = "0.36"
+# default-features minus "time": lopdf 0.44.0's "time" feature module fails to
+# compile against the `time` crate version this workspace resolves
+# (FormatItem::StringLiteral removed - upstream bug, fixed by unreleased
+# J-F-Liu/lopdf#527 but not yet in a published crates.io version). We never use
+# lopdf's time-crate date helpers (annotation.rs has its own chrono-based
+# to_pdf_date/from_pdf_date), so dropping the feature avoids the broken module
+# entirely with zero behavior change.
+lopdf = { version = "0.44", default-features = false, features = ["chrono", "jiff", "rayon"] }
 
 # --- Memory-mapped file loading ---
 # Required for PDFs > 2 GiB: PDFium's streaming FPDF_LoadCustomDocument path uses
