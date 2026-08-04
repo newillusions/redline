@@ -3,7 +3,15 @@
   import type { MarkupStore } from "$lib/markup-store.svelte";
   import type { UserRef } from "$lib/ipc";
   import { getUserIdentity } from "$lib/ipc";
-  import { patchAppearance, patchFields, commonValue, FONT_FAMILIES, FONT_SIZES } from "$lib/markup-properties";
+  import {
+    patchAppearance,
+    patchFields,
+    patchStatus,
+    commonValue,
+    FONT_FAMILIES,
+    FONT_SIZES,
+  } from "$lib/markup-properties";
+  import type { MarkupWorkflow } from "$lib/ipc";
 
   const { store }: { store: MarkupStore } = $props();
 
@@ -59,6 +67,15 @@
     const pairs = selected.map((m) => ({
       before: m,
       after: patchFields(m, patch, by(m.audit.modified_by), now),
+    }));
+    store.applyBatch(pairs);
+  }
+
+  function commitStatusPatch(status: MarkupWorkflow["status"]) {
+    const now = new Date().toISOString();
+    const pairs = selected.map((m) => ({
+      before: m,
+      after: patchStatus(m, status, by(m.audit.modified_by), now),
     }));
     store.applyBatch(pairs);
   }
@@ -143,6 +160,10 @@
 
   function layerValue(): string {
     return commonValue(selected, (m) => m.layer ?? "") ?? "";
+  }
+
+  function statusValue(): string {
+    return commonValue(selected, (m) => m.workflow.status) ?? "";
   }
 
   /** 1-based page display for the properties panel (read-only). */
@@ -233,6 +254,11 @@
   function onLayerInput(e: Event) {
     const v = (e.target as HTMLInputElement).value;
     commitFieldPatch({ layer: v || null });
+  }
+
+  function onStatusChange(e: Event) {
+    const v = (e.target as HTMLSelectElement).value as MarkupWorkflow["status"];
+    commitStatusPatch(v);
   }
 </script>
 
@@ -482,6 +508,32 @@
       <div class="prop-row">
         <span class="prop-label">Page</span>
         <span class="prop-value muted">{pageDisplay()}</span>
+      </div>
+    </section>
+
+    <!-- Workflow group: review status over the reserved workflow fields (spec §6 decision
+         f) that already round-trip through the PDF via /RLWorkflowExtra (PR #52). This is
+         the first UI surface that writes to them - assignee/thread stay unedited for now. -->
+    <section class="prop-group">
+      <h3 class="prop-group-title">Workflow</h3>
+
+      <div class="prop-row">
+        <label for="prop-status" class="prop-label">Status</label>
+        <select
+          id="prop-status"
+          data-field="status"
+          value={statusValue()}
+          onchange={onStatusChange}
+          class="prop-select"
+        >
+          {#if !statusValue()}
+            <option value="" disabled selected>Mixed</option>
+          {/if}
+          <option value="None">None</option>
+          <option value="Accepted">Accepted</option>
+          <option value="Rejected">Rejected</option>
+          <option value="Completed">Completed</option>
+        </select>
       </div>
     </section>
   {/if}

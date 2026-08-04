@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import {
   measureLength,
   measureArea,
+  measurePerimeter,
+  measureAngleDegrees,
   formatQuantity,
   countSubtotals,
   countSubtotalsByPage,
@@ -169,6 +171,60 @@ describe("measureArea", () => {
   it("computes right triangle area", () => {
     const pts = [{ x: 0, y: 0 }, { x: 6, y: 0 }, { x: 0, y: 4 }];
     expect(measureArea(pts)).toBeCloseTo(12, 9);
+  });
+});
+
+describe("measurePerimeter", () => {
+  it("returns 0 for fewer than 3 points", () => {
+    expect(measurePerimeter([{ x: 0, y: 0 }, { x: 1, y: 0 }])).toBe(0);
+  });
+
+  it("sums the closed loop of a unit square (includes the closing edge)", () => {
+    const pts = [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }];
+    expect(measurePerimeter(pts)).toBeCloseTo(4, 9);
+  });
+
+  it("differs from measureLength (open) by exactly the closing edge", () => {
+    const pts = [{ x: 0, y: 0 }, { x: 3, y: 0 }, { x: 3, y: 4 }];
+    // Open length: 3 + 4 = 7. Closing edge back to start: hypot(3,4) = 5. Perimeter: 12.
+    expect(measureLength(pts)).toBeCloseTo(7, 9);
+    expect(measurePerimeter(pts)).toBeCloseTo(12, 9);
+  });
+});
+
+describe("measureAngleDegrees", () => {
+  it("computes a right angle as 90", () => {
+    const vertex = { x: 0, y: 0 };
+    const a = { x: 1, y: 0 };
+    const b = { x: 0, y: 1 };
+    expect(measureAngleDegrees(a, vertex, b)).toBeCloseTo(90, 9);
+  });
+
+  it("computes a straight angle as 180", () => {
+    const vertex = { x: 0, y: 0 };
+    const a = { x: -1, y: 0 };
+    const b = { x: 1, y: 0 };
+    expect(measureAngleDegrees(a, vertex, b)).toBeCloseTo(180, 9);
+  });
+
+  it("computes a 60-degree angle", () => {
+    const vertex = { x: 0, y: 0 };
+    const a = { x: 1, y: 0 };
+    const b = { x: Math.cos(Math.PI / 3), y: Math.sin(Math.PI / 3) };
+    expect(measureAngleDegrees(a, vertex, b)).toBeCloseTo(60, 6);
+  });
+
+  it("is independent of ray length (only direction matters)", () => {
+    const vertex = { x: 0, y: 0 };
+    const a1 = { x: 1, y: 0 };
+    const a2 = { x: 100, y: 0 };
+    const b = { x: 0, y: 1 };
+    expect(measureAngleDegrees(a1, vertex, b)).toBeCloseTo(measureAngleDegrees(a2, vertex, b), 9);
+  });
+
+  it("returns 0 for a degenerate (zero-length) ray rather than NaN", () => {
+    const vertex = { x: 0, y: 0 };
+    expect(measureAngleDegrees(vertex, vertex, { x: 1, y: 0 })).toBe(0);
   });
 });
 

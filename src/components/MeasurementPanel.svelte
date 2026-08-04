@@ -26,7 +26,10 @@
     docId,
   }: { store: MarkupStore; takeoffStore: TakeoffStore; docId: string } = $props();
 
-  const MEASUREMENT_TYPES = new Set(["MeasurementLength", "MeasurementArea", "MeasurementCount"]);
+  const MEASUREMENT_TYPES = new Set([
+    "MeasurementLength", "MeasurementArea", "MeasurementCount",
+    "MeasurementPerimeter", "MeasurementVolume", "MeasurementAngle", "MeasurementRadius",
+  ]);
 
   const measurements = $derived(
     store.markups.filter((m: Markup) => MEASUREMENT_TYPES.has(m.markup_type))

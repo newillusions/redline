@@ -21,6 +21,7 @@ pub mod document;
 pub mod geometry;
 mod identity;
 pub mod license;
+mod panic_guard;
 pub mod render;
 pub mod sidecar;
 
@@ -124,6 +125,11 @@ fn pdfium_lib_filename() -> &'static str {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Install before anything else (render thread, plugins) spawns, so a panic on
+    // any thread - not just main - is routed through the file log rather than
+    // vanishing into a release build's detached stderr.
+    panic_guard::install_panic_hook();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_log::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())

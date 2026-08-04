@@ -1998,6 +1998,106 @@ describe("Viewport G8 grouping", () => {
   });
 
   // -------------------------------------------------------------------------
+  // M3-4: MeasurementRadius drag-draw creates a MeasurementRadius markup
+  // (identical two-point gesture to MeasurementLength - see M3-2 above).
+  // -------------------------------------------------------------------------
+  it("M3-4: MeasurementRadius drag-draw creates a MeasurementRadius markup with distance raw_measure", async () => {
+    const takeoffStore = new TakeoffStore();
+    const { overlay } = await mountViewport(store, takeoffStore);
+    store.activeTool = "MeasurementRadius";
+    await tick();
+
+    ptr(overlay, "pointerdown", 50, 50);
+    await tick();
+    ptr(overlay, "pointermove", 100, 50);
+    await tick();
+    ptr(overlay, "pointerup", 100, 50);
+    await tick();
+
+    expect(store.markups).toHaveLength(1);
+    const m = store.markups[0];
+    expect(m.markup_type).toBe("MeasurementRadius");
+    // 50px horizontal drag at zoom=1 -> 50 PDF-unit distance.
+    expect(m.measurement?.raw_measure).toBeCloseTo(50, 6);
+  });
+
+  // -------------------------------------------------------------------------
+  // M3-5: MeasurementPerimeter — 3 clicks + Enter creates a closed-loop markup
+  // -------------------------------------------------------------------------
+  it("M3-5: MeasurementPerimeter — 3 clicks + Enter creates a MeasurementPerimeter markup", async () => {
+    const takeoffStore = new TakeoffStore();
+    const { overlay } = await mountViewport(store, takeoffStore);
+    store.activeTool = "MeasurementPerimeter";
+    await tick();
+
+    fireEvent.click(overlay, { clientX: 50, clientY: 50 });
+    fireEvent.click(overlay, { clientX: 100, clientY: 50 });
+    fireEvent.click(overlay, { clientX: 100, clientY: 100 });
+    fireEvent.keyDown(window, { key: "Enter" });
+    await tick();
+
+    expect(store.markups).toHaveLength(1);
+    const m = store.markups[0];
+    expect(m.markup_type).toBe("MeasurementPerimeter");
+    // Right triangle legs 50+50, closing hypotenuse 50√2 ≈ 70.71 -> perimeter ≈ 170.71.
+    expect(m.measurement?.raw_measure).toBeCloseTo(50 + 50 + 50 * Math.SQRT2, 3);
+  });
+
+  // -------------------------------------------------------------------------
+  // M3-6: MeasurementVolume — 3 clicks + Enter creates a closed-loop markup
+  // with a default depth of 1 (named simplification - no depth-input UI yet).
+  // -------------------------------------------------------------------------
+  it("M3-6: MeasurementVolume — 3 clicks + Enter creates a MeasurementVolume markup with depth 1", async () => {
+    const takeoffStore = new TakeoffStore();
+    const { overlay } = await mountViewport(store, takeoffStore);
+    store.activeTool = "MeasurementVolume";
+    await tick();
+
+    fireEvent.click(overlay, { clientX: 50, clientY: 50 });
+    fireEvent.click(overlay, { clientX: 100, clientY: 50 });
+    fireEvent.click(overlay, { clientX: 100, clientY: 100 });
+    fireEvent.keyDown(window, { key: "Enter" });
+    await tick();
+
+    expect(store.markups).toHaveLength(1);
+    const m = store.markups[0];
+    expect(m.markup_type).toBe("MeasurementVolume");
+    expect(m.measurement?.depth).toBe(1);
+    // Right triangle legs 50×50 -> area 1250 (same base area as MeasurementArea would report).
+    expect(m.measurement?.raw_measure).toBeCloseTo(1250, 6);
+  });
+
+  // -------------------------------------------------------------------------
+  // M3-7: MeasurementAngle — 3 clicks (no Enter needed) auto-finishes at the
+  // 3rd point: click1=ray, click2=vertex, click3=ray.
+  // -------------------------------------------------------------------------
+  it("M3-7: MeasurementAngle — 3 clicks auto-finish and compute the vertex angle in degrees", async () => {
+    const takeoffStore = new TakeoffStore();
+    const { overlay } = await mountViewport(store, takeoffStore);
+    store.activeTool = "MeasurementAngle";
+    await tick();
+
+    // PDF coords (zoom=1, 200x200, y-flip): click(50,150)->PDF(50,50) [vertex candidate
+    // order below is a=ray, vertex, b=ray]. Choose screen points so the PDF-space rays
+    // from the vertex are perpendicular (90°): vertex at (100,100), ray ends at
+    // (150,100) and (100,150) in PDF space.
+    // screen(sx,sy) -> PDF(sx, 200-sy): vertex PDF(100,100) -> screen(100,100).
+    // ray A PDF(150,100) -> screen(150,100). ray B PDF(100,150) -> screen(100,50).
+    fireEvent.click(overlay, { clientX: 150, clientY: 100 }); // ray A
+    fireEvent.click(overlay, { clientX: 100, clientY: 100 }); // vertex
+    fireEvent.click(overlay, { clientX: 100, clientY: 50 });  // ray B
+    await tick();
+
+    expect(store.markups).toHaveLength(1);
+    const m = store.markups[0];
+    expect(m.markup_type).toBe("MeasurementAngle");
+    expect(m.measurement?.unit).toBe("deg");
+    expect(m.measurement?.raw_measure).toBeCloseTo(90, 3);
+    // Angle is scale-independent: computed_quantity equals raw_measure, never scaled.
+    expect(m.measurement?.computed_quantity).toBeCloseTo(m.measurement!.raw_measure, 9);
+  });
+
+  // -------------------------------------------------------------------------
   // G8-4: Cmd+Shift+G ungroups — group_id back to null, one undo frame
   // -------------------------------------------------------------------------
   it("G8-4: Cmd+Shift+G ungroups selected markups — group_id set to null, one undo frame", async () => {

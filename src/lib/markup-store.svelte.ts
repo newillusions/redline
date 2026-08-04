@@ -45,6 +45,12 @@ export type ToolKind =
   | "MeasurementLength"
   | "MeasurementArea"
   | "MeasurementCount"
+  // Perimeter/Volume/Angle/Radius: model/IPC/render support predates this - only the
+  // draw-tool wiring was missing (toolchest-activation.ts used to document the gap).
+  | "MeasurementPerimeter"
+  | "MeasurementVolume"
+  | "MeasurementAngle"
+  | "MeasurementRadius"
   // Tool Chest Drawing-mode placement (M2): drops an exact, translated copy of
   // `MarkupStore.pendingPlacementTool`'s fixed geometry on the next click - see
   // ToolChestPanel.svelte (activation) and Viewport.svelte onOverlayClick (placement).

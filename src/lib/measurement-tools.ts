@@ -124,6 +124,35 @@ export function measureArea(pts: PdfPoint[]): number {
 }
 
 /**
+ * Perimeter of a closed polygon (sum of segment lengths INCLUDING the closing edge from
+ * the last vertex back to the first), in PDF points. Returns the raw_measure for
+ * MeasurementPerimeter. Distinct from `measureLength`, which treats its input as an OPEN
+ * polyline - a closed loop needs the extra final-to-first segment reflected here.
+ */
+export function measurePerimeter(pts: PdfPoint[]): number {
+  if (pts.length < 3) return 0;
+  return measureLength(pts) + measureLength([pts[pts.length - 1], pts[0]]);
+}
+
+/**
+ * Interior angle at `vertex`, in degrees (0-180), between the two rays vertex→a and
+ * vertex→b. Scale-independent by construction (an angle between two directions doesn't
+ * change with the drawing's real-world scale) - raw_measure for MeasurementAngle IS the
+ * final degree value; callers must NOT multiply it by a scale ratio (unlike every other
+ * measurement type). Returns 0 for degenerate input (either ray zero-length).
+ */
+export function measureAngleDegrees(a: PdfPoint, vertex: PdfPoint, b: PdfPoint): number {
+  const v1 = { x: a.x - vertex.x, y: a.y - vertex.y };
+  const v2 = { x: b.x - vertex.x, y: b.y - vertex.y };
+  const mag1 = Math.hypot(v1.x, v1.y);
+  const mag2 = Math.hypot(v2.x, v2.y);
+  if (mag1 === 0 || mag2 === 0) return 0;
+  const cos = (v1.x * v2.x + v1.y * v2.y) / (mag1 * mag2);
+  const clamped = Math.min(1, Math.max(-1, cos));
+  return (Math.acos(clamped) * 180) / Math.PI;
+}
+
+/**
  * Convert a raw_measure to a display string using the given scale.
  *
  * @param rawMeasure  Scale-independent value in PDF points (length) or points² (area).

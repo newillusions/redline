@@ -48,6 +48,7 @@
   import type { RecentDoc } from "$lib/recent-docs";
   import SettingsDialog from "./components/SettingsDialog.svelte";
   import UpdateNotification from "./components/UpdateNotification.svelte";
+  import ErrorBanner from "./components/ErrorBanner.svelte";
   import ToolChestPanel from "./components/ToolChestPanel.svelte";
   import { ToolChestStore } from "$lib/toolchest-store.svelte";
   import ActivationGate from "./components/ActivationGate.svelte";
@@ -890,6 +891,10 @@
   <UpdateNotification />
 </div>
 {/if}
+
+<!-- Crash-guard: mounted unconditionally, outside the license gate, so an uncaught
+     error during license checks / activation is caught too, not just post-activation. -->
+<ErrorBanner />
 
 <style>
   .app-shell {

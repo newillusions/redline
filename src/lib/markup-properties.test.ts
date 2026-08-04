@@ -9,6 +9,7 @@ import {
   patchAppearance,
   patchFields,
   patchGroup,
+  patchStatus,
   commonValue,
 } from "./markup-properties";
 import type { Appearance, UserRef, Markup } from "./ipc";
@@ -278,6 +279,37 @@ describe("patchGroup", () => {
     const snapshot = JSON.parse(JSON.stringify(m)) as Markup;
     patchGroup(m, "new-group", OTHER, LATER);
     expect(m.group_id).toBe(snapshot.group_id);
+    expect(m.audit.revision).toBe(snapshot.audit.revision);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// patchStatus
+// ---------------------------------------------------------------------------
+describe("patchStatus", () => {
+  const m = mkMarkup("s1");
+
+  it("sets workflow.status and bumps audit", () => {
+    const result = patchStatus(m, "Accepted", OTHER, LATER);
+    expect(result.workflow.status).toBe("Accepted");
+    expect(result.audit.revision).toBe(BASE_AUDIT.revision + 1);
+    expect(result.audit.modified_by).toEqual(OTHER);
+    expect(result.audit.modified_at).toBe(LATER);
+  });
+
+  it("leaves assignee and thread untouched", () => {
+    const withAssignee = mkMarkup("s2", {
+      workflow: { status: "None", assignee: OTHER, thread: ["note"] },
+    });
+    const result = patchStatus(withAssignee, "Rejected", USER, LATER);
+    expect(result.workflow.assignee).toEqual(OTHER);
+    expect(result.workflow.thread).toEqual(["note"]);
+  });
+
+  it("does not mutate the input markup", () => {
+    const snapshot = JSON.parse(JSON.stringify(m)) as Markup;
+    patchStatus(m, "Completed", OTHER, LATER);
+    expect(m.workflow.status).toBe(snapshot.workflow.status);
     expect(m.audit.revision).toBe(snapshot.audit.revision);
   });
 });

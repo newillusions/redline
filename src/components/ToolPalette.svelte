@@ -23,6 +23,10 @@
     { kind: "MeasurementLength", label: "↔", title: "Measure Length" },
     { kind: "MeasurementArea", label: "⬛", title: "Measure Area" },
     { kind: "MeasurementCount", label: "⊕", title: "Count" },
+    { kind: "MeasurementPerimeter", label: "⬡", title: "Measure Perimeter (click each vertex, double-click or Enter to finish)" },
+    { kind: "MeasurementVolume", label: "▦", title: "Measure Volume (click each vertex, double-click or Enter to finish)" },
+    { kind: "MeasurementAngle", label: "∠", title: "Measure Angle (click first ray, vertex, second ray)" },
+    { kind: "MeasurementRadius", label: "⊙", title: "Measure Radius (drag from centre to edge)" },
   ];
 </script>
 <div class="tool-strip" role="toolbar" aria-label="Markup tools">

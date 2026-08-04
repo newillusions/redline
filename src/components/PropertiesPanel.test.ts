@@ -446,6 +446,44 @@ describe("single selection mode", () => {
 
     expect(store.markups[0].layer).toBe("Architectural");
   });
+
+  it("status select reflects the selected markup's workflow.status", async () => {
+    const store = makeStore();
+    const m = makeMarkup("m1");
+    store.seed([m]);
+    store.selectedIds = new Set(["m1"]);
+
+    const { container } = await mountPanel(store);
+
+    const statusSelect = container.querySelector(
+      "select[data-field='status']"
+    ) as HTMLSelectElement;
+    expect(statusSelect).toBeTruthy();
+    expect(statusSelect.value).toBe("None");
+  });
+
+  it("status select commits workflow.status and is undoable", async () => {
+    const store = makeStore();
+    const m = makeMarkup("m1");
+    store.seed([m]);
+    store.selectedIds = new Set(["m1"]);
+
+    const { container } = await mountPanel(store);
+
+    const statusSelect = container.querySelector(
+      "select[data-field='status']"
+    ) as HTMLSelectElement;
+
+    fireEvent.change(statusSelect, { target: { value: "Accepted" } });
+    await tick();
+
+    expect(store.markups[0].workflow.status).toBe("Accepted");
+    expect(store.canUndo).toBe(true);
+
+    store.undo();
+    await tick();
+    expect(store.markups[0].workflow.status).toBe("None");
+  });
 });
 
 // ---------------------------------------------------------------------------

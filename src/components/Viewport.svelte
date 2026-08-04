@@ -69,7 +69,7 @@
   } from "$lib/markup-tools";
   import { patchGroup } from "$lib/markup-properties";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
-  import { measureLength, measureArea } from "$lib/measurement-tools";
+  import { measureLength, measureArea, measurePerimeter, measureAngleDegrees } from "$lib/measurement-tools";
   import { addScale, type MeasurementPayload, type SearchHit } from "$lib/ipc";
   import { pdfUserSpaceToScreen } from "$lib/viewport";
   import CalibrationDialog from "./CalibrationDialog.svelte";
@@ -272,10 +272,20 @@
   /** Vertex eligible for keyboard delete (Delete/Backspace) — set when a vertex is engaged. */
   let activeVertex = $state<number | null>(null);
 
+  /**
+   * Measurement tools that share MeasurementArea's closed-multi-click gesture (click each
+   * vertex, double-click/Enter to finish) - Perimeter and Volume both measure a closed
+   * polygon just like Area, differing only in what raw_measure/unit they compute from the
+   * finished vertex list. See onOverlayClick/onOverlayDblClick/onOverlayMouseMove below.
+   */
+  const CLOSED_MEASUREMENT_TOOLS: ReadonlySet<string> =
+    new Set(["MeasurementArea", "MeasurementPerimeter", "MeasurementVolume"]);
+
   /** True when any creation tool is active (all tools except hand/select). */
   const isCreateTool = (t = store.activeTool) =>
     isDrawTool(t) || isMultiClickTool(t) || isInkTool(t) || isTextTool(t) ||
-    t === "calibrate" || t === "MeasurementLength" || t === "MeasurementArea" || t === "MeasurementCount" ||
+    t === "calibrate" || t === "MeasurementLength" || t === "MeasurementRadius" ||
+    CLOSED_MEASUREMENT_TOOLS.has(t) || t === "MeasurementCount" || t === "MeasurementAngle" ||
     t === "placeTool";
 
   /** True when the select tool is active. */
@@ -782,21 +792,12 @@
       return;
     }
     if (e.key === "Enter") {
-      // MeasurementArea finish via Enter.
-      if (store.activeTool === "MeasurementArea" && identity && mcVerts.length >= 3) {
-        const raw = measureArea(mcVerts);
-        const scale = takeoffStore.activeScale;
-        const meas: MeasurementPayload = {
-          scale_ref: scale?.id ?? null,
-          raw_measure: raw,
-          unit: scale?.unit ?? "pt²",
-          computed_quantity: scale ? raw * scale.ratio * scale.ratio : 0,
-          depth: null,
-          count_value: null,
-          custom_columns: {},
-        };
+      // MeasurementArea / MeasurementPerimeter / MeasurementVolume finish via Enter.
+      const enterTool = store.activeTool;
+      if (CLOSED_MEASUREMENT_TOOLS.has(enterTool) && identity && mcVerts.length >= 3) {
+        const closedTool = enterTool as "MeasurementArea" | "MeasurementPerimeter" | "MeasurementVolume";
         const m = buildMarkup({
-          markupType: "MeasurementArea",
+          markupType: closedTool,
           page: pageIndex,
           geometry: polylineGeometry(mcVerts),
           appearance: store.draftAppearance,
@@ -804,7 +805,7 @@
           now: new Date().toISOString(),
           id: crypto.randomUUID(),
         });
-        m.measurement = meas;
+        m.measurement = closedMeasurementPayload(closedTool, mcVerts);
         store.create(m);
         resetMultiClick();
       } else if (store.activeTool === "selectText" && textSelection) {
@@ -1097,6 +1098,58 @@
     mcVerts = [];
     mcCursor = null;
     previewMarkup = null;
+  }
+
+  /**
+   * Build the `MeasurementPayload` for a finished MeasurementArea / MeasurementPerimeter
+   * / MeasurementVolume closed polygon. Shared by the Enter-to-finish keyboard handler
+   * and the dblclick-to-finish pointer handler so the area/perimeter/volume math lives
+   * in exactly one place.
+   */
+  function closedMeasurementPayload(
+    tool: "MeasurementArea" | "MeasurementPerimeter" | "MeasurementVolume",
+    verts: PdfPoint[],
+  ): MeasurementPayload {
+    const scale = takeoffStore.activeScale;
+    if (tool === "MeasurementPerimeter") {
+      const raw = measurePerimeter(verts);
+      return {
+        scale_ref: scale?.id ?? null,
+        raw_measure: raw,
+        unit: scale?.unit ?? "pt",
+        computed_quantity: scale ? raw * scale.ratio : 0,
+        depth: null,
+        count_value: null,
+        custom_columns: {},
+      };
+    }
+    if (tool === "MeasurementVolume") {
+      const raw = measureArea(verts);
+      // NAMED SIMPLIFICATION (v1): depth defaults to 1 - no placement-time depth-input
+      // UI yet (would need its own prompt dialog, out of this pass's scope). The
+      // Measurement payload's `depth` field is real and round-trips through the PDF;
+      // a future session can add an edit surface without touching this math.
+      const depth = 1;
+      return {
+        scale_ref: scale?.id ?? null,
+        raw_measure: raw,
+        unit: scale ? `${scale.unit}³` : "pt³",
+        computed_quantity: scale ? raw * scale.ratio * scale.ratio * depth : 0,
+        depth,
+        count_value: null,
+        custom_columns: {},
+      };
+    }
+    const raw = measureArea(verts);
+    return {
+      scale_ref: scale?.id ?? null,
+      raw_measure: raw,
+      unit: scale?.unit ?? "pt²",
+      computed_quantity: scale ? raw * scale.ratio * scale.ratio : 0,
+      depth: null,
+      count_value: null,
+      custom_columns: {},
+    };
   }
 
   function cancelEditor() {
@@ -1426,13 +1479,13 @@
       return;
     }
 
-    // --- MEASUREMENT COUNT tool branch (single click, handled via onOverlayClick) ---
-    if (tool === "MeasurementCount") return;
+    // --- MEASUREMENT COUNT / ANGLE tool branches (click-based, handled via onOverlayClick) ---
+    if (tool === "MeasurementCount" || tool === "MeasurementAngle") return;
 
     // --- CREATE tool branch ---
     if (!isCreateTool(tool) || !identity) return;
     // Multi-click tools handle gestures via click/dblclick, not pointer capture.
-    if (isMultiClickTool(tool) || tool === "MeasurementArea") return;
+    if (isMultiClickTool(tool) || CLOSED_MEASUREMENT_TOOLS.has(tool)) return;
     const p = localPdf(e);
     if (!p) return;
     (e.target as Element).setPointerCapture(e.pointerId);
@@ -1649,8 +1702,10 @@
       return;
     }
 
-    // --- MeasurementLength: drag-draw with measurement payload ---
-    if (tool === "MeasurementLength") {
+    // --- MeasurementLength / MeasurementRadius: drag-draw with measurement payload ---
+    // Radius shares Length's exact two-point distance gesture and math - a radius IS a
+    // distance (centre → edge), it just gets a different markup_type/unit label.
+    if (tool === "MeasurementLength" || tool === "MeasurementRadius") {
       if (!drawing || !drawStartPdf || !identity) { drawing = false; drawStartPdf = null; return; }
       const p = localPdf(e);
       drawing = false;
@@ -1670,7 +1725,7 @@
         custom_columns: {},
       };
       const m = buildMarkup({
-        markupType: "MeasurementLength",
+        markupType: tool,
         page: pageIndex,
         geometry: { Polyline: pts },
         appearance: store.draftAppearance,
@@ -1858,8 +1913,10 @@
       return;
     }
 
-    // MeasurementArea: multi-click polygon (same as Polygon but with measurement payload).
-    if (tool === "MeasurementArea" && identity) {
+    // MeasurementArea / MeasurementPerimeter / MeasurementVolume: multi-click closed
+    // polygon (same gesture as Polygon, differing only in the measurement payload
+    // computed at finish - see onOverlayDblClick).
+    if (CLOSED_MEASUREMENT_TOOLS.has(tool) && identity) {
       const p = localPdfFromMouse(e);
       if (!p) return;
       mcVerts = [...mcVerts, p];
@@ -1867,7 +1924,7 @@
       const vertsForPreview = mcCursor ? [...mcVerts, mcCursor] : mcVerts;
       if (vertsForPreview.length >= 2) {
         previewMarkup = buildMarkup({
-          markupType: "MeasurementArea",
+          markupType: tool as "MeasurementArea" | "MeasurementPerimeter" | "MeasurementVolume",
           page: pageIndex,
           geometry: polylineGeometry(vertsForPreview),
           appearance: store.draftAppearance,
@@ -1876,6 +1933,57 @@
           id: "preview",
         });
       }
+      return;
+    }
+
+    // MeasurementAngle: click first ray point, then the vertex, then the second ray
+    // point - always exactly 3 clicks, auto-finishes on the 3rd (no Enter/dblclick,
+    // unlike the closed-polygon measurement tools above).
+    if (tool === "MeasurementAngle" && identity) {
+      const p = localPdfFromMouse(e);
+      if (!p) return;
+      mcVerts = [...mcVerts, p];
+      if (mcVerts.length < 3) {
+        const vertsForPreview = mcCursor ? [...mcVerts, mcCursor] : mcVerts;
+        if (vertsForPreview.length >= 2) {
+          previewMarkup = buildMarkup({
+            markupType: "MeasurementAngle",
+            page: pageIndex,
+            geometry: polylineGeometry(vertsForPreview),
+            appearance: store.draftAppearance,
+            identity,
+            now: new Date().toISOString(),
+            id: "preview",
+          });
+        }
+        return;
+      }
+      const [a, vertex, b] = mcVerts;
+      const raw = measureAngleDegrees(a, vertex, b);
+      // Angle is scale-independent - the degree value never scales with the drawing's
+      // real-world ratio, unlike every other measurement type (measureAngleDegrees'
+      // doc comment). computed_quantity is therefore raw_measure itself, unscaled.
+      const meas: MeasurementPayload = {
+        scale_ref: null,
+        raw_measure: raw,
+        unit: "deg",
+        computed_quantity: raw,
+        depth: null,
+        count_value: null,
+        custom_columns: {},
+      };
+      const m = buildMarkup({
+        markupType: "MeasurementAngle",
+        page: pageIndex,
+        geometry: polylineGeometry(mcVerts),
+        appearance: store.draftAppearance,
+        identity,
+        now: new Date().toISOString(),
+        id: crypto.randomUUID(),
+      });
+      m.measurement = meas;
+      store.create(m);
+      resetMultiClick();
       return;
     }
 
@@ -1966,21 +2074,15 @@
     // finishing.
     if (mcVerts.length > 0) mcVerts = mcVerts.slice(0, -1);
 
-    // MeasurementArea: finish polygon and add measurement payload.
-    if (tool === "MeasurementArea" && identity && mcVerts.length >= 3) {
-      const raw = measureArea(mcVerts);
-      const scale = takeoffStore.activeScale;
-      const meas: MeasurementPayload = {
-        scale_ref: scale?.id ?? null,
-        raw_measure: raw,
-        unit: scale?.unit ?? "pt²",
-        computed_quantity: scale ? raw * scale.ratio * scale.ratio : 0,
-        depth: null,
-        count_value: null,
-        custom_columns: {},
-      };
+    // MeasurementArea / MeasurementPerimeter / MeasurementVolume: finish the closed
+    // polygon and add the measurement payload. Same gesture as MeasurementArea always
+    // was; only the raw_measure/unit/computed_quantity math differs per type (see
+    // closedMeasurementPayload, shared with the Enter-to-finish keyboard handler).
+    if (CLOSED_MEASUREMENT_TOOLS.has(tool) && identity && mcVerts.length >= 3) {
+      const closedTool = tool as "MeasurementArea" | "MeasurementPerimeter" | "MeasurementVolume";
+      const meas = closedMeasurementPayload(closedTool, mcVerts);
       const m = buildMarkup({
-        markupType: "MeasurementArea",
+        markupType: closedTool,
         page: pageIndex,
         geometry: polylineGeometry(mcVerts),
         appearance: store.draftAppearance,
@@ -2000,8 +2102,9 @@
   function onOverlayMouseMove(e: MouseEvent) {
     if (isSelectTool()) return;
     const tool = store.activeTool;
-    const isAreaTool = tool === "MeasurementArea";
-    if (!isMultiClickTool(tool) && !isAreaTool) return;
+    const isClosedMeasurementTool = CLOSED_MEASUREMENT_TOOLS.has(tool);
+    const isAngleTool = tool === "MeasurementAngle";
+    if (!isMultiClickTool(tool) && !isClosedMeasurementTool && !isAngleTool) return;
     if (mcVerts.length === 0 || !identity) return;
     const p = localPdfFromMouse(e);
     if (!p) return;
@@ -2010,8 +2113,9 @@
     const vertsForPreview = [...mcVerts, p];
     if (vertsForPreview.length >= 2) {
       previewMarkup = buildMarkup({
-        // MeasurementArea uses "MeasurementArea" as the markupType for the preview.
-        markupType: isAreaTool ? "MeasurementArea" : (tool as MultiClickTool),
+        markupType: isClosedMeasurementTool || isAngleTool
+          ? (tool as "MeasurementArea" | "MeasurementPerimeter" | "MeasurementVolume" | "MeasurementAngle")
+          : (tool as MultiClickTool),
         page: pageIndex,
         geometry: polylineGeometry(vertsForPreview),
         appearance: store.draftAppearance,

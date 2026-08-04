@@ -3,7 +3,7 @@
  * No DOM, no Svelte, no side effects. The panel component stays thin by delegating
  * all mutation logic here.
  */
-import type { Markup, Appearance, UserRef } from "./ipc";
+import type { Markup, Appearance, UserRef, MarkupWorkflow } from "./ipc";
 import { bumpAudit } from "./markup-tools";
 
 /** Base-14 font families offered by the picker (reliable cross-viewer /DA rendering). */
@@ -55,6 +55,16 @@ export function patchFields(
  */
 export function patchGroup(m: Markup, groupId: string | null, by: UserRef, now: string): Markup {
   return bumpAudit({ ...m, group_id: groupId }, by, now);
+}
+
+/**
+ * Return a clone of `m` with `workflow.status` set to `status` and the audit trail
+ * bumped. The reserved review-workflow fields (spec §6 decision f) already round-trip
+ * through the PDF via `/RLWorkflowExtra` (PR #52) - this is the first UI surface that
+ * writes to them. `assignee`/`thread` are left untouched. Pure; no mutation of the input.
+ */
+export function patchStatus(m: Markup, status: MarkupWorkflow["status"], by: UserRef, now: string): Markup {
+  return bumpAudit({ ...m, workflow: { ...m.workflow, status } }, by, now);
 }
 
 /**

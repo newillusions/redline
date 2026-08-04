@@ -66,6 +66,10 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Compile-time license API URL default (mirrors build-windows below) - without
+          # this, a macOS release build has NO baked default and license checks only work
+          # via a runtime env override (src-tauri/src/license/client.rs).
+          REDLINE_LICENSE_API_URL_DEFAULT: https://staff.emittiv.studio
         run: npm run tauri:build -- --target ${{ matrix.target }}
 
       - name: Fix code signature

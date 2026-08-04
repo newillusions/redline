@@ -12,15 +12,17 @@ import type { MarkupStore, ToolKind } from "./markup-store.svelte";
  * existing tool palette can create geometry for them). Properties-mode activation maps a
  * tool's `markup_type` onto its matching `ToolKind` 1:1 when the name matches one of these.
  *
- * SIMPLIFICATION (named): `Stamp`, `StampDynamic`, `MeasurementPerimeter`,
- * `MeasurementVolume`, and `MeasurementAngle`/`MeasurementRadius` measurement subtypes have
- * no drawing UI in the tool palette yet (a pre-existing gap, not introduced here) - a
- * Properties-mode tool of one of those types still updates `draftAppearance` (so the
- * appearance is ready the moment a compatible tool exists) but cannot select `activeTool`.
+ * SIMPLIFICATION (named): `Stamp`/`StampDynamic` have no drawing UI in the tool palette yet
+ * (a pre-existing gap, not introduced here) - a Properties-mode tool of one of those types
+ * still updates `draftAppearance` (so the appearance is ready the moment a compatible tool
+ * exists) but cannot select `activeTool`. The four measurement subtypes formerly listed
+ * here as gaps (`MeasurementPerimeter`, `MeasurementVolume`, `MeasurementAngle`,
+ * `MeasurementRadius`) now have real ToolPalette entries - see Viewport.svelte.
  */
 const DRAWABLE_MARKUP_TYPES: ReadonlySet<string> = new Set<ToolKind>([
   "Rectangle", "Ellipse", "Line", "Arrow", "Highlight", "Polyline", "Polygon", "Cloud",
   "Ink", "Text", "Callout", "MeasurementLength", "MeasurementArea", "MeasurementCount",
+  "MeasurementPerimeter", "MeasurementVolume", "MeasurementAngle", "MeasurementRadius",
 ]);
 
 /**
