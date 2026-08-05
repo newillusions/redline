@@ -292,39 +292,39 @@ jobs:
       - name: Sign Windows installer (Authenticode)
         if: steps.sign_check.outputs.available == 'true'
         id: sign
-        shell: bash
+        # shell: pwsh - NOT bash. Git-Bash/MSYS rewrites any argument starting with
+        # "/" into a Windows path, so signtool's /fd /tr /td flags never reached it
+        # ("SignTool Error: No file digest algorithm specified" despite /fd SHA256
+        # being passed - v0.3.8 run 30994084371). PowerShell has no such mangling.
+        shell: pwsh
         env:
           WINDOWS_SIGN_CERT_B64: ${{ secrets.WINDOWS_SIGN_CERT_B64 }}
           WINDOWS_SIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGN_CERT_PASSWORD }}
         run: |
-          NSIS_PATH=$(find target/release/bundle/nsis -name "*-setup.exe" | head -1)
-          if [ -z "$NSIS_PATH" ]; then
-            echo "No NSIS installer found - nothing to sign."
-            echo "signed=false" >> $GITHUB_OUTPUT
+          $nsis = Get-ChildItem -Path "target/release/bundle/nsis" -Filter "*-setup.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $nsis) {
+            Write-Host "No NSIS installer found - nothing to sign."
+            "signed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             exit 0
-          fi
+          }
 
-          SIGNTOOL=$(find "/c/Program Files (x86)/Windows Kits/10/bin" -name "signtool.exe" 2>/dev/null | grep -i '/x64/' | sort -V | tail -1)
-          if [ -z "$SIGNTOOL" ]; then
-            echo "signtool.exe not found under Windows Kits on this runner."
-            exit 1
-          fi
+          $signtool = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Filter "signtool.exe" -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\' } |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not $signtool) { Write-Error "signtool.exe not found under Windows Kits on this runner."; exit 1 }
+          Write-Host "Using signtool: $($signtool.FullName)"
 
-          TMP_PFX="${RUNNER_TEMP}/codesign.pfx"
-          echo "$WINDOWS_SIGN_CERT_B64" | base64 -d > "$TMP_PFX"
+          $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGN_CERT_B64))
 
-          "$SIGNTOOL" sign \
-            /f "$TMP_PFX" \
-            /p "$WINDOWS_SIGN_CERT_PASSWORD" \
-            /fd SHA256 \
-            /tr "http://timestamp.digicert.com" \
-            /td SHA256 \
-            "$NSIS_PATH"
+          & $signtool.FullName sign /f $pfx /p $env:WINDOWS_SIGN_CERT_PASSWORD /fd SHA256 /tr "http://timestamp.digicert.com" /td SHA256 $nsis.FullName
+          $rc = $LASTEXITCODE
+          Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+          if ($rc -ne 0) { Write-Error "signtool failed with exit code $rc"; exit $rc }
 
-          rm -f "$TMP_PFX"
-
-          echo "signed=true" >> $GITHUB_OUTPUT
-          echo "Signed $NSIS_PATH"
+          & $signtool.FullName verify /pa /v $nsis.FullName
+          "signed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Signed $($nsis.FullName)"
 
       - name: Regenerate updater signature (post-Authenticode)
         if: steps.sign_check.outputs.available == 'true' && steps.sign.outputs.signed == 'true'
