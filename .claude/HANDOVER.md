@@ -2,12 +2,14 @@
 
 ## Current Status
 
-**main was at `88ba31a` (post-wave-2, vector snap v1 + OCR descope, PR #62) before this
-session's PR. Wave-3 shipped the three fixes from the wave-2b GUI validation pass
-(obs:us5j4ne1r5byjzle8u23): undo/redo now has a real keyboard + toolbar UI surface,
-ErrorBanner no longer occludes the toolbar-right panel-toggle buttons, and the
-tools/gui-harness.mjs license-mock fix (left uncommitted by the validation session) is
-now committed. See Last Session below for detail.**
+**main is at `f695610a` (PR #63, squash-merged 2026-08-05; was `88ba31a` post-wave-2,
+vector snap v1 + OCR descope, PR #62). Wave-3 shipped the three fixes from the wave-2b
+GUI validation pass (obs:us5j4ne1r5byjzle8u23): undo/redo now has a real keyboard +
+toolbar UI surface, ErrorBanner no longer occludes the toolbar-right panel-toggle
+buttons, and the tools/gui-harness.mjs license-mock fix (left uncommitted by the
+validation session) is now committed. A mid-flight CI failure (Docker build context
+didn't include tools/fixtures/) was root-caused and fixed in the same PR before merge
+- see Last Session for the full incident. Detail: obs:p2rl32rnjhpq2dygkcz5.**
 
 **Previous status (wave-2, superseded above but kept for context): main was at `8d84754c`
 (post-v0.3.6) before wave-2's PR. Wave-2 resolved two
@@ -94,6 +96,21 @@ branch) - flagging as an environment gap, not a code issue.
 longer overlapping the toolbar buttons) - this session's verification was automated
 tests only, no screenshots taken. Also still owed from wave-2b: the vector-snap ring
 indicator live check and the `.btx` import UI drive-through (see item 4 above).
+
+**CI incident mid-flight (fixed same PR)**: the first push (`83cb51a`) went CI-red -
+`test-rust` failed to compile with `couldn't read .../tools/fixtures/sample-tool-set.btx:
+No such file or directory` from the `include_str!` in `btx.rs`. Root cause:
+`.forgejo/Dockerfile.test-rust`'s build context only `COPY`s `Cargo.toml`/`Cargo.lock`/
+`src-tauri`/`crates` into the image - `tools/` was never in it, even though the fixture
+was genuinely committed to git (checked `git ls-tree` before assuming otherwise). Fixed
+by switching the test to a runtime `std::fs::read` gated on file existence (mirrors
+`render::tests::corpus()`'s existing `CARGO_MANIFEST_DIR`-relative pattern one directory
+up in this repo) plus a narrow `COPY tools/fixtures tools/fixtures` added to the
+Dockerfile so CI actually exercises the fixture instead of permanently skipping it.
+Verified both the present-file and skip-gated paths locally before repushing. CI green on
+`ba3225a` (run #166), then squash-merged as `f695610a`.
+
+**PR merged**: https://forge.mms.name/emittiv/redline/pulls/63, squash `f695610a4c67d385c3ae60dcb6ee8aa991184496`.
 
 ### Previous session (2026-08-05, wave-2b GUI validation pass, dispatched by the
 orchestrator - "have you tested the redline markups? And all the other tools?")
