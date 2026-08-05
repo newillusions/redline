@@ -273,11 +273,22 @@ jobs:
             echo "WINDOWS_SIGN_CERT_B64/WINDOWS_SIGN_CERT_PASSWORD not set - skipping Authenticode signing, build stays unsigned."
           fi
 
-      - name: Install osslsigncode
-        if: steps.sign_check.outputs.available == 'true'
-        shell: bash
-        run: choco install osslsigncode -y --no-progress
-
+      # NOTE (2026-08-05, fix/windows-signtool-native): osslsigncode was dropped here.
+      # v0.3.7's release run failed at this step - "Failed to parse PKCS#12 file ...
+      # (Wrong password?)" followed by OpenSSL provider errors ("could not load legacy.dll",
+      # "Algorithm (RC2-40-CBC : 0)" unsupported). The password was never wrong: our PFX is a
+      # legacy-format PKCS#12 (RC2-40-CBC), and OpenSSL 3 (which osslsigncode links) removed
+      # legacy-cipher support into an opt-in provider it can't load on this runner. The exact
+      # same cert+secret signed every release through v0.3.6, so this was runner-image/OpenSSL
+      # drift, not a credential change - confirmed, no cert re-issue needed.
+      #
+      # Fixed by signing with signtool.exe directly instead: it's part of the Windows SDK,
+      # preinstalled on windows-latest (github/runner-images), and loads PFX files via
+      # Windows CryptoAPI/CNG - which still supports legacy PKCS#12 ciphers like RC2-40-CBC
+      # natively. `signtool sign /f <pfx> /p <password> ...` signs straight from the PFX file,
+      # no store import or thumbprint lookup needed (Microsoft docs, "Using SignTool to Sign a
+      # File"). This also drops the `choco install osslsigncode` step entirely - nothing left
+      # to install.
       - name: Sign Windows installer (Authenticode)
         if: steps.sign_check.outputs.available == 'true'
         id: sign
@@ -293,20 +304,23 @@ jobs:
             exit 0
           fi
 
+          SIGNTOOL=$(find "/c/Program Files (x86)/Windows Kits/10/bin" -name "signtool.exe" 2>/dev/null | grep -i '/x64/' | sort -V | tail -1)
+          if [ -z "$SIGNTOOL" ]; then
+            echo "signtool.exe not found under Windows Kits on this runner."
+            exit 1
+          fi
+
           TMP_PFX="${RUNNER_TEMP}/codesign.pfx"
           echo "$WINDOWS_SIGN_CERT_B64" | base64 -d > "$TMP_PFX"
 
-          SIGNED_PATH="${NSIS_PATH%.exe}-signed.exe"
-          osslsigncode sign \
-            -pkcs12 "$TMP_PFX" \
-            -pass "$WINDOWS_SIGN_CERT_PASSWORD" \
-            -n "Redline" \
-            -i "https://forge.mms.name/emittiv/redline" \
-            -t "http://timestamp.digicert.com" \
-            -in "$NSIS_PATH" \
-            -out "$SIGNED_PATH"
+          "$SIGNTOOL" sign \
+            /f "$TMP_PFX" \
+            /p "$WINDOWS_SIGN_CERT_PASSWORD" \
+            /fd SHA256 \
+            /tr "http://timestamp.digicert.com" \
+            /td SHA256 \
+            "$NSIS_PATH"
 
-          mv -f "$SIGNED_PATH" "$NSIS_PATH"
           rm -f "$TMP_PFX"
 
           echo "signed=true" >> $GITHUB_OUTPUT
