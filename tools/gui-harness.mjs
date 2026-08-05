@@ -74,6 +74,23 @@ function installMockTauri() {
     delete_markup: () => null,
     save_document: () => null,
     save_document_as: () => null,
+    // license_status has no handler here since this harness predates S2b (PR #49,
+    // 2026-07-08) - the missing entry falls through to Promise.resolve(null), and
+    // App.svelte's `licenseState.state !== "valid"` throws on that null, which never
+    // resolves .viewport-root (confirmed 2026-08-05 during a GUI validation pass).
+    // Mocked "valid" here so the harness can mount the app again.
+    license_status: () => ({
+      state: "valid", staff_id: "harness", expires_at: "2099-01-01T00:00:00Z",
+      days_remaining: 9999, renew_due: false,
+    }),
+    list_scales: () => [],
+    get_page_snap_targets: () => [],
+    list_tool_sets: () => [],
+    recent_tools: () => [],
+    folder_index_status: () => ({ status: "idle", doc_count: 0 }),
+    load_recent_docs: () => [],
+    save_recent_docs: () => null,
+    check_file_exists: () => true,
   };
 
   window.__TAURI_INTERNALS__ = {

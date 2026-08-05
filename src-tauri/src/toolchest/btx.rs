@@ -268,6 +268,44 @@ mod tests {
         assert!(report.tools[0].geometry.is_some());
     }
 
+    // --- checked-in fixture (tools/fixtures/sample-tool-set.btx), added 2026-08-05 so the
+    // GUI harness has a real file to drive the ".btx" import path through - this test ties
+    // the fixture to the parser so it can't silently drift from something this module no
+    // longer accepts (it's the same PLAIN_ITEM shape plus a leading XML comment, proving
+    // parse_btx_xml tolerates a comment before the root element).
+    //
+    // Read at RUNTIME (not `include_str!`) and gated on the file existing, mirroring
+    // render::tests::corpus()'s pattern one directory up - `tools/` lives outside
+    // src-tauri/, and .forgejo/Dockerfile.test-rust's CI build context only COPYs
+    // Cargo.toml/Cargo.lock/src-tauri/crates into the image, so include_str!'s
+    // compile-time path doesn't exist there even though the file is genuinely committed
+    // (confirmed: CI run #165 failed with "couldn't read ...tools/fixtures/..." while
+    // `git ls-tree HEAD` shows the file present - a build-context gap, not a missing
+    // commit). The Dockerfile now also COPYs tools/fixtures so this runs for real in CI
+    // rather than skipping there forever; the runtime-read + skip stays as defense for
+    // any other narrower build context, same reasoning as corpus()'s gating.
+    fn sample_tool_set_fixture_path() -> Option<std::path::PathBuf> {
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("tools")
+            .join("fixtures")
+            .join("sample-tool-set.btx");
+        p.exists().then_some(p)
+    }
+
+    #[test]
+    fn checked_in_sample_tool_set_fixture_imports_via_import_btx_bytes() {
+        let Some(path) = sample_tool_set_fixture_path() else {
+            eprintln!("skip: tools/fixtures/sample-tool-set.btx not present in this build context");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read checked-in fixture");
+        let report = import_btx_bytes(&bytes);
+        assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+        assert_eq!(report.tools.len(), 1);
+        assert_eq!(report.tools[0].name, "Fire Rated Door");
+    }
+
     // --- (e) a zlib-`789c` <Raw> inflates + parses ---
 
     #[test]

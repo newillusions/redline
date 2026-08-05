@@ -2,7 +2,15 @@
 
 ## Current Status
 
-**main was at `8d84754c` (post-v0.3.6) before this session's PR. Wave-2 resolved two
+**main was at `88ba31a` (post-wave-2, vector snap v1 + OCR descope, PR #62) before this
+session's PR. Wave-3 shipped the three fixes from the wave-2b GUI validation pass
+(obs:us5j4ne1r5byjzle8u23): undo/redo now has a real keyboard + toolbar UI surface,
+ErrorBanner no longer occludes the toolbar-right panel-toggle buttons, and the
+tools/gui-harness.mjs license-mock fix (left uncommitted by the validation session) is
+now committed. See Last Session below for detail.**
+
+**Previous status (wave-2, superseded above but kept for context): main was at `8d84754c`
+(post-v0.3.6) before wave-2's PR. Wave-2 resolved two
 spec-vs-reality gaps flagged by the 2026-08-04 portfolio review: geometry/snap
 (BUILT a real v1) and OCR (DESCOPED, formally). See Last Session below for detail and
 `.claude/rules/judgment.md` for the carried-forward gotchas both touch. One residual
@@ -14,7 +22,128 @@ compatible with rkyv 0.8. Detail: `obs:w3mm0ublu2xu1t8y8tyv`.**
 
 ## Last Session
 
-**Date**: 2026-08-04 (wave-2, dispatched by the orchestrator - "resolve the two
+**Date**: 2026-08-05 (wave-3, dispatched by the orchestrator - ship the fixes from the
+GUI validation pass)
+
+**Summary**: All three items from the validation pass (obs:us5j4ne1r5byjzle8u23), one PR.
+
+1. **Undo/redo UI surface** (was fully implemented in `MarkupStore.undo()`/`redo()` with
+   zero UI/keyboard surface - Finding 1 of the validation pass). Keyboard: Cmd/Ctrl+Z ->
+   undo, Cmd/Ctrl+Shift+Z and Cmd/Ctrl+Y -> redo, wired into `App.svelte`'s existing
+   `handleKeydown` (same location as the Cmd/Ctrl+S / Ctrl+Tab bindings). The dispatch-
+   and-guard logic is a new pure module, `src/lib/keyboard-shortcuts.ts`
+   (`resolveUndoRedoShortcut` + `isEditableTarget`) - extracted rather than inlined
+   because App.svelte has no test file of its own (license gate + Tauri IPC make it
+   expensive to mount in vitest), so this is the same conflict-avoidance/testability
+   pattern as `recent-docs.ts`/`license.ts`/`patchStatus`. The guard matters concretely:
+   the Text/Callout inline `<textarea>` (Viewport.svelte) needs the browser's own
+   field-level undo, not the app-level one - `isEditableTarget` returns true for
+   INPUT/TEXTAREA/contentEditable targets and the resolver returns `null` for those, so
+   `handleKeydown` never calls `preventDefault()` there.
+   Toolbar surface: new `UndoRedoControls.svelte` (mirrors `ToolChestPanel`'s
+   `markupStore` prop pattern - a separate leaf component specifically so it's directly
+   testable with @testing-library/svelte, the same reason App.svelte's buttons aren't
+   inlined here), mounted in the toolbar-left group right after "Save As…".
+   **Real bug found and fixed en route, not cosmetic**: `MarkupStore.canUndo`/`canRedo`
+   read `History`'s undo/redo stacks, which are plain (non-`$state`) arrays on a plain
+   class (`markup-commands.ts`, not a `.svelte.ts` file, so runes aren't available
+   there) - a component binding a button's `disabled` to `store.canUndo` would never
+   re-render on push/pop, since Svelte's reactivity never saw a `$state` change. Added
+   `historyVersion = $state(0)` to `MarkupStore`, bumped on every history mutation
+   (create/update/delete/undo/redo/applyBatch/deleteSelected/seed); `canUndo`/`canRedo`
+   read it (`void this.historyVersion`) purely to register the dependency before
+   delegating to `history.canUndo`/`canRedo`. Without this the toolbar buttons would
+   have shipped with a stuck disabled/enabled state - exactly the class of bug a mock-IPC
+   harness pass can't catch (it never round-trips through Svelte's real reactivity graph
+   the way a mounted component test does).
+2. **ErrorBanner occlusion fix** (Finding 3 of the validation pass). `.error-banner-stack`
+   moved from `top: var(--space-3)` (12px - inside the 40px toolbar) to
+   `top: calc(var(--toolbar-height) + var(--space-3))` (below it entirely). Visibility
+   unchanged, occlusion gone - no interactive control sits under the banner anymore.
+   Not screenshot-verified in this session (no live `cargo tauri dev`/harness run
+   performed here - see "Not done" below); the fix is geometry-only (fully-below the
+   fixed-height toolbar) so a visual regression is unlikely, but flagging per the
+   verification-gate standard rather than claiming a screenshot that wasn't taken.
+3. **Committed the gui-harness.mjs mock-IPC fix** left uncommitted by the validation
+   session (9 missing mock handlers incl. `license_status`, whose absence broke the
+   documented harness procedure since the 2026-07-08 S2b gate - PR #49). Own commit,
+   dev-tooling only, no app code.
+4. **`.btx` fixture** - NOT skipped, was trivial: `tools/fixtures/sample-tool-set.btx`
+   is the exact `PLAIN_ITEM` shape from `btx.rs`'s own test suite (a known-good fixture,
+   not guessed), plus a leading XML comment for provenance. New Rust test
+   (`checked_in_sample_tool_set_fixture_imports_via_import_btx_bytes`, uses
+   `include_str!`) ties the checked-in file to the parser so it can't silently drift.
+   **Not done** (named, not silently skipped): the fixture is not yet wired into
+   `tools/gui-harness.mjs` itself - the harness has no file-dialog mock at all today (it
+   only drives zoom/pan/page-nav), so actually exercising the click-through Tool Chest
+   import UI is separate, larger scope than "add a fixture". This just removes the
+   blocker for whoever does that next.
+
+Tests: `npm test` 694/694 (694 = 673 baseline + 21 new: 15 `keyboard-shortcuts.test.ts`,
+6 `UndoRedoControls.test.ts` - 5 direct + reactivity implied by the disabled-state
+assertions). `npm run check` 0 errors (19 pre-existing a11y/legacy-syntax warnings,
+none in touched files). `cargo test --lib` 416/416 (415 baseline + 1 new fixture test).
+`cargo clippy --all-targets` 1 pre-existing unrelated warning (`commands/docops.rs`
+redundant closure, present on `main` before this branch). `npm run lint`/`npm run
+format` could not run in this session - `eslint`/`prettier` binaries are absent from
+`node_modules/.bin` (confirmed pre-existing via `git stash` + rerun, not caused by this
+branch) - flagging as an environment gap, not a code issue.
+
+**Owed / not done this session**: live GUI re-verify of both UI fixes in a real
+`cargo tauri dev` or harness session (button click -> visible undo, error banner no
+longer overlapping the toolbar buttons) - this session's verification was automated
+tests only, no screenshots taken. Also still owed from wave-2b: the vector-snap ring
+indicator live check and the `.btx` import UI drive-through (see item 4 above).
+
+### Previous session (2026-08-05, wave-2b GUI validation pass, dispatched by the
+orchestrator - "have you tested the redline markups? And all the other tools?")
+
+**Summary**: Exercised all 22 toolbar tools + supporting UI (properties panel, workflow-
+status dropdown, Tool Chest, Takeoff/Quantities panel, Flatten/Optimize/Apply Redactions
+buttons, Compare panel) via scripted Playwright driving the real Vite dev app with a mock
+Tauri IPC layer - the same technique as `tools/gui-harness.mjs`, extended to drive each
+tool individually rather than just the render-loop smoke. 27/29 checks passed with
+screenshot + overlay-DOM-delta evidence (40 screenshots captured this session, in the
+dispatching session's scratchpad, not committed to the repo).
+
+**Found and fixed (uncommitted - `git diff -- tools/gui-harness.mjs`)**: the repo's own
+documented GUI harness had been silently broken since the 2026-07-08 S2b license gate
+(PR #49) landed - its mock IPC had no `license_status` handler, so `getLicenseStatus()`
+resolved to `null`, `App.svelte` threw on `null.state`, and `.viewport-root` never
+mounted. Added `license_status` + 8 other missing mock handlers
+(`list_scales`/`get_page_snap_targets`/`list_tool_sets`/`recent_tools`/
+`folder_index_status`/`load_recent_docs`/`save_recent_docs`/`check_file_exists`) so the
+documented procedure works again. **Recommend committing this as a real fix** - it is
+not app code, only the dev-tool mock.
+
+**Two real product defects found** (not harness artifacts):
+1. `MarkupStore.undo()`/`redo()` (src/lib/markup-store.svelte.ts:159-161) are fully
+   implemented with a working command-history stack (unit-tested) but have **zero UI or
+   keyboard surface** anywhere in the frontend - no button, no menu item, no Cmd/Ctrl+Z
+   binding in `App.svelte`'s `handleKeydown`. Confirmed via `grep -rn "\.undo(\|\.redo("`
+   (zero call sites outside the store + its own test) and empirically (drew 24 markups,
+   Ctrl+Z/Ctrl+Shift+Z produced zero overlay change). A user cannot undo a markup today.
+2. `ErrorBanner.svelte`'s `.error-banner-stack` (`position: fixed; top/right: var(--space-3);
+   z-index: 2000`) sits exactly on top of the toolbar-right panel-toggle buttons (left
+   panel / right panel / markups-list / settings - the last four icons in the toolbar
+   header). Any uncaught error occludes and blocks clicks on those buttons until every
+   stacked error is manually dismissed.
+
+**Not independently verifiable this pass** (named, not silently skipped): real text
+selection (mock has no PDFium text layer), the vector-snap v1 ring indicator (a second
+targeted mock attempt with a synthetic `SnapTarget` was inconclusive - `.snap-indicator`
+never appeared across a coordinate sweep; not concluded as a bug, needs a human GUI pass
+- already independently tracked as owed), `.btx` Tool Set import (no fixture file in the
+repo), drag-and-drop file open (`getCurrentWebview()` needs the real Tauri webview API).
+
+Full detail + method notes (incl. `SnapTarget`'s actual wire shape `{point:{x,y},kind}`
+for anyone else mocking `get_page_snap_targets`): `obs:us5j4ne1r5byjzle8u23`.
+
+Dev server started/stopped cleanly via targeted `lsof -ti tcp:1421 | xargs kill -TERM`
+(never `pkill`); no cargo/Rust build was triggered (frontend-only Vite dev session); no
+scratch files left in the repo beyond the one harness fix.
+
+### Previous session (2026-08-04, wave-2, dispatched by the orchestrator - "resolve the two
 spec-vs-reality gaps found in the portfolio review, with authority to decide on
 engineering evidence")
 

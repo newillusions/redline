@@ -83,6 +83,11 @@ export class MarkupStore implements MarkupSink {
   private history = new History(this);
   private queue: MirrorOp[] = [];
   private drainPromise: Promise<void> | null = null;
+  /** Bumped on every history mutation (push/pushBatch/undo/redo/seed). `History`'s
+   *  undo/redo stacks are plain (non-$state) arrays on a plain class, so reading them
+   *  directly from a component template would never re-render on change - this counter
+   *  is the $state dependency the `canUndo`/`canRedo` getters read to stay reactive. */
+  private historyVersion = $state(0);
 
   constructor(private readonly docId: string, private readonly ipc: MarkupIpc) {
     // Seed one default set so the Count tool tallies into a named bucket out of the box.
@@ -135,6 +140,7 @@ export class MarkupStore implements MarkupSink {
   seed(markups: Markup[]) {
     this.markups = markups;
     this.history = new History(this);
+    this.historyVersion++;
     this.queue = [];
     this.drainPromise = null;
     this.dirty = false;
@@ -151,17 +157,19 @@ export class MarkupStore implements MarkupSink {
   }
 
   // --- Mutations (undoable + mirrored) ---
-  create(m: Markup) { this.dirty = true; this.enqueue(this.history.push(new CreateCmd(m))); }
-  update(before: Markup, after: Markup) { this.dirty = true; this.enqueue(this.history.push(new UpdateCmd(before, after))); }
-  delete(id: string) { const m = this.getById(id); if (m) { this.dirty = true; this.enqueue(this.history.push(new DeleteCmd(m))); } }
+  create(m: Markup) { this.dirty = true; this.enqueue(this.history.push(new CreateCmd(m))); this.historyVersion++; }
+  update(before: Markup, after: Markup) { this.dirty = true; this.enqueue(this.history.push(new UpdateCmd(before, after))); this.historyVersion++; }
+  delete(id: string) { const m = this.getById(id); if (m) { this.dirty = true; this.enqueue(this.history.push(new DeleteCmd(m))); this.historyVersion++; } }
 
   /** Undo the last frame (which may be 1 or N commands). Each op is enqueued in order. */
-  undo() { const ops = this.history.undo(); if (ops) { this.dirty = true; ops.forEach((op) => this.enqueue(op)); } }
+  undo() { const ops = this.history.undo(); if (ops) { this.dirty = true; ops.forEach((op) => this.enqueue(op)); this.historyVersion++; } }
   /** Redo the last undone frame. Each op is enqueued in order. */
-  redo() { const ops = this.history.redo(); if (ops) { this.dirty = true; ops.forEach((op) => this.enqueue(op)); } }
+  redo() { const ops = this.history.redo(); if (ops) { this.dirty = true; ops.forEach((op) => this.enqueue(op)); this.historyVersion++; } }
 
-  get canUndo() { return this.history.canUndo; }
-  get canRedo() { return this.history.canRedo; }
+  // `historyVersion` is read (not used) purely to register the reactive dependency -
+  // see its declaration above for why the underlying stacks can't be read directly.
+  get canUndo() { void this.historyVersion; return this.history.canUndo; }
+  get canRedo() { void this.historyVersion; return this.history.canRedo; }
 
   /** The markups that are currently selected. */
   get selectedMarkups(): Markup[] {
@@ -178,6 +186,7 @@ export class MarkupStore implements MarkupSink {
     const cmds = pairs.map(({ before, after }) => new UpdateCmd(before, after));
     const ops = this.history.pushBatch(cmds);
     ops.forEach((op) => this.enqueue(op));
+    this.historyVersion++;
   }
 
   /**
@@ -191,6 +200,7 @@ export class MarkupStore implements MarkupSink {
     const cmds = targets.map((m) => new DeleteCmd(m));
     const ops = this.history.pushBatch(cmds);
     ops.forEach((op) => this.enqueue(op));
+    this.historyVersion++;
     this.selectedIds = new Set();
   }
 

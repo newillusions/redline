@@ -54,6 +54,8 @@
   import ActivationGate from "./components/ActivationGate.svelte";
   import { getLicenseStatus, renewLicenseIfDue } from "$lib/license";
   import type { LicenseState } from "$lib/license";
+  import UndoRedoControls from "./components/UndoRedoControls.svelte";
+  import { resolveUndoRedoShortcut } from "$lib/keyboard-shortcuts";
 
   // ---------------------------------------------------------------------------
   // S2b client entitlement gate - null while the initial check is in flight,
@@ -576,6 +578,17 @@
   function handleKeydown(e: KeyboardEvent) {
     const mod = e.metaKey || e.ctrlKey;
 
+    // Cmd/Ctrl+Z — undo; Cmd/Ctrl+Shift+Z / Cmd/Ctrl+Y — redo. Resolver returns null (and
+    // does nothing here) while a text/callout inline editor or other input has focus, so
+    // the field keeps its own native undo (see keyboard-shortcuts.ts).
+    const undoRedoAction = resolveUndoRedoShortcut(e);
+    if (undoRedoAction) {
+      e.preventDefault();
+      if (undoRedoAction === "undo") activeTab?.store.undo();
+      else activeTab?.store.redo();
+      return;
+    }
+
     // Cmd/Ctrl+S — save active tab
     if (mod && e.key.toLowerCase() === "s" && !e.shiftKey) {
       e.preventDefault();
@@ -637,6 +650,7 @@
       <button class="btn-toolbar" onclick={handleSaveAs} disabled={!activeTab || isSaving} title="Save As…">
         Save As…
       </button>
+      <UndoRedoControls store={activeTab?.store ?? null} />
       <button
         class="btn-toolbar"
         onclick={handleSaveUnprotectedCopyMenuAction}

@@ -22,6 +22,11 @@ COPY --chown=root:root src-tauri src-tauri
 # Without this COPY the src-tauri compilation fails immediately
 # because cargo cannot resolve the path dep ../crates/pdf-diff.
 COPY --chown=root:root crates crates
+# Checked-in test fixtures read at runtime by src-tauri tests (e.g.
+# toolchest::btx::tests reads tools/fixtures/sample-tool-set.btx). Narrow COPY (not the
+# whole tools/ dir, which also holds the Node-only gui-harness.mjs with no place in this
+# Rust-only image) so this stays a minimal, purpose-scoped addition to the build context.
+COPY --chown=root:root tools/fixtures tools/fixtures
 
 ENV CARGO_TARGET_DIR=/target
 

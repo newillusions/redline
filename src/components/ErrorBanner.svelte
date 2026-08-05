@@ -55,7 +55,12 @@
 <style>
   .error-banner-stack {
     position: fixed;
-    top: var(--space-3);
+    /* Offset below the toolbar (--toolbar-height), not just --space-3 from the viewport
+       top - a plain --space-3 offset sits inside the 40px toolbar and occludes the
+       toolbar-right panel-toggle buttons (left/right panel, markups-list, settings)
+       whenever an error is showing, blocking clicks on them until dismissed. Found in
+       the 2026-08-05 GUI validation pass, obs:us5j4ne1r5byjzle8u23. */
+    top: calc(var(--toolbar-height) + var(--space-3));
     right: var(--space-3);
     z-index: 2000;
     display: flex;
