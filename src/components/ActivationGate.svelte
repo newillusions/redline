@@ -25,10 +25,12 @@
   let error = $state<string | null>(null);
 
   const headline: Record<LicenseState["state"], string> = {
-    valid: "", // never rendered - App.svelte only mounts this gate when not valid
+    valid: "", // never rendered - App.svelte only mounts this gate when not usable
+    grace: "", // never rendered - grace is usable; see LicenseGraceWarning instead
     missing: "Activate Redline",
     expired: "License expired",
     invalid: "License invalid",
+    revoked: "License revoked",
   };
 
   const hint = $derived.by(() => {
@@ -37,6 +39,9 @@
         return "This activation is bound to a different device. Contact the administrator for a new activation code.";
       }
       return `This installation's license could not be verified (${licenseState.reason}). Enter a new activation code below.`;
+    }
+    if (licenseState.state === "revoked") {
+      return `This device's license was revoked by the administrator (${licenseState.reason}). Enter a new activation code to continue.`;
     }
     if (licenseState.state === "expired") {
       return "Your license has expired and could not be renewed automatically. Enter a new activation code, or contact the administrator.";

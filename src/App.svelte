@@ -52,17 +52,26 @@
   import ToolChestPanel from "./components/ToolChestPanel.svelte";
   import { ToolChestStore } from "$lib/toolchest-store.svelte";
   import ActivationGate from "./components/ActivationGate.svelte";
-  import { getLicenseStatus, renewLicenseIfDue } from "$lib/license";
+  import LicenseGraceWarning from "./components/LicenseGraceWarning.svelte";
+  import { getLicenseStatus, checkInIfActivated, isUsable } from "$lib/license";
   import type { LicenseState } from "$lib/license";
   import UndoRedoControls from "./components/UndoRedoControls.svelte";
   import { resolveUndoRedoShortcut } from "$lib/keyboard-shortcuts";
 
   // ---------------------------------------------------------------------------
-  // S2b client entitlement gate - null while the initial check is in flight,
-  // then either "valid" (app content renders) or a locked-out reason
-  // (ActivationGate renders instead). See handleActivated / initializeAppContent.
+  // S2b client entitlement gate - null while the initial (offline, fast) check
+  // is in flight, then either usable ("valid" or "grace" - app content
+  // renders) or a locked-out reason (ActivationGate renders instead). See
+  // handleActivated / maybeInitializeAppContent / checkInIfActivated.
   // ---------------------------------------------------------------------------
   let licenseState = $state<LicenseState | null>(null);
+  /** Guards against double-initializing app content when the background
+   * online check-in resolves after the fast local read already started it
+   * (or self-heals an unusable local read into a usable one). */
+  let appContentStarted = false;
+  /** Grace warning is shown once per launch; dismissing it (or opening
+   * Settings from it) hides it for the rest of this process's lifetime. */
+  let graceWarningDismissed = $state(false);
 
   // ---------------------------------------------------------------------------
   // Multi-doc state
@@ -171,24 +180,42 @@
     });
   }
 
+  /** Runs initializeAppContent exactly once, whenever `state` first becomes
+   * usable (valid or grace) - whether that's from the initial fast local
+   * read, ActivationGate's onActivated callback, or a background check-in
+   * that self-heals a previously unusable read. */
+  async function maybeInitializeAppContent(state: LicenseState) {
+    if (appContentStarted || !isUsable(state)) return;
+    appContentStarted = true;
+    await initializeAppContent();
+  }
+
   /** ActivationGate calls this after a successful activate_license. */
   async function handleActivated(state: LicenseState) {
     licenseState = state;
-    if (state.state === "valid") await initializeAppContent();
+    await maybeInitializeAppContent(state);
   }
 
   onMount(async () => {
     licenseState = await getLicenseStatus().catch(
       (e): LicenseState => ({ state: "invalid", reason: e instanceof Error ? e.message : String(e) }),
     );
-    if (licenseState.state !== "valid") return;
 
-    await initializeAppContent();
-    // Best-effort renew when within the renew window - never blocks the app;
-    // a failed/offline renew just leaves the current token gating as-is.
-    renewLicenseIfDue(licenseState).then((updated) => {
-      if (updated) licenseState = updated;
+    // Online is authoritative (2026-08-05 launch model): whenever a stored
+    // activation exists at all - regardless of whether the fast offline
+    // read says valid/grace/expired/invalid - always attempt the online
+    // check-in on launch. A reachable server can revoke instantly (the
+    // check-in resolves to "revoked", which flips the gate closed even if
+    // the local read was "valid") or heal a stale local read via a fresh
+    // renew (e.g. "expired" -> "valid"). Fire-and-forget: this never blocks
+    // startup, which renders from the fast local read immediately below.
+    checkInIfActivated(licenseState).then((updated) => {
+      if (!updated) return;
+      licenseState = updated;
+      void maybeInitializeAppContent(updated);
     });
+
+    await maybeInitializeAppContent(licenseState);
   });
 
   onDestroy(() => { _dropUnlisten?.(); });
@@ -633,7 +660,7 @@
   <!-- Initial license check in flight - avoid a flash of the activation gate
        for the common case (already-activated install). -->
   <div class="app-shell license-checking"></div>
-{:else if licenseState.state !== "valid"}
+{:else if !isUsable(licenseState)}
   <ActivationGate licenseState={licenseState} onActivated={handleActivated} />
 {:else}
 <div class="app-shell">
@@ -899,7 +926,28 @@
 
   <!-- Settings dialog -->
   {#if settingsOpen}
-    <SettingsDialog onClose={() => (settingsOpen = false)} />
+    <SettingsDialog
+      onClose={() => (settingsOpen = false)}
+      onLicenseChanged={(state) => {
+        licenseState = state;
+        void maybeInitializeAppContent(state);
+      }}
+    />
+  {/if}
+
+  <!-- License grace-period warning: shown once per launch while running on
+       an offline-expired token still inside the server's grace window (see
+       maybeInitializeAppContent / checkInIfActivated above). Non-blocking -
+       app content renders behind it. -->
+  {#if licenseState.state === "grace" && !graceWarningDismissed}
+    <LicenseGraceWarning
+      state={licenseState}
+      onOpenSettings={() => {
+        graceWarningDismissed = true;
+        settingsOpen = true;
+      }}
+      onDismiss={() => (graceWarningDismissed = true)}
+    />
   {/if}
 
   <UpdateNotification />

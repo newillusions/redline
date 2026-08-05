@@ -30,6 +30,18 @@ pub fn load(data_dir: &Path) -> io::Result<Option<StoredLicense>> {
     Ok(serde_json::from_slice::<StoredLicense>(&bytes).ok())
 }
 
+/// Remove the stored activation, if any. Idempotent - `Ok(())` whether or not
+/// a file was present, mirroring `load`'s "missing is not an error" stance.
+/// Used by the settings-panel "remove license from this device" action.
+pub fn clear(data_dir: &Path) -> io::Result<()> {
+    let path = license_file_path(data_dir);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Persist the activation atomically (temp + rename).
 pub fn save(data_dir: &Path, license: &StoredLicense) -> io::Result<()> {
     let license_dir = data_dir.join("license");
@@ -110,6 +122,50 @@ mod tests {
         let dir = scratch_dir();
         fs::create_dir_all(dir.join("license")).unwrap();
         fs::write(dir.join("license").join("activation.json"), b"not json").unwrap();
+        assert_eq!(load(&dir).unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_removes_an_existing_activation() {
+        let dir = scratch_dir();
+        save(
+            &dir,
+            &StoredLicense {
+                code: "ABCD-1234".to_string(),
+                token: "payload.sig".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(load(&dir).unwrap().is_some());
+
+        clear(&dir).unwrap();
+        assert_eq!(load(&dir).unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_is_idempotent_when_nothing_stored() {
+        let dir = scratch_dir();
+        // Never activated - not even the license dir exists yet.
+        clear(&dir).unwrap();
+        assert_eq!(load(&dir).unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_twice_in_a_row_is_still_ok() {
+        let dir = scratch_dir();
+        save(
+            &dir,
+            &StoredLicense {
+                code: "ABCD-1234".to_string(),
+                token: "payload.sig".to_string(),
+            },
+        )
+        .unwrap();
+        clear(&dir).unwrap();
+        clear(&dir).unwrap(); // second call: file already gone
         assert_eq!(load(&dir).unwrap(), None);
         let _ = fs::remove_dir_all(&dir);
     }

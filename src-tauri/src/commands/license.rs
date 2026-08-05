@@ -84,9 +84,11 @@ pub async fn activate_license(app_handle: tauri::AppHandle, code: String) -> Res
     })
 }
 
-/// Attempt a renew (call when `license_status`/`activate_license` reported
-/// `renew_due: true`). Never blocks the app: on an offline/rejected renew,
-/// the existing token's own expiry keeps gating (the grace window).
+/// The online check-in - called unconditionally on every app launch whenever
+/// a stored activation exists (see `license/service.rs` module doc comment),
+/// not just when close to expiry. Never blocks the app: an unreachable
+/// server falls back to the cached token's own offline/grace evaluation; a
+/// reachable-but-refused check-in is an instant hard stop (`Revoked`).
 #[tauri::command]
 pub async fn renew_license(app_handle: tauri::AppHandle) -> Result<LicenseState, String> {
     let dir = data_dir(&app_handle)?;
@@ -107,4 +109,34 @@ pub async fn renew_license(app_handle: tauri::AppHandle) -> Result<LicenseState,
         chrono::Utc::now(),
     )
     .await)
+}
+
+/// Settings-panel display bundle: the activation code on file (if any), this
+/// device's fingerprint, and the current gate state. Pure local read, no
+/// network call.
+#[tauri::command]
+pub async fn license_info(app_handle: tauri::AppHandle) -> Result<service::LicenseInfo, String> {
+    let dir = data_dir(&app_handle)?;
+    let device_fingerprint = resolve_device_fingerprint(dir.clone()).await?;
+    let stored = resolve_stored_license(dir).await?;
+    let public_key = parse_public_key_pem(LICENSE_PUBLIC_KEY_PEM);
+    Ok(service::info(
+        stored.as_ref(),
+        &device_fingerprint,
+        &public_key,
+        chrono::Utc::now(),
+    ))
+}
+
+/// Settings-panel "remove license from this device" - local-only, works
+/// offline, always succeeds (idempotent). Returns `Missing` so the caller can
+/// update its UI state without a second round trip.
+#[tauri::command]
+pub async fn deactivate_license(app_handle: tauri::AppHandle) -> Result<LicenseState, String> {
+    let dir = data_dir(&app_handle)?;
+    tokio::task::spawn_blocking(move || service::deactivate(&dir))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("Failed to remove license: {e}"))?;
+    Ok(LicenseState::Missing)
 }
