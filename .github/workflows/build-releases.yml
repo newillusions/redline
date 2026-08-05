@@ -322,7 +322,14 @@ jobs:
           Remove-Item $pfx -Force -ErrorAction SilentlyContinue
           if ($rc -ne 0) { Write-Error "signtool failed with exit code $rc"; exit $rc }
 
-          & $signtool.FullName verify /pa /v $nsis.FullName
+          # NOT `signtool verify /pa`: that enforces the Authenticode trust policy and
+          # ALWAYS fails for our SELF-SIGNED cert ("certificate chain processed, but
+          # terminated in a root certificate which is not trusted") - it failed the
+          # v0.3.9 build even though signing itself succeeded. Assert a signature is
+          # PRESENT instead, which is the property we actually care about here.
+          $sig = Get-AuthenticodeSignature $nsis.FullName
+          if (-not $sig.SignerCertificate) { Write-Error "No Authenticode signature present after signing."; exit 1 }
+          Write-Host "Authenticode signature present (status: $($sig.Status), subject: $($sig.SignerCertificate.Subject))"
           "signed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Signed $($nsis.FullName)"
 
