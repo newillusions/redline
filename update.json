@@ -1,15 +1,15 @@
 {
-  "version": "0.3.8",
-  "notes": "Release v0.3.8",
-  "pub_date": "2026-08-05T09:52:31Z",
+  "version": "0.3.9",
+  "notes": "Release v0.3.9",
+  "pub_date": "2026-08-05T10:17:18Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTbTN6SDFvSTVnWnc1QXdNbGpaZ0kyMVJadktmdHc2SHBSNG9NOVZ5Wm40V21CdmhzWkNmLy84OVJvL1RTY0s4YkU0VUwyQ1lJUE9JZzJMRXpBNUtwOFk0MnA5Tk9uYlFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1OTIzMjg2CWZpbGU6UmVkbGluZS5hcHAudGFyLmd6ClVpTVFPUGtNMEFnSEx3Mi9yM0czY3dobjJaTkMwdVFDRllYMWVaWXNpdTM3RkVJeDR6MHFyMXQrWjhlZUFScjV6aEJFU3hzdDBSaVZjZDVOWFFZZkJnPT0K",
-      "url": "https://forge.mms.name/emittiv/redline/releases/download/v0.3.8/Redline_0.3.8_aarch64.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTbTN6SDFvSTVnWjMxbG5lMFkzZktHL3N0R0pxdzdKU0xtbW5HYlU3Mmhyc0VGdFIvRXlhVkRhR09oQ1lrYVFBWEZ2bWc1S0dJWjVsdWFJLzd1R1JjNU1EYVRSZ0RYd3dnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1OTI0NjQzCWZpbGU6UmVkbGluZS5hcHAudGFyLmd6CkFodHVaNWFwSjJVUVQ1RWUxOFppZk9ETXlKUUxDLzVQMkFKZnZGQVlnUWlZdHpCYXRNTldKMFkrSDRTREd0UlV0WUxLeVNlTm0rN0FJRUV5Mk9MT0N3PT0K",
+      "url": "https://forge.mms.name/emittiv/redline/releases/download/v0.3.9/Redline_0.3.9_aarch64.app.tar.gz"
     },
     "windows-x86_64": {
       "signature": "",
-      "url": "https://forge.mms.name/emittiv/redline/releases/download/v0.3.8/Redline_0.3.8_x64-setup.exe"
+      "url": "https://forge.mms.name/emittiv/redline/releases/download/v0.3.9/Redline_0.3.9_x64-setup.exe"
     }
   }
 }
