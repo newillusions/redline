@@ -232,6 +232,60 @@ describe("text search ipc wrappers (Tauri v2 camelCase keys)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// DocOps IPC wrappers (M5 — flatten / optimize / redact, spec §8)
+//
+// No casing-assertion coverage existed for these three wrappers before this test
+// (confirmed via `grep -n "flatten_document\|optimize_document\|redact_document"` — zero
+// hits anywhere in this file) despite judgment.md's rule that every new IPC wrapper gets
+// one. Added while investigating a live report that "flatten and optimise don't seem to
+// do anything" — this proves/refutes the "IPC arg fails to bind" hypothesis for `level`
+// specifically (a JS default parameter with no explicit call-site value is a plausible
+// silent-binding trap).
+// ---------------------------------------------------------------------------
+
+describe("docops ipc invoke argument keys (Tauri v2 camelCase)", () => {
+  const mockInvokeDocops = vi.mocked(invoke);
+
+  beforeEach(() => {
+    mockInvokeDocops.mockReset();
+    mockInvokeDocops.mockResolvedValue(undefined as never);
+  });
+
+  it("flattenDocument → docId", async () => {
+    await ipc.flattenDocument("d1");
+    expect(mockInvokeDocops).toHaveBeenCalledWith("flatten_document", { docId: "d1" });
+  });
+
+  it("optimizeDocument with no explicit level → docId / level:2 (the default that ships as the UI button's call)", async () => {
+    await ipc.optimizeDocument("d1");
+    expect(mockInvokeDocops).toHaveBeenCalledWith("optimize_document", {
+      docId: "d1",
+      level: 2,
+    });
+  });
+
+  it("optimizeDocument with an explicit level → docId / level", async () => {
+    await ipc.optimizeDocument("d1", 1);
+    expect(mockInvokeDocops).toHaveBeenCalledWith("optimize_document", {
+      docId: "d1",
+      level: 1,
+    });
+  });
+
+  it("redactDocument → docId / regions / applyAnnots", async () => {
+    const regions: ipc.RedactRegion[] = [
+      { page_index: 0, x: 1, y: 2, width: 3, height: 4 },
+    ];
+    await ipc.redactDocument("d1", regions, true);
+    expect(mockInvokeDocops).toHaveBeenCalledWith("redact_document", {
+      docId: "d1",
+      regions,
+      applyAnnots: true,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Versioning IPC wrappers (M4 S2)
 // ---------------------------------------------------------------------------
 

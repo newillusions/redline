@@ -56,6 +56,7 @@
   import type { LicenseState } from "$lib/license";
   import UndoRedoControls from "./components/UndoRedoControls.svelte";
   import { resolveUndoRedoShortcut } from "$lib/keyboard-shortcuts";
+  import { runDocOpAndReseed, formatBytes } from "$lib/docops-handlers";
 
   // ---------------------------------------------------------------------------
   // S2b client entitlement gate - null while the initial check is in flight,
@@ -83,6 +84,11 @@
   let isFlattening = $state(false);
   let isOptimizing = $state(false);
   let isRedacting = $state(false);
+  /** Transient success feedback for the DocOps actions (Flatten/Optimize/Redact) - these
+   *  have no other visible confirmation (Optimize changes nothing on screen at all;
+   *  Flatten/Redact bake content that was already visible). Without this, a successful
+   *  no-op action and a real one look identical - see docops-handlers.ts's doc comment. */
+  let docOpsStatus = $state<string | null>(null);
 
   // --- Save-prompt dialog state ---
   /** docId of the document awaiting save/discard/cancel decision; null when dialog is hidden. */
@@ -510,10 +516,21 @@
   async function handleFlatten() {
     if (!activeTab || isFlattening) return;
     openError = null;
+    docOpsStatus = null;
     isFlattening = true;
+    const docId = activeTab.docId;
+    const store = activeTab.store;
     try {
-      await activeTab.store.flush();
-      await flattenDocument(activeTab.docId);
+      const count = await runDocOpAndReseed(
+        docId,
+        store,
+        { loadMarkups },
+        () => flattenDocument(docId),
+      );
+      docOpsStatus =
+        count === 0
+          ? "Flatten: no annotations with an appearance found on this document - nothing to flatten."
+          : `Flatten complete - ${count} annotation${count === 1 ? "" : "s"} baked into page content.`;
     } catch (e) {
       openError = `Flatten failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
@@ -524,10 +541,22 @@
   async function handleOptimize() {
     if (!activeTab || isOptimizing) return;
     openError = null;
+    docOpsStatus = null;
     isOptimizing = true;
+    const docId = activeTab.docId;
+    const store = activeTab.store;
     try {
-      await activeTab.store.flush();
-      await optimizeDocument(activeTab.docId);
+      const report = await runDocOpAndReseed(
+        docId,
+        store,
+        { loadMarkups },
+        () => optimizeDocument(docId),
+      );
+      const saved = report.bytes_before - report.bytes_after;
+      docOpsStatus =
+        saved > 0
+          ? `Optimize complete - file size reduced from ${formatBytes(report.bytes_before)} to ${formatBytes(report.bytes_after)} (saved ${formatBytes(saved)}).`
+          : "Optimize complete - the file was already optimal; no size reduction.";
     } catch (e) {
       openError = `Optimize failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
@@ -538,10 +567,18 @@
   async function handleRedact() {
     if (!activeTab || isRedacting) return;
     openError = null;
+    docOpsStatus = null;
     isRedacting = true;
+    const docId = activeTab.docId;
+    const store = activeTab.store;
     try {
-      await activeTab.store.flush();
-      await redactDocument(activeTab.docId, [], true);
+      await runDocOpAndReseed(
+        docId,
+        store,
+        { loadMarkups },
+        () => redactDocument(docId, [], true),
+      );
+      docOpsStatus = "Apply Redactions complete.";
     } catch (e) {
       openError = `Redact failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
@@ -748,6 +785,10 @@
 
   {#if openError}
     <div class="error-banner">{openError}</div>
+  {/if}
+
+  {#if docOpsStatus}
+    <div class="docops-status-banner">{docOpsStatus}</div>
   {/if}
 
   <!-- Main 3-column body -->
@@ -1010,6 +1051,17 @@
   /* --- Error banner --- */
   .error-banner {
     background: var(--color-danger);
+    color: #fff;
+    font-size: var(--font-size-sm);
+    padding: var(--space-2) var(--space-4);
+    flex-shrink: 0;
+  }
+
+  /* DocOps (Flatten/Optimize/Redact) success feedback - these actions have no other
+     visible confirmation, so a distinct banner reports what actually happened (see
+     docOpsStatus / docops-handlers.ts). */
+  .docops-status-banner {
+    background: var(--color-success, #3ba55d);
     color: #fff;
     font-size: var(--font-size-sm);
     padding: var(--space-2) var(--space-4);
