@@ -13,17 +13,25 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::commands::document::apply_page_edit;
-use crate::docops::{flatten_annotations, optimize_in_place, redact_annotations, redact_regions, RedactRegion};
+use crate::docops::{
+    flatten_annotations, optimize_in_place_with_images, redact_annotations, redact_regions,
+    ImageOptimizeStats, ImageQualityPreset, RedactRegion,
+};
 use crate::AppState;
 
 /// File-size before/after an `optimize_document` call, so the frontend can report what
 /// actually happened (pruned/compressed vs. genuinely nothing to save) instead of giving
 /// identical silent-success feedback either way - the same "success that changed nothing
 /// must say so" gap `flatten_document`'s returned count closes for Flatten.
+///
+/// `image_stats` is all-zeros (via `ImageOptimizeStats::default()`) when `image_preset`
+/// was `None` — additive to the original two-field shape, so existing frontend code
+/// reading only `bytes_before`/`bytes_after` is unaffected.
 #[derive(Debug, Clone, Serialize)]
 pub struct OptimizeReport {
     pub bytes_before: u64,
     pub bytes_after: u64,
+    pub image_stats: ImageOptimizeStats,
 }
 
 /// Flatten all annotation appearance streams in the open document into page content.
@@ -100,18 +108,28 @@ pub async fn redact_document(
     .await
 }
 
-/// Optimize the open document (prune unused objects and/or compress streams).
+/// Optimize the open document (prune unused objects, compress streams, and — when
+/// `image_preset` is given — recompress raster images).
 ///
-/// `level` controls optimization depth (see `docops::optimize_in_place`):
+/// `level` controls object/stream optimization depth (see `docops::optimize_in_place`):
 /// - 0: no-op.
 /// - 1: prune unreferenced objects only (lossless, fast).
 /// - 2: prune + Deflate-compress all compressable streams (default for UI button).
 ///
+/// `image_preset` is a separate, orthogonal axis controlling the raster image
+/// pipeline (see `docops::image_ops`): downsamples oversized images to the preset's
+/// target DPI and re-encodes as JPEG at the preset's quality factor. `None` skips
+/// image work entirely, preserving the original (pre-image-pipeline) behavior exactly.
+/// This is additive rather than a change to `level`'s existing semantics, so the
+/// pre-existing IPC casing test for `optimizeDocument`'s default `level` argument is
+/// unaffected.
+///
 /// After completion the render engine is reloaded so the viewport reflects the
-/// updated file. Returns the file size before and after (see `OptimizeReport`) - optimize
-/// has no other user-visible effect (no annotations change, no viewport difference), so
-/// without this the toolbar action would look identical whether it saved a meaningful
-/// amount of space or nothing at all.
+/// updated file. Returns the file size before and after plus a per-category image
+/// breakdown (see `OptimizeReport`) - optimize has no other user-visible effect (no
+/// annotations change, no viewport difference beyond raster fidelity if images were
+/// recompressed), so without this the toolbar action would look identical whether it
+/// saved a meaningful amount of space or nothing at all.
 ///
 /// # Errors
 ///
@@ -122,6 +140,7 @@ pub async fn optimize_document(
     state: State<'_, AppState>,
     doc_id: String,
     level: u8,
+    image_preset: Option<ImageQualityPreset>,
 ) -> Result<OptimizeReport, String> {
     let path = state
         .markups
@@ -131,10 +150,27 @@ pub async fn optimize_document(
         .map(|m| m.len())
         .map_err(|e| format!("stat {}: {e}", path.display()))?;
 
-    apply_page_edit(&state, &doc_id, move |doc| optimize_in_place(doc, level)).await?;
+    let image_stats = std::sync::Arc::new(std::sync::Mutex::new(ImageOptimizeStats::default()));
+    let image_stats_write = std::sync::Arc::clone(&image_stats);
+    apply_page_edit(&state, &doc_id, move |doc| {
+        let stats = optimize_in_place_with_images(doc, level, image_preset)?;
+        *image_stats_write
+            .lock()
+            .expect("image_stats mutex poisoned") = stats;
+        Ok(())
+    })
+    .await?;
+    let image_stats = image_stats
+        .lock()
+        .expect("image_stats mutex poisoned")
+        .clone();
 
     let bytes_after = std::fs::metadata(&path)
         .map(|m| m.len())
         .map_err(|e| format!("stat {}: {e}", path.display()))?;
-    Ok(OptimizeReport { bytes_before, bytes_after })
+    Ok(OptimizeReport {
+        bytes_before,
+        bytes_after,
+        image_stats,
+    })
 }

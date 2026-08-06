@@ -615,31 +615,56 @@ export async function flattenDocument(docId: string): Promise<number> {
   return invoke<number>("flatten_document", { docId });
 }
 
-/** File size before/after an `optimizeDocument` call (bytes). */
+/**
+ * Compression/quality preset for raster image recompression (spec §8's "deep image
+ * downsampling", implemented via `docops::image_ops`) — the compression-vs-quality
+ * control on the Optimize action. Mirrors the Rust `ImageQualityPreset` enum
+ * (`#[serde(rename_all = "snake_case")]`): `"high"` (300 DPI / JPEG q90, minimal loss),
+ * `"balanced"` (200 DPI / q75, the default), `"small"` (150 DPI / q50, aggressive).
+ */
+export type ImageQualityPreset = "high" | "balanced" | "small";
+
+/** Per-category breakdown of what the image pipeline actually did (or didn't). */
+export interface ImageOptimizeStats {
+  images_total: number;
+  images_recompressed: number;
+  images_downsampled: number;
+  images_passed_through: number;
+  image_bytes_before: number;
+  image_bytes_after: number;
+  skip_reasons: Record<string, number>;
+}
+
+/** File size before/after an `optimizeDocument` call (bytes), plus the image breakdown. */
 export interface OptimizeReport {
   bytes_before: number;
   bytes_after: number;
+  image_stats: ImageOptimizeStats;
 }
 
 /**
- * Optimize the open document by pruning unreferenced objects and (at level 2)
- * Deflate-compressing all compressable streams.
+ * Optimize the open document by pruning unreferenced objects, (at level 2)
+ * Deflate-compressing all compressable streams, and — when `imagePreset` is given —
+ * recompressing raster images per the preset (downsample to its target DPI, re-encode
+ * as JPEG at its quality factor; see `ImageQualityPreset`).
  *
- * Level semantics:
+ * Level semantics (unchanged, orthogonal to `imagePreset`):
  *   0 — no-op passthrough
  *   1 — prune unused objects only (lossless, fastest)
  *   2 — prune + compress streams (default for the UI "Optimize" action)
  *
- * Deep image downsampling is out of scope for the v1 baseline (spec §8).
+ * `imagePreset` defaults to `undefined` (no image work) for callers that only want the
+ * original object/stream-level optimization; the toolbar "Optimize" button always
+ * passes a preset (default `"balanced"`) via its compression/quality control.
  *
  * The Tauri backend atomically rewrites the file and reloads the render engine,
  * so the viewport updates automatically after this call returns.
  *
- * Optimize has no visible effect on the viewport or markup list (annotations are
- * rewritten byte-identical in meaning, only the underlying stream bytes shrink) — the
- * returned before/after file size is the only observable evidence anything happened,
- * so callers surface it rather than a bare "done" that looks the same for a genuine
- * no-op (an already-optimized file) as for a real reduction.
+ * Optimize's only other visible effect is on raster fidelity if `imagePreset` was given
+ * (annotations/vector content are unchanged) — the returned before/after file size and
+ * image stats are the observable evidence anything happened, so callers surface them
+ * rather than a bare "done" that looks the same for a genuine no-op (an already-optimized
+ * file) as for a real reduction.
  *
  * Returns a rejected promise on backend error (unknown doc_id, lopdf parse
  * failure, or atomic-save failure).
@@ -647,8 +672,9 @@ export interface OptimizeReport {
 export async function optimizeDocument(
   docId: string,
   level: number = 2,
+  imagePreset?: ImageQualityPreset,
 ): Promise<OptimizeReport> {
-  return invoke<OptimizeReport>("optimize_document", { docId, level });
+  return invoke<OptimizeReport>("optimize_document", { docId, level, imagePreset });
 }
 
 /** A page region to redact (PDF user space coordinates). */

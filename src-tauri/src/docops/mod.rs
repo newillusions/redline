@@ -57,6 +57,9 @@ use anyhow::{Context, Result};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
 use std::collections::HashSet;
 
+pub mod image_ops;
+pub use image_ops::{ImageOptimizeStats, ImageQualityPreset};
+
 // ---------------------------------------------------------------------------
 // Public trait
 // ---------------------------------------------------------------------------
@@ -99,8 +102,7 @@ pub struct LopdfDocOps;
 impl DocOps for LopdfDocOps {
     fn flatten(&self, pdf_bytes: &[u8]) -> Result<Vec<u8>> {
         use std::io::Cursor;
-        let mut doc =
-            Document::load_from(Cursor::new(pdf_bytes)).context("load PDF from bytes")?;
+        let mut doc = Document::load_from(Cursor::new(pdf_bytes)).context("load PDF from bytes")?;
         flatten_annotations(&mut doc)?;
         let mut out: Vec<u8> = Vec::new();
         doc.save_to(&mut out).context("save PDF to bytes")?;
@@ -126,8 +128,7 @@ impl DocOps for LopdfDocOps {
             return Ok(pdf_bytes.to_vec());
         }
         use std::io::Cursor;
-        let mut doc =
-            Document::load_from(Cursor::new(pdf_bytes)).context("load PDF for redact")?;
+        let mut doc = Document::load_from(Cursor::new(pdf_bytes)).context("load PDF for redact")?;
         redact_regions(&mut doc, regions)?;
         let mut out: Vec<u8> = Vec::new();
         doc.save_to(&mut out).context("save redacted PDF")?;
@@ -163,6 +164,40 @@ pub fn optimize_in_place(doc: &mut Document, level: u8) -> Result<()> {
         doc.compress();
     }
     Ok(())
+}
+
+/// `optimize_in_place` plus, when `image_preset` is given, image-aware raster
+/// recompression (downsample + JPEG re-encode per [`image_ops`]) — the fix for
+/// "Optimize doesn't actually optimize" (spec §8's "deep image downsampling" item,
+/// deliberately deferred in the original v1 baseline).
+///
+/// Order: prune orphans first (so we never spend time recompressing an image that's
+/// about to be pruned as unreachable), then the image pipeline (which only ever
+/// replaces already-filtered image streams, so it can never interact badly with the
+/// final step), then the generic Deflate pass for any remaining uncompressed
+/// non-image streams. Returns [`ImageOptimizeStats::default()`] (all zeros) when
+/// `image_preset` is `None`, so callers can always read a well-formed stats struct.
+///
+/// This is a separate function rather than changing `optimize_in_place`'s signature so
+/// every existing call site (the trait impl, and this module's own extensive test
+/// suite) is untouched — see `commands::docops::optimize_document` for the only caller
+/// that needs the image pipeline today.
+pub fn optimize_in_place_with_images(
+    doc: &mut Document,
+    level: u8,
+    image_preset: Option<ImageQualityPreset>,
+) -> Result<ImageOptimizeStats> {
+    if level >= 1 {
+        doc.prune_objects();
+    }
+    let image_stats = match image_preset {
+        Some(preset) => image_ops::optimize_images_in_place(doc, preset)?,
+        None => ImageOptimizeStats::default(),
+    };
+    if level >= 2 {
+        doc.compress();
+    }
+    Ok(image_stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -367,14 +402,12 @@ fn flatten_page(doc: &mut Document, page_id: ObjectId) -> Result<usize> {
 
 /// Append `new_id` to the page's `/Contents` array.
 /// If `/Contents` was a single indirect reference, it is promoted to an array.
-fn append_to_page_contents(
-    doc: &mut Document,
-    page_id: ObjectId,
-    new_id: ObjectId,
-) -> Result<()> {
+fn append_to_page_contents(doc: &mut Document, page_id: ObjectId, new_id: ObjectId) -> Result<()> {
     // Read existing /Contents (owned).
     let existing: Option<Object> = {
-        let page = doc.get_dictionary(page_id).context("page dict for contents")?;
+        let page = doc
+            .get_dictionary(page_id)
+            .context("page dict for contents")?;
         page.get(b"Contents").ok().cloned()
     };
 
@@ -963,7 +996,10 @@ mod tests {
         let contents = page.get(b"Contents").unwrap();
         match contents {
             Object::Array(arr) => {
-                assert!(arr.len() >= 2, "/Contents must have at least 2 streams after flatten");
+                assert!(
+                    arr.len() >= 2,
+                    "/Contents must have at least 2 streams after flatten"
+                );
             }
             _ => panic!("expected /Contents to be an array after flatten"),
         }
@@ -1110,8 +1146,7 @@ mod tests {
         let out_bytes = ops.flatten(&bytes).unwrap();
 
         // Load the output and verify.
-        let out_doc =
-            Document::load_from(std::io::Cursor::new(&out_bytes)).unwrap();
+        let out_doc = Document::load_from(std::io::Cursor::new(&out_bytes)).unwrap();
         let page_ids: Vec<ObjectId> = out_doc.get_pages().values().cloned().collect();
         assert_eq!(page_ids.len(), 1, "page count unchanged after flatten");
 
@@ -1146,7 +1181,10 @@ mod tests {
 
         let ops = LopdfDocOps;
         let out = ops.redact(&bytes, &[]).unwrap();
-        assert_eq!(out, bytes, "empty-region redact must be byte-identical (early exit)");
+        assert_eq!(
+            out, bytes,
+            "empty-region redact must be byte-identical (early exit)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1427,7 +1465,13 @@ mod tests {
     #[test]
     fn redact_regions_adds_image_xobject_to_resources() {
         let (mut doc, page_id) = bare_page_doc();
-        let region = RedactRegion { page_index: 0, x: 50.0, y: 50.0, width: 100.0, height: 40.0 };
+        let region = RedactRegion {
+            page_index: 0,
+            x: 50.0,
+            y: 50.0,
+            width: 100.0,
+            height: 40.0,
+        };
         redact_regions(&mut doc, &[region]).unwrap();
 
         let page = doc.get_dictionary(page_id).unwrap();
@@ -1444,7 +1488,13 @@ mod tests {
     #[test]
     fn redact_regions_adds_content_stream_with_do_and_cm() {
         let (mut doc, page_id) = bare_page_doc();
-        let region = RedactRegion { page_index: 0, x: 10.0, y: 20.0, width: 80.0, height: 30.0 };
+        let region = RedactRegion {
+            page_index: 0,
+            x: 10.0,
+            y: 20.0,
+            width: 80.0,
+            height: 30.0,
+        };
         redact_regions(&mut doc, &[region]).unwrap();
 
         let page = doc.get_dictionary(page_id).unwrap();
@@ -1460,8 +1510,14 @@ mod tests {
         let last_ref = arr.last().unwrap().as_reference().unwrap();
         let last_stream = doc.get_object(last_ref).unwrap().as_stream().unwrap();
         let text = std::str::from_utf8(&last_stream.content).unwrap_or("");
-        assert!(text.contains("Do"), "overlay must contain 'Do'; got: {text:?}");
-        assert!(text.contains("cm"), "overlay must contain 'cm'; got: {text:?}");
+        assert!(
+            text.contains("Do"),
+            "overlay must contain 'Do'; got: {text:?}"
+        );
+        assert!(
+            text.contains("cm"),
+            "overlay must contain 'cm'; got: {text:?}"
+        );
     }
 
     #[test]
@@ -1489,18 +1545,27 @@ mod tests {
             "Contents" => content1,
             "Resources" => Object::Dictionary(dictionary! {}),
         }));
-        doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
-            "Type" => "Pages",
-            "Kids" => vec![Object::Reference(page0_id), Object::Reference(page1_id)],
-            "Count" => 2_i64,
-        }));
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page0_id), Object::Reference(page1_id)],
+                "Count" => 2_i64,
+            }),
+        );
         let catalog_id = doc.add_object(Object::Dictionary(dictionary! {
             "Type" => "Catalog",
             "Pages" => pages_id,
         }));
         doc.trailer.set("Root", catalog_id);
 
-        let region = RedactRegion { page_index: 0, x: 0.0, y: 0.0, width: 100.0, height: 50.0 };
+        let region = RedactRegion {
+            page_index: 0,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 50.0,
+        };
         redact_regions(&mut doc, &[region]).unwrap();
 
         // Page 0: /Contents is now an array.
@@ -1522,8 +1587,20 @@ mod tests {
     #[test]
     fn redact_multiple_regions_same_page_adds_multiple_xobjects() {
         let (mut doc, page_id) = bare_page_doc();
-        let r0 = RedactRegion { page_index: 0, x: 10.0, y: 10.0, width: 50.0, height: 20.0 };
-        let r1 = RedactRegion { page_index: 0, x: 100.0, y: 200.0, width: 80.0, height: 30.0 };
+        let r0 = RedactRegion {
+            page_index: 0,
+            x: 10.0,
+            y: 10.0,
+            width: 50.0,
+            height: 20.0,
+        };
+        let r1 = RedactRegion {
+            page_index: 0,
+            x: 100.0,
+            y: 200.0,
+            width: 80.0,
+            height: 30.0,
+        };
         redact_regions(&mut doc, &[r0, r1]).unwrap();
 
         let page = doc.get_dictionary(page_id).unwrap();
@@ -1541,7 +1618,11 @@ mod tests {
         let (mut doc, page_id) = bare_page_doc();
         let before = doc.objects.len();
         redact_annotations(&mut doc).unwrap();
-        assert_eq!(doc.objects.len(), before, "no-op on page with no annotations");
+        assert_eq!(
+            doc.objects.len(),
+            before,
+            "no-op on page with no annotations"
+        );
         let page = doc.get_dictionary(page_id).unwrap();
         assert!(page.get(b"Annots").is_err(), "/Annots must remain absent");
     }
@@ -1598,11 +1679,14 @@ mod tests {
             "Resources" => Object::Dictionary(dictionary! {}),
             "Annots" => vec![Object::Reference(annot_id)],
         }));
-        doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
-            "Type" => "Pages",
-            "Kids" => vec![Object::Reference(page_id)],
-            "Count" => 1_i64,
-        }));
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1_i64,
+            }),
+        );
         let catalog_id = doc.add_object(Object::Dictionary(dictionary! {
             "Type" => "Catalog",
             "Pages" => pages_id,
@@ -1685,11 +1769,21 @@ mod tests {
         doc.save_to(&mut bytes).unwrap();
 
         let ops = LopdfDocOps;
-        let region = RedactRegion { page_index: 0, x: 20.0, y: 30.0, width: 60.0, height: 20.0 };
+        let region = RedactRegion {
+            page_index: 0,
+            x: 20.0,
+            y: 30.0,
+            width: 60.0,
+            height: 20.0,
+        };
         let out = ops.redact(&bytes, &[region]).unwrap();
 
         let out_doc = Document::load_from(std::io::Cursor::new(&out)).unwrap();
-        assert_eq!(out_doc.get_pages().len(), 1, "page count preserved after redact");
+        assert_eq!(
+            out_doc.get_pages().len(),
+            1,
+            "page count preserved after redact"
+        );
     }
 
     #[test]
@@ -1699,7 +1793,13 @@ mod tests {
         doc.save_to(&mut bytes).unwrap();
 
         let ops = LopdfDocOps;
-        let region = RedactRegion { page_index: 0, x: 0.0, y: 0.0, width: 100.0, height: 50.0 };
+        let region = RedactRegion {
+            page_index: 0,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 50.0,
+        };
         let out_bytes = ops.redact(&bytes, &[region]).unwrap();
 
         let out_doc = Document::load_from(std::io::Cursor::new(&out_bytes)).unwrap();

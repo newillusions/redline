@@ -272,6 +272,27 @@ describe("docops ipc invoke argument keys (Tauri v2 camelCase)", () => {
     });
   });
 
+  it("optimizeDocument with an imagePreset → docId / level / imagePreset (camelCase multi-word key)", async () => {
+    await ipc.optimizeDocument("d1", 2, "balanced");
+    expect(mockInvokeDocops).toHaveBeenCalledWith("optimize_document", {
+      docId: "d1",
+      level: 2,
+      imagePreset: "balanced",
+    });
+  });
+
+  it("optimizeDocument imagePreset accepts all three presets verbatim (matches Rust's snake_case rename)", async () => {
+    for (const preset of ["high", "balanced", "small"] as const) {
+      mockInvokeDocops.mockClear();
+      await ipc.optimizeDocument("d1", 2, preset);
+      expect(mockInvokeDocops).toHaveBeenCalledWith("optimize_document", {
+        docId: "d1",
+        level: 2,
+        imagePreset: preset,
+      });
+    }
+  });
+
   it("redactDocument → docId / regions / applyAnnots", async () => {
     const regions: ipc.RedactRegion[] = [
       { page_index: 0, x: 1, y: 2, width: 3, height: 4 },

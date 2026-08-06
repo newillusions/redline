@@ -38,7 +38,7 @@
   import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
-  import type { DocumentInfo } from "$lib/ipc";
+  import type { DocumentInfo, ImageQualityPreset } from "$lib/ipc";
   import { MarkupStore } from "$lib/markup-store.svelte";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
   import { DocTabStore } from "$lib/doc-tabs.svelte";
@@ -93,6 +93,9 @@
   let isFlattening = $state(false);
   let isOptimizing = $state(false);
   let isRedacting = $state(false);
+  /** Compression/quality control for the Optimize action (spec §8 image downsampling) -
+   *  Bluebeam-style preset: High (minimal loss) / Balanced (default) / Small (aggressive). */
+  let imageQualityPreset = $state<ImageQualityPreset>("balanced");
   /** Transient success feedback for the DocOps actions (Flatten/Optimize/Redact) - these
    *  have no other visible confirmation (Optimize changes nothing on screen at all;
    *  Flatten/Redact bake content that was already visible). Without this, a successful
@@ -577,13 +580,20 @@
         docId,
         store,
         { loadMarkups },
-        () => optimizeDocument(docId),
+        () => optimizeDocument(docId, 2, imageQualityPreset),
       );
       const saved = report.bytes_before - report.bytes_after;
+      const { images_recompressed, images_downsampled, images_total } = report.image_stats;
+      const imageNote =
+        images_total > 0
+          ? images_recompressed > 0
+            ? ` (${images_recompressed} of ${images_total} image${images_total === 1 ? "" : "s"} recompressed, ${images_downsampled} downsampled)`
+            : ` (0 of ${images_total} image${images_total === 1 ? "" : "s"} could be recompressed further)`
+          : "";
       docOpsStatus =
         saved > 0
-          ? `Optimize complete - file size reduced from ${formatBytes(report.bytes_before)} to ${formatBytes(report.bytes_after)} (saved ${formatBytes(saved)}).`
-          : "Optimize complete - the file was already optimal; no size reduction.";
+          ? `Optimize complete - file size reduced from ${formatBytes(report.bytes_before)} to ${formatBytes(report.bytes_after)} (saved ${formatBytes(saved)})${imageNote}.`
+          : `Optimize complete - the file was already optimal; no size reduction${imageNote}.`;
     } catch (e) {
       openError = `Optimize failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
@@ -731,11 +741,22 @@
       >
         {isFlattening ? "Flattening…" : "Flatten"}
       </button>
+      <select
+        class="toolbar-select"
+        bind:value={imageQualityPreset}
+        disabled={!activeTab || isOptimizing || isSaving}
+        title="Image quality for Optimize — trades file size against raster image quality (Bluebeam-style compression preset)"
+        aria-label="Optimize image quality preset"
+      >
+        <option value="high">High quality</option>
+        <option value="balanced">Balanced</option>
+        <option value="small">Small file</option>
+      </select>
       <button
         class="btn-toolbar btn-docops"
         onclick={handleOptimize}
         disabled={!activeTab || isOptimizing || isSaving}
-        title="Optimize — remove unused objects and compress streams to reduce file size"
+        title="Optimize — remove unused objects, compress streams, and recompress images to reduce file size"
       >
         {isOptimizing ? "Optimizing…" : "Optimize"}
       </button>
@@ -1064,6 +1085,16 @@
   .btn-toolbar.btn-compare-toggle:hover {
     background: var(--color-primary-surface, #eff6ff);
   }
+  .toolbar-select {
+    background: var(--color-bg-active);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    color: var(--color-text);
+    cursor: pointer;
+    font-size: var(--font-size-sm);
+    padding: var(--space-1) var(--space-2);
+  }
+  .toolbar-select:disabled { opacity: 0.5; cursor: not-allowed; }
 
   /* --- Compare bar (M6) --- */
   .compare-bar {

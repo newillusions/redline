@@ -77,8 +77,9 @@ lopdf = { version = "0.44", default-features = false, features = ["chrono", "jif
 # reading the whole file into RSS. See render::open_document.
 memmap2 = "0.9.10"
 
-# --- Image handling (tile encoding → PNG/RGBA bytes to webview) ---
-image = { version = "0.25", features = ["png"] }
+# --- Image handling (tile encoding → PNG/RGBA bytes to webview; "jpeg" also used by
+# docops::image_ops for Optimize's raster recompression pipeline) ---
+image = { version = "0.25", features = ["png", "jpeg"] }
 
 # --- Unique IDs ---
 uuid = { version = "1.0", features = ["v4", "serde"] }
