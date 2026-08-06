@@ -1,16 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Minimal valid Bluebeam Tool Set fixture (redline#63, GUI validation pass
-     obs:us5j4ne1r5byjzle8u23). Mirrors PLAIN_ITEM in src-tauri/src/toolchest/btx.rs's own
-     test suite (parses cleanly via parses_plaintext_raw_item_into_a_tool - a known-good
-     shape, not guessed) so tools/gui-harness.mjs can exercise the Tool Chest's ".btx"
-     import path without needing real Bluebeam-exported output. Not yet wired into the
-     harness script itself (no file-dialog mock exists there today) - this fixture just
-     removes the blocker for whoever adds that drive next. -->
-<ToolChestData>
+     obs:us5j4ne1r5byjzle8u23; updated 2026-08-06 for the btx import-fidelity fix once real
+     Bluebeam .btx samples existed to verify the wire format against - bench/corpus/btx/).
+     <Name> is now an OPAQUE Bluebeam-style id (real exports carry random-looking codes
+     there, never a human label) and the display name lives in /Subj, matching the real
+     wire format - the ORIGINAL version of this fixture had that backwards. Root element
+     also corrected to <BluebeamRevuToolSet>, the real one (harmless either way for parsing
+     - item discovery doesn't look at the root tag - but this fixture should model reality).
+     Mirrors PLAIN_ITEM in src-tauri/src/toolchest/btx.rs's own test suite (parses cleanly
+     via parses_plaintext_raw_item_into_a_tool) so tools/gui-harness.mjs can exercise the
+     Tool Chest's ".btx" import path without needing real Bluebeam-exported output. Not yet
+     wired into the harness script itself (no file-dialog mock exists there today) - this
+     fixture just removes the blocker for whoever adds that drive next. -->
+<BluebeamRevuToolSet Version="1">
   <ToolChestItem>
-    <Name>Fire Rated Door</Name>
+    <Name>QCJXKLPMNZRSTWYA</Name>
     <Type>Bluebeam.PDF.Annotations.AnnotationSquare</Type>
     <Mode>properties</Mode>
-    <Raw><![CDATA[<< /Subtype /Square /Rect [10 20 110 70] /C [1 0 0] /BS << /W 2 >> /Subj (Door) >>]]></Raw>
+    <Raw><![CDATA[<< /Subtype /Square /Rect [10 20 110 70] /C [1 0 0] /BS << /W 2 >> /Subj (Fire Rated Door) >>]]></Raw>
   </ToolChestItem>
-</ToolChestData>
+</BluebeamRevuToolSet>

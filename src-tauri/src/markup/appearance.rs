@@ -24,11 +24,20 @@
 //! # Known simplifications (named, not silently dropped - see PR description)
 //! - Cloud draws a plain closed polygon, not the scalloped revision-cloud arcs.
 //! - Stamp/StampDynamic with a `StampAsset::PngBase64` asset draws a REAL Image XObject
-//!   (see `decode_png_stamp_image` + `StampImageXObject`) - this is the v0.3.1 fix. A
-//!   `Svg` or `PdfBase64` asset, or a malformed/undecodable PNG, still falls back to the
+//!   (see `decode_png_stamp_image` + `StampImageXObject`) - this is the v0.3.1 fix.
+//! - Stamp/StampDynamic with a `StampAsset::BluebeamFormXObject` asset (a `.btx`-imported
+//!   Bluebeam stamp - see `toolchest::btx` module doc "Stamp artwork") `Do`-references the
+//!   AS-AUTHORED Bluebeam Form XObject rather than redrawing it - see
+//!   `draw_stamp_form_xobject` and `StampFormXObjectRef`. This is the 2026-08-06 fix for
+//!   the "stamp artwork dropped entirely" defect, made possible once real Bluebeam `.btx`
+//!   samples existed to verify the wire format against.
+//! - A `Svg` or `PdfBase64` asset, or a malformed/undecodable PNG, still falls back to the
 //!   v0.3.0 bordered-box + label text (named deferral - vector-SVG-to-PDF-operator
-//!   conversion and embedded-PDF content-stream splicing are both out of scope for this
-//!   pass; box+label is a valid, already-shipped appearance, not a broken one).
+//!   conversion and embedded-PDF content-stream splicing for those TWO asset kinds remain
+//!   out of scope; box+label is a valid, already-shipped appearance, not a broken one).
+//!   `BluebeamFormXObject` above sidesteps that deferral entirely for the mechanism real
+//!   Bluebeam exports actually use: its bytes are already valid PDF content-stream
+//!   operators, so there is no "conversion" step to build - only object-graph splicing.
 
 use lopdf::{dictionary, Dictionary, Object, Stream};
 
@@ -125,30 +134,49 @@ pub(crate) struct StampImageXObject {
     pub smask: Option<Stream>,
 }
 
+/// An unresolved reference to a `.btx`-imported Bluebeam Form XObject appearance graph
+/// (`StampAsset::BluebeamFormXObject`, `toolchest::btx` module doc "Stamp artwork") that a
+/// Stamp/StampDynamic's content stream `Do`-references by `name`. `document::annots::
+/// write_markups` (the one place holding `&mut Document`) is what actually splices
+/// `objects` into real indirect objects - via `toolchest::btx::{resolve_bb_objptr_refs,
+/// parse_pdf_object_bytes}` - and points a `/Resources/XObject/{name}` entry at whichever
+/// one is `root_id`.
+pub(crate) struct StampFormXObjectRef {
+    /// Resource name the content stream references via its `Do` operator (e.g. `"Fx0"`).
+    pub name: String,
+    /// Which entry of `objects` is the one to point `name` at once spliced.
+    pub root_id: String,
+    /// Every object the graph transitively references (including the root), raw
+    /// PDF-syntax bytes keyed by id - see `StampAsset::BluebeamFormXObject` doc comment.
+    pub objects: std::collections::BTreeMap<String, Vec<u8>>,
+}
+
 /// The un-finished result of building `m`'s `/AP /N` appearance: everything that can be
 /// computed WITHOUT a `Document` (pure, and what this module's own tests exercise
-/// directly), plus any auxiliary Image XObjects the content stream references. Call
-/// [`finish_ap_stream`] once the caller has resolved `image_xobjects` into real indirect
-/// references.
+/// directly), plus any auxiliary Image/Form XObjects the content stream references. Call
+/// [`finish_ap_stream`] once the caller has resolved `image_xobjects`/`form_xobject` into
+/// real indirect references.
 pub(crate) struct ApBuild {
     bbox: [f64; 4],
     content: String,
     resources: Dictionary,
     pub image_xobjects: Vec<StampImageXObject>,
+    pub form_xobject: Option<StampFormXObjectRef>,
 }
 
 /// Build `m`'s `/AP /N` appearance (pure - no `Document` access, so this module's tests
 /// can call it directly). The caller (`document::annots::write_markups`) resolves
-/// `image_xobjects` (if any) into real indirect objects and calls [`finish_ap_stream`] to
-/// get the final `Stream` it then adds to the `Document`.
+/// `image_xobjects`/`form_xobject` (if any) into real indirect objects and calls
+/// [`finish_ap_stream`] to get the final `Stream` it then adds to the `Document`.
 pub(crate) fn build_ap_stream(m: &Markup) -> ApBuild {
     let bbox = ap_bbox(m);
-    let (content, resources, image_xobjects) = draw(m);
+    let (content, resources, image_xobjects, form_xobject) = draw(m);
     ApBuild {
         bbox,
         content,
         resources,
         image_xobjects,
+        form_xobject,
     }
 }
 
@@ -688,6 +716,21 @@ fn draw_stamp_image(
     ));
 }
 
+/// Draw a spliced Bluebeam Form XObject (`StampAsset::BluebeamFormXObject`). Unlike
+/// [`draw_stamp_image`] this applies NO extra scale: Bluebeam already bakes the correct
+/// scale into the Form's own `/Matrix` so its content fills the tool's own authored
+/// `[0,0,w,h]` footprint exactly (verified against every Stamp-subtype item in the sample
+/// corpus - measured effective size, in several cases, is intentionally SMALLER than the
+/// annotation `/Rect` where Bluebeam letterboxes a non-matching aspect ratio rather than
+/// stretching it; re-adding a scale here would distort exactly the fidelity this asset
+/// kind exists to preserve). Only a translate to the geometry's own origin is applied, so
+/// a source Rect that doesn't start at `(0,0)` (not seen in the sample corpus, but not
+/// guaranteed absent) still lands in the right place.
+fn draw_stamp_form_xobject(out: &mut String, res: &mut Resources, a: &Appearance, min: PdfPoint, name: &str) {
+    let gs_name = res.add_gstate(shape_gstate(a));
+    out.push_str(&format!("q\n/{gs_name} gs\n1 0 0 1 {} {} cm\n/{name} Do\nQ\n", num(min.x), num(min.y)));
+}
+
 /// Decode a base64 PNG stamp asset into a color Image XObject stream + optional soft-mask
 /// (alpha channel) stream. Returns `None` on ANY failure (malformed base64, undecodable
 /// image bytes, zero-size image) rather than erroring - callers fall back to the
@@ -778,11 +821,13 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Build the content-stream operators + resources for `m`. Returns (content, resources,
-/// auxiliary image xobjects - empty except for a PNG-backed Stamp/StampDynamic).
-fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>) {
+/// auxiliary image xobjects, auxiliary form xobject) - both auxiliary outputs are empty/
+/// `None` except for a PNG- or Bluebeam-Form-backed Stamp/StampDynamic respectively.
+fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>, Option<StampFormXObjectRef>) {
     let mut out = String::new();
     let mut res = Resources::new();
     let mut image_xobjects: Vec<StampImageXObject> = Vec::new();
+    let mut form_xobject: Option<StampFormXObjectRef> = None;
     let a = &m.appearance;
 
     match (m.markup_type, &m.geometry) {
@@ -1026,15 +1071,36 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>) {
             out.push_str("Q\n");
         }
 
-        // --- Stamp / StampDynamic: real Image XObject when a decodable PNG asset is
-        // present, else the bordered-box + label fallback (named simplification for
-        // Svg/PdfBase64 assets and malformed PNGs - see the module doc comment) ---
+        // --- Stamp / StampDynamic: authentic Bluebeam Form XObject when a
+        // BluebeamFormXObject asset is present (highest fidelity - as-authored artwork,
+        // not a redraw), else a real Image XObject for a decodable PNG asset, else the
+        // bordered-box + label fallback (named simplification for Svg/PdfBase64 assets
+        // and malformed PNGs - see the module doc comment) ---
         (MarkupType::Stamp | MarkupType::StampDynamic, MarkupGeometry::Rect { min, max }) => {
+            let bb_form = match &m.stamp_asset {
+                Some(StampAsset::BluebeamFormXObject { root_id, objects }) => {
+                    Some((root_id.clone(), objects.clone()))
+                }
+                _ => None,
+            };
             let png_image = match &m.stamp_asset {
                 Some(StampAsset::PngBase64(b64)) => decode_png_stamp_image(b64),
                 _ => None,
             };
-            if let Some((color, smask)) = png_image {
+            if let Some((root_id, objects)) = bb_form {
+                let name = "Fx0".to_string();
+                draw_stamp_form_xobject(&mut out, &mut res, a, *min, &name);
+                form_xobject = Some(StampFormXObjectRef { name, root_id, objects });
+                // Dynamic-stamp overlay text draws OUTSIDE any alpha scope, same
+                // convention as every other Stamp asset kind and Text/Callout.
+                if let Some(text) = &m.contents {
+                    let origin = PdfPoint {
+                        x: min.x + 2.0,
+                        y: (min.y + max.y) / 2.0 - 5.0,
+                    };
+                    draw_text_block(&mut out, &mut res, text, &a.color, origin, a.font.as_ref());
+                }
+            } else if let Some((color, smask)) = png_image {
                 let name = "Im0".to_string();
                 draw_stamp_image(&mut out, &mut res, a, *min, *max, &name);
                 image_xobjects.push(StampImageXObject {
@@ -1127,7 +1193,7 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>) {
         _ => {}
     }
 
-    (out, res.finish(), image_xobjects)
+    (out, res.finish(), image_xobjects, form_xobject)
 }
 
 #[cfg(test)]

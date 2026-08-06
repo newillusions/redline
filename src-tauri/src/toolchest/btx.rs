@@ -1,23 +1,92 @@
 //! `.btx` (Bluebeam Tool Set) importer (spec "Importing Bluebeam Tool Sets & stamps").
 //!
-//! `.btx` is XML/UTF-8. Each `<ToolChestItem>` carries a `<Name>` (id), a `<Type>` (e.g.
-//! `Bluebeam.PDF.Annotations.AnnotationFreeText`), a `<Mode>` (`properties`/`drawing` -
-//! maps directly to our two placement modes), optional `<BSIColumnData>` (custom columns -
-//! NAMED deferral, see [`skip_custom_columns`] doc comment), and a `<Raw>` payload that IS
-//! a PDF annotation dictionary (`/Subtype/FreeText /Rect[...] /CL[...] /Subj(...)` etc).
+//! Rewritten 2026-08-06 against FOUR real Bluebeam-exported `.btx` files (a 77-item, 4-file
+//! corpus - `bench/corpus/btx/`), the first real samples this importer was ever checked
+//! against. Several assumptions baked into the original implementation turned out wrong;
+//! this doc comment describes the VERIFIED real wire format, not the earlier guess.
+//!
+//! `.btx` is UTF-8 XML (real exports carry a UTF-8 BOM). The real root element is
+//! `<BluebeamRevuToolSet Version="N">` (NOT `<ToolChestData>`, which only ever existed in
+//! this module's own test fixtures) - harmless in practice, since item discovery
+//! (`doc.descendants().filter(has_tag_name("ToolChestItem"))`) doesn't care about the root
+//! tag, but worth recording accurately. A `<Title>` sibling (also hex+zlib, like `<Raw>`)
+//! carries the tool set's own display name - not consumed here, it's set-level metadata.
+//!
+//! Each `<ToolChestItem>` carries:
+//! - `<Name>` - a Bluebeam-internal OPAQUE id (real exports: 16-char random-looking codes
+//!   like `"XAZASJPZJVLIFSAM"`), NOT a human label. The name Bluebeam actually shows in its
+//!   Tool Chest is the annotation's own `/Subj` (Subject) key inside `<Raw>` - this
+//!   importer now prefers that, falling back to `<Name>` only when `/Subj` is absent
+//!   (measured: present on ~90% of real items). Using `<Name>` as the display name (the
+//!   original implementation) is the root cause of the "naming differs from the original
+//!   Bluebeam tool" defect Martin reported.
+//! - `<Type>` (e.g. `Bluebeam.PDF.Annotations.AnnotationFreeText`) - informational only,
+//!   never read; the `<Raw>` dict's own `/Subtype` already gives the same information in
+//!   the form `Markup::from_annotation_dict` actually consumes.
+//! - `<Mode>` (`properties`/`drawing` - maps directly to our two placement modes).
+//! - `<X>`/`<Y>` - duplicate the geometry's own origin coordinates (verified: e.g. an Ink
+//!   tool's `<X>`/`<Y>` exactly match its `/InkList`'s first vertex) and carry no
+//!   additional information - not read.
+//! - `<Index>` - Bluebeam's AUTHORED display order within the tool set. Real exports do
+//!   NOT store items in that order in the XML itself (measured on one sample: `<Index>`
+//!   values `139,2,0,24,0,0,12,43,0` against XML document positions `0..8`) - `.btx`
+//!   parsing now sorts the final tool list by `<Index>` (stable, ties keep document order)
+//!   so imported Tool Chest order matches Bluebeam's, rather than an arbitrary XML order.
+//! - A `<Raw>` payload that IS a PDF annotation dictionary
+//!   (`/Subtype/FreeText /Rect[...] /CL[...] /Subj(...)` etc), always hex+zlib-encoded in
+//!   every real sample seen (the "plain-text `<Raw>`" case this module's tests also cover
+//!   is UNVERIFIED against any real Bluebeam export - kept as defensive parsing, not
+//!   confirmed to occur in the wild).
+//! - Optionally one or more sibling `<Resources>` blocks (see "Stamp artwork" below).
+//! - Optionally a `<Child>` element - a SECOND, paired annotation (e.g. a shape + its
+//!   attached text label, or a callout + its leader arrow) that Bluebeam groups with the
+//!   parent as one visual unit. **NAMED, NOT FIXED**: measured at 33/77 (43%) of real
+//!   items across the sample corpus - not a rare edge case. `Tool` is architecturally 1:1
+//!   with a single `Markup`+geometry (`toolchest::mod`), so representing a `<Child>`
+//!   losslessly needs a data-model change (an optional linked/secondary markup on `Tool`)
+//!   AND a placement-time change (dropping two annotations, not one) - genuinely beyond
+//!   this importer module's own scope, not merely unimplemented. The child's entire
+//!   annotation is currently silently discarded; only the parent's own `<Raw>` becomes the
+//!   Tool. See `tests::grouped_child_annotation_is_named_not_fixed`.
+//!
+//! Custom estimating columns (`/BSIColumnData`): this module's ORIGINAL doc comment
+//! claimed it was a separate `<BSIColumnData>` XML element - WRONG, confirmed against the
+//! real corpus (zero such elements exist anywhere in 4 real files). It is a KEY INSIDE the
+//! `<Raw>` PDF dictionary itself, e.g. `/BSIColumnData[(01 General)(Stiles)]`. Detected
+//! from the right place now (so a future feature can act on it) but still a genuine
+//! deferral - Tool Chest has no estimating-columns UI concept yet.
+//!
+//! **Stamp artwork** (previously "dropped entirely", now fixed for the mechanism real
+//! Bluebeam exports actually use): a genuine Bluebeam Stamp/StampDynamic `<Raw>` dict
+//! references its artwork INDIRECTLY, via `/AP<</N/BBObjPtr_<id>>>` - a NAME placeholder,
+//! not a stream or a real indirect reference. Bluebeam resolves it against sibling
+//! `<Resources>` blocks on the SAME `<ToolChestItem>`, each holding a hex+zlib `<ID>`
+//! (the id a `/BBObjPtr_<id>` name refers to) and `<Data>` (raw PDF-syntax bytes for that
+//! object - typically a `/Subtype/Form` XObject whose OWN `/Resources` dict may itself
+//! reference further `<Resources>` blocks by the same mechanism, e.g. an `/ExtGState`,
+//! forming a small object graph, not just one flat blob). This importer resolves that
+//! graph into [`stamp::StampAsset::BluebeamFormXObject`] (root id + every referenced
+//! object's raw bytes, `/BBObjPtr_*` placeholders still unresolved); the actual
+//! placeholder->indirect-reference splicing happens at PLACEMENT time in
+//! `document::annots::write_markups` (the one place holding `&mut Document`) via
+//! [`resolve_bb_objptr_refs`]/[`parse_pdf_object_bytes`] - see `markup::appearance`'s
+//! Stamp/StampDynamic draw arm for how the placed annotation references it. Measured:
+//! every Stamp-subtype item in the sample corpus (11/11) uses this exact mechanism.
 //!
 //! The importer reuses the existing annotation reader ([`Markup::from_annotation_dict`])
-//! for `<Raw>` - it does not reimplement annotation parsing. Two wrinkles handled here:
-//! zlib-deflated `<Raw>` payloads (hex starting `789c`), and `.zip`-wrapped `.btx` files.
-//! A malformed/unparseable item is skipped and reported, never fatal to the whole import.
+//! for `<Raw>` - it does not reimplement annotation parsing. Wrinkles handled: hex+zlib
+//! `<Raw>` payloads (hex starting `789c`), and `.zip`-wrapped `.btx` files (this second
+//! case remains UNVERIFIED against any real sample - none of the 4 real files were
+//! zip-wrapped). A malformed/unparseable item is skipped and reported, never fatal to the
+//! whole import.
 
 use std::io::Read;
 
-use lopdf::Dictionary;
+use lopdf::{Dictionary, Object};
 use serde::Serialize;
 
 use crate::markup::Markup;
-use crate::toolchest::{PlacementMode, Tool};
+use crate::toolchest::{PlacementMode, StampAsset, StampDef, Tool};
 
 /// One item that failed to import, with a human-readable reason (spec: "skipped-and-
 /// reported, not fatal").
@@ -94,7 +163,16 @@ fn import_btx_zip(bytes: &[u8]) -> ImportReport {
 /// Parse `.btx` XML text into a set of tools + a skip report. A document-level parse
 /// failure is itself reported as one skipped item rather than propagated as an error, so
 /// callers always get a usable (possibly empty) report.
+///
+/// Strips a leading UTF-8 BOM (`U+FEFF`) before handing the text to roxmltree - every real
+/// Bluebeam export in the sample corpus carries one immediately before `<?xml ...?>`, which
+/// `std::str::from_utf8` happily decodes (the BOM bytes are valid UTF-8). Verified NOT
+/// currently load-bearing (roxmltree 0.21 tolerates the BOM character fine on its own,
+/// confirmed against the real corpus with this strip removed) - kept anyway as defensive,
+/// free-to-add insurance against relying on an undocumented leniency in a third-party
+/// parser (see `tests::leading_utf8_bom_does_not_break_xml_parsing`).
 pub fn parse_btx_xml(xml: &str) -> ImportReport {
+    let xml = xml.strip_prefix('\u{FEFF}').unwrap_or(xml);
     let doc = match roxmltree::Document::parse(xml) {
         Ok(d) => d,
         Err(e) => {
@@ -109,13 +187,28 @@ pub fn parse_btx_xml(xml: &str) -> ImportReport {
     };
 
     let mut report = ImportReport { tools: Vec::new(), skipped: Vec::new() };
-    for item in doc.descendants().filter(|n| n.has_tag_name("ToolChestItem")) {
+    // Bluebeam's authored display order (`<Index>`) does NOT match XML document order in
+    // real exports (measured: one sample's `<Index>` values were `139,2,0,24,0,0,12,43,0`
+    // against document positions `0..8`) - collect `(index, tool)` pairs and sort once at
+    // the end, rather than trusting insertion order, so the imported Tool Chest matches
+    // Bluebeam's own layout. An item with no/unparseable `<Index>` keeps its natural
+    // document position as a stand-in key (a stable sort then leaves it where it would
+    // have landed anyway relative to other index-less items).
+    let mut indexed: Vec<(i64, Tool)> = Vec::new();
+    for (doc_pos, item) in doc.descendants().filter(|n| n.has_tag_name("ToolChestItem")).enumerate() {
         let name = child_text(item, "Name").unwrap_or("<unnamed>").to_string();
         match import_item(item, &name) {
-            Ok(tool) => report.tools.push(tool),
+            Ok(tool) => {
+                let index = child_text(item, "Index")
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .unwrap_or(doc_pos as i64);
+                indexed.push((index, tool));
+            }
             Err(reason) => report.skipped.push(SkippedItem { name, reason }),
         }
     }
+    indexed.sort_by_key(|(index, _)| *index);
+    report.tools = indexed.into_iter().map(|(_, tool)| tool).collect();
     report
 }
 
@@ -128,13 +221,16 @@ fn import_item(item: roxmltree::Node, name: &str) -> Result<Tool, String> {
     let placement_mode =
         if mode_tag.eq_ignore_ascii_case("drawing") { PlacementMode::Drawing } else { PlacementMode::Properties };
 
-    // BSIColumnData (custom estimating columns): NAMED deferral - see module doc. We
-    // recognise the element but do not yet map it onto Tool.subject/custom columns; a
-    // present-but-unmapped block is not a reason to skip the item.
-    let _ = child_text(item, "BSIColumnData");
-
     let raw = child_text(item, "Raw").ok_or_else(|| "missing <Raw> element".to_string())?;
     let dict = raw_to_dict(raw)?;
+
+    // BSIColumnData (custom estimating columns): NAMED deferral - see module doc. It is a
+    // KEY INSIDE the parsed `<Raw>` dict (`/BSIColumnData[...]`), not a separate XML
+    // element (the module doc previously claimed otherwise - confirmed wrong against the
+    // real corpus). Detected here so a future feature can act on it; still not mapped onto
+    // anything - Tool Chest has no estimating-columns UI concept yet, and a
+    // present-but-unmapped block is not a reason to skip the item.
+    let _ = dict.get(b"BSIColumnData");
 
     // Guard against Markup::from_annotation_dict's permissive `_ => Text` /Subtype
     // fallback: that arm is only reachable-safely from document::annots::read_markups,
@@ -151,31 +247,81 @@ fn import_item(item: roxmltree::Node, name: &str) -> Result<Tool, String> {
 
     let markup = Markup::from_annotation_dict(&dict);
 
+    // Naming fidelity (module doc, "naming differs from the original" defect): Bluebeam's
+    // own `<Name>` is an opaque internal id, not what Bluebeam shows the user - that's the
+    // annotation's own `/Subj`. Prefer it; fall back to `<Name>` only when `/Subj` is
+    // absent or blank (measured absent on ~10% of real items) so every tool still gets a
+    // non-empty name.
+    let display_name = markup
+        .subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| name.to_string());
+
     let geometry = match placement_mode {
         PlacementMode::Drawing => Some(markup.geometry.clone()),
         PlacementMode::Properties => None,
     };
 
+    // Stamp artwork fidelity (module doc "Stamp artwork" section) - fixed 2026-08-06 now
+    // that real Bluebeam stamp samples exist to verify the wire format against. A genuine
+    // Stamp/StampDynamic Raw dict names its appearance indirectly (`/AP<</N/BBObjPtr_id>>`)
+    // rather than embedding it; resolve that against this item's own sibling <Resources>
+    // blocks into a StampAsset the placement pipeline can splice into a real appearance
+    // stream (see document::annots::write_markups). `None` for anything that isn't
+    // Stamp-shaped this way (not a Stamp, or a Stamp using some other/no artwork
+    // mechanism - none observed in the sample corpus, but not assumed impossible).
+    let stamp = bb_form_xobject_root_id(&dict).map(|root_id| StampDef::Static {
+        asset: StampAsset::BluebeamFormXObject { root_id, objects: collect_bb_resources(item) },
+    });
+
     Ok(Tool {
         id: uuid::Uuid::new_v4(),
-        name: name.to_string(),
+        name: display_name,
         markup_type: markup.markup_type,
         appearance: markup.appearance,
         subject: markup.subject,
         placement_mode,
         geometry,
-        // NAMED GAP, NOT YET BUILT (corrected 2026-08 - this comment previously described
-        // a "dedicated stamp-import path" (`import_stamp_item`) and `<Type>`-based
-        // branching that do not exist anywhere in this codebase; `<Type>` is never read at
-        // all in this module). A `/Subtype /Stamp` Raw payload imports successfully (no
-        // skip - Stamp is in MARKUP_SUBTYPES) but always gets `stamp: None`, silently
-        // discarding the source appearance/graphic. See
-        // `tests::stamp_import_currently_drops_the_appearance_asset_named_gap_not_fixed_this_pass`
-        // for the full analysis of why this is unfixed (needs a real Bluebeam stamp sample
-        // to verify the wire format against, and depends on `appearance::draw()`'s
-        // already-separately-deferred `PdfBase64`/`Svg` rendering support).
-        stamp: None,
+        stamp,
     })
+}
+
+/// If `dict`'s `/AP` names its Normal appearance via a `/BBObjPtr_<id>` placeholder name
+/// (Bluebeam's own indirect-reference stand-in - see module doc "Stamp artwork"), return
+/// `<id>`. `None` for anything else (no `/AP`, an `/AP/N` that's already a real stream/
+/// reference, or a name not matching the `BBObjPtr_` convention).
+fn bb_form_xobject_root_id(dict: &Dictionary) -> Option<String> {
+    let ap = dict.get(b"AP").ok()?.as_dict().ok()?;
+    let n = ap.get(b"N").ok()?;
+    let name = n.as_name().ok()?;
+    std::str::from_utf8(name).ok()?.strip_prefix("BBObjPtr_").map(str::to_string)
+}
+
+/// Decode every `<Resources>` child of `item` into `(id, raw_bytes)` pairs - Bluebeam's
+/// own sidecar storage for stamp/appearance-stream content (module doc "Stamp artwork").
+/// Both `<ID>` and `<Data>` are hex+zlib exactly like `<Raw>`, but `<Data>` may decode to
+/// BINARY content (an already-Flate-compressed PDF stream body), so this decodes to raw
+/// bytes rather than reusing [`inflate_hex_zlib`]'s string-returning path. A block that
+/// fails to decode is skipped rather than aborting the whole item (same never-fatal
+/// posture as everything else in this module) - it simply leaves any `/BBObjPtr_<id>`
+/// reference to it unresolved at splice time.
+fn collect_bb_resources(item: roxmltree::Node) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    for res in item.children().filter(|n| n.has_tag_name("Resources")) {
+        let (Some(id_hex), Some(data_hex)) = (child_text(res, "ID"), child_text(res, "Data")) else {
+            continue;
+        };
+        let (Some(id_bytes), Some(data_bytes)) = (decode_hex_zlib_bytes(id_hex), decode_hex_zlib_bytes(data_hex))
+        else {
+            continue;
+        };
+        let Ok(id) = String::from_utf8(id_bytes) else { continue };
+        out.insert(id, data_bytes);
+    }
+    out
 }
 
 /// Decode a `<Raw>` payload into a PDF annotation dictionary. Two encodings seen in the
@@ -198,11 +344,25 @@ fn is_hex_zlib(s: &str) -> bool {
 }
 
 fn inflate_hex_zlib(hex: &str) -> Result<String, String> {
-    let bytes = hex_decode(hex)?;
+    let bytes = decode_hex_zlib_bytes(hex).ok_or_else(|| "hex+zlib decode failed".to_string())?;
+    String::from_utf8(bytes).map_err(|e| format!("inflated bytes are not valid UTF-8: {e}"))
+}
+
+/// Hex-decode + zlib-inflate a `<Raw>`/`<ID>`/`<Data>` blob to raw bytes (the byte-oriented
+/// primitive both [`inflate_hex_zlib`] and `collect_bb_resources` build on - `<Data>` in
+/// particular may decode to BINARY content, e.g. an already-Flate-compressed PDF stream
+/// body, so it cannot go through a `String`-returning path). `None` on any failure (not
+/// hex+zlib, bad hex, inflate error) - callers degrade gracefully rather than panicking.
+fn decode_hex_zlib_bytes(hex: &str) -> Option<Vec<u8>> {
+    let trimmed = hex.trim();
+    if !is_hex_zlib(trimmed) {
+        return None;
+    }
+    let bytes = hex_decode(trimmed).ok()?;
     let mut decoder = flate2::read::ZlibDecoder::new(&bytes[..]);
-    let mut out = String::new();
-    decoder.read_to_string(&mut out).map_err(|e| format!("zlib inflate failed: {e}"))?;
-    Ok(out)
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok()?;
+    Some(out)
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
@@ -247,6 +407,74 @@ fn wrap_dict_as_pdf(dict_text: &str) -> Vec<u8> {
     buf
 }
 
+// ---------------------------------------------------------------------------
+// Stamp artwork: Bluebeam `/BBObjPtr_<id>` graph resolution (module doc "Stamp artwork").
+// ---------------------------------------------------------------------------
+
+/// Replace every `/BBObjPtr_<id>` name placeholder found in the DICTIONARY portion of
+/// `raw` (i.e. before a literal `stream\n`/`stream\r\n` keyword, if any) with the real
+/// indirect reference `id_to_objid` assigns that id - e.g. `/BBObjPtr_ABC123` becomes
+/// ` 5 0 R`. The replacement carries a LEADING SPACE deliberately: PDF name tokens are
+/// self-delimiting (no separator needed between a preceding key name and this one, e.g.
+/// `/ExtGState/BBObjPtr_X`), but `5 0 R` has no leading `/` to delimit it from whatever
+/// precedes it - textually substituting without the space produces `/ExtGState5 0 R`,
+/// which a PDF tokenizer reads as the single name `ExtGState5` followed by a floating,
+/// meaningless `0 R` (confirmed by a failing round-trip before this fix was added - the
+/// extra space is always harmless, PDF collapses whitespace runs). Never touches bytes
+/// from `stream` onward: those are an opaque, often still-compressed binary payload, and
+/// a `/BBObjPtr_` byte sequence occurring there by pure coincidence must not be
+/// corrupted. An id with no entry in `id_to_objid` (a reference to a block that failed to
+/// decode, or wasn't captured) is left as a literal, inert name - PDF viewers ignore a
+/// `/Resources` entry that resolves to nothing rather than failing the whole page, so
+/// this degrades that one visual detail, not the stamp.
+pub(crate) fn resolve_bb_objptr_refs(raw: &[u8], id_to_objid: &std::collections::BTreeMap<String, (u32, u16)>) -> Vec<u8> {
+    let stream_at = find_subslice(raw, b"stream\n")
+        .or_else(|| find_subslice(raw, b"stream\r\n"))
+        .unwrap_or(raw.len());
+    let (head, tail) = raw.split_at(stream_at);
+    let mut head_text = String::from_utf8_lossy(head).into_owned();
+    for (id, (num, gen)) in id_to_objid {
+        head_text = head_text.replace(&format!("/BBObjPtr_{id}"), &format!(" {num} {gen} R"));
+    }
+    let mut out = head_text.into_bytes();
+    out.extend_from_slice(tail);
+    out
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Parse raw PDF object bytes (a `<< dict >>`, optionally followed by
+/// `stream ... endstream`) into a [`lopdf::Object`] - the byte-oriented sibling of
+/// [`parse_pdf_dict`], needed because a Bluebeam `<Resources>` graph node may be a Stream
+/// (binary body, e.g. a Form XObject's compressed content), not just a bare dictionary
+/// like `<Raw>` always is.
+pub(crate) fn parse_pdf_object_bytes(bytes: &[u8]) -> Result<Object, String> {
+    let pdf_bytes = wrap_object_bytes_as_pdf(bytes);
+    let doc = lopdf::Document::load_mem(&pdf_bytes).map_err(|e| format!("PDF object parse failed: {e}"))?;
+    doc.get_object((1, 0)).cloned().map_err(|e| format!("missing wrapped object: {e}"))
+}
+
+/// Byte-oriented sibling of [`wrap_dict_as_pdf`] - `object_bytes` is inserted verbatim
+/// (never routed through a `&str`) so a binary stream body inside it survives intact.
+fn wrap_object_bytes_as_pdf(object_bytes: &[u8]) -> Vec<u8> {
+    let header = b"%PDF-1.4\n".to_vec();
+    let obj_offset = header.len();
+
+    let mut buf = header;
+    buf.extend_from_slice(b"1 0 obj\n");
+    buf.extend_from_slice(object_bytes);
+    buf.extend_from_slice(b"\nendobj\n");
+
+    let xref_offset = buf.len();
+    let xref = format!(
+        "xref\n0 2\n0000000000 65535 f \n{obj_offset:010} 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF"
+    );
+    buf.extend_from_slice(xref.as_bytes());
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,7 +498,10 @@ mod tests {
         assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
         assert_eq!(report.tools.len(), 1);
         let tool = &report.tools[0];
-        assert_eq!(tool.name, "Fire Rated Door");
+        // PLAIN_ITEM's <Name> ("Fire Rated Door") is the OLD, wrong mental model of what
+        // Bluebeam's <Name> holds - real exports carry an opaque id there. The tool's
+        // display name now correctly prefers /Subj ("Door") - see module doc "naming".
+        assert_eq!(tool.name, "Door");
         assert_eq!(tool.markup_type, crate::markup::MarkupType::Rectangle);
         assert_eq!(tool.appearance.color, "#ff0000");
         assert_eq!(tool.appearance.line_weight, 2.0);
@@ -288,6 +519,13 @@ mod tests {
         // roxmltree (XML) nor lopdf (PDF literal strings) should mangle valid UTF-8/Latin-1
         // text; this is a real-world-plausible case (non-English trade names, e.g. a
         // Francophone or Chinese-market project) worth confirming rather than assuming.
+        //
+        // Updated for the naming fix (module doc "naming"): the tool's DISPLAY name now
+        // prefers /Subj, so the Cyrillic /Subj value is what must survive as `tool.name`
+        // here. The emoji <Name> is still exercised (proves XML text-content decoding
+        // doesn't choke on it) but is expected to be DISCARDED in favour of /Subj, not to
+        // become the tool's name - that's precisely the naming-precedence behaviour this
+        // fix introduced.
         let xml = r#"<ToolChestData>
           <ToolChestItem>
             <Name>Détecteur de fumée 🔥</Name>
@@ -299,13 +537,33 @@ mod tests {
         let report = parse_btx_xml(xml);
         assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
         assert_eq!(report.tools.len(), 1);
-        assert_eq!(report.tools[0].name, "Détecteur de fumée 🔥");
         // /Subj is a PDF literal string outside Latin-1 (Cyrillic) - lopdf reads literal
         // strings as raw bytes; the annotation reader's `get_string` behaviour on non-
         // Latin-1 bytes is what's actually under test here (real-world PDFs may use
-        // PDFDocEncoding or UTF-16BE with a BOM for such content, not raw UTF-8 - assert
-        // on what the pipeline actually produces rather than assuming instead of guessing).
-        eprintln!("subject after round-trip: {:?}", report.tools[0].subject);
+        // PDFDocEncoding or UTF-16BE with a BOM for such content, not raw UTF-8) - and it
+        // is now BOTH the tool's name and its subject.
+        assert_eq!(report.tools[0].name, "Порядок");
+        assert_eq!(report.tools[0].subject.as_deref(), Some("Порядок"));
+    }
+
+    #[test]
+    fn falls_back_to_xml_name_when_subj_is_absent_non_ascii_included() {
+        // The FALLBACK half of the naming fix: an item with no /Subj at all must still
+        // get a usable, correctly-decoded name from <Name> - including non-ASCII content,
+        // the case the previous test no longer exercises now that /Subj wins when present.
+        let xml = r#"<ToolChestData>
+          <ToolChestItem>
+            <Name>Détecteur de fumée 🔥</Name>
+            <Mode>properties</Mode>
+            <Raw><![CDATA[<< /Subtype /Square /Rect [10 20 110 70] /C [1 0 0] >>]]></Raw>
+          </ToolChestItem>
+        </ToolChestData>"#;
+
+        let report = parse_btx_xml(xml);
+        assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+        assert_eq!(report.tools.len(), 1);
+        assert_eq!(report.tools[0].name, "Détecteur de fumée 🔥");
+        assert_eq!(report.tools[0].subject, None);
     }
 
     #[test]
@@ -391,7 +649,7 @@ mod tests {
         let report = import_btx_bytes(&zip_bytes);
         assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
         assert_eq!(report.tools.len(), 1);
-        assert_eq!(report.tools[0].name, "Fire Rated Door");
+        assert_eq!(report.tools[0].name, "Door"); // PLAIN_ITEM's /Subj - see naming fix
     }
 
     #[test]
@@ -567,46 +825,16 @@ mod tests {
     }
 
     #[test]
-    fn stamp_import_currently_drops_the_appearance_asset_named_gap_not_fixed_this_pass() {
-        // NAMED, CONFIRMED, NOT FIXED. A genuine `/Subtype /Stamp` Raw payload (Stamp IS
-        // in MARKUP_SUBTYPES, so it passes the subtype guard fixed above and imports
-        // successfully - no skip) still gets `stamp: None` unconditionally. `import_item`
-        // (this file) has never branched on markup_type at all; there is no code anywhere
-        // matching `import_stamp_item`, despite this file's OWN doc comment (a few lines
-        // above `import_item`) describing "a dedicated stamp-import path ... see
-        // `import_stamp_item` used by the command layer for `<Type>` values containing
-        // 'Stamp'" - that path does not exist (confirmed via
-        // `grep -rn "import_stamp_item\|fn import_stamp"`, zero hits besides the comment
-        // itself), and `<Type>` is not read ANYWHERE in this module (confirmed via
-        // `grep -n "\"Type\""`) - the doc comment describes a design that was never built.
-        //
-        // Real-world impact: a Bluebeam-exported custom image/graphic stamp (the common
-        // case for a firm's own rubber-stamp graphics) imports with NO error and NO skip
-        // entry - it "succeeds" - but silently loses its entire visual payload. Placing it
-        // later falls back to `appearance::draw_stamp_box_and_label` (a plain bordered box
-        // + the tool's Name as text), which looks nothing like the imported stamp. This
-        // is exactly the "success that silently drops data" failure class the dispatch
-        // asked to watch for.
-        //
-        // NOT fixed in this pass, deliberately: `StampAsset::PdfBase64` exists specifically
-        // "as the natural landing spot for imported Bluebeam stamps" (see its doc comment,
-        // `toolchest/stamp.rs`), but `appearance::draw()`'s Stamp/StampDynamic arm ONLY
-        // renders `PngBase64` - `PdfBase64` and `Svg` both already fall back to box+label,
-        // a DIFFERENT, ALREADY-DOCUMENTED deferral (`appearance.rs` module doc: "vector-
-        // SVG-to-PDF-operator conversion and embedded-PDF content-stream splicing are both
-        // out of scope for this pass"). Populating `stamp: Some(StampDef::Static { asset:
-        // PdfBase64(..) })` on import today would change NOTHING user-visible (rendering
-        // still falls back to the same box+label either way) - it would be inert plumbing
-        // for a rendering feature that doesn't exist yet, built on an unverified guess at
-        // Bluebeam's real wire format for stamp appearance data (no actual .btx sample
-        // with an embedded stamp graphic was available to confirm the shape against -
-        // bench/corpus/ is machine-local/gitignored and absent in this worktree). Building
-        // BOTH the import-side extraction and the render-side PdfBase64 support blind, in
-        // one pass, without a real sample to verify against, is the wrong tradeoff here -
-        // it would ship an unverified format guess as if it were a confirmed fix. Recommend
-        // as a follow-up: obtain one real Bluebeam .btx export containing a custom-image
-        // stamp, confirm the actual object-reference shape of its <Raw> payload's /AP, THEN
-        // build import_stamp_item + PdfBase64 rendering together against real data.
+    fn stamp_without_an_ap_reference_still_has_no_artwork_residual_case() {
+        // RESIDUAL, CORRECTLY NAMED (not the general gap - see `bb_form_xobject_root_id_
+        // and_sibling_resources_resolve_into_a_bluebeam_form_x_object` below and the module
+        // doc "Stamp artwork" for the mechanism that IS now fixed, 2026-08-06). A Stamp
+        // Raw payload with no `/AP` at all - not something observed in the real sample
+        // corpus (every one of the 11 Stamp-subtype items across it uses the
+        // `/AP<</N/BBObjPtr_id>>` mechanism), but not guaranteed impossible - still
+        // correctly gets `stamp: None`, since there is nothing to resolve. It imports with
+        // no error and no skip; placement falls back to `appearance::draw_stamp_box_and_
+        // label` (a plain bordered box + the tool's name as text).
         let xml = r#"<ToolChestData>
           <ToolChestItem>
             <Name>Company Logo Stamp</Name>
@@ -620,12 +848,239 @@ mod tests {
         assert_eq!(report.tools.len(), 1);
         let tool = &report.tools[0];
         assert_eq!(tool.markup_type, crate::markup::MarkupType::Stamp);
-        assert!(
-            tool.stamp.is_none(),
-            "current (unfixed) behaviour: the appearance/graphic payload is always \
-             discarded for Stamp imports - this assertion documents the gap, it is not the \
-             desired end state"
+        assert!(tool.stamp.is_none(), "no /AP reference means nothing to resolve - box+label fallback is correct here");
+    }
+
+    // --- Stamp artwork fixed (module doc "Stamp artwork") - real mechanism, verified
+    // against `bench/corpus/btx/` (every Stamp-subtype item there uses it) ---
+
+    /// Hex+zlib-encode `text`, the inverse of `inflate_hex_zlib`/`decode_hex_zlib_bytes` -
+    /// lets tests build real Bluebeam-shaped `<Raw>`/`<ID>`/`<Data>` blobs instead of
+    /// relying on the plain-text `<Raw>` fallback (UNVERIFIED against any real sample -
+    /// see module doc).
+    fn hex_zlib_encode(bytes: &[u8]) -> String {
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+        compressed.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn bb_form_xobject_root_id_and_sibling_resources_resolve_into_a_bluebeam_form_x_object() {
+        // Reproduces the exact shape found in bench/corpus/btx/my-tools.btx's
+        // AnnotationBRXStamp item: /AP<</N/BBObjPtr_<id>>> plus a sibling <Resources>
+        // block whose <ID> decodes to that same <id> and whose <Data> is the Form
+        // XObject's own raw PDF-syntax bytes.
+        let form_bytes = b"<</Type/XObject/Subtype/Form/FormType 1/BBox[0 0 100 100]>>\nstream\nfake-content\nendstream";
+        let id_hex = hex_zlib_encode(b"LBLQFTNPNJGWOKCB");
+        let data_hex = hex_zlib_encode(form_bytes);
+        let raw_hex = hex_zlib_encode(
+            b"<</Subtype/Stamp/Rect[0 0 117.3555 82.95998]/AP<</N/BBObjPtr_LBLQFTNPNJGWOKCB>>/Subj(Stamp)>>",
         );
+        let xml = format!(
+            r#"<BluebeamRevuToolSet Version="1"><ToolChestItem>
+                <Name>OYXLGGCUBDYSRJYS</Name>
+                <Mode>drawing</Mode>
+                <Raw>{raw_hex}</Raw>
+                <Resources><ID>{id_hex}</ID><Data>{data_hex}</Data></Resources>
+            </ToolChestItem></BluebeamRevuToolSet>"#
+        );
+
+        let report = parse_btx_xml(&xml);
+        assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+        assert_eq!(report.tools.len(), 1);
+        let tool = &report.tools[0];
+        assert_eq!(tool.markup_type, crate::markup::MarkupType::Stamp);
+        match &tool.stamp {
+            Some(StampDef::Static { asset: StampAsset::BluebeamFormXObject { root_id, objects } }) => {
+                assert_eq!(root_id, "LBLQFTNPNJGWOKCB");
+                assert_eq!(objects.len(), 1);
+                assert_eq!(objects.get("LBLQFTNPNJGWOKCB").map(Vec::as_slice), Some(&form_bytes[..]));
+            }
+            other => panic!("expected a resolved BluebeamFormXObject asset, got {other:?}"),
+        }
+    }
+
+    // NOTE: the end-to-end "does this actually splice into a real indirect object on
+    // save" proof lives in `document::annots::tests::
+    // write_markups_splices_a_bluebeam_form_x_object_graph_into_real_indirect_objects` -
+    // that module already has `one_page_doc`/`resolve_ap_n_stream`/`Markup::new` in scope,
+    // so the round-trip test belongs there rather than duplicating that scaffolding here.
+
+    // --- Ordering fidelity (module doc "<Index>") ---
+
+    #[test]
+    fn tools_are_reordered_by_index_not_left_in_xml_document_order() {
+        // Real exports store items in an order that does NOT match Bluebeam's authored
+        // display order (module doc) - this XML deliberately lists "Third"/"First"/
+        // "Second" in that document order, with <Index> values proving the real order is
+        // First(0) < Second(1) < Third(2).
+        let xml = r#"<BluebeamRevuToolSet Version="1">
+          <ToolChestItem><Name>Third</Name><Mode>properties</Mode><Index>2</Index>
+            <Raw><![CDATA[<< /Subtype /Square /Rect [0 0 1 1] /Subj (Third) >>]]></Raw></ToolChestItem>
+          <ToolChestItem><Name>First</Name><Mode>properties</Mode><Index>0</Index>
+            <Raw><![CDATA[<< /Subtype /Square /Rect [0 0 1 1] /Subj (First) >>]]></Raw></ToolChestItem>
+          <ToolChestItem><Name>Second</Name><Mode>properties</Mode><Index>1</Index>
+            <Raw><![CDATA[<< /Subtype /Square /Rect [0 0 1 1] /Subj (Second) >>]]></Raw></ToolChestItem>
+        </BluebeamRevuToolSet>"#;
+
+        let report = parse_btx_xml(xml);
+        assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+        let names: Vec<&str> = report.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["First", "Second", "Third"]);
+    }
+
+    #[test]
+    fn items_with_no_index_keep_their_relative_document_order() {
+        // No <Index> anywhere - every item falls back to its document position as the
+        // sort key, so a stable sort leaves them exactly as authored (the common case for
+        // the existing, pre-fix test fixtures in this file, none of which set <Index>).
+        let xml = r#"<BluebeamRevuToolSet Version="1">
+          <ToolChestItem><Name>Alpha</Name><Mode>properties</Mode>
+            <Raw><![CDATA[<< /Subtype /Square /Rect [0 0 1 1] /Subj (Alpha) >>]]></Raw></ToolChestItem>
+          <ToolChestItem><Name>Beta</Name><Mode>properties</Mode>
+            <Raw><![CDATA[<< /Subtype /Square /Rect [0 0 1 1] /Subj (Beta) >>]]></Raw></ToolChestItem>
+        </BluebeamRevuToolSet>"#;
+
+        let report = parse_btx_xml(xml);
+        let names: Vec<&str> = report.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["Alpha", "Beta"]);
+    }
+
+    // --- BOM handling (module doc: every real export carries one) ---
+
+    #[test]
+    fn leading_utf8_bom_does_not_break_xml_parsing() {
+        let xml_with_bom = format!("\u{FEFF}{PLAIN_ITEM}");
+        let report = parse_btx_xml(&xml_with_bom);
+        assert!(report.skipped.is_empty(), "a leading BOM must not fail XML parsing: {:?}", report.skipped);
+        assert_eq!(report.tools.len(), 1);
+    }
+
+    // --- Grouped/paired <Child> annotations (module doc "<Child>") - NAMED, NOT FIXED ---
+
+    #[test]
+    fn grouped_child_annotation_is_named_not_fixed() {
+        // A <Child> represents a SECOND, paired annotation Bluebeam groups with the
+        // parent (measured: 33/77 = 43% of real items across the sample corpus carry
+        // one - not a rare edge case). `Tool` is architecturally 1:1 with a single
+        // Markup+geometry, so this cannot be losslessly represented without a data-model
+        // change - documenting the current (safe: no crash, no skip; incomplete: the
+        // child's entire annotation is silently discarded) behaviour rather than treating
+        // it as fixed.
+        let xml = r#"<BluebeamRevuToolSet Version="1">
+          <ToolChestItem>
+            <Name>Parent</Name>
+            <Mode>properties</Mode>
+            <Raw><![CDATA[<< /Subtype /Polygon /Rect [0 0 50 50] /Subj (Cloud Shape) >>]]></Raw>
+            <Child>
+              <Type>Bluebeam.PDF.Annotations.AnnotationFreeText</Type>
+              <Raw><![CDATA[<< /Subtype /FreeText /Rect [0 0 20 10] /Subj (Attached Label) >>]]></Raw>
+            </Child>
+          </ToolChestItem>
+        </BluebeamRevuToolSet>"#;
+
+        let report = parse_btx_xml(xml);
+        assert!(report.skipped.is_empty(), "the parent still imports cleanly: {:?}", report.skipped);
+        assert_eq!(report.tools.len(), 1, "exactly the PARENT becomes a tool - the <Child> is not a second tool");
+        assert_eq!(report.tools[0].subject.as_deref(), Some("Cloud Shape"));
+        assert_eq!(
+            report.tools[0].markup_type,
+            crate::markup::MarkupType::Polygon,
+            "only the parent's own /Subtype Polygon is represented"
+        );
+        // The child's "Attached Label" text is nowhere in the imported Tool - this is the
+        // named, not-yet-fixed gap. There is deliberately no `Tool` field that COULD hold
+        // it today (see module doc); this assertion exists so a future fix that adds one
+        // has a red test to turn green, rather than this gap silently persisting forever.
+    }
+
+    // --- Real-sample characterization (bench/corpus/btx/ - gitignored is NOT the case
+    // here, these 4 files are checked in as real fixtures per the dispatch) ---
+
+    fn real_corpus_files() -> Vec<std::path::PathBuf> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("bench").join("corpus").join("btx");
+        let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("btx")))
+            .collect()
+    }
+
+    #[test]
+    fn real_bluebeam_samples_import_without_crashing_and_every_tool_gets_a_nonempty_name() {
+        // Runs against the actual 4-file, 77-item real-sample corpus this rewrite was
+        // built against (see module doc). Gated on the files existing (same pattern as
+        // `sample_tool_set_fixture_path`) so this degrades to a skip rather than a
+        // failure in a build context that doesn't carry bench/corpus/btx/ (e.g. the CI
+        // Docker build context, which historically has NOT COPY'd bench/ - see the
+        // sample-tool-set fixture's own test for that exact prior incident).
+        let files = real_corpus_files();
+        if files.is_empty() {
+            eprintln!("skip: bench/corpus/btx/ not present in this build context");
+            return;
+        }
+        let mut total_tools = 0usize;
+        let mut total_bluebeam_form_stamps = 0usize;
+        for path in &files {
+            let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            let report = import_btx_bytes(&bytes);
+            assert!(
+                !report.tools.is_empty() || !report.skipped.is_empty(),
+                "{path:?} produced neither tools nor skips - the parse silently found nothing"
+            );
+            for tool in &report.tools {
+                assert!(!tool.name.trim().is_empty(), "{path:?}: every imported tool must have a non-empty name");
+                if let Some(StampDef::Static { asset: StampAsset::BluebeamFormXObject { .. } }) = &tool.stamp {
+                    total_bluebeam_form_stamps += 1;
+                }
+            }
+            total_tools += report.tools.len();
+        }
+        assert!(total_tools > 0, "the real corpus must produce at least one tool across all 4 files");
+        assert!(
+            total_bluebeam_form_stamps > 0,
+            "at least one real Stamp item must resolve to a BluebeamFormXObject asset - \
+             every Stamp-subtype item in this corpus uses that mechanism (module doc)"
+        );
+    }
+
+    #[test]
+    #[ignore] // diagnostic only - prints the fidelity table numbers quoted in the PR body, not an assertion
+    fn print_real_corpus_fidelity_numbers() {
+        let files = real_corpus_files();
+        if files.is_empty() {
+            eprintln!("skip: no corpus");
+            return;
+        }
+        for path in &files {
+            let bytes = std::fs::read(path).unwrap();
+            let report = import_btx_bytes(&bytes);
+            let mut stamps_total = 0usize;
+            let mut stamps_with_artwork = 0usize;
+            let mut name_differs_from_subj = 0usize;
+            for t in &report.tools {
+                if matches!(t.markup_type, crate::markup::MarkupType::Stamp | crate::markup::MarkupType::StampDynamic) {
+                    stamps_total += 1;
+                    if matches!(&t.stamp, Some(StampDef::Static { asset: StampAsset::BluebeamFormXObject { .. } })) {
+                        stamps_with_artwork += 1;
+                    }
+                }
+                if t.subject.as_deref() != Some(t.name.as_str()) {
+                    name_differs_from_subj += 1;
+                }
+            }
+            eprintln!(
+                "{:?}: tools={} skipped={} stamps={} stamps_with_artwork={} names_from_fallback_not_subj={}",
+                path.file_name().unwrap(),
+                report.tools.len(),
+                report.skipped.len(),
+                stamps_total,
+                stamps_with_artwork,
+                name_differs_from_subj
+            );
+        }
     }
 
     #[test]
@@ -657,3 +1112,6 @@ mod tests {
         assert_eq!(ids.len(), N, "every tool must get a unique id - no collisions at scale");
     }
 }
+
+
+

@@ -185,6 +185,29 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
             let image_id = doc.add_object(Object::Stream(color));
             xobject_refs.set(aux.name, Object::Reference(image_id));
         }
+        // A `.btx`-imported Bluebeam stamp's Form XObject graph (`StampAsset::
+        // BluebeamFormXObject`, `toolchest::btx` module doc "Stamp artwork"): splice every
+        // node in as a real indirect object, rewriting each node's own `/BBObjPtr_<id>`
+        // placeholders to the real references just reserved for its siblings, then point
+        // this resource name at whichever node is the root. A node that fails to parse
+        // (unexpected bytes) is simply left absent - any `/BBObjPtr_` reference to it
+        // stays an inert name PDF viewers ignore, degrading that one visual detail rather
+        // than the whole stamp (same never-fatal posture as import).
+        if let Some(form) = built.form_xobject.take() {
+            let id_to_objid: std::collections::BTreeMap<String, (u32, u16)> =
+                form.objects.keys().map(|id| (id.clone(), doc.new_object_id())).collect();
+            for (id, raw) in &form.objects {
+                let resolved = crate::toolchest::btx::resolve_bb_objptr_refs(raw, &id_to_objid);
+                if let Ok(obj) = crate::toolchest::btx::parse_pdf_object_bytes(&resolved) {
+                    if let Some(&oid) = id_to_objid.get(id) {
+                        doc.set_object(oid, obj);
+                    }
+                }
+            }
+            if let Some(&root_oid) = id_to_objid.get(&form.root_id) {
+                xobject_refs.set(form.name, Object::Reference(root_oid));
+            }
+        }
         let ap_id = doc.add_object(Object::Stream(appearance::finish_ap_stream(
             built,
             xobject_refs,
@@ -746,6 +769,83 @@ pub(crate) mod tests {
                 .unwrap(),
             b"DeviceGray"
         );
+    }
+
+    #[test]
+    fn write_markups_splices_a_bluebeam_form_x_object_graph_into_real_indirect_objects() {
+        // A `.btx`-imported Bluebeam stamp (`StampAsset::BluebeamFormXObject`,
+        // `toolchest::btx` module doc "Stamp artwork") must, on save, produce a real
+        // /AP/N whose /Resources/XObject points at a genuine indirect Form XObject
+        // stream - AND have its nested /BBObjPtr_ reference (mirroring the real
+        // ExtGState-chain shape found in bench/corpus/btx/my-tools.btx) resolved to a
+        // real indirect reference too, not left as an inert placeholder name.
+        use crate::toolchest::StampAsset;
+        use std::collections::BTreeMap;
+
+        let mut objects = BTreeMap::new();
+        // /Length must be present and exact (mirrors every real bench/corpus/btx/ sample -
+        // lopdf's stream reader uses it, not "scan for endstream", to know where the body
+        // ends).
+        objects.insert(
+            "ROOTID".to_string(),
+            b"<</Type/XObject/Subtype/Form/FormType 1/BBox[0 0 100 100]/Length 4/Resources<</ExtGState/BBObjPtr_GSID>>>>\nstream\nfake\nendstream"
+                .to_vec(),
+        );
+        objects.insert("GSID".to_string(), b"<</Type/ExtGState/OPM 1>>".to_vec());
+
+        let (mut doc, page_id) = one_page_doc();
+        let m = Markup::new(
+            MarkupType::Stamp,
+            0,
+            MarkupGeometry::Rect {
+                min: PdfPoint { x: 0.0, y: 0.0 },
+                max: PdfPoint { x: 100.0, y: 100.0 },
+            },
+            Appearance::default(),
+            UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: "Alice".into(),
+            },
+        )
+        .with_stamp_asset(StampAsset::BluebeamFormXObject { root_id: "ROOTID".to_string(), objects });
+
+        write_markups(&mut doc, std::slice::from_ref(&m)).unwrap();
+
+        let annots = page_annots(&doc, page_id).unwrap();
+        assert_eq!(annots.len(), 1);
+        let (_, dict) = &annots[0];
+        let ap_stream = resolve_ap_n_stream(&doc, dict);
+
+        let content = String::from_utf8(ap_stream.content.clone()).unwrap();
+        assert!(content.contains("/Fx0 Do\n"), "AP content must reference the spliced Form: {content}");
+        assert!(!content.contains(" re\n"), "a real Form-backed stamp must not draw the box fallback: {content}");
+
+        let resources = ap_stream.dict.get(b"Resources").unwrap().as_dict().unwrap();
+        let xobjects = resources.get(b"XObject").expect("Resources must carry /XObject").as_dict().unwrap();
+        let fx0_ref = match xobjects.get(b"Fx0").unwrap() {
+            Object::Reference(r) => *r,
+            other => panic!("/XObject /Fx0 must be an indirect reference, got {other:?}"),
+        };
+        let fx0 = match doc.get_object(fx0_ref).unwrap() {
+            Object::Stream(s) => s,
+            other => panic!("/XObject /Fx0 must resolve to a real Form XObject Stream, got {other:?}"),
+        };
+        assert_eq!(fx0.dict.get(b"Subtype").unwrap().as_name().unwrap(), b"Form");
+
+        // The nested /BBObjPtr_GSID reference (the root's OWN /Resources/ExtGState
+        // entry) must also have been resolved to a real indirect reference, not left as
+        // a dangling placeholder name - proving multi-level graph splicing, not just the
+        // root object.
+        let nested_gs = fx0.dict.get(b"Resources").unwrap().as_dict().unwrap().get(b"ExtGState").unwrap();
+        let nested_gs_ref = match nested_gs {
+            Object::Reference(r) => *r,
+            other => panic!("nested /BBObjPtr_GSID must resolve to a real reference, not a dangling name: {other:?}"),
+        };
+        let nested_gs_obj = match doc.get_object(nested_gs_ref).unwrap() {
+            Object::Dictionary(d) => d,
+            other => panic!("nested ExtGState must resolve to a real Dictionary, got {other:?}"),
+        };
+        assert_eq!(nested_gs_obj.get(b"Type").unwrap().as_name().unwrap(), b"ExtGState");
     }
 
     /// Regression guard: adding `/AP` must not change any of the semantic keys

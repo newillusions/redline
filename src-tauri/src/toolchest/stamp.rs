@@ -24,6 +24,29 @@ pub enum StampAsset {
     /// Base64-encoded single-page PDF bytes (the natural landing spot for imported
     /// Bluebeam stamps, which arrive as PDF-backed annotations).
     PdfBase64(String),
+    /// A genuine Bluebeam-native Form XObject appearance graph, extracted from a `.btx`
+    /// `<ToolChestItem>`'s sibling `<Resources>` blocks (`toolchest::btx` module doc,
+    /// "Stamp artwork" - real Bluebeam stamps reference their artwork via an
+    /// `/AP<</N/BBObjPtr_<id>>>` name placeholder rather than embedding it). Carries the
+    /// AS-AUTHORED appearance-stream bytes rather than a redrawn approximation, so a
+    /// placed stamp renders identically to the source instead of falling back to a
+    /// generic box+label. `document::annots::write_markups` (the one place holding
+    /// `&mut Document`) splices this into real indirect objects at save time - see
+    /// `toolchest::btx::{resolve_bb_objptr_refs, parse_pdf_object_bytes}` and
+    /// `markup::appearance`'s Stamp/StampDynamic draw arm.
+    BluebeamFormXObject {
+        /// Which entry of `objects` the placed stamp's own wrapper Form `Do`-references.
+        /// Its `/BBox`+`/Matrix` already map it onto the tool's own `[0,0,w,h]` bbox -
+        /// Bluebeam bakes the scale in (verified against every Stamp-subtype item in the
+        /// sample corpus) - so no extra scale is applied at placement time, only a
+        /// translate to the geometry's own origin.
+        root_id: String,
+        /// Every object this graph transitively references (including the root itself),
+        /// each as raw PDF-syntax bytes (a `<< dict >>`, optionally followed by
+        /// `stream ... endstream`) with its own `/BBObjPtr_*` placeholders still
+        /// unresolved, keyed by the decoded `<Resources>/<ID>` name that names it.
+        objects: std::collections::BTreeMap<String, Vec<u8>>,
+    },
 }
 
 /// Where a dynamic stamp's sequential auto-number counter is scoped (spec section 12
