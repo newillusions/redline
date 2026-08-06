@@ -8,7 +8,243 @@
 use anyhow::{bail, Context, Result};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId};
 
-use crate::markup::{appearance, Markup};
+use crate::geometry::PdfPoint;
+use crate::markup::{appearance, Markup, MarkupGeometry};
+
+// ---------------------------------------------------------------------------
+// Rotation- and MediaBox-origin-aware coordinate conversion (interop fix, 2026-08-06
+// owner report: "the markups from redline show up in different locations in bluebeam
+// now").
+//
+// redline's frontend captures markup geometry in PDFium's "display" page space -
+// `get_page_size` returns PDFium's `PdfPage::page_size()`, which (per the pdfium public
+// header: "Changing the rotation of |page| affects the return value") already has the
+// page's own `/Rotate` baked in - width/height are SWAPPED for a 90/270-rotated page, and
+// `render_tile`'s custom-matrix path renders into that SAME already-rotated space (PDFium
+// applies `/Rotate` internally to every page-space API uniformly, including the raw
+// `FPDF_RenderPageBitmapWithMatrix` path - confirmed empirically, not assumed; see the
+// `rotation_interop` test module below, which keeps the coverage a set of now-deleted
+// throwaway probe tests originally proved).
+//
+// A SECOND, independent effect discovered the same way: PDFium's page space also treats
+// `/MediaBox`'s own lower-left corner as its origin, NOT absolute PDF coordinate (0,0) -
+// confirmed empirically (a page with `/MediaBox [36 36 576 756]` and content drawn at
+// absolute (100,100) rendered 36pt further toward the origin than a naive "content-stream
+// coordinates are used directly" model would predict). PDF content-stream operators (and
+// therefore annotation `/Rect`) are always in the ABSOLUTE default user space - MediaBox's
+// corners are just particular absolute coordinates within it, not a new local origin - so
+// this is a second, independent source of drift whenever `/MediaBox` doesn't start at
+// (0,0), completely orthogonal to rotation (a cropped/trimmed sheet with a shifted
+// MediaBox needs no `/Rotate` at all to trigger it).
+//
+// PDF spec annotation `/Rect` (and every geometry key derived from it) MUST be expressed
+// in the page's TRUE, ABSOLUTE default user space, which neither `/Rotate` NOR a
+// non-origin `/MediaBox` affects (ISO 32000-1 §14.4 / §8.4.1: rotation is a viewing-time
+// transform applied uniformly to the whole page - content stream AND annotations together
+// - never a change to the coordinate system itself; MediaBox merely bounds the physical
+// medium within that same absolute system). Writing PDFium's rotated/origin-relative
+// "display space" numbers straight into `/Rect` is therefore wrong whenever either effect
+// applies: redline's own viewer stays self-consistent (it captures and re-displays using
+// the SAME frame), while a spec-conformant reader like Bluebeam correctly re-derives its
+// OWN display from the TRUE `/Rect` plus `/Rotate`/`/MediaBox` - and ends up drawing the
+// annotation somewhere completely different, because it was never given true-space
+// coordinates.
+//
+// The fix: keep the in-memory `Markup::geometry` in display space everywhere else in the
+// app (measurement/takeoff, snap targets, the SVG overlay, selection/hit-testing all stay
+// exactly as before - zero behaviour change for the overwhelmingly common case of
+// rotation=0 and a MediaBox already starting at (0,0), which is an identity transform
+// end-to-end), and convert ONLY at the serialization boundary: `write_markups` maps
+// display -> true before building `/Rect`/`/AP`/geometry keys; `read_markups` maps true ->
+// display after parsing them back.
+//
+// Closed-form transforms below, EMPIRICALLY VERIFIED (not just derived) against PDFium's
+// own rendering for all four rotations and a non-origin MediaBox - see the
+// `rotation_interop` tests. `w0`/`h0` are the page's TRUE (unrotated) MediaBox width and
+// height; `ox`/`oy` are its lower-left corner's absolute coordinates (0,0 for the common
+// case). The rotation-only step operates in the MediaBox's own LOCAL frame (as if its
+// origin were (0,0)) and the origin shift is applied outside that step - order matters:
+// subtract-then-rotate going true->display, rotate-then-add going display->true.
+
+/// Rotation-only step (MediaBox assumed to start at its own local (0,0)) - PDF true
+/// default user space -> PDFium "display" (rotated) page space.
+fn rotate_local_true_to_display(p: PdfPoint, rotation: i32, w0: f64, h0: f64) -> PdfPoint {
+    match rotation.rem_euclid(360) {
+        90 => PdfPoint {
+            x: p.y,
+            y: w0 - p.x,
+        },
+        180 => PdfPoint {
+            x: w0 - p.x,
+            y: h0 - p.y,
+        },
+        270 => PdfPoint {
+            x: h0 - p.y,
+            y: p.x,
+        },
+        _ => p, // 0 (or a non-multiple-of-90 value some other tool wrote) - identity.
+    }
+}
+
+/// Exact inverse of [`rotate_local_true_to_display`] (verified by round-trip in
+/// `rotation_interop` tests).
+fn rotate_local_display_to_true(p: PdfPoint, rotation: i32, w0: f64, h0: f64) -> PdfPoint {
+    match rotation.rem_euclid(360) {
+        90 => PdfPoint {
+            x: w0 - p.y,
+            y: p.x,
+        },
+        180 => PdfPoint {
+            x: w0 - p.x,
+            y: h0 - p.y,
+        },
+        270 => PdfPoint {
+            x: p.y,
+            y: h0 - p.x,
+        },
+        _ => p,
+    }
+}
+
+/// PDF true (absolute) default user space -> PDFium "display" page space: shift into the
+/// MediaBox's own local frame, then rotate.
+fn true_to_display(p: PdfPoint, rotation: i32, w0: f64, h0: f64, ox: f64, oy: f64) -> PdfPoint {
+    let local = PdfPoint {
+        x: p.x - ox,
+        y: p.y - oy,
+    };
+    rotate_local_true_to_display(local, rotation, w0, h0)
+}
+
+/// PDFium "display" page space -> PDF true (absolute) default user space: un-rotate, then
+/// shift out of the MediaBox's local frame. Exact inverse of [`true_to_display`].
+fn display_to_true(p: PdfPoint, rotation: i32, w0: f64, h0: f64, ox: f64, oy: f64) -> PdfPoint {
+    let local = rotate_local_display_to_true(p, rotation, w0, h0);
+    PdfPoint {
+        x: local.x + ox,
+        y: local.y + oy,
+    }
+}
+
+/// Apply a point-wise transform to every coordinate in a `MarkupGeometry`. `Rect`'s two
+/// corners are re-normalised (component-wise min/max) after mapping rather than kept as
+/// (mapped_min, mapped_max) verbatim - a 90/270 rotation can flip which mapped corner has
+/// the smaller x or y, and `MarkupGeometry::Rect` is documented (and relied on elsewhere,
+/// e.g. `appearance::draw`'s `max.x - min.x` width calc) to keep `min <= max` per axis.
+fn map_geometry(g: &MarkupGeometry, f: impl Fn(PdfPoint) -> PdfPoint) -> MarkupGeometry {
+    match g {
+        MarkupGeometry::Point(p) => MarkupGeometry::Point(f(*p)),
+        MarkupGeometry::Rect { min, max } => {
+            let (a, b) = (f(*min), f(*max));
+            MarkupGeometry::Rect {
+                min: PdfPoint {
+                    x: a.x.min(b.x),
+                    y: a.y.min(b.y),
+                },
+                max: PdfPoint {
+                    x: a.x.max(b.x),
+                    y: a.y.max(b.y),
+                },
+            }
+        }
+        MarkupGeometry::Polyline(pts) => {
+            MarkupGeometry::Polyline(pts.iter().copied().map(f).collect())
+        }
+        MarkupGeometry::Ink(strokes) => MarkupGeometry::Ink(
+            strokes
+                .iter()
+                .map(|s| s.iter().copied().map(&f).collect())
+                .collect(),
+        ),
+        MarkupGeometry::Quads(quads) => MarkupGeometry::Quads(
+            quads
+                .iter()
+                .map(|q| [f(q[0]), f(q[1]), f(q[2]), f(q[3])])
+                .collect(),
+        ),
+    }
+}
+
+/// Resolve a page's TRUE (unrotated) `/MediaBox` as `(width, height, origin_x, origin_y)`,
+/// where `origin_x`/`origin_y` is the box's own lower-left corner in ABSOLUTE PDF
+/// coordinates (0,0 for the common case). Walks the `/Parent` chain if the page dict
+/// doesn't set `/MediaBox` directly (a valid, common PDF - the attribute is inheritable
+/// per ISO 32000-1 §7.7.3.4, and several real-world producers only set it once on the
+/// Pages root for a uniform-size document). The spec allows either diagonal corner pair
+/// in either order, so the origin is `min(x0,x1)`/`min(y0,y1)`, not necessarily entries 0/1.
+fn true_media_box(doc: &Document, page_id: ObjectId) -> Result<(f64, f64, f64, f64)> {
+    let mut current = Some(page_id);
+    let mut hops = 0u8;
+    while let Some(id) = current {
+        hops += 1;
+        if hops > 64 {
+            bail!(
+                "page {:?}: /Parent chain too deep (possible cycle)",
+                page_id
+            );
+        }
+        let dict = doc.get_dictionary(id).context("page/pages dict")?;
+        if let Ok(mb) = dict.get(b"MediaBox") {
+            let arr = mb.as_array().context("/MediaBox is not an array")?;
+            if arr.len() != 4 {
+                bail!("/MediaBox does not have exactly 4 entries");
+            }
+            let nums: Vec<f64> = arr
+                .iter()
+                .map(|o| {
+                    o.as_float()
+                        .map(|f| f as f64)
+                        .context("/MediaBox entry is not a number")
+                })
+                .collect::<Result<_>>()?;
+            let (x0, y0, x1, y1) = (nums[0], nums[1], nums[2], nums[3]);
+            let (ox, oy) = (x0.min(x1), y0.min(y1));
+            return Ok(((x1 - x0).abs(), (y1 - y0).abs(), ox, oy));
+        }
+        current = match dict.get(b"Parent") {
+            Ok(Object::Reference(r)) => Some(*r),
+            _ => None,
+        };
+    }
+    bail!(
+        "page {:?}: no /MediaBox found on page or any ancestor",
+        page_id
+    )
+}
+
+/// Per-page `(rotation, true_width, true_height, origin_x, origin_y)`, resolved lazily and
+/// cached so a document with many markups on the same page only reads its `/Rotate`/
+/// `/MediaBox` once. `rotation == 0 && origin == (0,0)` is the overwhelming majority of
+/// real pages, in which case [`display_to_true`]/[`true_to_display`] are the identity and
+/// the whole conversion is a no-op - existing behaviour for those pages is unchanged.
+struct PageSpaceCache<'a> {
+    doc: &'a Document,
+    cache: std::collections::HashMap<ObjectId, (i32, f64, f64, f64, f64)>,
+}
+
+impl<'a> PageSpaceCache<'a> {
+    fn new(doc: &'a Document) -> Self {
+        Self {
+            doc,
+            cache: std::collections::HashMap::new(),
+        }
+    }
+
+    fn get(
+        &mut self,
+        page_id: ObjectId,
+        page_idx_0based: u32,
+    ) -> Result<(i32, f64, f64, f64, f64)> {
+        if let Some(v) = self.cache.get(&page_id) {
+            return Ok(*v);
+        }
+        let rotation = crate::document::page_ops::page_rotation(self.doc, page_idx_0based)?;
+        let (w0, h0, ox, oy) = true_media_box(self.doc, page_id)?;
+        let v = (rotation, w0, h0, ox, oy);
+        self.cache.insert(page_id, v);
+        Ok(v)
+    }
+}
 
 /// PDF annotation subtypes imported as markups (spec section 6 type set).
 ///
@@ -117,6 +353,19 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
         markups.iter().map(|m| m.id().to_string()).collect();
     let pages = doc.get_pages(); // 1-based page no -> page ObjectId
 
+    // Resolve every target page's (rotation, true_width, true_height, origin_x, origin_y)
+    // UP FRONT, while `doc` is only borrowed immutably - `PageSpaceCache` can't be held
+    // across Phase 2's `doc.add_object` calls (that needs `&mut Document`), so this is
+    // plain owned data, not the cache struct itself. See the rotation-interop comment
+    // block above for why this conversion exists at all.
+    let mut page_space: std::collections::HashMap<ObjectId, (i32, f64, f64, f64, f64)> =
+        std::collections::HashMap::new();
+    for (page_no, page_id) in &pages {
+        let rotation = crate::document::page_ops::page_rotation(doc, page_no - 1)?;
+        let (w0, h0, ox, oy) = true_media_box(doc, *page_id)?;
+        page_space.insert(*page_id, (rotation, w0, h0, ox, oy));
+    }
+
     // Phase 1: collect surviving foreign entries per page.
     let mut kept: std::collections::BTreeMap<ObjectId, Vec<Object>> =
         std::collections::BTreeMap::new();
@@ -163,6 +412,26 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
                 pages.len()
             )
         })?;
+        // Convert this markup's geometry from PDFium "display" space (what the frontend
+        // captured and what `m.geometry` holds everywhere else in the app) into the PDF's
+        // TRUE default user space BEFORE building /Rect/AP - see the rotation-interop
+        // comment block above `display_to_true`. A borrowed COPY, not `m` itself: nothing
+        // outside serialization should ever see transformed coordinates. Identity (a
+        // clone with unchanged geometry) for the common case (rotation=0, MediaBox
+        // starting at (0,0)) - the vast majority of real pages are byte-for-byte
+        // unaffected by this change.
+        let (rotation, w0, h0, ox, oy) = page_space[&page_id];
+        let m: std::borrow::Cow<Markup> = if rotation == 0 && ox == 0.0 && oy == 0.0 {
+            std::borrow::Cow::Borrowed(m)
+        } else {
+            let mut transformed = m.clone();
+            transformed.geometry = map_geometry(&m.geometry, |p| {
+                display_to_true(p, rotation, w0, h0, ox, oy)
+            });
+            std::borrow::Cow::Owned(transformed)
+        };
+        let m: &Markup = &m;
+
         // Build the Normal appearance stream first (indirect object), then point the
         // annotation dict's /AP /N at it - PDF requires a stream to be an indirect
         // object (it cannot be embedded inline in a dictionary), so this order is
@@ -194,8 +463,11 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
         // stays an inert name PDF viewers ignore, degrading that one visual detail rather
         // than the whole stamp (same never-fatal posture as import).
         if let Some(form) = built.form_xobject.take() {
-            let id_to_objid: std::collections::BTreeMap<String, (u32, u16)> =
-                form.objects.keys().map(|id| (id.clone(), doc.new_object_id())).collect();
+            let id_to_objid: std::collections::BTreeMap<String, (u32, u16)> = form
+                .objects
+                .keys()
+                .map(|id| (id.clone(), doc.new_object_id()))
+                .collect();
             for (id, raw) in &form.objects {
                 let resolved = crate::toolchest::btx::resolve_bb_objptr_refs(raw, &id_to_objid);
                 if let Ok(obj) = crate::toolchest::btx::parse_pdf_object_bytes(&resolved) {
@@ -244,7 +516,9 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
 /// Read all markup-like annotations. Page index (0-based) comes from the page tree.
 pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
     let mut out = Vec::new();
+    let mut page_space = PageSpaceCache::new(doc);
     for (page_no_1based, page_id) in doc.get_pages() {
+        let (rotation, w0, h0, ox, oy) = page_space.get(page_id, page_no_1based - 1)?;
         for (_, dict) in page_annots(doc, page_id)? {
             let Some(st) = subtype(&dict) else { continue };
             if !MARKUP_SUBTYPES.contains(&st.as_str()) {
@@ -252,6 +526,18 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
             }
             let mut m = Markup::from_annotation_dict(&dict);
             m.page = page_no_1based - 1;
+            // `from_annotation_dict` recovers geometry in the PDF's TRUE default user
+            // space (from /RLRect, /L, /Vertices, /QuadPoints, /InkList, or a legacy/
+            // foreign /Rect - all of those are true-space per spec). Convert to PDFium
+            // "display" space to match what the rest of the app expects `Markup::geometry`
+            // to be (see the rotation-interop comment block above `display_to_true`) -
+            // the exact inverse of what `write_markups` does, so redline's own round-trip
+            // stays lossless on a rotated page or an offset-origin MediaBox.
+            if rotation != 0 || ox != 0.0 || oy != 0.0 {
+                m.geometry = map_geometry(&m.geometry, |p| {
+                    true_to_display(p, rotation, w0, h0, ox, oy)
+                });
+            }
             out.push(m);
         }
     }
@@ -1419,6 +1705,322 @@ pub(crate) mod tests {
                         )
                     });
                 assert_markup_fidelity(m1, m2);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Rotation- and MediaBox-origin-interop tests (2026-08-06 fix). Covers exactly the
+    // geometry classes the interop investigation named: rotated pages (0/90/180/270,
+    // matching the dispatch's "prime suspect 1"), an offset-origin MediaBox (a second,
+    // independent effect FOUND during this investigation - see the module doc comment
+    // above `display_to_true`), and the two combined. The BBox-padding fix (`ap_bbox`
+    // widening `/Rect`) is deliberately orthogonal to these - a Rectangle-type markup with
+    // default `line_weight` still gets padded, so these tests read `/RLRect` (the exact,
+    // unpadded authored geometry) rather than `/Rect` to isolate what THIS fix changes.
+    // -----------------------------------------------------------------------
+
+    mod rotation_interop {
+        use super::*;
+
+        fn reals(d: &Dictionary, key: &[u8]) -> Vec<f64> {
+            d.get(key)
+                .unwrap_or_else(|_| panic!("{} missing", String::from_utf8_lossy(key)))
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o.as_float().unwrap() as f64)
+                .collect()
+        }
+
+        /// Independent hand-computation of the true-space point for a display-space
+        /// point, mirroring `display_to_true`'s derivation but written separately here on
+        /// purpose - a test that imports the function under test as its own oracle proves
+        /// nothing about correctness, only that the code agrees with itself. Derivation +
+        /// empirical verification against real PDFium rendering: the module doc comment
+        /// above `display_to_true` in the parent module.
+        fn expected_true(
+            display: PdfPoint,
+            rotation: i32,
+            w0: f64,
+            h0: f64,
+            ox: f64,
+            oy: f64,
+        ) -> PdfPoint {
+            let local = match rotation.rem_euclid(360) {
+                90 => PdfPoint {
+                    x: w0 - display.y,
+                    y: display.x,
+                },
+                180 => PdfPoint {
+                    x: w0 - display.x,
+                    y: h0 - display.y,
+                },
+                270 => PdfPoint {
+                    x: display.y,
+                    y: h0 - display.x,
+                },
+                _ => display,
+            };
+            PdfPoint {
+                x: local.x + ox,
+                y: local.y + oy,
+            }
+        }
+
+        fn rect_markup(min: PdfPoint, max: PdfPoint) -> Markup {
+            Markup::new(
+                MarkupType::Rectangle,
+                0,
+                MarkupGeometry::Rect { min, max },
+                Appearance::default(),
+                UserRef {
+                    user_id: uuid::Uuid::new_v4(),
+                    display_name: "Alice".into(),
+                },
+            )
+        }
+
+        /// A markup authored at the SAME display-space geometry on pages with each of the
+        /// four rotations must write `/RLRect` (the exact, unpadded authored geometry) as
+        /// the hand-computed TRUE-space box, then round-trip back to the EXACT original
+        /// display-space geometry on reread. `min=(20,30) max=(80,130)` on a 612x792
+        /// MediaBox with rotation=0 is deliberately the identity case (min==RLRect==
+        /// original) - the pre-fix behaviour, still correct and unchanged.
+        #[test]
+        fn rlrect_uses_true_space_and_round_trips_for_every_rotation() {
+            let (min, max) = (
+                PdfPoint { x: 20.0, y: 30.0 },
+                PdfPoint { x: 80.0, y: 130.0 },
+            );
+            for rotation in [0, 90, 180, 270] {
+                let (mut doc, page_id) = one_page_doc(); // 612x792 MediaBox, rotation 0
+                if rotation != 0 {
+                    crate::document::page_ops::rotate_page(&mut doc, 0, rotation).unwrap();
+                }
+                let m = rect_markup(min, max);
+                write_markups(&mut doc, std::slice::from_ref(&m)).unwrap();
+
+                let annots = page_annots(&doc, page_id).unwrap();
+                let (_, dict) = annots
+                    .iter()
+                    .find(|(_, d)| d.has(b"RLType"))
+                    .unwrap_or_else(|| panic!("rotation {rotation}: markup dict present"));
+
+                let exp_min = expected_true(min, rotation, 612.0, 792.0, 0.0, 0.0);
+                let exp_max = expected_true(max, rotation, 612.0, 792.0, 0.0, 0.0);
+                // A 90/270 rotation can flip which authored corner ends up smaller on a
+                // given axis (see `map_geometry`'s Rect re-normalisation) - compare the
+                // WRITTEN box's own min/max against the component-wise min/max of the two
+                // hand-computed transformed corners, not positionally.
+                let got = reals(dict, b"RLRect");
+                let want = [
+                    exp_min.x.min(exp_max.x),
+                    exp_min.y.min(exp_max.y),
+                    exp_min.x.max(exp_max.x),
+                    exp_min.y.max(exp_max.y),
+                ];
+                for i in 0..4 {
+                    assert!(
+                        (got[i] - want[i]).abs() < 1e-3,
+                        "rotation {rotation}: /RLRect[{i}] = {} != hand-computed {}",
+                        got[i],
+                        want[i]
+                    );
+                }
+
+                let reread = read_markups(&doc).unwrap();
+                assert_eq!(reread.len(), 1, "rotation {rotation}: markup survives");
+                match &reread[0].geometry {
+                    MarkupGeometry::Rect {
+                        min: g_min,
+                        max: g_max,
+                    } => {
+                        assert!(
+                            (g_min.x - min.x).abs() < 1e-3,
+                            "rotation {rotation}: round-trip min.x"
+                        );
+                        assert!(
+                            (g_min.y - min.y).abs() < 1e-3,
+                            "rotation {rotation}: round-trip min.y"
+                        );
+                        assert!(
+                            (g_max.x - max.x).abs() < 1e-3,
+                            "rotation {rotation}: round-trip max.x"
+                        );
+                        assert!(
+                            (g_max.y - max.y).abs() < 1e-3,
+                            "rotation {rotation}: round-trip max.y"
+                        );
+                    }
+                    other => panic!("rotation {rotation}: geometry type changed: {other:?}"),
+                }
+            }
+        }
+
+        /// Second, INDEPENDENT effect found during this investigation (not one of the
+        /// dispatch's named suspects): a page whose `/MediaBox` doesn't start at absolute
+        /// (0,0) drifts the same way rotation does, with NO rotation involved at all.
+        /// Confirmed empirically against real PDFium rendering - see the module doc
+        /// comment above `display_to_true`.
+        #[test]
+        fn offset_origin_mediabox_is_corrected_with_no_rotation_involved() {
+            use lopdf::{dictionary, Document, Object, Stream};
+
+            let mut doc = Document::with_version("1.5");
+            let pages_id = doc.new_object_id();
+            let content_id = doc.add_object(Stream::new(dictionary! {}, b"BT ET".to_vec()));
+            // MediaBox origin at (36,36), NOT (0,0) - a trimmed/cropped sheet.
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![36.into(), 36.into(), 576.into(), 756.into()],
+                "Contents" => content_id,
+            });
+            doc.objects.insert(
+                pages_id,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![page_id.into()],
+                    "Count" => 1,
+                }),
+            );
+            let catalog_id =
+                doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+            doc.trailer.set("Root", catalog_id);
+
+            // `min`/`max` here are, BY THE SAME CONVENTION AS EVERYWHERE ELSE IN THE APP,
+            // "PDFium display space" values - i.e. LOCAL to this page's own MediaBox
+            // origin (36,36), exactly what a real captured screen click would produce via
+            // `get_page_size`/`screenToPdfUserSpace`. There is no way for `write_markups`
+            // to distinguish "this Markup was built by a test" from "this Markup was
+            // authored by a real click" - and there must not be one, or the conversion
+            // would silently depend on how a caller happened to construct the value.
+            let (min, max) = (
+                PdfPoint { x: 100.0, y: 100.0 },
+                PdfPoint { x: 150.0, y: 150.0 },
+            );
+            let m = rect_markup(min, max);
+            write_markups(&mut doc, std::slice::from_ref(&m)).unwrap();
+
+            let annots = page_annots(&doc, page_id).unwrap();
+            let (_, dict) = annots.iter().find(|(_, d)| d.has(b"RLType")).unwrap();
+            let got = reals(dict, b"RLRect");
+            // Hand-computed true (absolute) space: rotation=0 so the rotation step is the
+            // identity, and the offset is added straight through - true = display + origin.
+            let exp_min = expected_true(min, 0, 540.0, 720.0, 36.0, 36.0);
+            let exp_max = expected_true(max, 0, 540.0, 720.0, 36.0, 36.0);
+            assert!(
+                (got[0] - exp_min.x).abs() < 1e-3,
+                "/RLRect min.x = {} != {}",
+                got[0],
+                exp_min.x
+            );
+            assert!(
+                (got[1] - exp_min.y).abs() < 1e-3,
+                "/RLRect min.y = {} != {}",
+                got[1],
+                exp_min.y
+            );
+            assert!(
+                (got[2] - exp_max.x).abs() < 1e-3,
+                "/RLRect max.x = {} != {}",
+                got[2],
+                exp_max.x
+            );
+            assert!(
+                (got[3] - exp_max.y).abs() < 1e-3,
+                "/RLRect max.y = {} != {}",
+                got[3],
+                exp_max.y
+            );
+
+            let reread = read_markups(&doc).unwrap();
+            match &reread[0].geometry {
+                MarkupGeometry::Rect {
+                    min: g_min,
+                    max: g_max,
+                } => {
+                    assert!((g_min.x - min.x).abs() < 1e-3);
+                    assert!((g_min.y - min.y).abs() < 1e-3);
+                    assert!((g_max.x - max.x).abs() < 1e-3);
+                    assert!((g_max.y - max.y).abs() < 1e-3);
+                }
+                other => panic!("geometry type changed: {other:?}"),
+            }
+        }
+
+        /// The compound case: a rotated page whose `/MediaBox` ALSO doesn't start at
+        /// (0,0) - the two effects are independent and must compose without a residual
+        /// offset. `ox=20,oy=40`, 90-degree rotation, 592x752 true page (W0=592,H0=752
+        /// deliberately different from the other tests' 612x792 so a copy-paste of the
+        /// wrong constant would be caught).
+        #[test]
+        fn rotation_and_offset_origin_compose_correctly() {
+            use lopdf::{dictionary, Document, Object, Stream};
+
+            let (w0, h0, ox, oy) = (592.0, 752.0, 20.0, 40.0);
+            let mut doc = Document::with_version("1.5");
+            let pages_id = doc.new_object_id();
+            let content_id = doc.add_object(Stream::new(dictionary! {}, b"BT ET".to_vec()));
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![ox.into(), oy.into(), (ox + w0).into(), (oy + h0).into()],
+                "Rotate" => 90,
+                "Contents" => content_id,
+            });
+            doc.objects.insert(
+                pages_id,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![page_id.into()],
+                    "Count" => 1,
+                }),
+            );
+            let catalog_id =
+                doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+            doc.trailer.set("Root", catalog_id);
+
+            let (min, max) = (
+                PdfPoint { x: 30.0, y: 40.0 },
+                PdfPoint { x: 90.0, y: 140.0 },
+            );
+            let m = rect_markup(min, max);
+            write_markups(&mut doc, std::slice::from_ref(&m)).unwrap();
+
+            let annots = page_annots(&doc, page_id).unwrap();
+            let (_, dict) = annots.iter().find(|(_, d)| d.has(b"RLType")).unwrap();
+            let exp_min = expected_true(min, 90, w0, h0, ox, oy);
+            let exp_max = expected_true(max, 90, w0, h0, ox, oy);
+            let want = [
+                exp_min.x.min(exp_max.x),
+                exp_min.y.min(exp_max.y),
+                exp_min.x.max(exp_max.x),
+                exp_min.y.max(exp_max.y),
+            ];
+            let got = reals(dict, b"RLRect");
+            for i in 0..4 {
+                assert!(
+                    (got[i] - want[i]).abs() < 1e-3,
+                    "/RLRect[{i}] = {} != hand-computed {}",
+                    got[i],
+                    want[i]
+                );
+            }
+
+            let reread = read_markups(&doc).unwrap();
+            match &reread[0].geometry {
+                MarkupGeometry::Rect {
+                    min: g_min,
+                    max: g_max,
+                } => {
+                    assert!((g_min.x - min.x).abs() < 1e-3, "round-trip min.x");
+                    assert!((g_min.y - min.y).abs() < 1e-3, "round-trip min.y");
+                    assert!((g_max.x - max.x).abs() < 1e-3, "round-trip max.x");
+                    assert!((g_max.y - max.y).abs() < 1e-3, "round-trip max.y");
+                }
+                other => panic!("geometry type changed: {other:?}"),
             }
         }
     }

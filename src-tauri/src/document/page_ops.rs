@@ -467,7 +467,24 @@ pub(crate) mod tests {
     // Round-trip tests (critical guardrail)
     // ------------------------------------------------------------------
 
-    /// After rotate: save to disk, reload, assert markup geometry is exactly preserved.
+    /// After rotate: save to disk, reload, assert the markup survives AND its DISPLAY-space
+    /// geometry follows the rotation - it stays attached to the same physical content,
+    /// exactly like every conforming PDF viewer rotates content and annotations together
+    /// as one rigid unit (ISO 32000-1 - `/Rotate` is a whole-page viewing transform, never
+    /// a change to the stored coordinate system).
+    ///
+    /// Pre-2026-08-06-fix this test asserted raw numeric equality (the OLD, buggy
+    /// assumption that a markup's in-memory `geometry` and the PDF's true default user
+    /// space were interchangeable regardless of rotation - see the rotation-interop
+    /// comment block in `document::annots` for the full mechanism and why that was wrong).
+    /// `write_markups` runs here while the page is STILL unrotated (rotation=0, i.e. the
+    /// identity transform - the write is unaffected by the later `rotate_page` call), so
+    /// the stored true-space `/Rect`/`/RLRect` values are exactly the authored (10,10)/
+    /// (50,10)/(50,40) points. After `rotate_page` sets `/Rotate 90` (touching ONLY the
+    /// page dict, never the annotation), re-reading now converts those SAME true-space
+    /// values into 90°-rotated DISPLAY space - the hand-computed expected points below,
+    /// using the exact `(x,y) -> (y, w0-x)` transform this fix introduces (`w0` = the
+    /// page's true, unrotated MediaBox width, 612 from `n_page_doc`).
     #[test]
     fn rotate_page_roundtrip_preserves_markups() {
         let (mut doc, _) = n_page_doc(2);
@@ -482,18 +499,17 @@ pub(crate) mod tests {
         let reloaded = load_markups_from(&path, None).unwrap();
         assert_eq!(reloaded.len(), 1, "markup survives rotate round-trip");
         assert_eq!(reloaded[0].id(), m.id());
-        // Geometry coordinates must be exactly preserved (no f32 precision loss).
-        match (&reloaded[0].geometry, &m.geometry) {
-            (
-                crate::markup::MarkupGeometry::Polyline(got),
-                crate::markup::MarkupGeometry::Polyline(exp),
-            ) => {
-                for (g, e) in got.iter().zip(exp.iter()) {
-                    assert_eq!(g.x, e.x, "x coordinate exact");
-                    assert_eq!(g.y, e.y, "y coordinate exact");
+        // Authored true-space points (10,10),(50,10),(50,40) mapped through
+        // (x,y) -> (y, 612-x) for a 90-degree rotation on a 612x792 MediaBox.
+        let expected = [(10.0, 602.0), (10.0, 562.0), (40.0, 562.0)];
+        match &reloaded[0].geometry {
+            crate::markup::MarkupGeometry::Polyline(got) => {
+                for (g, (ex, ey)) in got.iter().zip(expected.iter()) {
+                    assert!((g.x - ex).abs() < 1e-4, "x coordinate: {} != {ex}", g.x);
+                    assert!((g.y - ey).abs() < 1e-4, "y coordinate: {} != {ey}", g.y);
                 }
             }
-            _ => panic!("geometry type changed"),
+            other => panic!("geometry type changed: {other:?}"),
         }
 
         // Rotation is present in the reloaded document.

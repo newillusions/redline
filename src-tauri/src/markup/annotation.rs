@@ -211,28 +211,6 @@ fn from_pdf_date(s: &str) -> Option<DateTime<Utc>> {
 
 // --- geometry <-> dict ---------------------------------------------------------
 
-fn bbox(g: &MarkupGeometry) -> [f64; 4] {
-    let pts: Vec<PdfPoint> = match g {
-        MarkupGeometry::Point(p) => vec![*p],
-        MarkupGeometry::Rect { min, max } => vec![*min, *max],
-        MarkupGeometry::Polyline(v) => v.clone(),
-        MarkupGeometry::Ink(strokes) => strokes.iter().flatten().copied().collect(),
-        MarkupGeometry::Quads(quads) => quads.iter().flatten().copied().collect(),
-    };
-    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-    for p in &pts {
-        x0 = x0.min(p.x);
-        y0 = y0.min(p.y);
-        x1 = x1.max(p.x);
-        y1 = y1.max(p.y);
-    }
-    if pts.is_empty() {
-        [0.0, 0.0, 0.0, 0.0]
-    } else {
-        [x0, y0, x1, y1]
-    }
-}
-
 fn geom_tag(g: &MarkupGeometry) -> &'static str {
     match g {
         MarkupGeometry::Point(_) => "point",
@@ -296,6 +274,29 @@ fn geometry_from_dict(d: &Dictionary) -> MarkupGeometry {
                 x: (x0 + x1) / 2.0,
                 y: (y0 + y1) / 2.0,
             })
+        }
+        Some("rect") => {
+            // /Rect is no longer a reliable source for Rect-type geometry (Rectangle,
+            // Ellipse, Stamp, StampDynamic): since the 2026-08-06 BBox-to-Rect interop fix,
+            // /Rect equals `appearance::ap_bbox`, which is PADDED for every type
+            // `interop_rect` doesn't special-case (see `to_annotation_dict`'s doc comment).
+            // The exact authored geometry is preserved losslessly in the private /RLRect
+            // key instead - same pattern as Polyline's /Vertices alongside /L/CL. Falls
+            // back to /Rect for annotations saved before this fix (no /RLRect key yet) -
+            // those still have the OLD tight-bbox /Rect, so the fallback is still exact.
+            let r = get_reals(d, b"RLRect")
+                .or_else(|| get_reals(d, b"Rect"))
+                .unwrap_or_else(|| vec![0.0, 0.0, 0.0, 0.0]);
+            MarkupGeometry::Rect {
+                min: PdfPoint {
+                    x: r.first().copied().unwrap_or(0.0),
+                    y: r.get(1).copied().unwrap_or(0.0),
+                },
+                max: PdfPoint {
+                    x: r.get(2).copied().unwrap_or(0.0),
+                    y: r.get(3).copied().unwrap_or(0.0),
+                },
+            }
         }
         Some("poly") => {
             let r = get_reals(d, b"Vertices")
@@ -369,12 +370,22 @@ impl Markup {
         d.set("Type", name("Annot"));
         d.set("Subtype", name(pdf_subtype(t)));
 
-        // Bounding box + per-shape geometry. For FreeText (Text/Callout) and count markers
-        // the /Rect must equal the /AP /BBox (see appearance::interop_rect) so a strict
-        // foreign viewer maps the appearance identically instead of rescaling it (resized
-        // FreeText) or dropping a zero-size rect (count markers). Every other type keeps the
-        // tight geometry bbox.
-        let bb = super::appearance::interop_rect(self).unwrap_or_else(|| bbox(&self.geometry));
+        // Bounding box + per-shape geometry. /Rect MUST equal the /AP /BBox for every
+        // markup type (`appearance::ap_bbox` is the single shared source for both) so a
+        // strict foreign viewer's BBox-to-Rect fit (ISO 32000-1 12.5.5) is always the
+        // identity map instead of rescaling the appearance toward its own centre. Before
+        // this fix only Text/Callout/MeasurementCount got the identity treatment (via
+        // `appearance::interop_rect`); every other type kept the tight geometry bbox here
+        // while its `/AP /BBox` was independently padded larger for stroke/arrowhead room
+        // (`appearance::ap_bbox`), so a strict reader honouring `/AP` (proven with PDFium's
+        // own annotation renderer in `render::tests::
+        // strict_reader_annotation_appearance_paints_at_the_authored_rect_not_shrunk_to_fit`,
+        // standing in for Bluebeam) visibly shrank every one of those shapes - the root
+        // cause of the "markups show up in different locations in Bluebeam" report
+        // (2026-08-06). `bbox()` (this module's own tight-geometry helper) is retired:
+        // `ap_bbox()` already falls back to the tight bbox, PADDED, for every type
+        // `interop_rect` doesn't special-case.
+        let bb = super::appearance::ap_bbox(self);
         d.set("Rect", Object::Array(bb.iter().map(|v| real(*v)).collect()));
         match &self.geometry {
             MarkupGeometry::Polyline(pts) => {
@@ -412,7 +423,13 @@ impl Markup {
                 // otherwise treat as the only geometry.
                 d.set("QuadPoints", flatten_quads(quads));
             }
-            MarkupGeometry::Point(_) | MarkupGeometry::Rect { .. } => {}
+            MarkupGeometry::Rect { min, max } => {
+                // Lossless authored geometry, independent of /Rect - see geometry_from_dict's
+                // "rect" arm doc comment for why /Rect alone is no longer sufficient (it is
+                // now `ap_bbox`, PADDED for every type `interop_rect` doesn't special-case).
+                d.set("RLRect", flatten(&[*min, *max]));
+            }
+            MarkupGeometry::Point(_) => {}
         }
 
         // Identity + text (spec §6 embed map).
@@ -1090,9 +1107,13 @@ mod tests {
         let m = fixture(MarkupGeometry::Quads(quads), MarkupType::Highlight);
         let d = m.to_annotation_dict();
         let rect = get_reals(&d, b"Rect").expect("/Rect present");
-        // bbox = [left, bottom, right, top] spanning both quads (min x=72, min y=686,
-        // max x=500, max y=712).
-        assert_eq!(rect, vec![72.0, 686.0, 500.0, 712.0]);
+        // Tight bbox spanning both quads (min x=72, min y=686, max x=500, max y=712),
+        // PADDED by `appearance::ap_bbox` (2026-08-06 fix: /Rect == /AP /BBox for every
+        // type, so a strict reader's BBox-to-Rect fit is always the identity map - see
+        // `to_annotation_dict`'s doc comment). Highlight isn't one of `interop_rect`'s
+        // identity-mapped types, so it gets the generic pad: `fixture()` sets
+        // line_weight=2.5, so pad = (2.5*3.0).max(6.0) = 7.5 on every side.
+        assert_eq!(rect, vec![64.5, 678.5, 507.5, 719.5]);
     }
 
     #[test]

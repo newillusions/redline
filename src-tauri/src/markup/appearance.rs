@@ -10,9 +10,10 @@
 //! # Coordinate space
 //! The Form's `/BBox` is expressed in the SAME PDF user-space coordinates as the markup's own
 //! geometry (no `/Matrix`, so it defaults to identity) - drawing operators use the raw geometry
-//! coordinates directly. `/BBox` is a dedicated computation ([`ap_bbox`]), independent of the
-//! annotation's own `/Rect` (which stays exactly as `to_annotation_dict` already computes it -
-//! this module never touches that function or the semantic `/RL*`/`/QuadPoints` keys).
+//! coordinates directly. `/BBox` is computed by [`ap_bbox`], which `annotation::to_annotation_dict`
+//! ALSO calls directly to source `/Rect` - the two are always the SAME box (2026-08-06 fix; see
+//! [`ap_bbox`]'s doc comment for why they must never be allowed to drift apart again). This
+//! module still never touches the semantic `/RL*`/`/QuadPoints` keys, only `/Rect` and `/AP`.
 //!
 //! # Opacity
 //! The annotation-level `/CA` (already written by `to_annotation_dict`) is applied by the
@@ -200,27 +201,37 @@ pub(crate) fn finish_ap_stream(built: ApBuild, xobject_refs: Dictionary) -> Stre
 }
 
 // ---------------------------------------------------------------------------
-// BBox - independent of the annotation's semantic /Rect (that one stays untouched).
+// BBox - since the annotation-interop fix (2026-08-06), `annotation.rs`'s `/Rect` is
+// ALWAYS sourced from `ap_bbox()` too, so `/Rect` and `/AP /BBox` can never drift apart.
 // ---------------------------------------------------------------------------
 
-/// The annotation `/Rect` AND the `/AP` Form `/BBox` for the shapes where the two MUST be
-/// identical for a strict foreign viewer (Bluebeam) to render the appearance at the authored
-/// size. A strict viewer maps the transformed appearance `/BBox` into the annotation `/Rect`
-/// (ISO 32000-1 12.5.5); when they disagree the whole appearance is scaled/distorted. For
-/// these types the rect is the exact bounds of what the appearance draws, so `annotation.rs`
-/// uses it for `/Rect` and [`ap_bbox`] uses it for `/BBox`, giving an identity map:
-///  - `Text`: the geometry `Rect` (box == text bounds).
+/// A shape-specific override for the box [`ap_bbox`] returns, for the types where the
+/// PLAIN geometry bbox is the wrong box even before padding - not just "tight vs padded"
+/// but genuinely missing part of what the appearance draws:
+///  - `Text`: the geometry `Rect` (box == text bounds) - no padding needed, it already IS
+///    the appearance bounds.
 ///  - `Callout`: the leader bounds UNIONED with the synthesized text box, which sits beyond
 ///    the leader vertices (the plain geometry bbox omits it - the "resized callout tiny in
 ///    Bluebeam" G9 defect).
 ///  - `MeasurementCount`: the symbol's bounds around the point. The zero-size Point geometry
-///    otherwise yields a zero `/Rect` that Bluebeam drops entirely (the "counts absent" G9
+///    otherwise yields a zero box that Bluebeam drops entirely (the "counts absent" G9
 ///    defect); the point is recovered from the `/Rect` centre on read.
 ///
-/// Returns `None` for every other type, whose `/Rect` stays the tight geometry bbox and whose
-/// `/BBox` keeps its stroke-padded bounds - Bluebeam regenerates those from the geometry keys
-/// and ignores the `/AP`, so the two need not match and the stroke pad avoids clipping in
-/// `/AP`-honouring viewers (Acrobat/PDFium).
+/// Returns `None` for every other type, which falls through to [`ap_bbox`]'s generic
+/// stroke-padded geometry bounds instead.
+///
+/// HISTORY (bug fixed 2026-08-06, see `annotation::to_annotation_dict`'s call-site doc
+/// comment): this function's box used to be the ONLY thing shared between `/Rect` and
+/// `/AP /BBox` - every OTHER type kept a tight, unpadded `/Rect` while `/AP /BBox` was
+/// independently padded larger, on the assumption that "Bluebeam regenerates those from
+/// the geometry keys and ignores the `/AP`". That assumption was never actually verified
+/// (CLAUDE.md's G9 human Acrobat/Bluebeam check is still owed) and was wrong: a strict
+/// reader that DOES honour `/AP` (proven here with PDFium's own annotation renderer,
+/// `render::tests::strict_reader_annotation_appearance_paints_at_the_authored_rect_not_shrunk_to_fit`)
+/// applies the ISO 32000-1 12.5.5 BBox-to-Rect fit and visibly shrinks the appearance
+/// toward its own centre whenever `/AP /BBox` is bigger than `/Rect`. `/Rect` is now
+/// ALWAYS `ap_bbox(m)` (this function's result when `Some`, else the padded geometry
+/// bbox) for every type, making the fit an identity map everywhere, not just here.
 pub(crate) fn interop_rect(m: &Markup) -> Option<[f64; 4]> {
     match (m.markup_type, &m.geometry) {
         (MarkupType::Text, MarkupGeometry::Rect { min, max }) => Some([
@@ -255,11 +266,15 @@ pub(crate) fn interop_rect(m: &Markup) -> Option<[f64; 4]> {
     }
 }
 
-/// The Form's own bounding box: for the interop-critical types ([`interop_rect`]) it equals
-/// the annotation `/Rect` exactly (identity map, no viewer rescale); for every other type
-/// it is the geometry's tight bounds, padded so strokes, arrowheads, and glyph ascenders/
-/// descenders never clip against the edge.
-fn ap_bbox(m: &Markup) -> [f64; 4] {
+/// The Form's own bounding box - and, as of the annotation-interop fix below, the ONLY
+/// source `annotation::to_annotation_dict` uses for `/Rect` too, for every markup type.
+/// For the interop-critical types ([`interop_rect`]) it equals the annotation `/Rect`
+/// exactly (identity map, no viewer rescale); for every other type it is the geometry's
+/// tight bounds, padded so strokes, arrowheads, and glyph ascenders/descenders never clip
+/// against the edge. `pub(crate)` (was private) so `annotation::to_annotation_dict` can
+/// call it directly and guarantee `/Rect` and `/AP /BBox` can never drift apart again -
+/// see the doc comment at that call site for why they must always agree.
+pub(crate) fn ap_bbox(m: &Markup) -> [f64; 4] {
     if let Some(rect) = interop_rect(m) {
         return rect;
     }

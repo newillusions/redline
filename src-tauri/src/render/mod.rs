@@ -1820,6 +1820,264 @@ pub(crate) mod tests {
         );
     }
 
+    /// Cross-viewer interop regression (owner report 2026-08-06, v0.3.11: "the markups
+    /// from redline show up in different locations in bluebeam now"). PDF spec 12.5.5's
+    /// annotation-appearance algorithm maps the (`/Matrix`-transformed) `/AP /N` `/BBox`
+    /// onto the annotation's own `/Rect` via an anisotropic scale+translate fit.
+    /// `appearance::ap_bbox` deliberately pads several shape families' `/BBox` LARGER than
+    /// the tight geometry `/Rect` (stroke/arrowhead clearance) - for any type NOT covered
+    /// by `appearance::interop_rect` (i.e. every shape except Text/Callout/
+    /// MeasurementCount), that padding is exactly the bug: `interop_rect`'s own doc
+    /// comment ASSUMED "Bluebeam regenerates those from the geometry keys and ignores the
+    /// /AP" - an assumption the module comment admits was never confirmed (CLAUDE.md's G9
+    /// human Acrobat/Bluebeam check is still owed). A STRICT reader that DOES honour `/AP`
+    /// (PDFium's own annotation renderer here, standing in for Bluebeam per the dispatch's
+    /// pdfium-cross-validation requirement) rescales the drawn content to fit the tighter
+    /// `/Rect`, shrinking it uniformly around its own centre - invisible to redline's own
+    /// viewer, which disables `render_annotations` and draws an accurate SVG overlay
+    /// instead (see the sibling `..._double_render_bug` test above).
+    ///
+    /// Hand-computed expected shift for THIS fixture (Rectangle, default `line_weight` 1.0
+    /// -> `ap_bbox` pad = `(1.0 * 3.0).max(6.0)` = 6.0):
+    ///   `/Rect` = `[200, 300, 300, 400]`  (tight geometry bbox, `annotation::bbox`)
+    ///   `/BBox` = `[194, 294, 306, 406]`  (padded ±6 every side, `appearance::ap_bbox`)
+    ///   scaleX = scaleY = (300-200)/(306-194) = 100/112 = 0.892857...
+    ///   translateX = 200 - 194*scaleX = 26.7857...  translateY = 300 - 294*scaleY = 37.5
+    ///   mapped content rect (BEFORE the fix) = `[205.357, 305.357, 294.643, 394.643]` -
+    ///   every edge inset ~5.357pt from the authored `[200,300]-[300,400]`, centre
+    ///   (250,350) exactly preserved (padding is symmetric on every side).
+    /// AFTER the fix (`/Rect` widened to equal `/BBox` for every shape family - the same
+    /// identity-map treatment `interop_rect` already gives Text/Callout/Count), scaleX =
+    /// scaleY = 1, translate = 0 -> the appearance paints at the AUTHORED coordinates with
+    /// no distortion, which is what this test asserts.
+    #[test]
+    fn strict_reader_annotation_appearance_paints_at_the_authored_rect_not_shrunk_to_fit() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+
+        let (mut doc, _page_id) = crate::document::annots::tests::one_page_doc();
+        let markup = crate::markup::Markup::new(
+            crate::markup::MarkupType::Rectangle,
+            0,
+            crate::markup::MarkupGeometry::Rect {
+                min: crate::geometry::PdfPoint { x: 200.0, y: 300.0 },
+                max: crate::geometry::PdfPoint { x: 300.0, y: 400.0 },
+            },
+            crate::markup::Appearance {
+                fill: Some("#FF0000".to_string()),
+                ..crate::markup::Appearance::default()
+            },
+            crate::markup::UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: "Test".to_string(),
+            },
+        );
+        crate::document::annots::write_markups(&mut doc, std::slice::from_ref(&markup))
+            .expect("write_markups");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("annot-fit.pdf");
+        doc.save(&path).expect("save fixture");
+
+        // Independent load via pdfium-render's own STANDARD render path (not redline's
+        // custom-matrix tile path, which deliberately disables render_annotations - see
+        // the sibling test above). This exercises the real spec-12.5.5 BBox-to-Rect fit,
+        // which is exactly what a strict foreign reader like Bluebeam is expected to run.
+        let bindings = Pdfium::bind_to_library(
+            std::env::var("PDFIUM_DYNAMIC_LIB_PATH").expect("checked above"),
+        )
+        .expect("bind pdfium");
+        let pdfium = Pdfium::new(bindings);
+        let document = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load fixture");
+        let page = document.pages().get(0).expect("page 0");
+
+        // 1pt = 1px so hand-computed PDF-space coordinates translate directly to pixels.
+        let render_config = PdfRenderConfig::new()
+            .scale_page_by_factor(1.0)
+            .render_annotations(true); // exercise the real fit, unlike render_tile's config
+        let bitmap = page
+            .render_with_config(&render_config)
+            .expect("pdfium render with annotations");
+        let img = bitmap.as_image().into_rgba8();
+
+        // Pixel-space bounding box of whatever fill colour PDFium actually painted.
+        let is_red = |p: &image::Rgba<u8>| {
+            let [r, g, b, a] = p.0;
+            a > 0 && r > 180 && g < 100 && b < 100
+        };
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        let mut found = false;
+        for (x, y, p) in img.enumerate_pixels() {
+            if is_red(p) {
+                found = true;
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+        assert!(
+            found,
+            "no red pixel painted at all - annotation appearance missing"
+        );
+
+        // Authored geometry in DEVICE pixel space (page height 792, PDF y-up -> device
+        // y-down flip): x:[200,300], y:[792-400, 792-300] = [392,492].
+        let expected = (200i64, 392i64, 300i64, 492i64);
+        // The pre-fix shrink is ~5.36pt/px per edge (see the derivation above) - an order
+        // of magnitude bigger than this tolerance, so the two cases are cleanly
+        // distinguishable; this only absorbs antialiasing/rounding noise.
+        let tol = 2i64;
+        assert!(
+            (x0 as i64 - expected.0).abs() <= tol
+                && (y0 as i64 - expected.1).abs() <= tol
+                && (x1 as i64 - expected.2).abs() <= tol
+                && (y1 as i64 - expected.3).abs() <= tol,
+            "annotation appearance painted at [{x0},{y0}]-[{x1},{y1}]px, expected \
+             [{},{}]-[{},{}]px (authored geometry, ±{tol}px) - a strict PDF-spec-12.5.5 \
+             reader is fitting the padded /AP /BBox into the tighter /Rect and shrinking \
+             the shape toward its own centre",
+            expected.0,
+            expected.1,
+            expected.2,
+            expected.3
+        );
+    }
+
+    /// Second cross-viewer interop regression, independent renderer, ROTATED page this
+    /// time: a strict reader (PDFium's OWN full rendering pipeline - `render_with_config`
+    /// with no custom matrix, so `/Rotate` is applied automatically exactly like a real
+    /// PDF viewer) must show the annotation at the SAME point on the physical page as
+    /// redline's own display. Ties together BOTH fixes end-to-end: `document::annots`'s
+    /// rotation-aware write (`display_to_true`) supplies spec-correct TRUE-space `/Rect`/
+    /// `/AP` coordinates, and `markup::appearance::ap_bbox` (the sibling BBox-to-Rect fit
+    /// fix above) keeps the appearance from also being rescaled - without both, this test
+    /// would fail two different ways (wrong quadrant of the page from the un-rotated
+    /// coordinates, ADDITIONALLY shrunk from the BBox padding).
+    ///
+    /// A Text markup is used here (not Rectangle) specifically because Text's `/Rect`
+    /// already equals its `/AP /BBox` via `interop_rect` - isolating the ROTATION
+    /// transform's own correctness without also depending on the exact padding pixel math
+    /// covered by the sibling test above.
+    #[test]
+    fn strict_reader_places_annotation_correctly_on_a_rotated_page() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+
+        // 612x792 MediaBox, /Rotate 90 (set via the same page_ops the app itself uses for
+        // a user-invoked page rotation - not hand-authored, so this exercises the exact
+        // production code path).
+        let (mut doc, _page_id) = crate::document::annots::tests::one_page_doc();
+        crate::document::page_ops::rotate_page(&mut doc, 0, 90).expect("rotate_page");
+
+        // Authored in "PDFium display space" (612x792 unrotated MediaBox rotated 90 ->
+        // 792x612 display) - a Text box near the display-space top-right, at
+        // display (700,10)-(750,60). Filled black so its rendered pixels are easy to find.
+        let mut m = crate::markup::Markup::new(
+            crate::markup::MarkupType::Text,
+            0,
+            crate::markup::MarkupGeometry::Rect {
+                min: crate::geometry::PdfPoint { x: 700.0, y: 10.0 },
+                max: crate::geometry::PdfPoint { x: 750.0, y: 60.0 },
+            },
+            crate::markup::Appearance {
+                fill: Some("#000000".to_string()),
+                color: "#000000".to_string(),
+                ..crate::markup::Appearance::default()
+            },
+            crate::markup::UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: "Test".to_string(),
+            },
+        );
+        m.contents = Some("x".into());
+        crate::document::annots::write_markups(&mut doc, std::slice::from_ref(&m))
+            .expect("write_markups");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rotated-annot.pdf");
+        doc.save(&path).expect("save fixture");
+
+        let bindings = Pdfium::bind_to_library(
+            std::env::var("PDFIUM_DYNAMIC_LIB_PATH").expect("checked above"),
+        )
+        .expect("bind pdfium");
+        let pdfium = Pdfium::new(bindings);
+        let document = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load fixture");
+        let page = document.pages().get(0).expect("page 0");
+
+        // Full PDFium rendering pipeline (NOT redline's custom-matrix tile path) - this is
+        // what applies `/Rotate` automatically, exactly like a real conforming viewer.
+        // The rotated page's OWN reported size is 792x612 (width/height swapped -
+        // confirmed against the PDFium public header: "Changing the rotation of |page|
+        // affects the return value").
+        let render_config = PdfRenderConfig::new()
+            .scale_page_by_factor(1.0)
+            .render_annotations(true);
+        let bitmap = page
+            .render_with_config(&render_config)
+            .expect("pdfium render with annotations");
+        let img = bitmap.as_image().into_rgba8();
+        assert_eq!(
+            img.width(),
+            792,
+            "rotated page renders at swapped (792x612) size"
+        );
+        assert_eq!(img.height(), 612);
+
+        let is_black = |p: &image::Rgba<u8>| {
+            let [r, g, b, a] = p.0;
+            a > 0 && r < 60 && g < 60 && b < 60
+        };
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        let mut found = false;
+        for (x, y, p) in img.enumerate_pixels() {
+            if is_black(p) {
+                found = true;
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+        assert!(
+            found,
+            "no black pixel painted at all - annotation appearance missing"
+        );
+
+        // Authored DISPLAY-space rect [700,10]-[750,60] -> device pixels (792-tall...792
+        // wide, y-up->y-down flip against the DISPLAY height 612, since PDFium is showing
+        // this page in its own already-rotated 792x612 frame and the annotation's /Rect
+        // was written to line up with exactly that frame): x:[700,750],
+        // y:[612-60,612-10] = [552,602].
+        let expected = (700i64, 552i64, 750i64, 602i64);
+        let tol = 3i64; // font metrics/antialiasing slack (Text draws glyph ink, not a
+                        // hard-edged fill, so this needs a little more room than the
+                        // filled-rectangle sibling test above).
+        assert!(
+            (x0 as i64 - expected.0).abs() <= tol
+                && (y0 as i64 - expected.1).abs() <= tol
+                && (x1 as i64 - expected.2).abs() <= tol
+                && (y1 as i64 - expected.3).abs() <= tol,
+            "annotation painted at [{x0},{y0}]-[{x1},{y1}]px, expected roughly \
+             [{},{}]-[{},{}]px (authored display-space geometry rotated into PDFium's own \
+             792x612 display frame, ±{tol}px) - the rotation-aware write in \
+             document::annots (display_to_true) is not correctly compensating for /Rotate",
+            expected.0,
+            expected.1,
+            expected.2,
+            expected.3
+        );
+    }
+
     // -----------------------------------------------------------------------
     // page_snap_index integration tests (spec §5, v1). Corpus-free — builds a
     // synthetic fixture with a real path-drawing content stream directly (same
