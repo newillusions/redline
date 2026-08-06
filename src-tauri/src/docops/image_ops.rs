@@ -28,8 +28,13 @@
 //!    size, capped so we **never upsample** (only ever shrink or leave alone). An image
 //!    with no discoverable placement (not reached by the content-stream walk) is treated
 //!    conservatively: quality re-encode only, no resize.
-//! 3. Decode, optionally resize (Lanczos3), re-encode as baseline JPEG at
-//!    `preset.jpeg_quality()`, and only replace the stream if the result is strictly
+//! 3. Decode, optionally resize (Lanczos3), and re-encode. Two candidate encodings are
+//!    compared - baseline JPEG at `preset.jpeg_quality()`, and plain unfiltered raw
+//!    samples - and whichever is smaller is used (for very small images JPEG's fixed
+//!    header/marker overhead can exceed the raw byte count outright; this matches
+//!    measured behavior from a real Bluebeam Revu "Reduce File Size" reference pair,
+//!    which stores its own tiny recompressed images - e.g. 9x9 px - unfiltered rather
+//!    than as JPEG). The stream is only replaced if the winning candidate is strictly
 //!    smaller than the original (never regress an already-efficient image).
 //!
 //! # Safety bar (spec §8, "never risk a wrong pixel on a construction drawing")
@@ -547,19 +552,42 @@ fn process_one_image(
         pixels
     };
 
-    let Some(jpeg_bytes) = encode_jpeg(
+    let jpeg_bytes = encode_jpeg(
         &final_pixels,
         new_w,
         new_h,
         plan.color_class,
         preset.jpeg_quality(),
-    ) else {
-        stats.record_skip("encode-failed");
-        return;
+    );
+
+    // For very small images, JPEG's fixed header/marker overhead can exceed the raw
+    // sample count outright - measured against a real Bluebeam Revu "Reduce File Size"
+    // reference pair (bench/corpus/bb-ref/): Revu stores tiny recompressed images (e.g.
+    // 9x9, down from a 36x36 JPEG) as plain unfiltered raw samples rather than JPEG,
+    // for exactly this reason. Pick whichever candidate is smaller; raw is always a
+    // valid PDF image representation (Filter absent, dict Width/Height/BitsPerComponent/
+    // ColorSpace describe it directly) - no extra caller-visible eligibility change.
+    let raw_len = final_pixels.len() as u64;
+    let jpeg_len = jpeg_bytes.as_ref().map(|b| b.len() as u64);
+    let use_raw = match jpeg_len {
+        Some(jl) => raw_len < jl,
+        None => true, // JPEG encode failed - raw is the only remaining candidate.
+    };
+
+    let (new_content, new_filter): (Vec<u8>, Option<&'static [u8]>) = if use_raw {
+        (final_pixels, None)
+    } else {
+        match jpeg_bytes {
+            Some(b) => (b, Some(b"DCTDecode")),
+            None => {
+                stats.record_skip("encode-failed");
+                return;
+            }
+        }
     };
 
     // Never regress: keep the original unless the new encoding is strictly smaller.
-    if (jpeg_bytes.len() as u64) >= plan.orig_len {
+    if (new_content.len() as u64) >= plan.orig_len {
         stats.record_skip("not-smaller");
         return;
     }
@@ -569,13 +597,18 @@ fn process_one_image(
         stats.record_skip("missing-object");
         return;
     };
-    let new_len = jpeg_bytes.len() as u64;
+    let new_len = new_content.len() as u64;
     stream.dict.remove(b"DecodeParms");
     stream.dict.remove(b"Decode");
-    stream.content = jpeg_bytes;
-    stream
-        .dict
-        .set("Filter", Object::Name(b"DCTDecode".to_vec()));
+    stream.content = new_content;
+    match new_filter {
+        Some(f) => {
+            stream.dict.set("Filter", Object::Name(f.to_vec()));
+        }
+        None => {
+            stream.dict.remove(b"Filter");
+        }
+    }
     stream.dict.set("Width", new_w as i64);
     stream.dict.set("Height", new_h as i64);
     stream.dict.set("BitsPerComponent", 8_i64);
@@ -1311,6 +1344,57 @@ mod tests {
         // don't shrink) — both are acceptable, but "images_downsampled" must be 0 since
         // 20x20 can never need enlarging under any DPI target we ship.
         assert_eq!(stats.images_downsampled, 0, "must never upsample");
+    }
+
+    #[test]
+    fn falls_back_to_raw_storage_when_jpeg_overhead_exceeds_raw_bytes() {
+        // A JPEG's fixed header/marker overhead (SOI/APP0/DQT/SOF/DHT/SOS/EOI - several
+        // hundred bytes minimum) reliably exceeds a 5x5 RGB raw sample count (75 bytes)
+        // regardless of pixel content, so this proves the raw-fallback mechanism
+        // deterministically rather than depending on a specific image's compressibility.
+        // Matches measured behavior from a real Bluebeam Revu reference file, which
+        // stores its own tiny recompressed images (9x9px) unfiltered rather than as JPEG.
+        let width = 5u32;
+        let height = 5u32;
+        let raw = synthetic_rgb(width, height);
+        let mut jpeg_bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_bytes, 90)
+            .encode(&raw, width, height, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        assert!(
+            jpeg_bytes.len() > (width * height * 3) as usize,
+            "test premise: JPEG overhead must exceed raw size ({}) for this to be meaningful, got {}",
+            width * height * 3,
+            jpeg_bytes.len()
+        );
+
+        let mut b = DocBuilder::new(5.0, 5.0); // 1:1 placement — isolates the encoding choice from resize.
+        let mut dict = raw_rgb_dict(width, height);
+        dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
+        b.place_image(dict, jpeg_bytes, 5.0, 5.0);
+        let (mut doc, _) = b.finish();
+
+        let stats = optimize_images_in_place(&mut doc, ImageQualityPreset::High).unwrap();
+        assert_eq!(
+            stats.images_recompressed, 1,
+            "skip_reasons: {:?}",
+            stats.skip_reasons
+        );
+
+        let img_id = doc
+            .objects
+            .iter()
+            .find_map(|(id, o)| match o {
+                Object::Stream(s) if is_image_stream(&s.dict) => Some(*id),
+                _ => None,
+            })
+            .unwrap();
+        let stream = doc.get_object(img_id).unwrap().as_stream().unwrap();
+        assert!(
+            stream.dict.get(b"Filter").is_err(),
+            "must fall back to unfiltered raw storage when it beats JPEG"
+        );
+        assert_eq!(stream.content.len(), (width * height * 3) as usize);
     }
 
     #[test]
