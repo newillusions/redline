@@ -2,8 +2,54 @@
 
 ## Current Status
 
-**main is at `f695610a` (PR #63, squash-merged 2026-08-05; was `88ba31a` post-wave-2,
-vector snap v1 + OCR descope, PR #62). Wave-3 shipped the three fixes from the wave-2b
+**main is still at `f695610a` (PR #63) - PR #67 is OPEN, CI green, NOT yet merged
+(orchestrator owns merge/deploy per dispatch scope). Branch
+`fix/docops-reseed-and-btx-subtype-guard`, head `39ee537c7b1c44a750e10b0bc2d0b94bfb428927`,
+https://forge.mms.name/emittiv/redline/pulls/67. Dispatched to investigate two live
+reports: "flatten and optimise don't seem to do anything" and ".btx file import issues."**
+
+**Flatten/optimize root cause (real bug, not cosmetic): MarkupStore (frontend) was never
+resynced after flatten_document/optimize_document/redact_document succeeded on the
+backend. The PDF was correctly rewritten, but the frontend kept showing the same
+markups as live/selectable (visually unchanged), and a LATER save would have
+resurrected the flattened annotations by re-writing the stale in-memory list - not
+just cosmetically silent, an actual data-integrity bug. Fixed via
+`src/lib/docops-handlers.ts::runDocOpAndReseed` wired into all three DocOps handlers
+in App.svelte. The "IPC level-arg-fails-to-bind" hypothesis was investigated and
+REFUTED (new casing tests in ipc.test.ts prove `optimizeDocument()`'s default level
+correctly resolves to 2). Backend now reports what happened instead of `Ok(())`:
+`flatten_document` returns the flattened count, `optimize_document` returns an
+`OptimizeReport` (bytes_before/bytes_after) - surfaced via a new `docOpsStatus`
+banner in App.svelte.**
+
+**.btx fix: `toolchest::btx::import_item` was missing the same `MARKUP_SUBTYPES`
+allowlist guard that `document::annots::read_markups` applies before calling
+`Markup::from_annotation_dict` - a Raw payload with an unmodeled subtype (Underline,
+StrikeOut, Widget, Popup, ...) silently imported as a bogus "Text" tool with no skip,
+no error. Fixed by exposing `MARKUP_SUBTYPES`/`subtype()` as `pub(crate)` and applying
+the guard in `import_item`.**
+
+**.btx NAMED, NOT FIXED - broader than first scoped: Martin corrected the diagnosis
+same-day - "stamps are part of the issue, but several more as well... naming is one,
+but also a number of items are incomplete or not the same as the original bb tool."
+The confirmed Stamp-appearance-loss gap (import always produces `stamp: None`,
+discarding the source graphic - see
+`tests::stamp_import_currently_drops_the_appearance_asset_named_gap_not_fixed_this_pass`)
+is ONE instance of this wider IMPORT-FIDELITY class, not the whole story. BLOCKED on
+real .btx sample files - Martin has been asked to drop them into `bench/corpus/btx/`
+(none present in this worktree). Do not start the naming/property-fidelity work
+without real samples to diff against - see obs:cxu0x9pn1czhjici5huh for the full
+analysis and the precondition. Mission record next_step `ns-btx-import-fidelity`.**
+
+**Tests: cargo test --lib 425/425 (416 baseline + 9 new). cargo clippy --all-targets
+0 warnings (incidentally cleared the one pre-existing redundant_closure warning in
+commands/docops.rs). npm test 705/705 (694 baseline + 11 new). npm run check 0 errors.
+npm run build clean. NOT done: live GUI re-verify in a real `cargo tauri dev` session
+(automated tests only this pass).**
+
+**Previous status (wave-3, superseded above but kept for context): main was at
+`f695610a` (PR #63, squash-merged 2026-08-05; was `88ba31a` post-wave-2, vector snap
+v1 + OCR descope, PR #62). Wave-3 shipped the three fixes from the wave-2b
 GUI validation pass (obs:us5j4ne1r5byjzle8u23): undo/redo now has a real keyboard +
 toolbar UI surface, ErrorBanner no longer occludes the toolbar-right panel-toggle
 buttons, and the tools/gui-harness.mjs license-mock fix (left uncommitted by the
@@ -24,7 +70,18 @@ compatible with rkyv 0.8. Detail: `obs:w3mm0ublu2xu1t8y8tyv`.**
 
 ## Last Session
 
-**Date**: 2026-08-05 (wave-3, dispatched by the orchestrator - ship the fixes from the
+**Date**: 2026-08-06 (dispatched by the orchestrator - investigate "flatten and
+optimise don't seem to do anything" + ".btx file import issues")
+
+**Summary**: See Current Status above for the full detail (root causes, fixes, named-
+not-fixed gap). PR #67 open, CI green, not yet merged. Two independent, real bugs
+fixed (frontend markup-store staleness after docops ops; a `.btx` unsupported-subtype
+silent-miscoercion). One hypothesis investigated and refuted (IPC level-arg binding).
+One broader gap named and correctly NOT attempted blind (`.btx` import fidelity vs
+Bluebeam originals - naming/property drift - blocked on real sample files Martin was
+asked to provide in `bench/corpus/btx/`).
+
+### Previous session (2026-08-05, wave-3, dispatched by the orchestrator - ship the fixes from the
 GUI validation pass)
 
 **Summary**: All three items from the validation pass (obs:us5j4ne1r5byjzle8u23), one PR.
@@ -456,7 +513,20 @@ still owed to a human session. Detail: `obs:e1tujicl7p4uck906rxa`.
 
 ## Next Steps
 
-**Immediate**: none from wave-2. Live-verify item added: place a measurement or draw
+**Immediate (2026-08-06, as of 2026-08-06)**:
+1. Merge PR #67 once orchestrator schedules it (CI already green).
+2. Live re-verify PR #67 in a real `cargo tauri dev` session: Flatten a doc with real
+   markups, confirm they disappear from the markup list/become unselectable and the
+   new success banner reports a count; Optimize and confirm the before/after
+   file-size banner; confirm a later save does NOT resurrect a flattened markup
+   (as of 2026-08-06).
+3. BLOCKED - `.btx` import fidelity (naming + property drift vs Bluebeam originals,
+   Martin-confirmed broader than the stamp gap): wait for real `.btx` samples in
+   `bench/corpus/btx/`, then diff `import_btx_bytes()`'s output field-by-field against
+   the real Bluebeam Tool Chest for the same tools. Do not guess at Bluebeam's wire
+   format without samples (as of 2026-08-06).
+
+**Immediate (wave-2, historical)**: none from wave-2. Live-verify item added: place a measurement or draw
 a Line/Arrow/Polyline near an existing vector line in a real (non-scanned) PDF and
 confirm the cursor snaps to its endpoint/midpoint with the ring indicator showing -
 the automated tests prove the extraction+plumbing is correct, but a human GUI pass on
@@ -554,6 +624,24 @@ Before the first tagged Windows/macOS release:
 
 ## Key Gotchas (carry forward)
 
+- **Any docops command that changes the file's annotation state (flatten/optimize/
+  redact) MUST reseed `MarkupStore` afterward** (PR #67, 2026-08-06) - `App.svelte`'s
+  handlers now go through `src/lib/docops-handlers.ts::runDocOpAndReseed`
+  (flush -> op -> `loadMarkups` -> `store.seed`). Do NOT call `flattenDocument`/
+  `optimizeDocument`/`redactDocument` directly without a reseed after - the store is
+  the frontend's SoT and nothing else re-syncs it; a stale store both looks unchanged
+  AND resurrects flattened annotations on the next save.
+- **`import_item` (toolchest/btx.rs) must apply the same `MARKUP_SUBTYPES` allowlist
+  guard as `document::annots::read_markups`** before calling
+  `Markup::from_annotation_dict` (PR #67) - that function's `_ => Text` fallback is
+  only safe when the caller pre-filters; `MARKUP_SUBTYPES`/`subtype()` are now
+  `pub(crate)` in `document/annots.rs` specifically so `btx.rs` can share them rather
+  than re-deriving the list.
+- **`.btx` Stamp import currently discards the source appearance** (`stamp: None`
+  always, PR #67 named-not-fixed) AND the wider import-fidelity gap Martin flagged
+  (naming/property drift vs Bluebeam originals) is BLOCKED on real `.btx` samples in
+  `bench/corpus/btx/` - do not attempt either without real samples to diff against,
+  see obs:cxu0x9pn1czhjici5huh.
 - **`FolderIndex::alive()`** = `Arc::strong_count(&self.inner) > 1` - background watcher thread exits within ~1s of AppState replacing the index
 - **Background indexer uses `std::thread::spawn`** (not tokio) - watcher loop is indefinitely blocking, must NOT consume tokio's blocking thread pool
 - **Tantivy `Document` trait must be imported** for `to_json()` to be in scope: `use tantivy::{Document, ...};`
@@ -641,4 +729,4 @@ Before the first tagged Windows/macOS release:
   set (the CI path) is unaffected - every PDFium test self-skips via that env check.
 
 ---
-*Updated: 2026-08-04 (wave-2: vector snap v1 built, OCR formally descoped)*
+*Updated: 2026-08-06 (PR #67: docops markup-store reseed fix + .btx unsupported-subtype guard; broader .btx import-fidelity gap named, blocked on real samples)*

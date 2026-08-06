@@ -171,19 +171,28 @@ pub fn optimize_in_place(doc: &mut Document, level: u8) -> Result<()> {
 
 /// Flatten all annotation appearance streams in `doc` into page content in place.
 ///
+/// Returns the total number of annotations actually flattened across every page - `0`
+/// is a real, meaningful result (nothing had a bakeable `/AP /N`), distinct from an
+/// error. Callers use this to tell a genuine no-op apart from a real flatten instead of
+/// treating every `Ok(())` the same way (see `commands::docops::flatten_document`, which
+/// surfaces the count to the frontend so "Flatten" can report what actually happened
+/// rather than looking identical whether it did something or nothing).
+///
 /// Called by both:
 /// - `LopdfDocOps::flatten` (bytes interface, for the trait / library use)
 /// - `commands::docops::flatten_document` (in-place, via `apply_page_edit`)
-pub fn flatten_annotations(doc: &mut Document) -> Result<()> {
+pub fn flatten_annotations(doc: &mut Document) -> Result<usize> {
     let page_ids: Vec<ObjectId> = doc.get_pages().values().cloned().collect();
+    let mut total = 0usize;
     for page_id in page_ids {
-        flatten_page(doc, page_id)?;
+        total += flatten_page(doc, page_id)?;
     }
-    Ok(())
+    Ok(total)
 }
 
-/// Flatten all annotation appearance streams on a single page.
-fn flatten_page(doc: &mut Document, page_id: ObjectId) -> Result<()> {
+/// Flatten all annotation appearance streams on a single page. Returns the number of
+/// annotations flattened on this page (`0` for every "nothing to do" early return).
+fn flatten_page(doc: &mut Document, page_id: ObjectId) -> Result<usize> {
     // -----------------------------------------------------------------------
     // Read phase — collect everything we need as owned data; no mutable borrows.
     // -----------------------------------------------------------------------
@@ -197,15 +206,15 @@ fn flatten_page(doc: &mut Document, page_id: ObjectId) -> Result<()> {
                 let rid = *r;
                 match doc.get_object(rid).and_then(|o| o.as_array()) {
                     Ok(a) => a.clone(),
-                    Err(_) => return Ok(()), // malformed — leave page unchanged
+                    Err(_) => return Ok(0), // malformed — leave page unchanged
                 }
             }
-            _ => return Ok(()), // no /Annots on this page
+            _ => return Ok(0), // no /Annots on this page
         }
     };
 
     if annots_array.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     // 2. Inspect each annotation and build the list of what can be flattened.
@@ -295,8 +304,9 @@ fn flatten_page(doc: &mut Document, page_id: ObjectId) -> Result<()> {
     }
 
     if targets.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
+    let flattened_count = targets.len();
 
     // -----------------------------------------------------------------------
     // Build content overlay: one `q … cm /Name Do Q` per annotation.
@@ -348,7 +358,7 @@ fn flatten_page(doc: &mut Document, page_id: ObjectId) -> Result<()> {
     let flattened_ids: HashSet<ObjectId> = targets.iter().map(|t| t.annot_id).collect();
     remove_page_annots(doc, page_id, &flattened_ids)?;
 
-    Ok(())
+    Ok(flattened_count)
 }
 
 // ---------------------------------------------------------------------------
@@ -887,7 +897,8 @@ mod tests {
     #[test]
     fn flatten_noop_on_no_annots() {
         let (mut doc, page_id) = bare_page_doc();
-        flatten_annotations(&mut doc).unwrap();
+        let count = flatten_annotations(&mut doc).unwrap();
+        assert_eq!(count, 0, "no annotations at all -> nothing flattened");
 
         // /Annots should still be absent.
         let page = doc.get_dictionary(page_id).unwrap();
@@ -911,7 +922,12 @@ mod tests {
             page.set("Annots", Object::Array(vec![Object::Reference(annot_id)]));
         }
 
-        flatten_annotations(&mut doc).unwrap();
+        let count = flatten_annotations(&mut doc).unwrap();
+        assert_eq!(
+            count, 0,
+            "an annotation with no /AP has nothing to bake - must report 0, not the \
+             annotation count, so callers can tell a genuine no-op apart from a real flatten"
+        );
 
         // Annotation without /AP must survive (not removed from /Annots).
         let page = doc.get_dictionary(page_id).unwrap();
@@ -926,7 +942,8 @@ mod tests {
     #[test]
     fn flatten_removes_annotation_from_annots() {
         let (mut doc, page_id, _annot_id) = doc_with_ap_annotation();
-        flatten_annotations(&mut doc).unwrap();
+        let count = flatten_annotations(&mut doc).unwrap();
+        assert_eq!(count, 1, "exactly one annotation was flattened");
 
         let page = doc.get_dictionary(page_id).unwrap();
         // All annotations had appearance streams, so /Annots must be gone.
@@ -1028,7 +1045,8 @@ mod tests {
             }
         }
 
-        flatten_annotations(&mut doc).unwrap();
+        let count = flatten_annotations(&mut doc).unwrap();
+        assert_eq!(count, 2, "both annotations across the page must be counted");
 
         let page = doc.get_dictionary(page_id).unwrap();
         assert!(

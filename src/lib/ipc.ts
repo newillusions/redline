@@ -603,11 +603,22 @@ export async function getFolderIndexStatus(): Promise<IndexStatus> {
  * The Tauri backend atomically rewrites the file and reloads the render engine,
  * so the viewport updates automatically after this call returns.
  *
+ * Returns the number of annotations actually flattened — `0` is a real, meaningful
+ * result (nothing on the document had a bakeable appearance), not an error. Callers
+ * use this to report a genuine no-op distinctly from a real flatten (see
+ * `docops-handlers.ts`) rather than showing identical "success" feedback either way.
+ *
  * Returns a rejected promise on backend error (unknown doc_id, lopdf parse
  * failure, or atomic-save failure).
  */
-export async function flattenDocument(docId: string): Promise<void> {
-  return invoke<void>("flatten_document", { docId });
+export async function flattenDocument(docId: string): Promise<number> {
+  return invoke<number>("flatten_document", { docId });
+}
+
+/** File size before/after an `optimizeDocument` call (bytes). */
+export interface OptimizeReport {
+  bytes_before: number;
+  bytes_after: number;
 }
 
 /**
@@ -624,14 +635,20 @@ export async function flattenDocument(docId: string): Promise<void> {
  * The Tauri backend atomically rewrites the file and reloads the render engine,
  * so the viewport updates automatically after this call returns.
  *
+ * Optimize has no visible effect on the viewport or markup list (annotations are
+ * rewritten byte-identical in meaning, only the underlying stream bytes shrink) — the
+ * returned before/after file size is the only observable evidence anything happened,
+ * so callers surface it rather than a bare "done" that looks the same for a genuine
+ * no-op (an already-optimized file) as for a real reduction.
+ *
  * Returns a rejected promise on backend error (unknown doc_id, lopdf parse
  * failure, or atomic-save failure).
  */
 export async function optimizeDocument(
   docId: string,
   level: number = 2,
-): Promise<void> {
-  return invoke<void>("optimize_document", { docId, level });
+): Promise<OptimizeReport> {
+  return invoke<OptimizeReport>("optimize_document", { docId, level });
 }
 
 /** A page region to redact (PDF user space coordinates). */

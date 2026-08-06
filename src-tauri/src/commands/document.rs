@@ -583,8 +583,11 @@ mod tests {
         doc.save(&path).unwrap();
 
         let m = redline_markup(0);
-        apply_edit_and_save(&path, std::slice::from_ref(&m), flatten_annotations)
-            .unwrap();
+        apply_edit_and_save(&path, std::slice::from_ref(&m), |doc| {
+            flatten_annotations(doc)?;
+            Ok(())
+        })
+        .unwrap();
 
         let reopened = lopdf::Document::load(&path).unwrap();
         let page_id = *reopened.get_pages().values().next().unwrap();
@@ -626,8 +629,11 @@ mod tests {
             panic!("expected polyline geometry from redline_markup fixture");
         }
 
-        apply_edit_and_save(&path, std::slice::from_ref(&m), flatten_annotations)
-            .unwrap();
+        apply_edit_and_save(&path, std::slice::from_ref(&m), |doc| {
+            flatten_annotations(doc)?;
+            Ok(())
+        })
+        .unwrap();
 
         let reopened = lopdf::Document::load(&path).unwrap();
         let page_id = *reopened.get_pages().values().next().unwrap();
@@ -670,6 +676,106 @@ mod tests {
         assert!(
             compressed_stream_exists,
             "level-2 optimize must compress at least one stream, including annotation appearances written just before it"
+        );
+    }
+
+    #[test]
+    fn flatten_via_apply_edit_and_save_handles_a_realistic_mix_of_markup_types() {
+        // The synthetic single-markup fixture used by the other flatten regression tests
+        // (a 3-point Cloud) is not representative of a real annotated drawing. Investigating
+        // the live report "flatten doesn't seem to do anything" required checking whether
+        // flatten_page's requirements (indirect /AP /N, a resolvable non-degenerate /BBox)
+        // hold for the FULL range of shapes redline's own appearance builder produces, not
+        // just one. This drives five structurally different markup types (rect fill+stroke,
+        // text-anchored quads highlight, freeform ink, a FreeText box, and a zero-size Point
+        // count marker - the case most likely to hit the "degenerate appearance" skip in
+        // flatten_page, since ap_bbox pads a Point to a small fixed box) through the SAME
+        // write_markups -> flatten_annotations pipeline the real app uses, and asserts every
+        // one of them actually gets flattened (no silent partial no-op for some shapes).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flatten-mixed-types.pdf");
+        let (mut doc, _page_id) = one_page_doc();
+        doc.save(&path).unwrap();
+
+        let creator = || UserRef {
+            user_id: uuid::Uuid::new_v4(),
+            display_name: "Alice".into(),
+        };
+
+        let rect = Markup::new(
+            MarkupType::Rectangle,
+            0,
+            MarkupGeometry::Rect {
+                min: PdfPoint { x: 10.0, y: 10.0 },
+                max: PdfPoint { x: 110.0, y: 60.0 },
+            },
+            Appearance {
+                fill: Some("#ffcc00".into()),
+                ..Appearance::default()
+            },
+            creator(),
+        );
+        let highlight = Markup::new(
+            MarkupType::Highlight,
+            0,
+            MarkupGeometry::Quads(vec![[
+                PdfPoint { x: 72.0, y: 712.0 },
+                PdfPoint { x: 200.0, y: 712.0 },
+                PdfPoint { x: 72.0, y: 700.0 },
+                PdfPoint { x: 200.0, y: 700.0 },
+            ]]),
+            Appearance::default(),
+            creator(),
+        );
+        let ink = long_ink_markup(0);
+        let mut text = Markup::new(
+            MarkupType::Text,
+            0,
+            MarkupGeometry::Rect {
+                min: PdfPoint { x: 300.0, y: 300.0 },
+                max: PdfPoint { x: 450.0, y: 330.0 },
+            },
+            Appearance::default(),
+            creator(),
+        );
+        text.contents = Some("A real annotation note".into());
+        let count = Markup::new(
+            MarkupType::MeasurementCount,
+            0,
+            MarkupGeometry::Point(PdfPoint { x: 500.0, y: 500.0 }),
+            Appearance::default(),
+            creator(),
+        );
+
+        let markups = vec![rect, highlight, ink, text, count];
+        let expected = markups.len();
+
+        apply_edit_and_save(&path, &markups, |doc| {
+            let n = flatten_annotations(doc)?;
+            assert_eq!(
+                n, expected,
+                "every markup type in this mix must be flattened - a partial count means \
+                 flatten_page's /AP or /BBox assumptions silently failed to hold for one \
+                 of these real shapes"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let reopened = lopdf::Document::load(&path).unwrap();
+        let page_id = *reopened.get_pages().values().next().unwrap();
+        let page = reopened.get_dictionary(page_id).unwrap();
+        assert!(
+            page.get(b"Annots").is_err(),
+            "all five markup types must be fully flattened - none left selectable"
+        );
+        let contents = page.get(b"Contents").unwrap().as_array().unwrap();
+        assert_eq!(
+            contents.len(),
+            2,
+            "one overlay content stream must be added regardless of how many distinct \
+             markup types it bakes (they all share one page-level overlay, per-annotation \
+             q/cm/Do/Q blocks within it)"
         );
     }
 

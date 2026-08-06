@@ -11,7 +11,16 @@ use lopdf::{dictionary, Dictionary, Document, Object, ObjectId};
 use crate::markup::{appearance, Markup};
 
 /// PDF annotation subtypes imported as markups (spec section 6 type set).
-const MARKUP_SUBTYPES: &[&str] = &[
+///
+/// `pub(crate)` so `toolchest::btx`'s `.btx` importer can apply the SAME allowlist before
+/// calling `Markup::from_annotation_dict` on a `<Raw>` payload - that function's /Subtype
+/// match has a permissive `_ => Text` fallback that is only safe here in `read_markups`
+/// because every annotation is filtered against this list FIRST. `import_item` originally
+/// had no such guard, so an unsupported subtype (Underline/StrikeOut/Widget/Popup/etc -
+/// none of which have a `MarkupType` variant) silently became a bogus "Text" tool instead
+/// of being skipped and reported (see `toolchest::btx::tests::
+/// unsupported_annotation_subtype_is_skipped_not_silently_reclassified_as_text`).
+pub(crate) const MARKUP_SUBTYPES: &[&str] = &[
     "Text",
     "FreeText",
     "Square",
@@ -24,7 +33,7 @@ const MARKUP_SUBTYPES: &[&str] = &[
     "Stamp",
 ];
 
-fn subtype(d: &Dictionary) -> Option<String> {
+pub(crate) fn subtype(d: &Dictionary) -> Option<String> {
     d.get(b"Subtype")
         .ok()?
         .as_name()
