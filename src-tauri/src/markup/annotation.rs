@@ -560,6 +560,23 @@ impl Markup {
         }
 
         // Private /RL* keys for lossless redline round-trip.
+        //
+        // /RLCoordV2 is a compatibility marker, NOT a lossless-roundtrip key: it tells
+        // `document::annots::read_markups` whether this annotation's geometry keys were
+        // written by the 2026-08-06 rotation/MediaBox-origin interop fix (present) or by
+        // an older redline version that wrote `self.geometry` straight into /Rect with no
+        // display<->true-space conversion at all (absent). Without this, upgrading redline
+        // would silently RE-POSITION every existing markup on a rotated or offset-origin
+        // page the instant its file is reopened - the new read-side transform would be
+        // applied to old data it was never written against, moving shapes to a
+        // completely different part of the screen even though the file was never
+        // touched. Any annotation lacking the marker is read WITHOUT the transform
+        // (identical to pre-fix behaviour, so on-screen position never changes for an
+        // untouched file); the very next save always writes both the marker and a
+        // spec-conformant /Rect, so a file self-heals for Bluebeam on its first re-save
+        // with zero visual disruption in redline itself. See the module doc comment
+        // above `display_to_true` in `document::annots` for the transform this gates.
+        d.set("RLCoordV2", Object::Boolean(true));
         d.set("RLType", name(&type_tag(t)));
         d.set("RLGeom", name(geom_tag(&self.geometry)));
         d.set("RLPage", Object::Integer(self.page as i64));

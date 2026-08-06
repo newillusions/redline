@@ -533,7 +533,24 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
             // to be (see the rotation-interop comment block above `display_to_true`) -
             // the exact inverse of what `write_markups` does, so redline's own round-trip
             // stays lossless on a rotated page or an offset-origin MediaBox.
-            if rotation != 0 || ox != 0.0 || oy != 0.0 {
+            //
+            // EXCEPT for a "legacy redline annotation": one with /RLType (redline-owned)
+            // but NO /RLCoordV2 marker - written by a pre-2026-08-06 redline that put
+            // `self.geometry` straight into /Rect with no display<->true conversion at
+            // all. For those, /Rect IS ALREADY effectively display-space (mislabeled as
+            // true-space by the old code, not actually true-space per spec). Applying
+            // this transform to it would silently re-position every existing markup on a
+            // rotated/offset-origin page the instant an upgraded redline reopens the
+            // file - moving shapes to a different part of the screen even though the
+            // file was never touched. Skipping the transform for legacy annotations
+            // preserves their on-screen position exactly as before; `write_markups`
+            // always stamps /RLCoordV2 and writes a spec-conformant /Rect on the very
+            // next save, so the file self-heals for Bluebeam with zero visual disruption
+            // in redline. A genuinely foreign annotation (no /RLType at all, e.g.
+            // imported from Bluebeam/Acrobat) is NOT "legacy redline" - its /Rect is
+            // real true-space per spec and must always be converted.
+            let is_legacy_redline_annotation = dict.has(b"RLType") && !dict.has(b"RLCoordV2");
+            if !is_legacy_redline_annotation && (rotation != 0 || ox != 0.0 || oy != 0.0) {
                 m.geometry = map_geometry(&m.geometry, |p| {
                     true_to_display(p, rotation, w0, h0, ox, oy)
                 });
@@ -2022,6 +2039,118 @@ pub(crate) mod tests {
                 }
                 other => panic!("geometry type changed: {other:?}"),
             }
+        }
+
+        /// THE bug this whole compatibility marker exists to prevent: a file saved by a
+        /// pre-2026-08-06 redline on a rotated page must NOT visually jump to a
+        /// different part of the screen the instant it's reopened in a fixed redline.
+        ///
+        /// Hand-builds a "legacy" annotation exactly as the OLD code would have written
+        /// it - `self.geometry` put straight into /Rect with no rotation conversion and
+        /// no `/RLCoordV2` marker (the marker did not exist yet) - on a page with
+        /// `/Rotate 90`. Proves three things in sequence:
+        /// 1. `read_markups` on the untouched legacy file recovers geometry EXACTLY
+        ///    equal to the raw /Rect numbers (no transform applied) - the file's
+        ///    on-screen appearance in redline is completely unaffected by the fix.
+        /// 2. Re-saving that markup (`write_markups`, simulating the user opening and
+        ///    saving the file with NO edits) stamps `/RLCoordV2` and writes a NEW,
+        ///    spec-conformant `/RLRect` - the self-heal - while the geometry handed to
+        ///    `write_markups` (unchanged self.geometry from step 1) is preserved
+        ///    on-screen: reading the freshly-saved file back recovers the SAME geometry
+        ///    as step 1, proving zero visual disruption across the migration.
+        /// 3. The newly-written `/RLRect` matches the hand-computed TRUE-space value
+        ///    for that same display-space point - i.e. the file is now ALSO correct for
+        ///    Bluebeam, not just visually stable in redline.
+        #[test]
+        fn legacy_pre_fix_annotation_is_read_unchanged_then_self_heals_on_next_save() {
+            let (mut doc, page_id) = one_page_doc(); // 612x792 MediaBox, rotation 0
+            crate::document::page_ops::rotate_page(&mut doc, 0, 90).unwrap();
+
+            // Exactly what pre-fix `to_annotation_dict` + `write_markups` would have
+            // produced: `self.geometry` (a display-space value the old code never
+            // transformed) written straight into /Rect, /RLType present, NO /RLCoordV2 -
+            // hand-built rather than going through today's `to_annotation_dict` (which
+            // always stamps the marker now) precisely because this must simulate a file
+            // that predates the marker's existence.
+            let legacy_display_rect = [700.0_f64, 10.0, 750.0, 60.0];
+            let legacy_dict = lopdf::dictionary! {
+                "Type" => "Annot",
+                "Subtype" => "Square",
+                "Rect" => legacy_display_rect.iter().map(|v| Object::Real(*v as f32)).collect::<Vec<_>>(),
+                "NM" => Object::string_literal("legacy-annot-nm"),
+                "RLType" => Object::Name(b"Rectangle".to_vec()),
+                "RLGeom" => Object::Name(b"rect".to_vec()),
+                // Deliberately no RLRect and no RLCoordV2 - both post-date this "file".
+            };
+            let aid = doc.add_object(Object::Dictionary(legacy_dict));
+            doc.get_dictionary_mut(page_id)
+                .unwrap()
+                .set("Annots", Object::Array(vec![Object::Reference(aid)]));
+
+            // Step 1: reading the untouched legacy file must NOT apply the rotation
+            // transform - geometry must equal the raw /Rect numbers exactly.
+            let read1 = read_markups(&doc).unwrap();
+            assert_eq!(read1.len(), 1);
+            let MarkupGeometry::Rect { min: m1, max: m2 } = &read1[0].geometry else {
+                panic!("geometry type changed");
+            };
+            assert!(
+                (m1.x - legacy_display_rect[0]).abs() < 1e-6,
+                "legacy read must be untransformed: min.x"
+            );
+            assert!(
+                (m1.y - legacy_display_rect[1]).abs() < 1e-6,
+                "legacy read must be untransformed: min.y"
+            );
+            assert!(
+                (m2.x - legacy_display_rect[2]).abs() < 1e-6,
+                "legacy read must be untransformed: max.x"
+            );
+            assert!(
+                (m2.y - legacy_display_rect[3]).abs() < 1e-6,
+                "legacy read must be untransformed: max.y"
+            );
+            let original_geometry = read1[0].geometry.clone();
+
+            // Step 2: re-save with NO edits (the file is "touched" only by opening it).
+            write_markups(&mut doc, &read1).unwrap();
+
+            let annots = page_annots(&doc, page_id).unwrap();
+            let (_, saved_dict) = annots.iter().find(|(_, d)| d.has(b"RLType")).unwrap();
+            assert!(
+                saved_dict.has(b"RLCoordV2"),
+                "re-save must stamp the migration marker"
+            );
+
+            // Step 3: the newly-written /RLRect must be the hand-computed TRUE-space
+            // value for the same display-space point (R=90 on a 612x792 page:
+            // (x,y) -> (612-y, x); see `display_to_true`'s doc comment for the
+            // derivation) - the file is now ALSO correct for Bluebeam.
+            let expected_true_min = expected_true(*m1, 90, 612.0, 792.0, 0.0, 0.0);
+            let expected_true_max = expected_true(*m2, 90, 612.0, 792.0, 0.0, 0.0);
+            let want = [
+                expected_true_min.x.min(expected_true_max.x),
+                expected_true_min.y.min(expected_true_max.y),
+                expected_true_min.x.max(expected_true_max.x),
+                expected_true_min.y.max(expected_true_max.y),
+            ];
+            let got = reals(saved_dict, b"RLRect");
+            for i in 0..4 {
+                assert!(
+                    (got[i] - want[i]).abs() < 1e-3,
+                    "post-migration /RLRect[{i}] = {} != hand-computed true-space {}",
+                    got[i],
+                    want[i]
+                );
+            }
+
+            // Re-reading the now-migrated file recovers the EXACT SAME display-space
+            // geometry as step 1 - zero visual disruption across the self-heal.
+            let read2 = read_markups(&doc).unwrap();
+            assert_eq!(
+                read2[0].geometry, original_geometry,
+                "geometry must be pixel-stable across the migration save"
+            );
         }
     }
 }
