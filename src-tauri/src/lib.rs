@@ -232,6 +232,8 @@ pub fn run() {
             commands::license::license_status,
             commands::license::activate_license,
             commands::license::renew_license,
+            commands::license::license_info,
+            commands::license::deactivate_license,
             // Tool Chest commands (M2)
             commands::toolchest::list_tool_sets,
             commands::toolchest::recent_tools,

@@ -3,8 +3,8 @@
  *
  * Covers: invoke command/argument-key correctness (Tauri v2 maps JS
  * camelCase keys to Rust snake_case params - see ipc.test.ts's guard comment
- * for the incident this protects against), the `isLicensed` type guard, and
- * `renewLicenseIfDue`'s never-throws contract.
+ * for the incident this protects against), the `isLicensed`/`isUsable` type
+ * guards, and `checkInIfActivated`'s never-throws, always-check-in contract.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
@@ -12,8 +12,11 @@ import {
   getLicenseStatus,
   activateLicense,
   renewLicense,
-  renewLicenseIfDue,
+  getLicenseInfo,
+  deactivateLicense,
+  checkInIfActivated,
   isLicensed,
+  isUsable,
 } from "./license";
 import type { LicenseState } from "./license";
 
@@ -42,6 +45,18 @@ describe("license invoke argument keys", () => {
     await renewLicense();
     expect(mockInvoke).toHaveBeenCalledWith("renew_license");
   });
+
+  it("license_info -> no args", async () => {
+    mockInvoke.mockResolvedValue({ code: null, device_fingerprint: "d1", state: { state: "missing" } } as never);
+    await getLicenseInfo();
+    expect(mockInvoke).toHaveBeenCalledWith("license_info");
+  });
+
+  it("deactivate_license -> no args", async () => {
+    mockInvoke.mockResolvedValue({ state: "missing" } as never);
+    await deactivateLicense();
+    expect(mockInvoke).toHaveBeenCalledWith("deactivate_license");
+  });
 });
 
 describe("isLicensed", () => {
@@ -51,68 +66,91 @@ describe("isLicensed", () => {
       staff_id: "staff:abc",
       expires_at: "2099-01-01T00:00:00Z",
       days_remaining: 10,
-      renew_due: false,
     };
     expect(isLicensed(valid)).toBe(true);
     expect(isLicensed({ state: "missing" })).toBe(false);
     expect(isLicensed({ state: "expired" })).toBe(false);
+    expect(isLicensed({ state: "grace", staff_id: "staff:abc", expired_at: "x", grace_deadline: "y", days_remaining: 3 })).toBe(false);
+    expect(isLicensed({ state: "revoked", reason: "staff_not_active" })).toBe(false);
     expect(isLicensed({ state: "invalid", reason: "bad_signature" })).toBe(false);
     expect(isLicensed(null)).toBe(false);
   });
 });
 
-describe("renewLicenseIfDue", () => {
-  it("does not call renew when state is not valid", async () => {
+describe("isUsable", () => {
+  it("is true for valid and grace, false for everything else", () => {
+    expect(isUsable({ state: "valid", staff_id: "staff:abc", expires_at: "x", days_remaining: 10 })).toBe(true);
+    expect(
+      isUsable({ state: "grace", staff_id: "staff:abc", expired_at: "x", grace_deadline: "y", days_remaining: 3 }),
+    ).toBe(true);
+    expect(isUsable({ state: "missing" })).toBe(false);
+    expect(isUsable({ state: "expired" })).toBe(false);
+    expect(isUsable({ state: "revoked", reason: "staff_not_active" })).toBe(false);
+    expect(isUsable({ state: "invalid", reason: "device_mismatch" })).toBe(false);
+    expect(isUsable(null)).toBe(false);
+  });
+});
+
+describe("checkInIfActivated", () => {
+  it("does not call renew when there's no stored activation", async () => {
     mockInvoke.mockReset();
-    const result = await renewLicenseIfDue({ state: "missing" });
+    const result = await checkInIfActivated({ state: "missing" });
     expect(result).toBeNull();
     expect(mockInvoke).not.toHaveBeenCalled();
   });
 
-  it("does not call renew when valid but renew_due is false", async () => {
-    mockInvoke.mockReset();
-    const result = await renewLicenseIfDue({
-      state: "valid",
-      staff_id: "staff:abc",
-      expires_at: "2099-01-01T00:00:00Z",
-      days_remaining: 10,
-      renew_due: false,
-    });
-    expect(result).toBeNull();
-    expect(mockInvoke).not.toHaveBeenCalled();
-  });
-
-  it("calls renew and returns the fresh state when renew_due is true", async () => {
+  it("checks in even when the offline read was already valid (online is authoritative every launch)", async () => {
     mockInvoke.mockReset();
     const fresh: LicenseState = {
       state: "valid",
       staff_id: "staff:abc",
       expires_at: "2099-02-01T00:00:00Z",
       days_remaining: 14,
-      renew_due: false,
     };
     mockInvoke.mockResolvedValue(fresh as never);
-    const result = await renewLicenseIfDue({
+    const result = await checkInIfActivated({
       state: "valid",
       staff_id: "staff:abc",
-      expires_at: "2026-01-04T00:00:00Z",
-      days_remaining: 2,
-      renew_due: true,
+      expires_at: "2099-01-04T00:00:00Z",
+      days_remaining: 10,
     });
     expect(mockInvoke).toHaveBeenCalledWith("renew_license");
     expect(result).toEqual(fresh);
   });
 
-  it("swallows a renew failure and returns null (existing token keeps gating)", async () => {
+  it("checks in on an expired local read, which can come back revoked", async () => {
     mockInvoke.mockReset();
-    mockInvoke.mockRejectedValue(new Error("offline"));
-    const result = await renewLicenseIfDue({
+    const revoked: LicenseState = { state: "revoked", reason: "staff_not_active" };
+    mockInvoke.mockResolvedValue(revoked as never);
+    const result = await checkInIfActivated({ state: "expired" });
+    expect(mockInvoke).toHaveBeenCalledWith("renew_license");
+    expect(result).toEqual(revoked);
+  });
+
+  it("checks in on a grace-period local read, which can come back valid", async () => {
+    mockInvoke.mockReset();
+    const fresh: LicenseState = {
       state: "valid",
       staff_id: "staff:abc",
-      expires_at: "2026-01-04T00:00:00Z",
-      days_remaining: 2,
-      renew_due: true,
+      expires_at: "2099-02-01T00:00:00Z",
+      days_remaining: 14,
+    };
+    mockInvoke.mockResolvedValue(fresh as never);
+    const result = await checkInIfActivated({
+      state: "grace",
+      staff_id: "staff:abc",
+      expired_at: "2026-01-01T00:00:00Z",
+      grace_deadline: "2026-01-08T00:00:00Z",
+      days_remaining: 3,
     });
+    expect(mockInvoke).toHaveBeenCalledWith("renew_license");
+    expect(result).toEqual(fresh);
+  });
+
+  it("swallows an unreachable-server failure and returns null (existing token keeps gating)", async () => {
+    mockInvoke.mockReset();
+    mockInvoke.mockRejectedValue(new Error("offline"));
+    const result = await checkInIfActivated({ state: "expired" });
     expect(result).toBeNull();
   });
 });
