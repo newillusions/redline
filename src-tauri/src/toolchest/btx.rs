@@ -494,9 +494,89 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// (binary body, e.g. a Form XObject's compressed content), not just a bare dictionary
 /// like `<Raw>` always is.
 pub(crate) fn parse_pdf_object_bytes(bytes: &[u8]) -> Result<Object, String> {
-    let pdf_bytes = wrap_object_bytes_as_pdf(bytes);
-    let doc = lopdf::Document::load_mem(&pdf_bytes).map_err(|e| format!("PDF object parse failed: {e}"))?;
-    doc.get_object((1, 0)).cloned().map_err(|e| format!("missing wrapped object: {e}"))
+    let bytes = fix_stream_length(bytes);
+    let pdf_bytes = wrap_object_bytes_as_pdf(&bytes);
+    let doc = lopdf::Document::load_mem(&pdf_bytes)
+        .map_err(|e| format!("PDF object parse failed: {e}"))?;
+    doc.get_object((1, 0))
+        .cloned()
+        .map_err(|e| format!("missing wrapped object: {e}"))
+}
+
+/// Correct a declared `/Length N` to the object's ACTUAL `stream...endstream` body size.
+///
+/// 2026-08-08 finding (Form XObject stamp rendering follow-up): real Bluebeam `.btx`
+/// exports' Form XObject nodes carry a `/Length` that does NOT match their real content -
+/// measured on `bench/corpus/btx/emittiv-markups.btx`'s own "emittiv stamp crop" stamp,
+/// `/Length 20` against a genuinely longer body (`/R0 gs /MWFOForm Do \n\n`, ~22 bytes).
+/// lopdf trusts a declared `/Length` when present rather than scanning for `endstream`
+/// (the module doc's own prior assumption, "/Length must be present and exact", was
+/// WRONG for real data - it held for every hand-authored test fixture, never checked
+/// against a real sample) - a mismatch makes it read a truncated/garbled body, which can
+/// silently produce a plain `Dictionary` instead of a `Stream` object entirely (observed:
+/// a REAL corpus root Form XObject failed `splice_bb_form_xobject`'s "is this a Stream"
+/// check with exactly this shape). Recomputing `/Length` from the real `stream`/
+/// `endstream` byte offsets before handing the object to lopdf fixes both `write_markups`
+/// (save-time splicing) and `build_isolated_form_xobject_pdf` (rasterization) - this was
+/// a LATENT bug in the shipped splicing path, never caught because no prior test spliced
+/// real corpus data through an actual PDF parse/render round-trip.
+///
+/// A no-op (returns the input unchanged) for a bare dictionary with no `stream` keyword,
+/// or if the `stream`/`endstream`/`/Length` markers can't all be found (malformed input -
+/// leaves it for `parse_pdf_object_bytes`'s own error path to report, rather than
+/// guessing).
+fn fix_stream_length(bytes: &[u8]) -> Vec<u8> {
+    // Find the OPENING "stream" keyword - distinct from "endstream" (which also
+    // contains the substring "stream") by requiring it not be preceded by "end".
+    let Some(stream_kw) = (0..bytes.len().saturating_sub(6))
+        .find(|&i| &bytes[i..i + 6] == b"stream" && !(i >= 3 && &bytes[i - 3..i] == b"end"))
+    else {
+        return bytes.to_vec(); // no stream body - plain dict, nothing to fix
+    };
+    // Per spec the "stream" keyword is followed by exactly one EOL (CRLF or LF) before
+    // the body starts - skip it.
+    let after_kw = stream_kw + 6;
+    let body_start = if bytes.get(after_kw..after_kw + 2) == Some(b"\r\n") {
+        after_kw + 2
+    } else if bytes.get(after_kw) == Some(&b'\n') {
+        after_kw + 1
+    } else {
+        return bytes.to_vec(); // no EOL after "stream" - malformed, leave for the error path
+    };
+    let Some(endstream_rel) = bytes[body_start..]
+        .windows(9)
+        .position(|w| w == b"endstream")
+    else {
+        return bytes.to_vec(); // "stream" with no matching "endstream" - malformed
+    };
+    let body_end = body_start + endstream_rel;
+    let actual_len = body_end - body_start;
+
+    // Rewrite the "/Length N" token (BEFORE "stream", inside the dict) to the real
+    // length. Assumes an inline integer, never an indirect `/Length N 0 R` reference -
+    // true of every real sample this shape has been observed in (self-contained
+    // serialized nodes with nothing else to reference).
+    let Some(length_kw) = bytes[..stream_kw].windows(7).rposition(|w| w == b"/Length") else {
+        return bytes.to_vec(); // no /Length key at all - leave as-is
+    };
+    let digits_start = bytes[length_kw + 7..stream_kw]
+        .iter()
+        .position(|b| b.is_ascii_digit())
+        .map(|p| length_kw + 7 + p);
+    let Some(digits_start) = digits_start else {
+        return bytes.to_vec(); // no digits found after /Length - malformed
+    };
+    let digits_end = digits_start
+        + bytes[digits_start..stream_kw]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(&bytes[..digits_start]);
+    out.extend_from_slice(actual_len.to_string().as_bytes());
+    out.extend_from_slice(&bytes[digits_end..]);
+    out
 }
 
 /// Byte-oriented sibling of [`wrap_dict_as_pdf`] - `object_bytes` is inserted verbatim
@@ -522,6 +602,57 @@ fn wrap_object_bytes_as_pdf(object_bytes: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    // --- 2026-08-08 Form XObject rendering follow-up: /Length mismatch in real data ---
+
+    #[test]
+    fn parse_pdf_object_bytes_corrects_a_wrong_declared_length() {
+        // Reproduces the EXACT shape found in bench/corpus/btx/emittiv-markups.btx's
+        // "emittiv stamp crop" stamp's root Form XObject: /Length 20, but the real
+        // stream body ("/R0 gs /MWFOForm Do \n\n") is longer. Trusting the wrong
+        // declared length made lopdf misparse this into a plain Dictionary instead of
+        // a Stream - this test pins the fix (recompute /Length from the real
+        // stream/endstream boundary before handing bytes to lopdf).
+        let raw = b"<</Length 20/Type/XObject/Subtype/Form/FormType 1/BBox[0 0 2021.747 741.9073]>>\nstream\n/R0 gs /MWFOForm Do \n\nendstream";
+
+        let obj = parse_pdf_object_bytes(raw).expect("must parse");
+        let stream = match obj {
+            Object::Stream(s) => s,
+            other => panic!("expected a Stream (the real bug: this came back as {other:?})"),
+        };
+        assert_eq!(
+            stream.dict.get(b"Subtype").unwrap().as_name().unwrap(),
+            b"Form"
+        );
+        // The content lopdf actually extracted must be the REAL body, not a 20-byte
+        // truncation of it.
+        assert_eq!(stream.content, b"/R0 gs /MWFOForm Do \n\n");
+    }
+
+    #[test]
+    fn parse_pdf_object_bytes_still_works_when_length_is_already_correct() {
+        // Regression guard: fix_stream_length must be a no-op (not corrupt anything)
+        // when the declared /Length is already right - covers every hand-authored test
+        // fixture elsewhere in this module and in document::annots.
+        let body = b"q 1 0 0 1 0 0 cm /Fx0 Do Q";
+        let raw = format!(
+            "<</Length {}/Type/XObject/Subtype/Form/FormType 1/BBox[0 0 10 10]>>\nstream\n{}endstream",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        let obj = parse_pdf_object_bytes(raw.as_bytes()).expect("must parse");
+        let stream = match obj {
+            Object::Stream(s) => s,
+            other => panic!("expected a Stream, got {other:?}"),
+        };
+        assert_eq!(stream.content, body);
+    }
+
+    #[test]
+    fn fix_stream_length_is_a_no_op_for_a_bare_dictionary() {
+        let dict = b"<</Type/ExtGState/OPM 1>>";
+        assert_eq!(fix_stream_length(dict), dict.to_vec());
+    }
 
     const PLAIN_ITEM: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <ToolChestData>

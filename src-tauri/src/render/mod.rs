@@ -806,6 +806,56 @@ impl RenderEngine {
         Ok(TextRangeSelection { quads, text })
     }
 
+    /// Rasterize page 0 of a small, throwaway, in-memory PDF to a transparent-background
+    /// PNG (2026-08-08 Form XObject stamp rendering follow-up — `document::annots::
+    /// build_isolated_form_xobject_pdf` builds exactly this shape: a single page whose
+    /// `/MediaBox` matches a stamp's own Form XObject `/BBox`, so this renders JUST that
+    /// stamp's artwork in isolation).
+    ///
+    /// Deliberately does NOT go through `self.documents`/the tile cache — this is a
+    /// one-shot, throwaway open-render-discard, not a document the app keeps navigating.
+    /// `max_dim_px` bounds the output's larger dimension (a stamp's PDF-point BBox can be
+    /// tiny or, in principle, very large — a fixed render scale would either blur small
+    /// stamps or allocate an unbounded bitmap for a large one).
+    pub fn rasterize_pdf_bytes(&self, bytes: Vec<u8>, max_dim_px: u32) -> Result<Vec<u8>> {
+        let document = self
+            .pdfium
+            .load_pdf_from_byte_vec(bytes, None)
+            .context("failed to open isolated stamp PDF")?;
+        let page = document
+            .pages()
+            .get(0)
+            .context("isolated stamp PDF has no page 0")?;
+        let (w_pts, h_pts) = (page.width().value, page.height().value);
+        if w_pts <= 0.0 || h_pts <= 0.0 {
+            anyhow::bail!("isolated stamp page has a non-positive dimension ({w_pts} x {h_pts})");
+        }
+        // Scale so the LARGER dimension hits max_dim_px, preserving aspect ratio - same
+        // "fit within a box" convention as everywhere else in this repo that sizes a
+        // raster output from a PDF-point extent.
+        let scale = (max_dim_px as f32 / w_pts.max(h_pts)).min(4.0); // cap upscaling of tiny stamps
+        let (target_w, target_h) = (
+            (w_pts * scale).round().max(1.0) as i32,
+            (h_pts * scale).round().max(1.0) as i32,
+        );
+        let render_config = PdfRenderConfig::new()
+            .set_target_size(target_w, target_h)
+            .set_clear_color(PdfColor::new(0, 0, 0, 0)); // transparent, not white - see module doc
+        let bitmap = page
+            .render_with_config(&render_config)
+            .context("PDFium failed to render the isolated stamp page")?;
+        let img = bitmap.as_image().into_rgba8();
+
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .context("failed to encode rasterized stamp as PNG")?;
+        Ok(png_bytes)
+    }
+
     /// Build (or return the cached) snap-target index for a page — the PDFium-
     /// touching half of `geometry::build_snap_index` (spec §5). Iterates the page's
     /// path objects via PDFium's *transformed* segment API so Form XObject CTMs
@@ -1216,6 +1266,13 @@ pub enum RenderCmd {
         page_index: u32,
         reply: oneshot::Sender<Result<Vec<crate::geometry::SnapTarget>>>,
     },
+    /// Rasterize a small, throwaway, in-memory PDF's page 0 to a transparent-background
+    /// PNG. See `RenderEngine::rasterize_pdf_bytes`.
+    RasterizePdfBytes {
+        bytes: Vec<u8>,
+        max_dim_px: u32,
+        reply: oneshot::Sender<Result<Vec<u8>>>,
+    },
 }
 
 /// A `Send + Sync` handle to the render thread.
@@ -1328,6 +1385,13 @@ impl RenderHandle {
                                 geom.snap_index.iter().cloned().collect::<Vec<_>>()
                             });
                             let _ = reply.send(result);
+                        }
+                        RenderCmd::RasterizePdfBytes {
+                            bytes,
+                            max_dim_px,
+                            reply,
+                        } => {
+                            let _ = reply.send(engine.rasterize_pdf_bytes(bytes, max_dim_px));
                         }
                     }
                 }
@@ -1518,6 +1582,22 @@ impl RenderHandle {
             .await
             .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
     }
+
+    /// Rasterize a small, throwaway, in-memory PDF's page 0 to a transparent-background
+    /// PNG. See [`RenderEngine::rasterize_pdf_bytes`].
+    pub async fn rasterize_pdf_bytes(&self, bytes: Vec<u8>, max_dim_px: u32) -> Result<Vec<u8>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(RenderCmd::RasterizePdfBytes {
+                bytes,
+                max_dim_px,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("render thread gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
+    }
 }
 
 /// Send an init-error reply to any command that arrived before PDFium loaded.
@@ -1549,6 +1629,9 @@ fn send_init_error(cmd: RenderCmd, err: &anyhow::Error) {
             let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
         }
         RenderCmd::PageSnapIndex { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+        }
+        RenderCmd::RasterizePdfBytes { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
         }
     }
@@ -2462,5 +2545,152 @@ pub(crate) mod tests {
             .render_tile(&one_tile(0))
             .expect("render c5 tile after normalize");
         assert!(!tile.png_base64.is_empty(), "C5 page 0 must render");
+    }
+
+    // -----------------------------------------------------------------------
+    // rasterize_pdf_bytes (2026-08-08 Form XObject stamp rendering follow-up).
+    // Corpus-free synthetic test + a real-corpus test, both gated on
+    // PDFIUM_DYNAMIC_LIB_PATH like every other PDFium-touching test in this file.
+    // -----------------------------------------------------------------------
+
+    /// Decode PNG bytes and report whether at least one pixel has non-zero alpha -
+    /// the discriminator between "real artwork rendered" and "blank/transparent image"
+    /// (an empty box regression would produce an all-transparent PNG here).
+    fn png_has_visible_content(png_bytes: &[u8]) -> bool {
+        let img = image::load_from_memory(png_bytes).expect("must decode as a valid image");
+        let rgba = img.to_rgba8();
+        rgba.pixels().any(|p| p.0[3] > 0)
+    }
+
+    #[test]
+    fn rasterize_pdf_bytes_renders_real_content_not_a_blank_transparent_image() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+        // A synthetic Form XObject that fills its whole BBox black - the simplest
+        // possible "definitely paints something" fixture.
+        let mut objects = std::collections::BTreeMap::new();
+        let content = b"0 0 0 rg 0 0 100 100 re f";
+        objects.insert(
+            "ROOTID".to_string(),
+            format!(
+                "<</Type/XObject/Subtype/Form/FormType 1/BBox[0 0 100 100]/Length {}>>\nstream\n{}\nendstream",
+                content.len(),
+                std::str::from_utf8(content).unwrap()
+            )
+            .into_bytes(),
+        );
+        let pdf_bytes =
+            crate::document::annots::build_isolated_form_xobject_pdf("ROOTID", &objects)
+                .expect("build isolated stamp pdf");
+
+        let engine = RenderEngine::new().expect("pdfium");
+        let png = engine
+            .rasterize_pdf_bytes(pdf_bytes, 256)
+            .expect("rasterize isolated stamp pdf");
+        assert!(
+            png_has_visible_content(&png),
+            "a filled-black Form XObject must rasterize to a non-blank image"
+        );
+    }
+
+    #[test]
+    fn rasterize_pdf_bytes_a_real_corpus_stamp_renders_non_blank_artwork() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("bench")
+            .join("corpus")
+            .join("btx");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            eprintln!("skip: bench/corpus/btx/ not present in this build context");
+            return;
+        };
+        let files: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("btx"))
+            })
+            .collect();
+        if files.is_empty() {
+            eprintln!("skip: no .btx files in bench/corpus/btx/");
+            return;
+        }
+
+        use crate::toolchest::{StampAsset, StampDef};
+        let engine = RenderEngine::new().expect("pdfium");
+        let mut real_stamps_rendered = 0usize;
+        // NAMED, NOT FIXED (2026-08-08): a stock/library Bluebeam stamp (its own
+        // /TmpBRXFile points inside Bluebeam's OWN install dir, e.g.
+        // "C:\ProgramData\Bluebeam Software\...\Stamps\en-GB\MR Init.pdf" - not a
+        // user-authored file) references a /BBObjPtr_<id> that is simply ABSENT from
+        // this item's own collected <Resources> siblings - Bluebeam doesn't embed
+        // built-in library stamp artwork in .btx exports at all, assuming the
+        // receiving install has its own copy of the same stock library. This is a
+        // genuine, deeper data-availability gap distinct from the custom-stamp
+        // rendering this test proves - there is no artwork to render from the .btx
+        // file for these, full stop. Counted and reported, not silently skipped.
+        let mut unresolvable_root_stamps = 0usize;
+        for path in &files {
+            let bytes = std::fs::read(path).unwrap();
+            let report = crate::toolchest::btx::import_btx_bytes(&bytes);
+            for tool in &report.tools {
+                let Some(StampDef::Static {
+                    asset: StampAsset::BluebeamFormXObject { root_id, objects },
+                }) = &tool.stamp
+                else {
+                    continue;
+                };
+                if !objects.contains_key(root_id) {
+                    eprintln!(
+                        "{:?} tool {:?}: root {root_id} absent from collected Resources - stock/library stamp, no embedded artwork (named gap, not a failure)",
+                        path.file_name(),
+                        tool.name
+                    );
+                    unresolvable_root_stamps += 1;
+                    continue;
+                }
+                let pdf_bytes =
+                    crate::document::annots::build_isolated_form_xobject_pdf(root_id, objects)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "{:?} tool {:?}: build isolated pdf failed: {e:#}",
+                                path.file_name(),
+                                tool.name
+                            )
+                        });
+                let png = engine
+                    .rasterize_pdf_bytes(pdf_bytes, 512)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{:?} tool {:?}: rasterize failed: {e:#}",
+                            path.file_name(),
+                            tool.name
+                        )
+                    });
+                assert!(
+                    png_has_visible_content(&png),
+                    "{:?} tool {:?}: real Bluebeam stamp artwork must not rasterize to a blank image",
+                    path.file_name(),
+                    tool.name
+                );
+                real_stamps_rendered += 1;
+            }
+        }
+        assert!(
+            real_stamps_rendered > 0,
+            "the real corpus must contain at least one BluebeamFormXObject stamp to prove this against \
+             (0 found - corpus fixtures may have changed shape)"
+        );
+        eprintln!(
+            "rasterized {real_stamps_rendered} real corpus stamps with embedded artwork, all non-blank \
+             ({unresolvable_root_stamps} stock/library stamps skipped - no embedded artwork in .btx, named gap above)"
+        );
     }
 }

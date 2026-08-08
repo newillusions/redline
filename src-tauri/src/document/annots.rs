@@ -346,6 +346,122 @@ fn is_managed(d: &Dictionary, ids: &std::collections::HashSet<String>) -> bool {
     d.has(b"RLType") || nm_of(d).map(|nm| ids.contains(&nm)).unwrap_or(false)
 }
 
+/// Splice a `StampAsset::BluebeamFormXObject` graph into `doc` as real indirect objects,
+/// rewriting each node's own `/BBObjPtr_<id>` placeholders to the real references just
+/// reserved for its siblings. Returns the root node's new `ObjectId`, or `None` if the
+/// root itself fails to resolve (a node other than the root failing to parse is not
+/// fatal: any `/BBObjPtr_` reference to it stays an inert name PDF viewers ignore,
+/// degrading that one visual detail rather than the whole stamp, same never-fatal
+/// posture as import). Shared by `write_markups` (splice at save time) and
+/// `build_isolated_form_xobject_pdf` (splice into a throwaway single-stamp document for
+/// rasterization - see `commands::toolchest::rasterize_form_xobject_asset`).
+pub(crate) fn splice_bb_form_xobject(
+    doc: &mut Document,
+    root_id: &str,
+    objects: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Option<ObjectId> {
+    let id_to_objid: std::collections::BTreeMap<String, (u32, u16)> = objects
+        .keys()
+        .map(|id| (id.clone(), doc.new_object_id()))
+        .collect();
+    for (id, raw) in objects {
+        let resolved = crate::toolchest::btx::resolve_bb_objptr_refs(raw, &id_to_objid);
+        if let Ok(obj) = crate::toolchest::btx::parse_pdf_object_bytes(&resolved) {
+            if let Some(&oid) = id_to_objid.get(id) {
+                doc.set_object(oid, obj);
+            }
+        }
+    }
+    id_to_objid.get(root_id).copied()
+}
+
+/// Build a minimal, self-contained single-page PDF (as bytes) that places `root_id`'s
+/// Form XObject at identity scale/translation, sized so the page's own `/MediaBox`
+/// exactly matches the Form's `/BBox` - i.e. rendering page 0 of the result shows JUST
+/// this stamp's artwork, isolated from any page content or other annotations. Used to
+/// rasterize a `StampAsset::BluebeamFormXObject` for display (see
+/// `commands::toolchest::rasterize_stamp_asset`) - the actual PDFium rendering happens
+/// on the render thread, this function only builds the bytes (no PDFium dependency, so
+/// it's plain-unit-testable without the `PDFIUM_DYNAMIC_LIB_PATH` gate).
+///
+/// Returns `Err` if the root object fails to splice or isn't a Form XObject stream with
+/// a readable `/BBox` - both indicate a malformed/unsupported asset, not a transient
+/// failure.
+pub(crate) fn build_isolated_form_xobject_pdf(
+    root_id: &str,
+    objects: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let mut doc = Document::with_version("1.5");
+    let root_oid = splice_bb_form_xobject(&mut doc, root_id, objects)
+        .context("Form XObject root failed to splice (missing or malformed)")?;
+    let bbox: Vec<f64> = {
+        let root_obj = doc
+            .get_object(root_oid)
+            .context("root object vanished after splice")?;
+        let stream = root_obj
+            .as_stream()
+            .context("root object is not a stream (not a Form XObject)")?;
+        let subtype = stream
+            .dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok());
+        if subtype != Some(b"Form".as_slice()) {
+            bail!("root object /Subtype is not /Form (got {subtype:?})");
+        }
+        let arr = stream
+            .dict
+            .get(b"BBox")
+            .context("Form XObject has no /BBox")?
+            .as_array()
+            .context("/BBox is not an array")?;
+        arr.iter()
+            .map(|o| {
+                o.as_float()
+                    .map(|f| f as f64)
+                    .context("/BBox entry is not numeric")
+            })
+            .collect::<Result<Vec<f64>>>()?
+    };
+    if bbox.len() != 4 {
+        bail!("/BBox must have exactly 4 entries, got {}", bbox.len());
+    }
+    let (x0, y0, x1, y1) = (
+        bbox[0].min(bbox[2]),
+        bbox[1].min(bbox[3]),
+        bbox[0].max(bbox[2]),
+        bbox[1].max(bbox[3]),
+    );
+
+    let pages_id = doc.new_object_id();
+    let content_id = doc.add_object(Object::Stream(lopdf::Stream::new(
+        Dictionary::new(),
+        b"q 1 0 0 1 0 0 cm /Fx0 Do Q".to_vec(),
+    )));
+    let resources =
+        dictionary! { "XObject" => dictionary! { "Fx0" => Object::Reference(root_oid) } };
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![x0.into(), y0.into(), x1.into(), y1.into()],
+        "Resources" => resources,
+        "Contents" => Object::Reference(content_id),
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(
+            dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 },
+        ),
+    );
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut buf = Vec::new();
+    doc.save_to(&mut buf)
+        .context("failed to serialize isolated stamp PDF")?;
+    Ok(buf)
+}
+
 /// Write the full markup set into the document: strip managed annotations from every
 /// page, keep foreign ones, then append the current set as fresh indirect objects.
 pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()> {
@@ -456,27 +572,10 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
         }
         // A `.btx`-imported Bluebeam stamp's Form XObject graph (`StampAsset::
         // BluebeamFormXObject`, `toolchest::btx` module doc "Stamp artwork"): splice every
-        // node in as a real indirect object, rewriting each node's own `/BBObjPtr_<id>`
-        // placeholders to the real references just reserved for its siblings, then point
-        // this resource name at whichever node is the root. A node that fails to parse
-        // (unexpected bytes) is simply left absent - any `/BBObjPtr_` reference to it
-        // stays an inert name PDF viewers ignore, degrading that one visual detail rather
-        // than the whole stamp (same never-fatal posture as import).
+        // node in as a real indirect object (see `splice_bb_form_xobject`), then point
+        // this resource name at whichever node is the root.
         if let Some(form) = built.form_xobject.take() {
-            let id_to_objid: std::collections::BTreeMap<String, (u32, u16)> = form
-                .objects
-                .keys()
-                .map(|id| (id.clone(), doc.new_object_id()))
-                .collect();
-            for (id, raw) in &form.objects {
-                let resolved = crate::toolchest::btx::resolve_bb_objptr_refs(raw, &id_to_objid);
-                if let Ok(obj) = crate::toolchest::btx::parse_pdf_object_bytes(&resolved) {
-                    if let Some(&oid) = id_to_objid.get(id) {
-                        doc.set_object(oid, obj);
-                    }
-                }
-            }
-            if let Some(&root_oid) = id_to_objid.get(&form.root_id) {
+            if let Some(root_oid) = splice_bb_form_xobject(doc, &form.root_id, &form.objects) {
                 xobject_refs.set(form.name, Object::Reference(root_oid));
             }
         }
@@ -1332,6 +1431,88 @@ pub(crate) mod tests {
             other => panic!("nested ExtGState must resolve to a real Dictionary, got {other:?}"),
         };
         assert_eq!(nested_gs_obj.get(b"Type").unwrap().as_name().unwrap(), b"ExtGState");
+    }
+
+    // --- 2026-08-08 Form XObject stamp RENDERING follow-up: build_isolated_form_xobject_pdf ---
+    //
+    // Pure structural tests only (no PDFium) - the actual rasterization is covered by
+    // `render::tests::rasterize_pdf_bytes_*` (PDFIUM_DYNAMIC_LIB_PATH-gated), which feeds
+    // THIS function's output into PDFium and asserts on real rendered pixels.
+
+    fn sample_form_xobject_objects() -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut objects = std::collections::BTreeMap::new();
+        objects.insert(
+            "ROOTID".to_string(),
+            b"<</Type/XObject/Subtype/Form/FormType 1/BBox[10 20 110 220]/Length 4/Resources<</ExtGState/BBObjPtr_GSID>>>>\nstream\nfake\nendstream"
+                .to_vec(),
+        );
+        objects.insert("GSID".to_string(), b"<</Type/ExtGState/OPM 1>>".to_vec());
+        objects
+    }
+
+    #[test]
+    fn build_isolated_form_xobject_pdf_sizes_media_box_to_the_form_bbox() {
+        let objects = sample_form_xobject_objects();
+        let bytes = build_isolated_form_xobject_pdf("ROOTID", &objects).unwrap();
+
+        let doc = Document::load_mem(&bytes).expect("output must be a loadable PDF");
+        let pages = doc.get_pages();
+        assert_eq!(pages.len(), 1, "must be a single-page document");
+        let (_, page_id) = pages.iter().next().unwrap();
+        let page = doc.get_dictionary(*page_id).unwrap();
+        let media_box: Vec<f64> = page
+            .get(b"MediaBox")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o.as_float().unwrap() as f64)
+            .collect();
+        // BBox was [10 20 110 220] - MediaBox must match exactly (identity placement,
+        // no extra scale/translate - the whole point is an isolated 1:1 render).
+        assert_eq!(media_box, vec![10.0, 20.0, 110.0, 220.0]);
+
+        let resources = page.get(b"Resources").unwrap().as_dict().unwrap();
+        let xobjects = resources.get(b"XObject").unwrap().as_dict().unwrap();
+        let fx0_ref = match xobjects.get(b"Fx0").unwrap() {
+            Object::Reference(r) => *r,
+            other => panic!("/Fx0 must be an indirect reference, got {other:?}"),
+        };
+        let fx0 = doc.get_object(fx0_ref).unwrap().as_stream().unwrap();
+        assert_eq!(fx0.dict.get(b"Subtype").unwrap().as_name().unwrap(), b"Form");
+        // Nested /BBObjPtr_GSID must be resolved too (same multi-level splice guarantee
+        // as write_markups's own test).
+        let nested = fx0.dict.get(b"Resources").unwrap().as_dict().unwrap().get(b"ExtGState").unwrap();
+        assert!(matches!(nested, Object::Reference(_)), "nested ref must resolve, got {nested:?}");
+
+        let content_id = match page.get(b"Contents").unwrap() {
+            Object::Reference(r) => *r,
+            other => panic!("/Contents must be an indirect reference, got {other:?}"),
+        };
+        let content = doc.get_object(content_id).unwrap().as_stream().unwrap();
+        let content_str = String::from_utf8(content.content.clone()).unwrap();
+        assert!(content_str.contains("/Fx0 Do"), "content stream must paint the form: {content_str}");
+    }
+
+    #[test]
+    fn build_isolated_form_xobject_pdf_errors_on_missing_root() {
+        let objects = sample_form_xobject_objects();
+        let err = build_isolated_form_xobject_pdf("NOT_A_REAL_ID", &objects).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to splice"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn build_isolated_form_xobject_pdf_errors_on_non_form_root() {
+        let mut objects = std::collections::BTreeMap::new();
+        objects.insert("ROOTID".to_string(), b"<</Type/ExtGState/OPM 1>>".to_vec());
+        let err = build_isolated_form_xobject_pdf("ROOTID", &objects).unwrap_err();
+        assert!(
+            err.to_string().contains("not a stream"),
+            "unexpected error message: {err}"
+        );
     }
 
     /// Regression guard: adding `/AP` must not change any of the semantic keys

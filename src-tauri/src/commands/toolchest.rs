@@ -9,12 +9,82 @@ use uuid::Uuid;
 
 use crate::markup::Markup;
 use crate::toolchest::btx::{self, ImportReport};
-use crate::toolchest::stamp::{compose_dynamic_text, DynamicField};
+use crate::toolchest::stamp::{compose_dynamic_text, DynamicField, StampAsset, StampDef};
 use crate::toolchest::{CounterScope, PlacementMode, Tool, ToolSet};
 use crate::AppState;
 
 fn parse_uuid(s: &str, what: &str) -> Result<Uuid, String> {
     Uuid::parse_str(s).map_err(|e| format!("bad {what} id: {e}"))
+}
+
+/// Rasterize a `StampAsset::BluebeamFormXObject` to a `PngBase64` preview for live
+/// display (2026-08-08 Form XObject stamp rendering follow-up - see
+/// `document::annots::build_isolated_form_xobject_pdf` / `render::RenderEngine::
+/// rasterize_pdf_bytes`). Falls back to returning `None` (leaving the caller's asset
+/// unchanged) rather than erroring, for two DISTINCT reasons that are both real:
+/// (a) the Form's root is genuinely unresolvable (a stock/library Bluebeam stamp with
+/// no embedded artwork in the `.btx` export - `markupToSvg`'s existing box+label
+/// fallback is the correct outcome for these, not a bug); (b) a transient render-thread
+/// failure (never silently swallowed - logged so it's visible, matching "degrade
+/// explicitly, never silently").
+///
+/// Deliberate trade-off, named here rather than hidden: this REPLACES the stored asset,
+/// not just a display-only copy - a stamp placed from a rasterized-preview Tool and
+/// then saved embeds the PNG raster in the output PDF, not the original Bluebeam Form
+/// XObject vector artwork. Chosen for scope/complexity reasons (a dual canonical-vs-
+/// preview asset representation was assessed as out of reach for this pass) - flagged
+/// as a follow-up if save-time vector fidelity for these stamps matters later.
+async fn rasterize_form_xobject_asset(
+    state: &AppState,
+    root_id: &str,
+    objects: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Option<StampAsset> {
+    if !objects.contains_key(root_id) {
+        return None; // (a) - no embedded artwork to render, not an error
+    }
+    let pdf_bytes = match crate::document::annots::build_isolated_form_xobject_pdf(root_id, objects)
+    {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("rasterize_form_xobject_asset: failed to build isolated stamp pdf: {e:#}");
+            return None; // (b) - logged, not silent
+        }
+    };
+    match state.render.rasterize_pdf_bytes(pdf_bytes, 512).await {
+        Ok(png) => Some(StampAsset::PngBase64(crate::render::base64_encode(&png))),
+        Err(e) => {
+            log::warn!("rasterize_form_xobject_asset: PDFium render failed: {e:#}");
+            None // (b) - logged, not silent
+        }
+    }
+}
+
+/// Rasterize every `BluebeamFormXObject`-backed stamp `Tool` in `tools` to a `PngBase64`
+/// preview, in place, so Tool Chest placement shows real artwork immediately instead of
+/// an empty box (see `rasterize_form_xobject_asset` for what "rasterize" means and its
+/// named trade-off). A tool whose asset can't be rasterized (library stamp, or a
+/// transient failure) is left completely unchanged.
+async fn rasterize_form_xobject_stamps_in_place(state: &AppState, tools: &mut [Tool]) {
+    for tool in tools.iter_mut() {
+        let (root_id, objects) = match &tool.stamp {
+            Some(StampDef::Static {
+                asset: StampAsset::BluebeamFormXObject { root_id, objects },
+            }) => (root_id.clone(), objects.clone()),
+            Some(StampDef::Dynamic {
+                asset: Some(StampAsset::BluebeamFormXObject { root_id, objects }),
+                ..
+            }) => (root_id.clone(), objects.clone()),
+            _ => continue,
+        };
+        let Some(rasterized) = rasterize_form_xobject_asset(state, &root_id, &objects).await else {
+            continue;
+        };
+        match &mut tool.stamp {
+            Some(StampDef::Static { asset }) => *asset = rasterized,
+            Some(StampDef::Dynamic { asset, .. }) => *asset = Some(rasterized),
+            None => {}
+        }
+    }
 }
 
 /// List every Tool Set (order is load order - see `ToolChestStore::load`; the frontend
@@ -95,9 +165,16 @@ pub fn record_recent_tool(state: State<'_, AppState>, tool: Tool) -> Result<(), 
 #[tauri::command]
 pub async fn import_btx(state: State<'_, AppState>, path: String) -> Result<ImportReport, String> {
     let bytes = tokio::fs::read(&path).await.map_err(|e| format!("read {path}: {e}"))?;
-    let report = tokio::task::spawn_blocking(move || btx::import_btx_bytes(&bytes))
+    let mut report = tokio::task::spawn_blocking(move || btx::import_btx_bytes(&bytes))
         .await
         .map_err(|e| e.to_string())?;
+
+    // Rasterize BluebeamFormXObject stamp artwork to PngBase64 previews (2026-08-08
+    // Form XObject stamp rendering follow-up) so a Tool Chest placement shows the real
+    // stamp immediately instead of an empty box - see
+    // `rasterize_form_xobject_stamps_in_place`'s doc comment for the named save-time
+    // fidelity trade-off this makes.
+    rasterize_form_xobject_stamps_in_place(&state, &mut report.tools).await;
 
     if !report.tools.is_empty() {
         let set_name = std::path::Path::new(&path)
