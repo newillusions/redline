@@ -20,6 +20,17 @@
 //!   (measured: present on ~90% of real items). Using `<Name>` as the display name (the
 //!   original implementation) is the root cause of the "naming differs from the original
 //!   Bluebeam tool" defect Martin reported.
+//!
+//!   2026-08-08 follow-up: /Subj is absent specifically on custom Stamp items (7/77 real
+//!   items, all Stamp-typed) - and for those, `<Name>` alone is STILL what a user saw
+//!   ("some imported tools still display UID names"). Every one of those 7 carries a
+//!   private `/TmpBRXFile` literal-string path recording the source file Bluebeam built
+//!   the stamp from (e.g. `D:\...\Stamps\MR Init.pdf`) - `stamp_source_file_basename`
+//!   extracts its basename minus extension ("MR Init") as a second-tier fallback, ahead
+//!   of the opaque `<Name>` UID. Measured: closes all 7/7 real UID-name cases in the
+//!   sample corpus. `<Name>` remains the final floor for the case neither `/Subj` nor
+//!   `/TmpBRXFile` is present (not observed in the sample corpus, but not assumed
+//!   impossible).
 //! - `<Type>` (e.g. `Bluebeam.PDF.Annotations.AnnotationFreeText`) - informational only,
 //!   never read; the `<Raw>` dict's own `/Subtype` already gives the same information in
 //!   the form `Markup::from_annotation_dict` actually consumes.
@@ -249,8 +260,13 @@ fn import_item(item: roxmltree::Node, name: &str) -> Result<Tool, String> {
 
     // Naming fidelity (module doc, "naming differs from the original" defect): Bluebeam's
     // own `<Name>` is an opaque internal id, not what Bluebeam shows the user - that's the
-    // annotation's own `/Subj`. Prefer it; fall back to `<Name>` only when `/Subj` is
-    // absent or blank (measured absent on ~10% of real items) so every tool still gets a
+    // annotation's own `/Subj`. Prefer it; when `/Subj` is absent or blank, every Stamp
+    // item observed in the 2026-08-08 UID-name follow-up (7/7 real corpus cases) is a
+    // custom stamp Bluebeam built from a user-selected file, recorded as a private
+    // `/TmpBRXFile` literal-string path (e.g. `D:\...\Stamps\MR Init.pdf`) - its basename
+    // minus extension ("MR Init") is a real, meaningful name, unlike the opaque `<Name>`
+    // UID. Falls back to `<Name>` only when NEITHER `/Subj` NOR `/TmpBRXFile` is present
+    // (2/7 real cases - genuinely nothing better to show) so every tool still gets a
     // non-empty name.
     let display_name = markup
         .subject
@@ -258,6 +274,7 @@ fn import_item(item: roxmltree::Node, name: &str) -> Result<Tool, String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+        .or_else(|| stamp_source_file_basename(&dict))
         .unwrap_or_else(|| name.to_string());
 
     let geometry = match placement_mode {
@@ -322,6 +339,32 @@ fn collect_bb_resources(item: roxmltree::Node) -> std::collections::BTreeMap<Str
         out.insert(id, data_bytes);
     }
     out
+}
+
+/// Second-tier stamp naming fallback (2026-08-08 corpus finding, see `import_item`'s
+/// naming comment): a custom Stamp built from a user-selected file carries that file's
+/// path as a private `/TmpBRXFile` literal string (backslash-separated Windows paths in
+/// every real sample seen - Bluebeam itself is Windows-only). Returns the basename with
+/// its extension stripped (`D:\...\Stamps\MR Init.pdf` -> `"MR Init"`), or `None` if the
+/// key is absent, not a string, empty, or decodes to an empty/whitespace-only basename.
+fn stamp_source_file_basename(dict: &Dictionary) -> Option<String> {
+    let raw = dict.get(b"TmpBRXFile").ok()?.as_str().ok()?;
+    let path = String::from_utf8_lossy(raw);
+    let basename = path.rsplit(['\\', '/']).next().unwrap_or(&path).trim();
+    if basename.is_empty() {
+        return None;
+    }
+    let without_ext = match basename.rsplit_once('.') {
+        Some((stem, _ext)) if !stem.is_empty() => stem,
+        Some(_) => return None, // leading-dot-only basename (".pdf") - not a real name
+        None => basename,       // no extension at all
+    }
+    .trim();
+    if without_ext.is_empty() {
+        None
+    } else {
+        Some(without_ext.to_string())
+    }
 }
 
 /// Decode a `<Raw>` payload into a PDF annotation dictionary. Two encodings seen in the
@@ -564,6 +607,95 @@ mod tests {
         assert_eq!(report.tools.len(), 1);
         assert_eq!(report.tools[0].name, "Détecteur de fumée 🔥");
         assert_eq!(report.tools[0].subject, None);
+    }
+
+    // --- 2026-08-08 corpus finding: custom Stamp items still displaying UID names -------
+
+    #[test]
+    fn stamp_source_file_basename_strips_windows_path_and_extension() {
+        let mut d = Dictionary::new();
+        d.set(
+            "TmpBRXFile",
+            Object::string_literal(r"D:\00 SetUp\Configs\BlueBeam\Stamps\MR Init.pdf"),
+        );
+        assert_eq!(stamp_source_file_basename(&d).as_deref(), Some("MR Init"));
+    }
+
+    #[test]
+    fn stamp_source_file_basename_handles_forward_slashes_and_no_extension() {
+        let mut d = Dictionary::new();
+        d.set("TmpBRXFile", Object::string_literal("/mnt/stamps/Approved"));
+        assert_eq!(stamp_source_file_basename(&d).as_deref(), Some("Approved"));
+    }
+
+    #[test]
+    fn stamp_source_file_basename_absent_key_returns_none() {
+        let d = Dictionary::new();
+        assert_eq!(stamp_source_file_basename(&d), None);
+    }
+
+    #[test]
+    fn stamp_source_file_basename_blank_path_returns_none() {
+        let mut d = Dictionary::new();
+        d.set("TmpBRXFile", Object::string_literal("   "));
+        assert_eq!(stamp_source_file_basename(&d), None);
+    }
+
+    #[test]
+    fn stamp_source_file_basename_dotfile_with_no_stem_returns_none() {
+        // A basename that IS just an extension (".pdf", no stem before the dot) must not
+        // produce an empty name - falls through to the raw <Name> UID like any other
+        // genuinely-nameless case.
+        let mut d = Dictionary::new();
+        d.set("TmpBRXFile", Object::string_literal(r"C:\Stamps\.pdf"));
+        assert_eq!(stamp_source_file_basename(&d), None);
+    }
+
+    #[test]
+    fn stamp_with_no_subj_but_tmp_brx_file_uses_the_source_filename_not_the_uid() {
+        // Reproduces the real corpus shape exactly: a Stamp Raw dict with /TmpBRXFile
+        // present and /Subj absent (measured 5/7 real UID-fallback cases) must now name
+        // the tool from the source file, not the opaque XML <Name>.
+        // PDF literal-string syntax requires a backslash to be escaped as `\\` - real
+        // Bluebeam-exported data does this correctly (confirmed against the actual
+        // corpus: decoded /TmpBRXFile bytes carry single 0x5C separators), so the test
+        // fixture must too.
+        let xml = r#"<ToolChestData>
+          <ToolChestItem>
+            <Name>XXEOVOCUQESTKIRL</Name>
+            <Mode>drawing</Mode>
+            <Raw><![CDATA[<< /Subtype /Stamp /Rect [0 0 202.4566 117.0346]
+              /TmpBRXFile (D:\\00 SetUp\\Configs\\BlueBeam\\Stamps\\emittiv stamp crop.pdf) >>]]></Raw>
+          </ToolChestItem>
+        </ToolChestData>"#;
+
+        let report = parse_btx_xml(xml);
+        assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+        assert_eq!(report.tools.len(), 1);
+        assert_eq!(report.tools[0].name, "emittiv stamp crop");
+        assert_eq!(
+            report.tools[0].subject, None,
+            "subject itself must stay None - only the DISPLAY name falls back, /Subj was genuinely absent"
+        );
+    }
+
+    #[test]
+    fn stamp_with_neither_subj_nor_tmp_brx_file_still_falls_back_to_xml_name() {
+        // The genuinely-nameless case (2/7 real UID-fallback cases: no /Subj, no
+        // /TmpBRXFile either) must still degrade to the opaque <Name> rather than
+        // producing an empty/panicking result - the original fallback floor is preserved.
+        let xml = r#"<ToolChestData>
+          <ToolChestItem>
+            <Name>OYXLGGCUBDYSRJYS</Name>
+            <Mode>drawing</Mode>
+            <Raw><![CDATA[<< /Subtype /Stamp /Rect [0 0 50 50] >>]]></Raw>
+          </ToolChestItem>
+        </ToolChestData>"#;
+
+        let report = parse_btx_xml(xml);
+        assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+        assert_eq!(report.tools.len(), 1);
+        assert_eq!(report.tools[0].name, "OYXLGGCUBDYSRJYS");
     }
 
     #[test]
@@ -1112,6 +1244,3 @@ mod tests {
         assert_eq!(ids.len(), N, "every tool must get a unique id - no collisions at scale");
     }
 }
-
-
-
