@@ -47,6 +47,7 @@
   import { loadRecentDocs, saveRecentDocs, upsertMru } from "$lib/recent-docs";
   import type { RecentDoc } from "$lib/recent-docs";
   import SettingsDialog from "./components/SettingsDialog.svelte";
+  import AboutDialog from "./components/AboutDialog.svelte";
   import UpdateNotification from "./components/UpdateNotification.svelte";
   import ErrorBanner from "./components/ErrorBanner.svelte";
   import ToolChestPanel from "./components/ToolChestPanel.svelte";
@@ -236,6 +237,7 @@
 
   // Settings dialog visibility
   let settingsOpen = $state(false);
+  let aboutOpen = $state(false);
 
   // ---------------------------------------------------------------------------
   // Open flow — dedup by path, new tab per file
@@ -800,6 +802,11 @@
         onclick={() => (settingsOpen = true)}
         title="Settings"
       >⚙</button>
+      <button
+        class="btn-toolbar btn-icon"
+        onclick={() => (aboutOpen = true)}
+        title="About Redline"
+      >ⓘ</button>
     </div>
   </header>
 
@@ -995,6 +1002,11 @@
         void maybeInitializeAppContent(state);
       }}
     />
+  {/if}
+
+  <!-- About dialog -->
+  {#if aboutOpen}
+    <AboutDialog onClose={() => (aboutOpen = false)} />
   {/if}
 
   <!-- License grace-period warning: shown once per launch while running on

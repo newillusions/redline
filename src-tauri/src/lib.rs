@@ -30,6 +30,7 @@ pub mod license;
 mod panic_guard;
 pub mod render;
 pub mod sidecar;
+pub mod updater_rollback;
 
 // Stub modules — spec §4 scaffolded, implemented in future milestones
 pub mod compare;
@@ -247,6 +248,9 @@ pub fn run() {
             commands::toolchest::import_btx,
             commands::toolchest::next_stamp_sequence,
             commands::toolchest::compose_stamp_text,
+            // About page: release history + dev-stage rollback
+            commands::updater::list_available_releases,
+            commands::updater::rollback_to_version,
         ])
         .run(tauri::generate_context!())
         .expect("error while running redline");

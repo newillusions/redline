@@ -13,7 +13,7 @@
   import { info as logInfo, error as logError } from "@tauri-apps/plugin-log";
 
   let showModal = $state(false);
-  let updateInfo = $state<{ version: string; notes: string } | null>(null);
+  let updateInfo = $state<{ version: string; currentVersion: string; notes: string } | null>(null);
   let downloading = $state(false);
   let downloadProgress = $state(0);
   let downloadedBytes = $state(0);
@@ -36,6 +36,11 @@
         updateObject = update;
         updateInfo = {
           version: update.version,
+          currentVersion: update.currentVersion,
+          // Release notes already restate the target version (see
+          // build-releases.yml's `"notes": "Release v$VERSION"`) - that's
+          // fine as prose in the notes box below, since the dialog-hint no
+          // longer duplicates it as a second standalone "Version" label.
           notes: update.body || `New version ${update.version} is available`,
         };
         showModal = true;
@@ -116,7 +121,7 @@
       aria-label="Update available"
     >
       <h3 class="dialog-title">Update Available</h3>
-      <p class="dialog-hint">Version {updateInfo.version}</p>
+      <p class="dialog-hint">v{updateInfo.currentVersion} &rarr; v{updateInfo.version}</p>
 
       <div class="release-notes">{updateInfo.notes}</div>
 
