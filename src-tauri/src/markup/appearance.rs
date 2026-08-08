@@ -794,8 +794,10 @@ fn decode_png_stamp_image(b64: &str) -> Option<(Stream, Option<Stream>)> {
 /// pulling in the `base64` crate for the one decode call site this module needs (stamp
 /// PNG assets arrive as base64 over IPC, mirroring how render tiles are base64-ENCODED
 /// for the trip the other way). Returns `None` on any malformed input (invalid character,
-/// truncated final group) rather than panicking.
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+/// truncated final group) rather than panicking. `pub(crate)` so `document::annots`'
+/// read-side stamp-asset recovery test can decode a recovered `PngBase64` asset back to
+/// bytes for a pixel-level round-trip comparison.
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),

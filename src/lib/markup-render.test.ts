@@ -516,3 +516,43 @@ describe("cloud rendering", () => {
     expect(ccw.every((f) => f === 0)).toBe(true);
   });
 });
+
+describe("markupToSvg stamp artwork (2026-08-08 fix)", () => {
+  it("renders a Stamp with a PngBase64 stamp_asset as a stamp-image, not an empty box", () => {
+    const m: Markup = {
+      ...mk({ Rect: { min: { x: 10, y: 20 }, max: { x: 60, y: 70 } } }, "Stamp"),
+      stamp_asset: { PngBase64: "AAAA" },
+    };
+    const s = markupToSvg(m, VS);
+    expect(s.kind).toBe("stamp-image");
+    if (s.kind === "stamp-image") {
+      expect(s.href).toBe("data:image/png;base64,AAAA");
+      // Same y-flip/zoom transform as every other Rect-geometry shape (VS: zoom 2, page 100pt).
+      expect(s.x).toBe(20);
+      expect(s.y).toBe((100 - 70) * 2);
+      expect(s.width).toBe(100);
+      expect(s.height).toBe(100);
+    }
+  });
+
+  it("StampDynamic with a PngBase64 asset also renders as a stamp-image", () => {
+    const m: Markup = {
+      ...mk({ Rect: { min: { x: 0, y: 0 }, max: { x: 10, y: 10 } } }, "StampDynamic"),
+      stamp_asset: { PngBase64: "BBBB" },
+    };
+    expect(markupToSvg(m, VS).kind).toBe("stamp-image");
+  });
+
+  it("falls back to the outline-box rect when stamp_asset is absent (no artwork recovered)", () => {
+    const m = mk({ Rect: { min: { x: 10, y: 20 }, max: { x: 60, y: 70 } } }, "Stamp");
+    expect(markupToSvg(m, VS).kind).toBe("rect");
+  });
+
+  it("falls back to rect for a non-Png stamp_asset kind (Svg/PdfBase64 - out of scope for this path)", () => {
+    const m: Markup = {
+      ...mk({ Rect: { min: { x: 10, y: 20 }, max: { x: 60, y: 70 } } }, "Stamp"),
+      stamp_asset: { Svg: "<svg/>" },
+    };
+    expect(markupToSvg(m, VS).kind).toBe("rect");
+  });
+});

@@ -555,10 +555,123 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
                     true_to_display(p, rotation, w0, h0, ox, oy)
                 });
             }
+            if matches!(
+                m.markup_type,
+                crate::markup::MarkupType::Stamp | crate::markup::MarkupType::StampDynamic
+            ) && m.stamp_asset.is_none()
+            {
+                m.stamp_asset = recover_stamp_asset(doc, &dict);
+            }
             out.push(m);
         }
     }
     Ok(out)
+}
+
+/// Recover a `StampAsset` from an already-placed Stamp/StampDynamic annotation's own
+/// `/AP /N` appearance stream when reading it back (2026-08-08 corpus finding -
+/// `Markup::from_annotation_dict` never populated `stamp_asset` on read at all, so EVERY
+/// reopened Stamp - redline's own placed stamps on save/reopen, not just foreign
+/// Bluebeam ones - lost its artwork and rendered as an empty box; see
+/// `markup::annotation::from_annotation_dict`'s `stamp_asset: None`).
+///
+/// Scoped to the case `write_markups`/`appearance::draw` itself produces for a
+/// `StampAsset::PngBase64` - a single Image XObject painted via `Do` in the AP's own
+/// `/Resources /XObject`, optionally with a `/SMask` alpha channel - re-encoded back into
+/// a `PngBase64` asset so a save/reopen round-trip is lossless. Returns `None` (never
+/// panics) on anything else: no `/AP`, a Form XObject (the `.btx`-import
+/// `BluebeamFormXObject` case - real Bluebeam artwork recovery from an opened PDF, not
+/// just `.btx` import, is a further gap, named not fixed here), multiple images, an
+/// unsupported colour space, or a malformed/undecodable stream - all degrade gracefully
+/// to the pre-existing bordered-box+label fallback rather than erroring the whole read.
+fn recover_stamp_asset(doc: &Document, dict: &Dictionary) -> Option<crate::toolchest::StampAsset> {
+    let ap = dict.get(b"AP").ok()?.as_dict().ok()?;
+    let n_stream = match ap.get(b"N").ok()? {
+        Object::Reference(r) => match doc.get_object(*r).ok()? {
+            Object::Stream(s) => s,
+            _ => return None,
+        },
+        Object::Stream(s) => s,
+        _ => return None,
+    };
+    let resources = n_stream.dict.get(b"Resources").ok()?.as_dict().ok()?;
+    let xobjects = resources.get(b"XObject").ok()?.as_dict().ok()?;
+
+    // Exactly one Image XObject expected (the shape `draw_stamp_image` writes); a Form
+    // XObject present instead (Bluebeam-native artwork) or more than one Image XObject
+    // is out of scope for this recovery path.
+    let mut image_stream = None;
+    for (_, obj) in xobjects.iter() {
+        let resolved = match obj {
+            Object::Reference(r) => doc.get_object(*r).ok()?,
+            other => other,
+        };
+        let s = resolved.as_stream().ok()?;
+        if s.dict.get(b"Subtype").ok()?.as_name().ok()? == b"Image" {
+            if image_stream.is_some() {
+                return None; // more than one image - not the simple case we can recover
+            }
+            image_stream = Some(s);
+        } else {
+            return None; // a Form XObject (or anything else) present - not our case
+        }
+    }
+    let image_stream = image_stream?;
+
+    let width = image_stream.dict.get(b"Width").ok()?.as_i64().ok()? as u32;
+    let height = image_stream.dict.get(b"Height").ok()?.as_i64().ok()? as u32;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let color_space = image_stream
+        .dict
+        .get(b"ColorSpace")
+        .ok()?
+        .as_name()
+        .ok()?
+        .to_vec();
+    let raw = image_stream.decompressed_content().ok()?;
+
+    let rgb: Vec<u8> = match color_space.as_slice() {
+        b"DeviceRGB" => {
+            if raw.len() < (width as usize) * (height as usize) * 3 {
+                return None;
+            }
+            raw
+        }
+        b"DeviceGray" => raw.iter().flat_map(|&g| [g, g, g]).collect(),
+        _ => return None, // CMYK/indexed/ICC - not the shape our own writer produces
+    };
+
+    let smask_alpha: Option<Vec<u8>> = match image_stream.dict.get(b"SMask") {
+        Ok(Object::Reference(r)) => doc.get_object(*r).ok().and_then(|o| match o {
+            Object::Stream(s) => s.decompressed_content().ok(),
+            _ => None,
+        }),
+        _ => None,
+    };
+
+    let img: image::DynamicImage = match smask_alpha {
+        Some(alpha) if alpha.len() >= (width as usize) * (height as usize) => {
+            let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
+            for (px, a) in rgb.chunks_exact(3).zip(alpha.iter()) {
+                rgba.extend_from_slice(px);
+                rgba.push(*a);
+            }
+            image::RgbaImage::from_raw(width, height, rgba).map(image::DynamicImage::ImageRgba8)?
+        }
+        _ => image::RgbImage::from_raw(width, height, rgb).map(image::DynamicImage::ImageRgb8)?,
+    };
+
+    let mut bytes: Vec<u8> = Vec::new();
+    img.write_to(
+        &mut std::io::Cursor::new(&mut bytes),
+        image::ImageFormat::Png,
+    )
+    .ok()?;
+    Some(crate::toolchest::StampAsset::PngBase64(
+        crate::render::base64_encode(&bytes),
+    ))
 }
 
 #[cfg(test)]
@@ -1072,6 +1185,76 @@ pub(crate) mod tests {
                 .unwrap(),
             b"DeviceGray"
         );
+    }
+
+    /// 2026-08-08 corpus finding: `Markup::from_annotation_dict` unconditionally set
+    /// `stamp_asset: None` on read - a REAL regression independent of Bluebeam interop,
+    /// since it means redline's OWN placed stamps lose their artwork the moment a file
+    /// is saved and reopened (not just foreign/Bluebeam-authored ones). Proves the
+    /// round-trip: write a Stamp with a real `PngBase64` asset, reload the saved
+    /// document, and confirm `read_markups` recovers an equivalent asset from the AP's
+    /// own Image XObject rather than rendering an empty box on every reopen.
+    #[test]
+    fn read_markups_recovers_a_png_stamp_asset_from_its_own_ap_image_xobject() {
+        use crate::toolchest::StampAsset;
+        use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
+
+        let img = DynamicImage::ImageRgba8(ImageBuffer::from_fn(3, 2, |x, y| {
+            Rgba([
+                x as u8 * 80,
+                y as u8 * 80,
+                200,
+                if x == 0 { 0 } else { 255 },
+            ])
+        }));
+        let mut png_bytes: Vec<u8> = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        let png_b64 = crate::render::base64_encode(&png_bytes);
+
+        let (mut doc, _page_id) = one_page_doc();
+        let m = Markup::new(
+            MarkupType::Stamp,
+            0,
+            MarkupGeometry::Rect {
+                min: PdfPoint { x: 10.0, y: 10.0 },
+                max: PdfPoint { x: 40.0, y: 30.0 },
+            },
+            Appearance::default(),
+            UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: "Alice".into(),
+            },
+        )
+        .with_stamp_asset(StampAsset::PngBase64(png_b64));
+        write_markups(&mut doc, std::slice::from_ref(&m)).unwrap();
+
+        let read_back = read_markups(&doc).unwrap();
+        assert_eq!(read_back.len(), 1);
+        let recovered_b64 = match &read_back[0].stamp_asset {
+            Some(StampAsset::PngBase64(b64)) => b64.clone(),
+            other => panic!("expected a recovered PngBase64 stamp_asset, got {other:?}"),
+        };
+
+        // Compare decoded pixels rather than raw bytes/base64 - a re-encode through the
+        // `image` crate need not produce byte-identical PNG output, but must be visually
+        // lossless (this asset is a raw RGBA round-trip through FlateDecode, no lossy
+        // step anywhere in the chain).
+        let recovered_bytes = crate::markup::appearance::base64_decode(&recovered_b64).unwrap();
+        let recovered_img = image::load_from_memory(&recovered_bytes).unwrap();
+        assert_eq!(recovered_img.dimensions(), (3, 2));
+        for y in 0..2 {
+            for x in 0..3 {
+                assert_eq!(
+                    recovered_img.get_pixel(x, y),
+                    img.get_pixel(x, y),
+                    "pixel ({x},{y}) must round-trip losslessly"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2154,3 +2337,4 @@ pub(crate) mod tests {
         }
     }
 }
+

@@ -31,6 +31,25 @@ interface SvgStyle {
 export type SvgShape =
   | (SvgStyle & { kind: "rect"; x: number; y: number; width: number; height: number })
   | (SvgStyle & {
+      /**
+       * A placed Stamp/StampDynamic markup carrying a `PngBase64` `stamp_asset` (2026-08-08
+       * corpus finding - `markupToSvg` had NO render case at all for a Stamp's artwork, so
+       * every placed stamp showed as an empty box regardless of whether the backend had a
+       * real asset; see `document::annots::recover_stamp_asset` on the Rust side, which
+       * closes the matching read-side gap for the same asset shape). Carries `SvgStyle`
+       * like every other shape (same `id` field consumers key off), even though the
+       * image's own pixels - not `stroke`/`fill` - are what's visible; kept uniform with
+       * the rest of the union rather than a special-cased shape type.
+       */
+      kind: "stamp-image";
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      /** Data URI, ready for an SVG/HTML `<image>` `href`. */
+      href: string;
+    })
+  | (SvgStyle & {
       kind: "quads";
       /** One SVG polygon points-string per quad (one per underlying text line). */
       polygons: string[];
@@ -491,6 +510,25 @@ export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
       fill: m.appearance.color, stroke: "none",
       fillOpacity: m.appearance.opacity * HIGHLIGHT_FILL_ALPHA,
       x, y, width: Math.abs(b.x - a.x), height: Math.abs(a.y - b.y),
+    };
+  }
+
+  if (
+    "Rect" in g &&
+    (m.markup_type === "Stamp" || m.markup_type === "StampDynamic") &&
+    m.stamp_asset &&
+    "PngBase64" in m.stamp_asset
+  ) {
+    const a = pdfUserSpaceToScreen(g.Rect.min.x, g.Rect.min.y, v);
+    const b = pdfUserSpaceToScreen(g.Rect.max.x, g.Rect.max.y, v);
+    return {
+      ...style,
+      kind: "stamp-image",
+      x: Math.min(a.x, b.x),
+      y: Math.min(a.y, b.y),
+      width: Math.abs(b.x - a.x),
+      height: Math.abs(a.y - b.y),
+      href: `data:image/png;base64,${m.stamp_asset.PngBase64}`,
     };
   }
 

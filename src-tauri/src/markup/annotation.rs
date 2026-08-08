@@ -303,7 +303,33 @@ fn geometry_from_dict(d: &Dictionary) -> MarkupGeometry {
                 .or_else(|| get_reals(d, b"CL"))
                 .or_else(|| get_reals(d, b"L"))
                 .unwrap_or_default();
-            MarkupGeometry::Polyline(points_from_reals(&r))
+            let points = points_from_reals(&r);
+            if !points.is_empty() {
+                MarkupGeometry::Polyline(points)
+            } else {
+                // Bluebeam-nudge interop fallback (2026-08-08 corpus finding): moving a
+                // Callout in Bluebeam Revu regenerates its appearance and DROPS /CL
+                // entirely (spec-legal - /CL is optional per ISO 32000-1 12.5.6.6) while
+                // leaving /RLGeom = "poly" (redline's own private tag) and a still-valid
+                // /Rect/RLRect in place. Falling through with an EMPTY Polyline is worse
+                // than a degenerate one: `markupToSvg`'s Callout branch reads the empty
+                // array's "last point" via `?? {x:0,y:0}` and anchors the whole markup at
+                // PDF-space (0,0) - the page's own origin corner - stacking every affected
+                // Callout on top of each other there instead of near its real position.
+                // A degenerate (zero-length) 2-point line anchored at the annotation's own
+                // /RLRect (falling back to /Rect) min corner keeps the anchor inside the
+                // markup's real footprint - the leader line itself renders invisibly
+                // (zero length) rather than wrongly, and the text box lands in the right
+                // neighbourhood instead of the page corner.
+                let rect = get_reals(d, b"RLRect").or_else(|| get_reals(d, b"Rect"));
+                match rect {
+                    Some(r) if r.len() >= 2 => {
+                        let anchor = PdfPoint { x: r[0], y: r[1] };
+                        MarkupGeometry::Polyline(vec![anchor, anchor])
+                    }
+                    _ => MarkupGeometry::Polyline(Vec::new()),
+                }
+            }
         }
         Some("ink") => {
             let strokes = d
@@ -1068,6 +1094,60 @@ mod tests {
         assert!(d.has(b"CL"), "Callout must emit /CL leader");
         assert!(!d.has(b"Vertices"), "Callout uses /CL, not /Vertices");
         assert_roundtrip(&m);
+    }
+
+    /// Reproduces the 2026-08-08 Bluebeam-nudge corpus finding: moving a Callout in
+    /// Bluebeam Revu regenerates its appearance and DROPS `/CL` entirely (spec-legal -
+    /// `/CL` is optional per ISO 32000-1 12.5.6.6) while leaving redline's own
+    /// `/RLGeom = "poly"` tag and a still-valid `/Rect`/`/RLRect` in place. Before the
+    /// fix, `geometry_from_dict`'s "poly" branch fell through to an EMPTY `Polyline`,
+    /// and `markupToSvg`'s Callout branch (frontend) reads that empty array's "last
+    /// point" via `?? {x:0,y:0}` - anchoring the whole markup at the PDF page's own
+    /// origin corner instead of near its real position. Every affected Callout in the
+    /// real corpus (`Comment`/`e-callout`/`Cloud+`) collapsed onto that one spot.
+    #[test]
+    fn callout_missing_cl_falls_back_to_rect_anchor_not_page_origin() {
+        let g = MarkupGeometry::Polyline(vec![
+            PdfPoint { x: 100.0, y: 200.0 },
+            PdfPoint { x: 150.0, y: 260.0 },
+        ]);
+        let m = fixture(g, MarkupType::Callout);
+        let mut d = m.to_annotation_dict();
+        assert!(d.has(b"CL"), "fixture sanity: written Callout has /CL");
+
+        // Simulate Bluebeam's nudge rewrite: /CL is gone, /RLGeom (and /RLRect/Rect)
+        // remain - exactly the key set diffed from the real corpus files.
+        d.remove(b"CL");
+        assert!(get_reals(&d, b"Vertices").is_none());
+        assert!(get_reals(&d, b"CL").is_none());
+        assert!(get_reals(&d, b"L").is_none());
+
+        let recovered = Markup::from_annotation_dict(&d);
+        let MarkupGeometry::Polyline(pts) = recovered.geometry else {
+            panic!(
+                "Callout must still recover Polyline geometry, got {:?}",
+                recovered.geometry
+            );
+        };
+        assert!(
+            !pts.is_empty(),
+            "must not silently degrade to an empty Polyline (collapses the anchor to (0,0))"
+        );
+        let anchor = pts.last().expect("non-empty");
+        assert!(
+            anchor.x != 0.0 || anchor.y != 0.0,
+            "anchor must not fall back to the PDF page origin (0,0), got {anchor:?}"
+        );
+        // The synthetic anchor must land inside/near the annotation's own Rect
+        // footprint, not at some unrelated point.
+        let rect = get_reals(&d, b"RLRect")
+            .or_else(|| get_reals(&d, b"Rect"))
+            .expect("Rect must still be present after simulated nudge");
+        assert!(
+            (anchor.x - rect[0]).abs() < 1e-6 && (anchor.y - rect[1]).abs() < 1e-6,
+            "expected anchor at the Rect's min corner {:?}, got {anchor:?}",
+            (rect[0], rect[1])
+        );
     }
 
     // --- Text-anchored Highlight: /QuadPoints round-trip -----------------------------

@@ -2339,6 +2339,14 @@
           fill="none"
           stroke-dasharray={s.dashArray ?? undefined}
           pointer-events="none" />
+      {:else if s.kind === "stamp-image"}
+        <!-- A placed Stamp/StampDynamic markup with a real PngBase64 asset (2026-08-08
+             fix - previously every Stamp fell through to the generic outline-box "rect"
+             kind, regardless of whether real artwork existed). No SvgStyle spread here:
+             the image carries its own colours. -->
+        <image href={s.href} x={s.x} y={s.y} width={s.width} height={s.height}
+          preserveAspectRatio="none"
+          pointer-events="none" />
       {:else if s.kind === "ink"}
         {#each s.strokes as stroke, i (i)}
           <polyline points={stroke}
