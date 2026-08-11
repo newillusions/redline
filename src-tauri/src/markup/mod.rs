@@ -107,6 +107,22 @@ pub enum CountSymbol {
     Hexagon,
 }
 
+/// Where a foreign `/OC` (optional content) value came from, preserved verbatim rather
+/// than interpreted (spec: BB-interop fix wave 2026-08-11, obs:je08u4y8rukjzbpm2y5f).
+/// Two shapes cover everything seen in practice: a real, already-opened PDF's own object
+/// graph carries `/OC` as an indirect reference to an OCG/OCMD dictionary (ISO 32000-1
+/// §8.11.2); Bluebeam's `.btx` Tool Set exports instead carry a plain PDF string naming
+/// the source layer (e.g. `/OC (emittiv markups)`) - a portable stand-in, since a Tool
+/// Set item has no resolvable cross-reference table of its own to point a real reference
+/// at. redline does not resolve or build the OCG tree itself; round-tripping the exact
+/// value it read (rather than reinterpreting or dropping it) means opening-then-resaving
+/// a layered foreign PDF doesn't silently strip an annotation from its layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OptionalContent {
+    Reference(u32, u16),
+    Text(String),
+}
+
 /// A Count "set" / category: a named bucket with its own colour + symbol so distinct item
 /// types are counted and tallied separately (spec §7). Document-scoped for v1 (definitions
 /// live in the markup store); each [`MarkupType::MeasurementCount`] markup references the set
@@ -307,6 +323,51 @@ pub struct Markup {
     /// keeps pre-this-field JSON deserialising to `None`.
     #[serde(default)]
     pub stamp_asset: Option<crate::toolchest::StampAsset>,
+    /// Standard `/F` annotation flags (ISO 32000-1 §12.5.3 table 165 - Print/Hidden/
+    /// NoZoom/NoRotate/Locked/...), the raw bit field. Every real annotation in the BB
+    /// corpus carries `/F` (almost always exactly `4`, the Print bit) and redline's
+    /// write path dropped it entirely pre-fix (BB-interop fix wave 2026-08-11,
+    /// obs:je08u4y8rukjzbpm2y5f) - plausibly interop-relevant since a strict viewer can
+    /// legitimately honour Locked/NoZoom/Print per this value. Defaults to `4` (Print)
+    /// for markups redline creates itself, matching the real corpus rather than the PDF
+    /// spec's own bare default of `0` (not printed) - see [`default_annot_flags`].
+    /// `#[serde(default = "default_annot_flags")]` keeps pre-this-field JSON
+    /// deserialising to the same default rather than `0`.
+    #[serde(default = "default_annot_flags")]
+    pub annot_flags: i32,
+    /// Standard `/RC` rich-text string (ISO 32000-1 §12.5.6.18, an XFA-flavoured XML
+    /// body) - Bluebeam/Acrobat's richer representation of a text-bearing markup's
+    /// content, alongside the plain `/Contents`. redline does not parse, edit, or
+    /// render this - `contents`/`subject` remain the single source of truth for the
+    /// plain-text note - it is preserved verbatim on round-trip only, so re-saving a
+    /// Bluebeam-authored FreeText/Circle markup doesn't silently strip formatting a
+    /// stricter viewer may still read back. `#[serde(default)]` keeps pre-this-field
+    /// JSON deserialising to `None`.
+    #[serde(default)]
+    pub rich_text: Option<String>,
+    /// Standard `/OC` optional-content value, preserved verbatim - see
+    /// [`OptionalContent`]. `#[serde(default)]` keeps pre-this-field JSON
+    /// deserialising to `None`.
+    #[serde(default)]
+    pub optional_content: Option<OptionalContent>,
+    /// A foreign `/DA` default-appearance string that carried no parseable font/size
+    /// operator (e.g. a colour-only Bluebeam `/DA` like `"0.5 0 1 rg"`, no `Tf` at all -
+    /// a real corpus shape, not hypothetical). Only ever populated on read when
+    /// `appearance.font` could NOT be recovered from it (see `font_from_da`); write-side
+    /// fallback only - `to_annotation_dict` always derives `/DA` from `appearance.font`
+    /// when one is present, and only falls back to re-emitting this raw string when it
+    /// is not, so redline's own font model always wins the moment the markup actually
+    /// has a font. `#[serde(default)]` keeps pre-this-field JSON deserialising to `None`.
+    #[serde(default)]
+    pub raw_da: Option<String>,
+}
+
+/// Default `/F` annotation flags for a markup redline creates itself: `4` (Print, bit 3
+/// per ISO 32000-1 table 165) - matches what every real Bluebeam-authored annotation in
+/// the BB corpus carries, so redline-authored markups print by default instead of
+/// relying on the PDF spec's own bare default (`0`, not printed).
+fn default_annot_flags() -> i32 {
+    4
 }
 
 impl Markup {
@@ -343,6 +404,10 @@ impl Markup {
             measurement: None,
             count_set: None,
             stamp_asset: None,
+            annot_flags: default_annot_flags(),
+            rich_text: None,
+            optional_content: None,
+            raw_da: None,
         }
     }
 

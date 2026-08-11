@@ -23,7 +23,7 @@ use lopdf::{Dictionary, Object};
 
 use super::{
     Appearance, Audit, CountSet, CountSymbol, FontSpec, LineStyle, Markup, MarkupGeometry,
-    MarkupStatus, MarkupType, Measurement, Origin, Reply, UserRef, Workflow,
+    MarkupStatus, MarkupType, Measurement, OptionalContent, Origin, Reply, UserRef, Workflow,
 };
 use crate::geometry::{PdfPoint, Quad};
 
@@ -64,6 +64,50 @@ fn get_reals(d: &Dictionary, key: &[u8]) -> Option<Vec<f64>> {
     arr.iter()
         .map(|o| o.as_float().ok().map(|f| f as f64))
         .collect()
+}
+
+/// Whether a foreign `/Subtype /Polygon` annotation is actually a Bluebeam-style
+/// revision cloud rather than a plain polygon. Real Bluebeam clouds carry `/BE << /S /C
+/// ... >>` (Cloudy border style) and/or `/IT /PolygonCloud`; a plain Polygon carries
+/// neither. Read-side half of the BB-interop fix wave 2026-08-11
+/// (obs:je08u4y8rukjzbpm2y5f): without this, every foreign cloud-style Polygon (no
+/// `/RLType` of its own) imported as a flat `MarkupType::Polygon`, and the existing
+/// write path only emits `/BE`+`/IT` for `MarkupType::Cloud` - so the cloud markers
+/// never survived a round-trip, matching the real corpus finding (4/7 golden Polygon
+/// items carry `/BE` that the pre-fix round-trip dropped).
+fn is_cloud_polygon(d: &Dictionary) -> bool {
+    if get_name(d, b"IT").as_deref() == Some("PolygonCloud") {
+        return true;
+    }
+    d.get(b"BE")
+        .ok()
+        .and_then(|o| o.as_dict().ok())
+        .map(|be| get_name(be, b"S").as_deref() == Some("C"))
+        .unwrap_or(false)
+}
+
+/// Recover a font from a foreign `/DA` default-appearance string (ISO 32000-1
+/// §12.7.3.3, e.g. `"1 0.5019608 0.2509804 rg /Calibri 10 Tf"` - the exact shape real
+/// Bluebeam FreeText/Callout annotations carry in the BB corpus). Read-side half of the
+/// BB-interop fix wave 2026-08-11 (obs:je08u4y8rukjzbpm2y5f): only used when redline's
+/// own lossless `/RLFontFamily`+`/RLFontSize` keys are absent (a foreign annotation, or
+/// one Bluebeam itself re-wrote). Without this, a golden FreeText item's font vanished
+/// on `from_annotation_dict` (no `/RL*` keys, so `appearance.font` read as `None`),
+/// which then suppressed the ALREADY-correct `/DA` write in `to_annotation_dict` (its
+/// emission is gated on `Some(font)`) - the actual mechanism behind the harness's
+/// "FreeText drops /DA on 22/22 golden items" finding; the write side needed nothing
+/// changed, only this read-side recovery. Bluebeam's `/DA` carries the real family name
+/// directly (e.g. "Calibri"), richer than redline's own base-14-alias write path, so
+/// this recovers genuine fidelity rather than merely satisfying the round-trip.
+fn font_from_da(da: &str) -> Option<FontSpec> {
+    let tf_idx = da.find(" Tf")?;
+    let mut tokens = da[..tf_idx].rsplit(' ');
+    let size_pt: f64 = tokens.next()?.parse().ok()?;
+    let family = tokens.next()?.strip_prefix('/')?.to_string();
+    if family.is_empty() {
+        return None;
+    }
+    Some(FontSpec { family, size_pt })
 }
 
 // --- enum <-> tag --------------------------------------------------------------
@@ -484,6 +528,28 @@ impl Markup {
             Object::string_literal(to_pdf_date(&self.audit.modified_at)),
         );
 
+        // Standard `/F` annotation flags (ISO 32000-1 §12.5.3) - always emitted, not
+        // conditional, matching every real annotation in the BB corpus (see the
+        // `annot_flags` field doc comment on why the default is 4/Print rather than the
+        // spec's own bare 0).
+        d.set("F", Object::Integer(self.annot_flags as i64));
+
+        // Standard `/RC` rich-text string and `/OC` optional-content value: both
+        // preserved verbatim on round-trip when present, never invented (see the field
+        // doc comments in mod.rs). Neither has redline UI/model semantics of its own.
+        if let Some(rc) = &self.rich_text {
+            d.set("RC", Object::string_literal(rc.clone()));
+        }
+        match &self.optional_content {
+            Some(OptionalContent::Text(s)) => {
+                d.set("OC", Object::string_literal(s.clone()));
+            }
+            Some(OptionalContent::Reference(num, gen)) => {
+                d.set("OC", Object::Reference((*num, *gen)));
+            }
+            None => {}
+        }
+
         // Appearance (colour / opacity / weight / fill / line-style).
         if let Some(rgb) = hex_to_rgb(&self.appearance.color) {
             d.set("C", Object::Array(rgb.iter().map(|v| real(*v)).collect()));
@@ -583,6 +649,13 @@ impl Markup {
             );
             d.set("RLFontFamily", Object::string_literal(font.family.clone()));
             d.set("RLFontSize", real(font.size_pt));
+        } else if let Some(raw) = &self.raw_da {
+            // No font to derive a /DA from (redline never sets one without a font), but
+            // a foreign /DA was read that carried no parseable Tf operator - e.g. a
+            // real Bluebeam colour-only DA like "0.5 0 1 rg" with no font/size at all
+            // (a real corpus shape, not hypothetical - see `raw_da`'s field doc
+            // comment). Re-emit it verbatim rather than silently dropping it.
+            d.set("DA", Object::string_literal(raw.clone()));
         }
 
         // Private /RL* keys for lossless redline round-trip.
@@ -681,7 +754,11 @@ impl Markup {
                 Some("Square") => Some(MarkupType::Rectangle),
                 Some("Circle") => Some(MarkupType::Ellipse),
                 Some("Line") => Some(MarkupType::Line),
-                Some("Polygon") => Some(MarkupType::Polygon),
+                Some("Polygon") => Some(if is_cloud_polygon(d) {
+                    MarkupType::Cloud
+                } else {
+                    MarkupType::Polygon
+                }),
                 Some("PolyLine") => Some(MarkupType::Polyline),
                 Some("Highlight") => Some(MarkupType::Highlight),
                 Some("Ink") => Some(MarkupType::Ink),
@@ -746,6 +823,22 @@ impl Markup {
             .or_else(|| get_real(d, b"CA"))
             .unwrap_or(1.0);
 
+        // Font: prefer redline's own lossless keys; fall back to parsing a foreign /DA
+        // (see `font_from_da`'s doc comment - this is what actually closes the
+        // "FreeText drops /DA on round-trip" finding, since the write side only ever
+        // needed a non-None `font` to already emit /DA correctly). When a `/DA` is
+        // present but carries no parseable font/size (real corpus shape: a colour-only
+        // DA like "0.5 0 1 rg", no Tf), keep the raw string so the write side can still
+        // re-emit it verbatim instead of losing it - see `raw_da`'s field doc comment.
+        let da_string = get_string(d, b"DA");
+        let font = get_real(d, b"RLFontSize")
+            .map(|size_pt| FontSpec {
+                family: get_string(d, b"RLFontFamily").unwrap_or_else(|| "Helvetica".to_string()),
+                size_pt,
+            })
+            .or_else(|| da_string.as_deref().and_then(font_from_da));
+        let raw_da = if font.is_none() { da_string } else { None };
+
         // Count set: reconstruct from /RLCountSet* keys; the colour comes from /C (== `color`).
         let count_set = get_string(d, b"RLCountSetId")
             .and_then(|s| uuid::Uuid::parse_str(&s).ok())
@@ -767,11 +860,7 @@ impl Markup {
                 opacity,
                 fill,
                 line_style,
-                font: get_real(d, b"RLFontSize").map(|size_pt| FontSpec {
-                    family: get_string(d, b"RLFontFamily")
-                        .unwrap_or_else(|| "Helvetica".to_string()),
-                    size_pt,
-                }),
+                font,
                 // Box border colour + fill alpha — absent on pre-outline / foreign
                 // annotations, which then deserialise to None (a sane default: border
                 // falls back to `color`, fill stays fully opaque).
@@ -811,6 +900,18 @@ impl Markup {
             // Not reconstructed on reopen - see the field doc comment in markup/mod.rs
             // (the appearance is already baked into the saved /AP /N stream by then).
             stamp_asset: None,
+            // Default to Print (4) when absent, matching Markup::new()'s own default -
+            // see the `annot_flags` field doc comment.
+            annot_flags: get_int(d, b"F").map(|f| f as i32).unwrap_or(4),
+            rich_text: get_string(d, b"RC"),
+            optional_content: d.get(b"OC").ok().and_then(|o| match o {
+                Object::String(bytes, _) => Some(OptionalContent::Text(
+                    String::from_utf8_lossy(bytes).into_owned(),
+                )),
+                Object::Reference((num, gen)) => Some(OptionalContent::Reference(*num, *gen)),
+                _ => None,
+            }),
+            raw_da,
         }
     }
 }
@@ -1843,5 +1944,235 @@ mod tests {
             r[3] > 60.0,
             "/Rect top edge must include the callout box height, got {r:?}"
         );
+    }
+
+    // --- BB-interop fix wave 2026-08-11 (obs:je08u4y8rukjzbpm2y5f) ---------------------
+
+    #[test]
+    fn annot_flags_default_to_print_and_round_trip() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 0.0, y: 0.0 },
+            max: PdfPoint { x: 10.0, y: 10.0 },
+        };
+        let m = fixture(g, MarkupType::Rectangle);
+        assert_eq!(m.annot_flags, 4, "Markup::new default must be Print (4)");
+        let d = m.to_annotation_dict();
+        assert_eq!(get_int(&d, b"F"), Some(4), "/F must always be emitted");
+        let back = Markup::from_annotation_dict(&d);
+        assert_eq!(back.annot_flags, 4);
+    }
+
+    #[test]
+    fn annot_flags_preserve_a_non_default_foreign_value() {
+        // A real corpus value: Print + NoZoom + NoRotate (4 + 8 + 16 = 28).
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("Square"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(0.0), real(0.0), real(10.0), real(10.0)]),
+        );
+        d.set("F", Object::Integer(28));
+        let m = Markup::from_annotation_dict(&d);
+        assert_eq!(m.annot_flags, 28);
+        let back_d = m.to_annotation_dict();
+        assert_eq!(
+            get_int(&back_d, b"F"),
+            Some(28),
+            "must round-trip exactly, not reset to the default"
+        );
+    }
+
+    #[test]
+    fn rich_text_rc_round_trips_when_present_and_is_absent_by_default() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 0.0, y: 0.0 },
+            max: PdfPoint { x: 10.0, y: 10.0 },
+        };
+        let mut m = fixture(g, MarkupType::Text);
+        assert!(
+            m.to_annotation_dict().get(b"RC").is_err(),
+            "no /RC by default"
+        );
+
+        m.rich_text = Some("<?xml version=\"1.0\"?><body>note</body>".to_string());
+        let d = m.to_annotation_dict();
+        assert_eq!(
+            get_string(&d, b"RC").as_deref(),
+            Some(m.rich_text.as_deref().unwrap())
+        );
+        let back = Markup::from_annotation_dict(&d);
+        assert_eq!(back.rich_text, m.rich_text);
+    }
+
+    #[test]
+    fn optional_content_text_and_reference_both_round_trip() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 0.0, y: 0.0 },
+            max: PdfPoint { x: 10.0, y: 10.0 },
+        };
+
+        // Bluebeam .btx-export shape: a plain PDF string naming the layer.
+        let mut m = fixture(g.clone(), MarkupType::Rectangle);
+        m.optional_content = Some(OptionalContent::Text("emittiv markups".to_string()));
+        let d = m.to_annotation_dict();
+        assert_eq!(
+            get_string(&d, b"OC").as_deref(),
+            Some("emittiv markups"),
+            "/OC must be written as the exact string, not reinterpreted"
+        );
+        let back = Markup::from_annotation_dict(&d);
+        assert_eq!(back.optional_content, m.optional_content);
+
+        // A real opened-PDF shape: an indirect reference to an OCG dictionary.
+        let mut m2 = fixture(g, MarkupType::Rectangle);
+        m2.optional_content = Some(OptionalContent::Reference(17, 0));
+        let d2 = m2.to_annotation_dict();
+        assert_eq!(
+            d2.get(b"OC").ok().and_then(|o| o.as_reference().ok()),
+            Some((17, 0))
+        );
+        let back2 = Markup::from_annotation_dict(&d2);
+        assert_eq!(back2.optional_content, m2.optional_content);
+    }
+
+    /// Read-side classification fix: a foreign (no `/RLType`) `/Subtype /Polygon`
+    /// annotation carrying `/BE << /S /C >>` (Cloudy border) must import as
+    /// `MarkupType::Cloud`, not a plain `Polygon` - otherwise the existing write path
+    /// (which only emits `/BE`+`/IT` for `MarkupType::Cloud`) never gets a chance to
+    /// re-emit them, and the real BB corpus's cloud markups lose their scalloped-arc
+    /// styling on every round-trip (4/7 golden Polygon items, obs:je08u4y8rukjzbpm2y5f).
+    #[test]
+    fn foreign_polygon_with_cloudy_be_imports_as_cloud_and_be_survives_round_trip() {
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("Polygon"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(0.0), real(0.0), real(10.0), real(10.0)]),
+        );
+        d.set(
+            "Vertices",
+            flatten(&[
+                PdfPoint { x: 0.0, y: 0.0 },
+                PdfPoint { x: 10.0, y: 0.0 },
+                PdfPoint { x: 5.0, y: 10.0 },
+            ]),
+        );
+        let mut be = Dictionary::new();
+        be.set("S", name("C"));
+        be.set("I", real(2.0));
+        d.set("BE", Object::Dictionary(be));
+        d.set("IT", name("PolygonCloud"));
+
+        let m = Markup::from_annotation_dict(&d);
+        assert_eq!(
+            m.markup_type,
+            MarkupType::Cloud,
+            "a foreign Polygon with a Cloudy /BE must classify as Cloud, not plain Polygon"
+        );
+
+        let round_tripped = m.to_annotation_dict();
+        assert!(round_tripped.has(b"BE"), "/BE must survive the round-trip");
+        assert_eq!(
+            get_name(&round_tripped, b"IT").as_deref(),
+            Some("PolygonCloud")
+        );
+    }
+
+    /// A plain foreign Polygon (no /BE, no /IT PolygonCloud) must still import as plain
+    /// `Polygon` - the Cloud-detection fix must not misclassify every Polygon.
+    #[test]
+    fn foreign_polygon_without_be_stays_plain_polygon() {
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("Polygon"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(0.0), real(0.0), real(10.0), real(10.0)]),
+        );
+        let m = Markup::from_annotation_dict(&d);
+        assert_eq!(m.markup_type, MarkupType::Polygon);
+    }
+
+    /// The actual mechanism behind the harness's "FreeText drops /DA on 22/22 golden
+    /// items" finding: a real Bluebeam `/DA` (no `/RLFontFamily`/`/RLFontSize`, since
+    /// it's foreign data) must be parsed into a font so the ALREADY-correct write path
+    /// (gated on `Some(font)`) re-emits it. The write side needed no change - only this
+    /// read-side recovery.
+    #[test]
+    fn foreign_da_with_font_operator_recovers_font_and_da_round_trips() {
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("FreeText"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(0.0), real(0.0), real(100.0), real(20.0)]),
+        );
+        d.set(
+            "DA",
+            Object::string_literal("1 0.5019608 0.2509804 rg /Calibri 10 Tf"),
+        );
+        let m = Markup::from_annotation_dict(&d);
+        let font = m
+            .appearance
+            .font
+            .as_ref()
+            .expect("font must be recovered from /DA");
+        assert_eq!(font.family, "Calibri");
+        assert_eq!(font.size_pt, 10.0);
+
+        let back_d = m.to_annotation_dict();
+        assert!(
+            back_d.has(b"DA"),
+            "/DA must round-trip once a font is recovered"
+        );
+    }
+
+    /// A real corpus shape: a `/DA` with a colour operator but NO `Tf` (font/size) at
+    /// all, e.g. `"0.5019608 0 1 rg"`. No font can be recovered, but the raw string
+    /// must still be preserved and re-emitted verbatim rather than silently dropped.
+    #[test]
+    fn foreign_da_without_font_operator_preserves_raw_string_verbatim() {
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("FreeText"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(0.0), real(0.0), real(100.0), real(20.0)]),
+        );
+        d.set("DA", Object::string_literal("0.5019608 0 1 rg"));
+        let m = Markup::from_annotation_dict(&d);
+        assert!(
+            m.appearance.font.is_none(),
+            "no Tf operator means no recoverable font"
+        );
+        assert_eq!(m.raw_da.as_deref(), Some("0.5019608 0 1 rg"));
+
+        let back_d = m.to_annotation_dict();
+        assert_eq!(
+            get_string(&back_d, b"DA").as_deref(),
+            Some("0.5019608 0 1 rg"),
+            "the raw /DA must round-trip verbatim when no font could be derived from it"
+        );
+    }
+
+    /// A redline-authored markup with a real font always writes /DA from the font model
+    /// (RLFontFamily/RLFontSize win over any raw_da fallback, which only applies when
+    /// there is no font at all).
+    #[test]
+    fn own_font_model_wins_over_raw_da_fallback_when_both_present() {
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 0.0, y: 0.0 },
+            max: PdfPoint { x: 100.0, y: 20.0 },
+        };
+        let mut m = fixture(g, MarkupType::Text);
+        m.appearance.font = Some(FontSpec {
+            family: "Helvetica".into(),
+            size_pt: 12.0,
+        });
+        m.raw_da = Some("this should never be written".to_string());
+        let d = m.to_annotation_dict();
+        let da = get_string(&d, b"DA").expect("/DA present");
+        assert!(
+            da.contains("Tf"),
+            "must derive from the real font model: {da:?}"
+        );
+        assert_ne!(da, "this should never be written");
     }
 }

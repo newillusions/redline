@@ -1255,6 +1255,10 @@ mod tests {
             measurement: None,
             count_set: None,
             stamp_asset: None,
+            annot_flags: 4,
+            rich_text: None,
+            optional_content: None,
+            raw_da: None,
         }
     }
 
