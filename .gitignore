@@ -38,5 +38,6 @@ Thumbs.db
 /src-tauri/resources/libpdfium.so
 /src-tauri/resources/pdfium.dll
 
-# Benchmark rendered output (PNG proofs)
+# Benchmark rendered output (PNG proofs, incl. nested dirs like render-matrix/)
 /bench/results/*.png
+/bench/results/**/*.png

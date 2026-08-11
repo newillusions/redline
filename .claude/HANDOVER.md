@@ -2,11 +2,402 @@
 
 ## Current Status
 
-**main is still at `f695610a` (PR #63) - PR #67 is OPEN, CI green, NOT yet merged
-(orchestrator owns merge/deploy per dispatch scope). Branch
-`fix/docops-reseed-and-btx-subtype-guard`, head `39ee537c7b1c44a750e10b0bc2d0b94bfb428927`,
-https://forge.mms.name/emittiv/redline/pulls/67. Dispatched to investigate two live
-reports: "flatten and optimise don't seem to do anything" and ".btx file import issues."**
+**PR #77 (self-service Bluebeam-interop validation harness, new dispatch 2026-08-11)
+open, mergeable, head `df4c727e83f6637e2f39fbe95dcbe8f381c71396`, based on
+main@23469e9 (post-v0.3.14), https://forge.mms.name/emittiv/redline/pulls/77. CI green
+(run #212, success). NOT yet merged (orchestrator owns merge - no deploy needed, this
+is dev/test tooling only, zero app code touched). Owner directive verbatim (G9
+reopened): "there are still significant issues with how our markups read in
+bluebeam... you need to find a way of testing and validating that yourself... in
+browsers and stirling pdf maybe."**
+
+**Structural conformance harness (primary check),
+`src-tauri/tests/bb_interop_conformance.rs`: diffs redline's write-side
+annotation-dictionary output against GENUINE Bluebeam-authored PDF annotation
+dictionaries, extracted independently (own hex+zlib decoder, not btx.rs's pub(crate)
+one) from the real `.btx` corpus (4 files/77 items). Round-trips each golden dict
+through the real production path (`Markup::from_annotation_dict` ->
+`to_annotation_dict`) and diffs key sets per subtype. Deliberately the primary check,
+not a render comparison - Bluebeam regenerates annotation appearances from the
+dictionary on edit, so a generic viewer blitting the stored `/AP` can look fine while
+the data model is wrong (the exact shape of every real G9 fix to date).**
+
+**Calibrated: correctly detects the known grouped-`<Child>` class (33/77 items,
+architecturally unsupported) and the known 4-stamp stock-artwork gap
+(`objects.get(&root_id)` unresolvable, the "MR Init"/"MR Sig" class from PR #76);
+confirms the 2026-08-08 UID-naming fix still holds (0/11 raw UID names).**
+
+**First-run findings, not previously enumerated - candidates for the owner's
+"significant issues" complaint, not yet fixed: every subtype's round-trip drops `/F`
+(annotation flags - Print/NoZoom/Locked); FreeText drops `/DA` (default appearance
+string - font/size/color) on 22/22 golden items - redline uses custom
+RLFontFamily/RLFontSize instead of standard `/DA`; FreeText/Circle drop `/RC` (rich
+text) on a majority of items that carry it; 4/7 golden Polygon items carry `/BE`
+(cloud border effect) that never survives the round-trip, suggesting some
+BB-authored cloud-style Polygons are misclassified as plain Polygon on read; `/OC`
+(optional content/layers) dropped everywhere. Full per-subtype breakdown via
+`cargo test --test bb_interop_conformance -- --ignored --nocapture`.**
+
+**Render matrix (secondary check), `tools/render-matrix.mjs` (`npm run
+render:matrix`): poppler + macOS Quartz + real Chrome (Playwright's bundled headless
+Chromium has NO PDF viewer at all under automation - confirmed empirically, "Download
+is starting" regardless of CDP settings; falls back to `channel: "chrome"`, which
+works). mutool/ImageMagick not installed on this machine, named as a gap not silently
+skipped. Verified end-to-end against `bench/corpus/bb-ref/markup-test-original.pdf`.**
+
+**Tool evaluation (deliverable 3, posted as a PR #77 comment): researched Stirling
+PDF, qpdf, Ghostscript, Okular, LibreOffice, PDFtk for appearance-REGENERATING
+Bluebeam-proxy behavior on MARKUP annotations (not AcroForm fields, which is what
+qpdf `--generate-appearances`/Ghostscript `/NeedAppearances` actually cover - a
+different, easily-confused mechanism). Conclusion: no verified open-source
+substitute exists. Recommendation: deploy nothing new - the structural harness above
+already sidesteps the problem by comparing against Bluebeam's own real output
+instead of needing a proxy tool.**
+
+**G9 stays OPEN pending the owner's capture pass (author a representative markup set,
+open in Bluebeam, note what reads wrong) plus triage of this harness's first-run
+findings above.**
+
+Verified: `cargo test --all-targets` 492 lib passed (486 baseline unaffected) + new
+harness's 2 tests pass under `--ignored --nocapture`; `cargo clippy --all-targets` 0
+warnings; `npm test` 742/742; `npm run check` 0 errors (23 pre-existing warnings, none
+in touched files).
+
+### Previous session (2026-08-08, PR #76, now merged as part of v0.3.14, kept for context)
+
+**PR #76 (Form XObject stamp rendering - final piece of the stamp saga, new dispatch
+2026-08-08) open, mergeable, head `9b82be4485996ce7f6e18031ff962399ca506dae`, based on
+main@710d45b3 (post-PR #75), https://forge.mms.name/emittiv/redline/pulls/76. NOT yet
+merged (orchestrator owns merge/deploy). Closes the owner's "still no joy with the
+stamps" report for the stamps he actually uses: all 11 real production stamps are
+`StampAsset::BluebeamFormXObject` and rendered as empty boxes everywhere before this.**
+
+**Design choice (justified in the PR body, per dispatch steer to weigh a raster
+alternative against a full interpreter): rasterize the Form XObject via PDFium rather
+than write a custom content-stream-to-SVG interpreter.** `build_isolated_form_xobject_pdf`
+(new, `document/annots.rs`) wraps the Form XObject in a minimal single-page PDF
+(MediaBox = the XObject's own `/BBox`, content stream `q 1 0 0 1 0 0 cm /Fx0 Do Q`),
+reusing `splice_bb_form_xobject` (refactored out of `write_markups`'s existing inline
+logic for reuse). New `RenderEngine::rasterize_pdf_bytes` (`render/mod.rs`) renders it
+through the app's existing single-instance PDFium render thread to a transparent PNG
+(`RenderCmd::RasterizePdfBytes`, follows the `PageSnapIndex` plumbing pattern exactly).
+Chosen over a custom interpreter because it gets nested XObjects, transforms, and text/
+font handling for free from PDFium's own engine rather than reimplementing all of it.
+
+**Zero frontend changes needed.** `Viewport.svelte`'s `stampAssetOf`/`createPlacedMarkup`
+already copy `tool.stamp.asset` verbatim onto placed markups, and PR #73's existing
+`"stamp-image"` render case already handles `PngBase64` - so wiring rasterization in at
+`.btx` import time (new `rasterize_form_xobject_stamps_in_place`, called from the
+`import_btx` command before tools are stored) was sufficient. Trade-off named in the PR
+body: this is eager/at-import-time, not a lazy frontend cache, so re-export writes the
+rasterized PNG rather than the original vector Form XObject - simpler, at the cost of
+losing that save-fidelity.
+
+**Two real, pre-existing bugs found and fixed en route (neither introduced by this PR):**
+1. **`/Length` mismatch in real Bluebeam `.btx` data.** `parse_pdf_object_bytes` (`btx.rs`)
+   produced an `Object::Dictionary` instead of `Object::Stream` whenever a real corpus
+   item's declared `/Length` didn't match the actual stream body length - a LATENT bug
+   that also silently affected the already-shipped `write_markups` save-time splicing,
+   not just this new rasterization path. Root-caused via a debug dump of the raw bytes
+   for a real failing corpus item ("emittiv stamp crop"). Fixed with new
+   `fix_stream_length()`: scans for the true `stream`/`endstream` byte boundary and
+   rewrites the `/Length` token to match before parsing.
+2. **Stock/library stamps have no embeddable artwork at all** (e.g. "MR Init", "MR Sig").
+   Their `/AP`'s `root_id` is absent from the item's own `<Resources>` block because
+   `/TmpBRXFile` points at Bluebeam's *bundled* stamps library, not a user file -
+   Bluebeam doesn't embed built-in library-stamp artwork in `.btx` exports. This is a
+   genuine data-availability gap, not a bug. Handled by returning `None`/a named,
+   logged skip rather than a silent blank box.
+
+**Result: 7/11 real corpus stamps now rasterize with actual non-blank artwork**
+(verified against real `bench/corpus/btx/*.btx` files through real PDFium, not
+mocked); the remaining 4 are the stock-stamp gap above, named not silently degraded.
+
+**Not done, named in the PR body:** read-side Form XObject recovery from an already-
+*opened* PDF (extending PR #73's `recover_stamp_asset` beyond the `.btx`-import path) -
+lower priority since all 11 real corpus stamps are sourced via `.btx` import, not
+pre-existing PDF annotations.
+
+Tests: `cargo test --all-targets` 486/486 lib (478 baseline + 8 new) + 21 pdf-diff, 0
+failed. `cargo clippy --all-targets` 0 warnings. Both new PDFium-gated tests
+(`rasterize_pdf_bytes_renders_real_content_not_a_blank_transparent_image`,
+`rasterize_pdf_bytes_a_real_corpus_stamp_renders_non_blank_artwork`) confirmed passing
+for real (not just skipped) via `PDFIUM_DYNAMIC_LIB_PATH=.../libpdfium.dylib cargo test
+--lib -- --test-threads=1`. `npm test` 733/733 (0 new - frontend untouched, gates run
+for regression confirmation only), `npm run check` 0 errors, `npm run build` clean.
+
+**Mission-record hygiene note (flagged for the orchestrator, not fixed here - out of
+this dispatch's scope):** the redline `next_steps` list has grown to 62 entries with
+`kb_status_update` returning lint warnings on several ("reads like code-level churn");
+worth a dedicated pruning pass per the live-project-ledger altitude rule.
+
+### Previous session (2026-08-08, PR #75, now the base for PR #76, kept for context)
+
+**PR #75 (About page + updater UX, new dispatch 2026-08-08) open, mergeable, head
+`d250ce320352f9a54481a2e0fbea4a8b810a0358`, based on main@f021cc7 (post-PR #74),
+https://forge.mms.name/emittiv/redline/pulls/75. NOT yet merged (orchestrator owns
+merge/deploy). Owner reported three UX gaps: no About page, update dialog showing the
+new version number twice, wanted a rollback-to-previous-release option "at least during
+dev stages".**
+
+1. **About page - built.** New `AboutDialog.svelte`, opened via a new toolbar icon button
+   (ⓘ) next to Settings. Shows the live app version (`@tauri-apps/api/app`'s
+   `getVersion()`, not hardcoded), a static update-channel line, a manual "Check for
+   Updates" action (reuses `@tauri-apps/plugin-updater`), and the release-history/
+   rollback list below.
+2. **Double-version bug - root-caused and fixed.**
+   `UpdateNotification.svelte:118-121` rendered `Version {update.version}` as its own
+   label, then the release-notes box (defaulting to `"Release v$VERSION"` per
+   `build-releases.yml`'s `update-manifest` job - every real release's manifest carries
+   exactly this text) repeated the SAME version a second time. `update.currentVersion`
+   was already on the `Update` object the whole time, only ever used in a log line, never
+   rendered. Fixed: dialog now shows `v{currentVersion} -> v{version}` as one distinct
+   line. Regression test (`UpdateNotification.test.ts`) confirmed red against the
+   pre-fix component via `git stash`, then green.
+3. **Real rollback mechanism - built, not faked.** `update.json` is overwritten to
+   advertise only the latest release on every deploy, but the SAME CI job
+   (`update-manifest` in `build-releases.yml`) also commits it to GitHub `main` on every
+   release as a plain commit (never force-pushed) - so each past release's exact,
+   CI-signed manifest stays reachable forever at a commit-pinned
+   `https://raw.githubusercontent.com/newillusions/redline/<sha>/update.json`. New
+   `src-tauri/src/updater_rollback.rs` lists past releases from that commit history (two
+   GitHub REST calls per release: commits API then contents API; `ReleaseSource` trait
+   for test injection, mirrors `license::service::LicenseClient`; dedup by version,
+   tolerant of individual bad/missing entries). New `rollback_to_version` Tauri command
+   points a custom `updater_builder().endpoints([...])` at the pinned manifest with a
+   permissive `version_comparator` (exact-match the requested version) and calls the
+   REAL `check()`/`download_and_install()` - minisign verification is exactly as real as
+   a normal update, since it's driven by CI's actual signing key output for that release.
+   Confirmed via context7 (Tauri v2.8.0+ docs, resolved crate version 2.10.1) that the
+   Rust builder's `endpoints()`/`version_comparator()` is what makes an arbitrary
+   historical rollback possible - the JS-level `check()` only has `allowDowngrades`,
+   which alone can't pick a SPECIFIC old version since the default manifest only ever
+   holds latest. **Shipped ungated** (visible in every build, not restricted to
+   `cargo tauri dev`) - judgment call: "dev stages" read as the product's current
+   internal/pre-1.0 lifecycle (no external users yet), not a compile-time debug flag.
+   Flagged in the PR body as worth revisiting once redline ships externally.
+
+Tests: `cargo test --all-targets` 484/484 (478 baseline + 6 new `updater_rollback` cases,
+all unit-tested via a fake `ReleaseSource`, no live network calls in the suite).
+`cargo clippy --all-targets` 0 warnings. `npm test` 742/742 (733 baseline + 9 new: 1
+UpdateNotification regression, 6 AboutDialog, 2 updater-rollback IPC casing). `npm run
+check` 0 errors (23 warnings, same pre-existing a11y-pattern class as
+SettingsDialog/UpdateNotification's own dialogs - one new reactivity warning was caught
+and fixed during development: `foundUpdate` needed `$state()`, not a plain `let`, since
+it's read directly in the template). `npm run build` clean.
+
+**PR #73 MERGED** (`b05bc73fcd3e1fc13472de7b3ea491b2b6a75028`) - see "Previous session
+(PR #73)" below for the full 4-class writeup (nudge-Callout anchor collapse, stamp
+artwork read recovery, text-rotation investigated-and-confirmed-already-fixed).
+
+**PR #74 (btx toolset import fidelity, same dispatch, owner scope addition mid-session)
+open, mergeable, head `3b14de6b291e4eaa30e72d221a24d4af551629bf`, based on main@b05bc73
+(post-PR #73), https://forge.mms.name/emittiv/redline/pulls/74. NOT yet merged
+(orchestrator owns merge/deploy). Owner: "btx toolset import is still not fully fixed
+despite v0.3.13's fidelity work" - (a) some tools still show UID names, (b) many tools
+don't match Bluebeam's format.**
+
+1. **UID names - FIXED.** Characterized against the real 77-item/4-file production
+   corpus (`bench/corpus/btx/`, gitignored): `/Subj` is absent on EXACTLY the Stamp-type
+   items (7/77, 100% of the naming-fallback population) - the existing fallback
+   (`/Subj` -> opaque `<Name>` UID) had nothing better than the raw UID e.g.
+   `"XXEOVOCUQESTKIRL"`. Found via a diagnostic dump: every one of those 7 items
+   carries a private `/TmpBRXFile` literal-string path (the source file Bluebeam built
+   the custom stamp from, e.g. `"D:\...\Stamps\MR Init.pdf"`) - its basename minus
+   extension (`"MR Init"`) is a real name. New `stamp_source_file_basename` second-tier
+   fallback: `/Subj` -> `/TmpBRXFile` basename -> opaque UID floor. Measured: closes
+   7/7 real UID-name cases (now `"emittiv stamp crop"`, `"MR Init"`, `"MR Sig"`), zero
+   regression to the 70 items that already had `/Subj`.
+2. **Format mismatches - dominant cause found, NAMED NOT FIXED (too large for this
+   dispatch).** 100% of real Stamp items (11/11) resolve to
+   `StampAsset::BluebeamFormXObject`. Neither the live canvas placement preview
+   (`markupToSvg`) nor PR #73's read-side recovery (`recover_stamp_asset`) handles that
+   asset kind - both only handle `PngBase64`. Every placed Bluebeam-native stamp
+   therefore renders as an empty box, BOTH in the live editing canvas right after
+   import/placement AND after save/reopen. This is a strong, evidenced candidate for
+   the MAJORITY of "format mismatch" reports - every real Stamp tool in the owner's own
+   production toolsets currently shows as a plain outline box, not its actual artwork,
+   anywhere in the live app. PROPER FIX needs interpreting a Form XObject's own content
+   stream (nested Image/Form XObjects, transform matrices) into renderable content -
+   effectively a small PDF-content-stream-to-SVG/raster renderer. Deliberately NOT
+   attempted here - follow-up PR territory.
+3. **Ruled out**: a geometry/appearance sanity sweep across the other 66 non-stamp real
+   corpus tools found no anomalies worth chasing beyond 8 Text/FreeText items with
+   `line_weight=0`, which reflects genuinely-authored borderless text tools in the
+   source data, not an import defect.
+
+Tests: `cargo test --all-targets` 478 lib passed (471 baseline + 7 new). `cargo clippy
+--all-targets` 0 warnings. (npm gates unaffected, no frontend files touched.)
+
+**Method note - PR merge race**: PR #73 was merged by the orchestrator WHILE this PR
+#74 commit was still being pushed to the same branch. The second push landed on an
+already-merged/closed PR, and a naive new-PR-from-the-same-branch showed 7 files
+changed (everything from the already-merged PR) instead of just the 1 new file. Fixed
+via `git fetch && git rebase origin/main` (cleanly skipped the already-applied commit)
++ `git push --force-with-lease`, re-verified via `list_pr_files` showing exactly 1
+file. Lesson: when resuming work on a branch across dispatch turns, always fetch and
+check whether the branch's earlier PR merged before opening/reusing a PR on it.
+
+### Previous session (2026-08-08, PR #73, now merged, kept for context)
+
+**PR #73 (Bluebeam-interop follow-up fixes, dispatched by the orchestrator - owner
+documented 4 fresh-corpus failure classes: original-render diffs, additional nudge-file
+failures, stamps rendering as empty boxes, text rotated 90 degrees), squash-merged as
+`b05bc73fcd3e1fc13472de7b3ea491b2b6a75028`,
+https://forge.mms.name/emittiv/redline/pulls/73. Two real bugs found and fixed, one
+investigated-and-confirmed-already-
+fixed, one subsumed:
+1. **Nudge-Callout anchor collapse (real bug, fixed)**: Bluebeam Revu's move/nudge
+   operation strips `/CL` entirely from Callout FreeText annotations (spec-legal -
+   `/CL` is optional per ISO 32000-1 12.5.6.6) while leaving redline's own
+   `/RLGeom = "poly"` tag and a still-valid `/Rect`/`/RLRect` in place.
+   `geometry_from_dict`'s `"poly"` branch (`markup/annotation.rs`) fell through to an
+   EMPTY `Polyline` when Vertices/CL/L were all absent, and `markupToSvg`'s Callout
+   branch (`markup-render.ts`) reads that empty array's "last point" via
+   `?? {x:0,y:0}` - anchoring the whole markup at the PDF page's own origin corner.
+   Every affected Callout in the real corpus (`Comment`/`e-callout`/`Cloud+`) stacked
+   on top of each other there. Fixed: fall back to a degenerate 2-point line anchored
+   at the annotation's own `/RLRect`/`/Rect` min corner when the leader-line keys are
+   all absent.
+2. **Stamps render as empty boxes (two real bugs, fixed, NEITHER Bluebeam-interop-
+   specific)**: `Markup::from_annotation_dict` (`annotation.rs:787`, pre-existing)
+   unconditionally set `stamp_asset: None` on EVERY read - redline's own placed stamps
+   lose their artwork the moment a file is saved and reopened, not just foreign
+   Bluebeam ones. `markupToSvg` also had ZERO render case for Stamp/StampDynamic
+   artwork at all. Fixed both: new `document::annots::recover_stamp_asset` reads the
+   AP's own Image XObject (+ optional `/SMask` alpha) back into a
+   `StampAsset::PngBase64`; new `"stamp-image"` `SvgShape` + `<image>` element in
+   `Viewport.svelte` renders it. Scoped to the Image-XObject case only - a
+   Bluebeam-native Form XObject stamp recovered from an OPENED PDF (as opposed to
+   `.btx` import, which already works) is a further gap, NAMED NOT FIXED. The corpus
+   file's own stamps have their real artwork already stripped by the owner (debug
+   red-outline box, deliberately, "so the empty boxes are visible") so this fix is
+   proven via a synthetic round-trip test, not against the corpus file itself.
+3. **Text markups rotated 90 degrees - INVESTIGATED, DOES NOT REPRODUCE on current
+   main (v0.3.13)**. Verified three independent ways: a Rust test reading the actual
+   corpus file's `read_markups()` output (correct wide/oriented display-space
+   geometry); an isolated vitest unit test of `markupToSvg` fed that exact geometry
+   (correctly wide, correctly positioned box); and a REAL BROWSER RENDER (Vite dev app
+   + Playwright + mock Tauri IPC seeded with the real corpus geometry from the first
+   check) whose screenshot matches the Bluebeam Revu reference screenshot almost
+   exactly. PR #70/#72's rotation/MediaBox-origin fix (2026-08-06) is working
+   correctly. No code change made for this class.
+4. **Rendering differences on the original (non-nudged) open** - subsumed by items 2/3
+   above; no separate defect found once those were addressed (confirmed via the same
+   browser-render verification against the ORIGINAL, non-nudged corpus file).
+
+Method note worth keeping: static/unit-level analysis of the rotation math (item 3)
+checked out correct on paper, yet the owner's screenshot showed it broken - only a
+REAL BROWSER RENDER (Vite dev + Playwright + mock Tauri IPC seeded with real
+backend-derived data, not synthetic fixtures) resolved the contradiction. This matches
+this project's own `judgment.md` precedent ("six M1 render-loop bugs were all
+invisible to headless tests, only surfaced on a real `cargo tauri dev` session") -
+worth reaching for this technique earlier next time static analysis and a screenshot
+disagree.
+
+Tests: `cargo test --all-targets` 471 lib passed (469 baseline + 2 new:
+`callout_missing_cl_falls_back_to_rect_anchor_not_page_origin`,
+`read_markups_recovers_a_png_stamp_asset_from_its_own_ap_image_xobject`) + 21 pdf-diff,
+0 failed. `npm test` 733/733 (4 new stamp-image render cases). `npm run check` 0
+errors. `cargo clippy --all-targets` 0 warnings. `npm run build` clean. Each fix has
+red-then-green TDD evidence (temporarily reverted, confirmed failing, restored,
+confirmed passing).
+
+### Previous session (2026-08-06, PR #71, now the base for PR #73, kept for context)
+
+**PR #71 (raw-storage fallback for tiny images + Bluebeam reference sanity-check,
+follow-up to PR #69) open, CI running, mergeable, NOT yet merged. Branch
+`fix/optimize-raw-fallback`, head `5365302bf93ac3995a5296c0bf75882973587006`,
+https://forge.mms.name/emittiv/redline/pulls/71, based on current main (post PR #70 +
+v0.3.12 bump). IMPORTANT PROCESS NOTE: PR #69's SECOND commit (the raw-fallback fix +
+annotation-fidelity test, pushed as `97765e1`) was NEVER actually merged despite
+Forgejo's PR #69 object showing `head.sha: 97765e1` after close - the orchestrator's
+merge (37a13d78, 22:09:36) happened 9 minutes BEFORE that commit was pushed (22:18:49),
+so the merge commit's actual parent only contains PR #69's first commit (`b05f4c7`).
+Verified by reading the merged file content directly off origin/main (the raw-fallback
+code was absent). Remediated by cherry-picking `97765e1` onto a fresh branch from
+current main and opening it as PR #71 instead of assuming the closed PR #69 already
+had it. Takeaway for future sessions: a closed/merged PR's `head.sha` reflects the
+BRANCH'S CURRENT TIP, not necessarily what was actually merged - verify by reading the
+merge commit's real file content, never trust the API field alone when a push happens
+close to a merge. Owner supplied a real Bluebeam Revu "Reduce File Size" A/B reference
+pair (bench/corpus/bb-ref/, gitignored) to sanity-check the image encoding choices;
+findings + a concrete "Optimize never moves annotations" proof (40/40 stable across all
+3 presets, re-verified against PR #70's Rect/BBox fix too) are in PR #71's body and
+obs:7w6wpwu8k2f2xumytan4.**
+
+### Previous session (2026-08-06, PR #70 - now merged, kept for context)
+
+**main is at `37a13d78` (PR #69 image-aware Optimize merged) - PR #70 (markup
+coordinate interop fix, this session) is open, CI green (run 3075, both test-rust and
+test-frontend success, verified directly against the Forgejo DB for the exact head
+sha), mergeable, NOT yet merged (orchestrator owns merge/deploy). Branch
+`fix/annotation-rect-bbox-fit`, head `bba2f7645615a7cae876874e22c7cf340c23e1cb`,
+https://forge.mms.name/emittiv/redline/pulls/70. Owner report: "the markups from
+redline show up in different locations in bluebeam now" - renders correctly in redline,
+wrong in Bluebeam. Two independent, empirically-proven bugs, NOT a single regression:
+(1) `/AP /BBox` padded larger than `/Rect` for every markup type except Text/Callout/
+MeasurementCount - per ISO 32000-1 12.5.5 a strict reader fits the padded BBox into the
+tighter Rect, shrinking the appearance toward its own centre (proven with PDFium's own
+annotation renderer); `/Rect` is now always sourced from `appearance::ap_bbox` for
+every type. (2) SEPARATE finding: redline captures markup geometry in PDFium's
+rotation- and MediaBox-origin-relative "display" space, but `/Rect` must be the PDF's
+TRUE absolute default user space; `document/annots.rs` now converts display<->true
+space only at the write/read serialization boundary, verified against real PDFium
+rendering for all 4 rotations + an offset MediaBox origin. Investigated and RULED OUT:
+CropBox != MediaBox does not actually cause a position bug (same absolute coordinate
+system regardless of CropBox windowing). Both root causes have existed since v0.2.4 (
+`/AP` generation) and v0.3.5 (a PARTIAL fix, Text/Callout/Count only) respectively -
+not a regression from PR #68/#69. Full detail: obs:xjevyc2hvploz7msy9pq, PR #70 body.
+Tests: 470 passed/0 failed/3 ignored (baseline 465/0/3, 5 new tests + 2 stale tests
+updated), `cargo clippy --all-targets` 0 warnings, `cargo fmt --check` clean on touched
+files (workspace-wide drift on untouched lines confirmed pre-existing, not introduced).**
+
+### Previous session (2026-08-06, PR #69, now merged, kept for context)
+
+**main was at `479aa8e8` (PR #68 merged) before PR #69 (image-aware Optimize) merged.
+Branch `fix/optimize-image-compression`, head
+`b05f4c70f65da2b447a09adb9e57aaf64ee32776`,
+https://forge.mms.name/emittiv/redline/pulls/69. Fixes the owner report "reduced by 9kb
+or something insanely silly" - `optimize_document`'s old baseline never touched raster
+images (89.6% of a real 110MB corpus file's bytes), only pruned objects and
+Deflate-compressed already-uncompressed streams. New `docops::image_ops` module
+(Bluebeam-style High/Balanced/Small compression/quality preset) downsamples + recompresses
+eligible images against a strict safety bar (skips ImageMask, explicit Mask, custom
+Decode, non-Gray/RGB colorspaces, non-8bpc raw, JPX/CCITT/JBIG2). Measured on real
+corpus: c1-typical 110.5MB -> 53.6MB (51.5%) at Balanced, up to 60.6% at Small. Render
+fidelity verified via real PDFium + visual before/after PNG comparison. Full detail:
+obs:t5g42nvkczmj5p12hhrt, PR #69 body.**
+
+### Previous session (2026-08-06, PR #67/#68 - now merged, kept for context)
+
+**main was at `f695610a` (PR #63) before PR #67 (docops reseed + btx subtype guard) and
+PR #68 (btx import fidelity) both merged. PR #68: branch `fix/btx-fidelity`, head
+`6fc966cd70bcf26eadf01850997edab2f8698fcd`. Real Bluebeam `.btx` samples finally
+arrived (bench/corpus/btx/, gitignored per repo policy - "NEVER commit", 18.7MB) and
+closed the blocker PR #67 left open ("naming is one, but also a number of items are
+incomplete... not the same as the original bb tool" - Martin, same day as PR #67).**
+
+**Fixed against 4 real files / 77 real items - the first real samples this importer was
+ever checked against: (1) tool NAMING now prefers the annotation's own `/Subj` over the
+opaque, Bluebeam-internal `<Name>` id (7/77 items fall back to `<Name>` when `/Subj` is
+absent); (2) tool ORDERING now sorts by `<Index>` - real exports do NOT store items in
+Bluebeam's authored display order; (3) STAMP ARTWORK - 11/11 real Stamp items now
+resolve to `StampAsset::BluebeamFormXObject` (Bluebeam references artwork via
+`/AP<</N/BBObjPtr_<id>>>`, resolved against sibling `<Resources>` blocks forming a small
+object graph), spliced into a genuine indirect Form XObject appearance at placement time
+(`document::annots::write_markups`) instead of the old always-`None` box+label fallback;
+(4) `/BSIColumnData` now read from inside the `<Raw>` PDF dict, not a nonexistent XML
+element. NAMED, NOT FIXED: `<Child>` (a second, paired annotation - shape + attached
+label, or callout + leader) appears on 33/77 (43%) of real items - `Tool` is
+architecturally 1:1 with a single Markup, so this needs a data-model change beyond the
+importer's scope. Full detail + fidelity table: obs:ullyvzs86ncoa70itfdi, PR #68 body.
+Tests: 465/465 passing (444 lib incl. 21 new + 7 + 14 pdf-diff crate), clippy 0
+warnings. `cargo fmt --check` fails identically on `origin/main` pre-branch (confirmed
+via git stash) - pre-existing workspace-wide drift, not introduced here.**
+
+### Previous session (2026-08-06, PR #67, dispatched by the orchestrator - investigate
+"flatten and optimise don't seem to do anything" and ".btx file import issues")
 
 **Flatten/optimize root cause (real bug, not cosmetic): MarkupStore (frontend) was never
 resynced after flatten_document/optimize_document/redact_document succeeded on the
@@ -70,7 +461,33 @@ compatible with rkyv 0.8. Detail: `obs:w3mm0ublu2xu1t8y8tyv`.**
 
 ## Last Session
 
-**Date**: 2026-08-06 (dispatched by the orchestrator - investigate "flatten and
+**Date**: 2026-08-11 (dispatched by the orchestrator - owner directive on the
+reopened G9 gate: "you need to find a way of testing and validating that yourself...
+in browsers and stirling pdf maybe")
+
+**Summary**: See Current Status above for full detail. PR #77 open, CI green, not yet
+merged. Built the self-service BB-interop validation harness: a structural
+annotation-dictionary conformance test against the real `.btx` corpus (primary check
+- catches data-model gaps a screenshot can't), a multi-renderer screenshot matrix
+(secondary check), and a research-only tool evaluation (no viable open-source
+Bluebeam appearance-regeneration proxy found for markup annotations - qpdf/
+Ghostscript's similar-sounding mechanisms are AcroForm-field-only). First run of the
+new harness already surfaces new candidate defects (missing `/F`/`/DA`/`/RC`, a
+`/BE`-vs-Cloud classification gap) beyond the known grouped-Child residual - not
+fixed this dispatch, flagged for the next fix wave once triaged.
+
+### Previous session (2026-08-06, PR #70, dispatched by the orchestrator - owner report "the markups from
+redline show up in different locations in bluebeam now")
+
+**Summary**: See "Previous session (2026-08-08, PR #76...)" above for full detail on
+the interim sessions. PR #70 open, CI green, not yet merged. Two independent root
+causes found and fixed (both proven with PDFium's own annotation renderer, not just
+derived): the `/AP /BBox`-vs-`/Rect` fit mismatch (the dominant, always-happens-on-
+every-save cause), and a rotation/MediaBox-origin coordinate-frame mismatch (found
+during this investigation). CropBox != MediaBox was investigated and ruled out as a
+real bug.
+
+### Previous session (2026-08-06, PR #67/#68/#69, dispatched by the orchestrator - investigate "flatten and
 optimise don't seem to do anything" + ".btx file import issues")
 
 **Summary**: See Current Status above for the full detail (root causes, fixes, named-
@@ -514,17 +931,30 @@ still owed to a human session. Detail: `obs:e1tujicl7p4uck906rxa`.
 ## Next Steps
 
 **Immediate (2026-08-06, as of 2026-08-06)**:
-1. Merge PR #67 once orchestrator schedules it (CI already green).
+-1. Merge PR #70 (markup coordinate interop fix - Bluebeam positions) once orchestrator
+   schedules it (CI green, run 3075). Live re-verify once merged: place a Rectangle/
+   Line/Arrow/Cloud/Highlight/Ink markup, save, open the file in real Bluebeam Revu,
+   confirm it renders in the same place and at the same size as in redline (as of
+   2026-08-06).
+0. Merge PR #69 (image-aware Optimize) once orchestrator schedules it (CI green, run #189).
+   Live re-verify: Optimize a doc with real raster content at each of the three quality
+   presets, confirm the toolbar select + completion banner's image breakdown, and
+   spot-check a recompressed page still looks correct at normal zoom (as of 2026-08-06).
+1. PR #67 and PR #68 are now MERGED (main at `479aa8e8`) - the live re-verify items below
+   are still owed against the merged code, not superseded by the merge.
 2. Live re-verify PR #67 in a real `cargo tauri dev` session: Flatten a doc with real
    markups, confirm they disappear from the markup list/become unselectable and the
    new success banner reports a count; Optimize and confirm the before/after
    file-size banner; confirm a later save does NOT resurrect a flattened markup
    (as of 2026-08-06).
-3. BLOCKED - `.btx` import fidelity (naming + property drift vs Bluebeam originals,
-   Martin-confirmed broader than the stamp gap): wait for real `.btx` samples in
-   `bench/corpus/btx/`, then diff `import_btx_bytes()`'s output field-by-field against
-   the real Bluebeam Tool Chest for the same tools. Do not guess at Bluebeam's wire
-   format without samples (as of 2026-08-06).
+3. Live re-verify PR #68: import one of the real `.btx` files
+   (`bench/corpus/btx/` locally, gitignored) via the Tool Chest UI, confirm tool names
+   match Bluebeam's own labels and a Stamp tool's placed appearance shows real artwork,
+   not a box+label (as of 2026-08-06).
+4. FOLLOW-UP, not started: `<Child>` grouped-annotation support (43% of real items) -
+   needs a `Tool` data-model change (optional linked/secondary markup) plus
+   placement-time support for two annotations at once. Scoping/design decision owed
+   before implementation (as of 2026-08-06).
 
 **Immediate (wave-2, historical)**: none from wave-2. Live-verify item added: place a measurement or draw
 a Line/Arrow/Polyline near an existing vector line in a real (non-scanned) PDF and
@@ -620,6 +1050,12 @@ Before the first tagged Windows/macOS release:
 | PR #59 | `https://forge.mms.name/emittiv/redline/pulls/59` (docs/HANDOVER reconciliation through PR#58 - MERGED `941c1e0`) |
 | PR #60 | `https://forge.mms.name/emittiv/redline/pulls/60` (lopdf 0.36->0.44 + quick-xml 0.39->0.41, RUSTSEC-2026-0187/0194/0195 - MERGED `ced6a4a`) |
 | PR #61 | `https://forge.mms.name/emittiv/redline/pulls/61` (measurement tools + markup status UI + crash-guard + macOS license-URL fix - MERGED `8d84754c`) |
+| PR #67 | `https://forge.mms.name/emittiv/redline/pulls/67` (docops markup-store reseed fix + btx unsupported-subtype guard - OPEN, CI green) |
+| PR #67 | `https://forge.mms.name/emittiv/redline/pulls/67` (docops reseed + btx subtype guard - MERGED `88861cc`) |
+| PR #68 | `https://forge.mms.name/emittiv/redline/pulls/68` (btx import fidelity vs real Bluebeam samples - MERGED `479aa8e8`) |
+| PR #69 | `https://forge.mms.name/emittiv/redline/pulls/69` (image-aware Optimize compression preset - MERGED `37a13d78`) |
+| PR #70 | `https://forge.mms.name/emittiv/redline/pulls/70` (markup coordinate interop fix for Bluebeam - OPEN, CI green) |
+| PR #69 | `https://forge.mms.name/emittiv/redline/pulls/69` (image-aware Optimize, compression/quality preset - OPEN, CI green run #189, head `b05f4c70`) |
 | S2b license contract | `emittiv-staff/src/lib/server/license.ts` (authoritative token shape - do not change without a hub message) |
 
 ## Key Gotchas (carry forward)
@@ -637,11 +1073,16 @@ Before the first tagged Windows/macOS release:
   only safe when the caller pre-filters; `MARKUP_SUBTYPES`/`subtype()` are now
   `pub(crate)` in `document/annots.rs` specifically so `btx.rs` can share them rather
   than re-deriving the list.
-- **`.btx` Stamp import currently discards the source appearance** (`stamp: None`
-  always, PR #67 named-not-fixed) AND the wider import-fidelity gap Martin flagged
-  (naming/property drift vs Bluebeam originals) is BLOCKED on real `.btx` samples in
-  `bench/corpus/btx/` - do not attempt either without real samples to diff against,
-  see obs:cxu0x9pn1czhjici5huh.
+- **`.btx` import fidelity FIXED against real samples (PR #68, 2026-08-06)**: tool
+  naming prefers `/Subj` over the opaque `<Name>` id; tools sort by `<Index>`; Stamp
+  artwork resolves via `/AP<</N/BBObjPtr_<id>>>` + sibling `<Resources>` blocks into
+  `StampAsset::BluebeamFormXObject`, spliced into a real indirect Form XObject by
+  `document::annots::write_markups` (never redraw a `BluebeamFormXObject` asset - its
+  whole point is being the AS-AUTHORED bytes; see `resolve_bb_objptr_refs`'s doc comment
+  for why the replacement needs a LEADING SPACE - PDF names are self-delimiting, `5 0 R`
+  with no separator produces an invalid merged token). STILL NAMED, NOT FIXED: `<Child>`
+  grouped/paired annotations (43% of real items) need a `Tool` data-model change beyond
+  this importer's scope. Full detail: obs:ullyvzs86ncoa70itfdi, PR #68.
 - **`FolderIndex::alive()`** = `Arc::strong_count(&self.inner) > 1` - background watcher thread exits within ~1s of AppState replacing the index
 - **Background indexer uses `std::thread::spawn`** (not tokio) - watcher loop is indefinitely blocking, must NOT consume tokio's blocking thread pool
 - **Tantivy `Document` trait must be imported** for `to_json()` to be in scope: `use tantivy::{Document, ...};`
@@ -727,6 +1168,17 @@ Before the first tagged Windows/macOS release:
   Commands) is not just a speed suggestion - it's required for the PDFium tests to
   pass reliably together. Plain `cargo test --lib` with no `PDFIUM_DYNAMIC_LIB_PATH`
   set (the CI path) is unaffected - every PDFium test self-skips via that env check.
+- **`docops::image_ops` (PR #69, 2026-08-06)**: `optimize_document`'s `image_preset`
+  param is additive to `level` - do not conflate the two axes. lopdf 0.44's
+  `Stream::decompressed_content()`/`get_plain_content()` only implement
+  FlateDecode/LZWDecode/ASCII85Decode internally (returns `Error::Unimplemented` for
+  DCTDecode/CCITT/JPX/JBIG2) - read DCTDecode bytes directly off `Stream.content`
+  instead, and for the `[FlateDecode DCTDecode]` double-wrap seen in real corpus files,
+  manually inflate via `flate2::read::ZlibDecoder` before JPEG-decoding (calling
+  `get_plain_content()` on that filter combo fails partway through). Placement-size
+  detection (for DPI-based downsampling) walks page + one level of Form XObject content
+  streams via `lopdf::content::Content::decode` tracking the CTM - do not add a second
+  level of nesting without a real corpus case that needs it, it adds real complexity.
 
 ---
-*Updated: 2026-08-06 (PR #67: docops markup-store reseed fix + .btx unsupported-subtype guard; broader .btx import-fidelity gap named, blocked on real samples)*
+*Updated: 2026-08-06 (PR #69: image-aware Optimize - real JPEG downsample+recompress fixes the "reduced by 9kb" report; PR #67/#68 now confirmed merged to main)*
