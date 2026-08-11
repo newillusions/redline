@@ -372,13 +372,14 @@ fn bb_interop_conformance_report() {
 }
 
 /// CALIBRATION: this is the acceptance test the dispatch asked for - the harness must
-/// actually flag the two known-bad classes and stay quiet on the known-good ones.
+/// actually flag the remaining known-bad class and stay quiet on the known-good ones.
 ///
-/// Known-bad #1: grouped `<Child>` annotations. Architecturally unsupported (Tool is
-/// 1:1 with a single Markup; a `<Child>` pair - shape + attached label, or callout +
-/// leader - needs a data-model change beyond this harness's scope to fix, see
-/// obs:ullyvzs86ncoa70itfdi). The harness must DETECT and COUNT these, not silently
-/// drop them.
+/// Grouped `<Child>` annotations moved from KNOWN-BAD to CONFORMANT 2026-08-11 (design
+/// doc `docs/design/2026-08-11-grouped-markups.md`) - see
+/// `grouped_children_are_captured_not_dropped_by_the_real_import_path` below for the
+/// dedicated structural-conformance assertion. This function still counts `total_with_child`
+/// (the golden-side XML detection is independent, reusable ground truth for that test) but
+/// no longer asserts it as a defect.
 ///
 /// Known-bad #2: the stock/library stamp artwork gap (4/11 real corpus stamps per
 /// HANDOVER PR #76 - "MR Init"/"MR Sig" class). The harness must find at least one
@@ -401,9 +402,12 @@ fn calibration_flags_known_defect_classes() {
     assert!(
         total_with_child > 0,
         "calibration FAILED: expected the harness to detect at least one grouped <Child> \
-         annotation in the real corpus (known-bad class, obs:ullyvzs86ncoa70itfdi) - found none"
+         annotation in the real corpus - found none (has the corpus changed?)"
     );
-    println!("PASS: grouped-<Child> class detected ({total_with_child}/{total_items} items)");
+    println!(
+        "grouped-<Child> class present in corpus ({total_with_child}/{total_items} items) - \
+         see grouped_children_are_captured_not_dropped_by_the_real_import_path for the conformance check"
+    );
 
     let (_resolvable, unresolvable) = stamp_resolvability_report();
     assert!(
@@ -445,4 +449,79 @@ fn calibration_flags_known_defect_classes() {
          regressed - a corpus stamp tool is back to showing a raw opaque UID as its name"
     );
     println!("PASS: v0.3.13 UID-naming fix holds (0/{checked} raw UID names)");
+}
+
+/// Grouped `<Child>` conformance (design doc `docs/design/2026-08-11-grouped-markups.md`
+/// §4/§7 Stage 1). Before this fix, `import_btx_bytes` silently discarded every `<Child>`,
+/// meaning a real Tool's grouped members were architecturally invisible
+/// (`obs:ullyvzs86ncoa70itfdi`). This test proves the fix moved the corpus's 33/77 grouped
+/// items from known-bad to structurally conformant, using TWO independent counts that must
+/// agree:
+///
+/// - GOLDEN side: `golden_items()`'s own `has_child` flag, decoded straight from the raw
+///   `<ToolChestItem>`/`<Child>` XML (this harness's own independent decoder, per the
+///   module's stated "duplicates the decode rather than reusing btx.rs's" philosophy).
+/// - PRODUCTION side: `import_btx_bytes` (the real public import path every user's `.btx`
+///   drag-and-drop goes through) - which real `Tool`s now come back with a non-empty
+///   `children` Vec.
+///
+/// A regression in EITHER the golden-side XML detection or the production import path
+/// would show up as a disagreement between the two counts, not just a silent zero.
+#[test]
+#[ignore]
+fn grouped_children_are_captured_not_dropped_by_the_real_import_path() {
+    let files = corpus_files();
+    if files.is_empty() {
+        eprintln!("skip: bb corpus not present (bench/corpus/btx/)");
+        return;
+    }
+
+    let mut golden_grouped_items = 0usize;
+    let mut production_grouped_tools = 0usize;
+    let mut production_total_children = 0usize;
+    let mut max_group_size = 0usize; // 1 (this tool) + children, for the largest group seen
+
+    for path in &files {
+        golden_grouped_items += golden_items(path).iter().filter(|i| i.has_child).count();
+
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        let report = import_btx_bytes(&bytes);
+        for tool in &report.tools {
+            if tool.children.is_empty() {
+                continue;
+            }
+            production_grouped_tools += 1;
+            production_total_children += tool.children.len();
+            max_group_size = max_group_size.max(1 + tool.children.len());
+        }
+    }
+
+    println!(
+        "golden_grouped_items={golden_grouped_items} production_grouped_tools={production_grouped_tools} \
+         production_total_children={production_total_children} max_group_size={max_group_size}"
+    );
+
+    assert!(golden_grouped_items > 0, "corpus present but golden side found zero grouped items - has the corpus changed?");
+    assert_eq!(
+        production_grouped_tools, golden_grouped_items,
+        "calibration FAILED: production import_btx_bytes found a DIFFERENT number of grouped \
+         tools than the golden XML scan - the two independent decoders disagree, meaning \
+         either the golden detection or the production <Child> capture has regressed"
+    );
+    assert!(
+        production_total_children > 0,
+        "calibration FAILED: grouped tools were detected but zero children were actually \
+         captured onto Tool.children - the fix has regressed to silently dropping them again"
+    );
+    assert!(
+        max_group_size > 2,
+        "calibration FAILED: expected at least one real corpus group with MORE than 2 \
+         members (the star-topology / 'compound stamp' class, up to 21 members observed) - \
+         found max_group_size={max_group_size}, suggesting only simple pairs are handled"
+    );
+    println!(
+        "PASS: {production_grouped_tools}/{production_grouped_tools} grouped tools structurally \
+         conformant ({production_total_children} children captured, largest group {max_group_size} members) - \
+         grouped-<Child> class moved from known-bad to conformant"
+    );
 }

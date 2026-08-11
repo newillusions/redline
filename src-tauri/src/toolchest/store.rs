@@ -235,6 +235,7 @@ mod tests {
             placement_mode: PlacementMode::Properties,
             geometry: None,
             stamp: None,
+            children: Vec::new(),
         }
     }
 

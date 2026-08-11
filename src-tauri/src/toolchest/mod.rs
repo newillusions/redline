@@ -30,6 +30,33 @@ pub enum PlacementMode {
     Drawing,
 }
 
+/// A second, paired markup that belongs to a grouped/compound Tool alongside its
+/// parent (design doc `docs/design/2026-08-11-grouped-markups.md` §4) - Bluebeam's
+/// `.btx` `<Child>` element(s), e.g. a shape + its attached text label, or a full
+/// multi-member "compound stamp" (real corpus: up to 20 children on one tool).
+/// Deliberately NOT a `Tool` itself (no `id`/`name`/`placement_mode`/`children` of its
+/// own - a child cannot itself be a compound tool; the real corpus shows no evidence
+/// of nested grouping, see design doc §1 finding 2) and deliberately does not carry
+/// `contents` - matching `Tool`'s own existing behaviour (a placed tool's text is
+/// supplied by the placement call site, not replayed from the template; see
+/// `Viewport.svelte::createPlacedMarkup`), a pre-existing gap this struct does not
+/// widen or narrow.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolChild {
+    pub markup_type: MarkupType,
+    pub appearance: Appearance,
+    pub subject: Option<String>,
+    /// Fixed geometry template, same convention as `Tool::geometry` - present only
+    /// for Drawing-mode tools (a compound tool is always Drawing-mode in the real
+    /// corpus: Properties-mode tools carry no fixed geometry to offset children by).
+    #[serde(default)]
+    pub geometry: Option<MarkupGeometry>,
+    /// Present iff this child is itself a stamp (real corpus: `(Stamp, Stamp)` and
+    /// `(Stamp, Square)` grouped pairs both occur).
+    #[serde(default)]
+    pub stamp: Option<StampDef>,
+}
+
 /// A reusable markup template (spec "Tools & Tool Sets").
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tool {
@@ -51,6 +78,15 @@ pub struct Tool {
     /// Present iff this tool is a stamp (spec "Stamps").
     #[serde(default)]
     pub stamp: Option<StampDef>,
+    /// Paired member(s) that place alongside this tool as one grouped unit (Bluebeam
+    /// `.btx` `<Child>` - design doc §4). Empty for the overwhelming majority of tools
+    /// (a single markup, no grouping). When non-empty, placement must create one
+    /// `Markup` per member (this tool + every child) sharing a single fresh
+    /// `group_id`, each translated by the SAME click-anchor delta as the parent -
+    /// never chained child-to-child (real corpus: every child's `<X>`/`<Y>` offset is
+    /// independent of the parent's own origin, not relative to a prior child).
+    #[serde(default)]
+    pub children: Vec<ToolChild>,
 }
 
 impl Tool {
@@ -72,6 +108,7 @@ impl Tool {
             placement_mode,
             geometry,
             stamp: None,
+            children: Vec::new(),
         }
     }
 }

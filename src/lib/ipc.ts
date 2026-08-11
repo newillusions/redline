@@ -818,6 +818,16 @@ export type StampDef =
   | { Static: { asset: StampAsset } }
   | { Dynamic: { asset: StampAsset | null; fields: DynamicField[]; base_text: string } };
 
+/** A second, paired member of a grouped/compound Tool (mirrors Rust `ToolChild`) -
+ *  Bluebeam `.btx` `<Child>` element(s). See `docs/design/2026-08-11-grouped-markups.md` §4. */
+export interface ToolChild {
+  markup_type: MarkupType;
+  appearance: Appearance;
+  subject: string | null;
+  geometry: MarkupGeometry | null;
+  stamp: StampDef | null;
+}
+
 /** A reusable markup template (mirrors Rust `Tool`). */
 export interface Tool {
   id: string;
@@ -829,6 +839,9 @@ export interface Tool {
   /** Fixed geometry template for Drawing-mode tools (symbols/stamps). */
   geometry: MarkupGeometry | null;
   stamp: StampDef | null;
+  /** Paired member(s) placed alongside this tool as one grouped unit (Bluebeam
+   *  `.btx` `<Child>`). Empty for the overwhelming majority of tools. */
+  children: ToolChild[];
 }
 
 /** A named, ordered collection of Tools (mirrors Rust `ToolSet`). */
