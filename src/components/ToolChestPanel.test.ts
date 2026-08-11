@@ -34,7 +34,7 @@ const APPEARANCE: Tool["appearance"] = {
 function tool(id: string, name: string): Tool {
   return {
     id, name, markup_type: "Rectangle", appearance: APPEARANCE, subject: null,
-    placement_mode: "Properties", geometry: null, stamp: null,
+    placement_mode: "Properties", geometry: null, stamp: null, children: [],
   };
 }
 

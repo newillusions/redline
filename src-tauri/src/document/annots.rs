@@ -277,6 +277,26 @@ pub(crate) fn subtype(d: &Dictionary) -> Option<String> {
         .map(|b| String::from_utf8_lossy(b).into_owned())
 }
 
+/// The `/IRT` (In Reply To) object reference of an annotation, if present - the
+/// standard PDF markup-annotation reply/group link (ISO 32000-1 §12.5.6.2). Combined
+/// with `/RT /Group` this is exactly the mechanism real Bluebeam-authored PDFs use to
+/// group markups (design doc: `docs/design/2026-08-11-grouped-markups.md` §1) - a
+/// follower annotation's `/IRT` points at its group's head annotation.
+fn irt_ref(d: &Dictionary) -> Option<ObjectId> {
+    match d.get(b"IRT").ok()? {
+        Object::Reference(r) => Some(*r),
+        _ => None,
+    }
+}
+
+/// True if this annotation's `/RT` (Reply Type) is `/Group` - i.e. it is a GROUP
+/// member (not a comment reply, the other `/RT` value ISO 32000-1 defines). Only
+/// `/RT /Group` + `/IRT` together mean "grouped with"; `/IRT` alone (no `/RT`, or
+/// `/RT /R`) is an ordinary comment reply and must not be treated as a group edge.
+fn rt_is_group(d: &Dictionary) -> bool {
+    matches!(d.get(b"RT").ok().and_then(|o| o.as_name().ok()), Some(b"Group"))
+}
+
 /// Resolve the page's /Annots into a list of (annot ObjectId | inline dict).
 /// Returns owned dictionaries plus the id when the annot is an indirect object.
 /// Used by Task 3 (write side) - pub(crate) to suppress dead_code until then.
@@ -517,6 +537,13 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
         kept.insert(*page_id, keep);
     }
 
+    // Collects each group's members' freshly-assigned object ids, in `markups` slice
+    // order, for Phase 2.5 below (design doc §3 "Write"). `BTreeMap` keyed by group_id
+    // gives deterministic iteration order across saves; the Vec preserves member order
+    // within a group so head selection ("first member in slice order") is stable.
+    let mut group_members: std::collections::BTreeMap<uuid::Uuid, Vec<ObjectId>> =
+        std::collections::BTreeMap::new();
+
     // Phase 2: append the current markups to their pages as fresh indirect objects.
     for m in markups {
         let page_no = m.page + 1; // store is 0-based, get_pages is 1-based
@@ -589,11 +616,34 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
             Object::Dictionary(dictionary! { "N" => Object::Reference(ap_id) }),
         );
         let aid = doc.add_object(Object::Dictionary(dict));
+        if let Some(gid) = m.group_id {
+            group_members.entry(gid).or_default().push(aid);
+        }
         // Invariant: phase 1 inserted an entry for every page id in `pages`, and
         // `page_id` came from `pages`, so the lookup cannot miss.
         kept.get_mut(&page_id)
             .expect("page in map")
             .push(Object::Reference(aid));
+    }
+
+    // Phase 2.5: for every group of >= 2 members, pick the first member (in `markups`
+    // slice order) as the synthesized head and patch every OTHER member's
+    // already-written dict with the standard PDF group-annotation link (ISO 32000-1
+    // §12.5.6.2: `/RT /Group` + `/IRT <head's object ref>`) - design doc §3 "Write". A
+    // "group" of exactly 1 (a stale/orphaned `group_id` with no surviving sibling this
+    // save) gets no `/IRT`/`/RT` - nothing to link to. `/RLGroup` (already written by
+    // `to_annotation_dict` above, per-markup) is left untouched as the redline-only
+    // fallback.
+    for members in group_members.values() {
+        let [head, followers @ ..] = members.as_slice() else { continue };
+        if followers.is_empty() {
+            continue;
+        }
+        for &follower_aid in followers {
+            let dict = doc.get_dictionary_mut(follower_aid).context("group follower dict")?;
+            dict.set("RT", Object::Name(b"Group".to_vec()));
+            dict.set("IRT", Object::Reference(*head));
+        }
     }
 
     // Phase 3: set each page's /Annots directly (drop any old Reference indirection).
@@ -614,17 +664,109 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
 
 /// Read all markup-like annotations. Page index (0-based) comes from the page tree.
 pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
-    let mut out = Vec::new();
-    let mut page_space = PageSpaceCache::new(doc);
-    for (page_no_1based, page_id) in doc.get_pages() {
-        let (rotation, w0, h0, ox, oy) = page_space.get(page_id, page_no_1based - 1)?;
-        for (_, dict) in page_annots(doc, page_id)? {
+    // Pass 1: collect every markup-subtype annotation dict across the whole document
+    // (with its object id, when it has one) BEFORE converting to `Markup` - group
+    // membership (`/IRT` + `/RT /Group`) is a cross-annotation relationship that
+    // `Markup::from_annotation_dict` cannot see on its own (design doc §3 "Read").
+    struct Collected {
+        oid: Option<ObjectId>,
+        dict: Dictionary,
+        page_no_1based: u32,
+    }
+    let pages = doc.get_pages(); // 1-based page no -> page ObjectId; queried once, reused below
+    let mut collected: Vec<Collected> = Vec::new();
+    for (&page_no_1based, &page_id) in &pages {
+        for (oid, dict) in page_annots(doc, page_id)? {
             let Some(st) = subtype(&dict) else { continue };
             if !MARKUP_SUBTYPES.contains(&st.as_str()) {
                 continue;
             }
+            collected.push(Collected { oid, dict, page_no_1based });
+        }
+    }
+
+    // Pass 2: resolve group membership via a union-find over object ids. A follower's
+    // `/IRT` points at its group's head; union both into the same component. Multiple
+    // followers sharing one head (the star topology every real corpus group uses,
+    // including >2-member "compound tool" groups) all land in one component for free.
+    let oid_to_index: std::collections::HashMap<ObjectId, usize> = collected
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| c.oid.map(|oid| (oid, i)))
+        .collect();
+    let mut parent: Vec<usize> = (0..collected.len()).collect();
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        if parent[x] != x {
+            parent[x] = find(parent, parent[x]);
+        }
+        parent[x]
+    }
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let (ra, rb) = (find(parent, a), find(parent, b));
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+    for (i, c) in collected.iter().enumerate() {
+        if !rt_is_group(&c.dict) {
+            continue;
+        }
+        let Some(target_oid) = irt_ref(&c.dict) else { continue };
+        let Some(&j) = oid_to_index.get(&target_oid) else { continue };
+        union(&mut parent, i, j);
+    }
+    // Assign one fresh synthetic group id per component of size >= 2. Components of
+    // size 1 (no group edges, or an unresolvable `/IRT`) are not a group.
+    let mut component_size: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for i in 0..collected.len() {
+        *component_size.entry(find(&mut parent, i)).or_insert(0) += 1;
+    }
+    // Prefer an existing `/RLGroup` value already carried by a component's member, over
+    // minting a fresh id, whenever one is present - keeps a redline-authored group's
+    // identity STABLE across repeated write/read cycles (write_markups now always
+    // stamps real /IRT+/RT alongside /RLGroup, so without this preference every reopen
+    // would otherwise synthesize a brand-new, unnecessarily churning id even though
+    // membership never changed). `/IRT`+`/RT` still solely decides WHO is grouped
+    // (membership); `/RLGroup` only supplies the group's stable VALUE when available -
+    // a genuinely foreign (BB-only, no prior redline save) group has no `/RLGroup` on
+    // any member and gets a fresh synthesized id, same as before.
+    fn existing_rl_group(d: &Dictionary) -> Option<uuid::Uuid> {
+        let s = d.get(b"RLGroup").ok()?.as_str().ok()?;
+        uuid::Uuid::parse_str(&String::from_utf8_lossy(s)).ok()
+    }
+    let mut group_ids: std::collections::HashMap<usize, uuid::Uuid> = std::collections::HashMap::new();
+    for c in &collected {
+        let Some(existing) = existing_rl_group(&c.dict) else { continue };
+        // `oid` is None for an inline (non-indirect) annotation dict, which cannot
+        // participate in the union-find (nothing can point /IRT at it) - safe to skip.
+        let Some(oid) = c.oid else { continue };
+        let Some(&i) = oid_to_index.get(&oid) else { continue };
+        let root = find(&mut parent, i);
+        if component_size.get(&root).copied().unwrap_or(1) < 2 {
+            continue; // no surviving group to attach a stable id to
+        }
+        group_ids.entry(root).or_insert(existing);
+    }
+
+    let mut out = Vec::new();
+    let mut page_space = PageSpaceCache::new(doc);
+    for (i, c) in collected.into_iter().enumerate() {
+        let dict = c.dict;
+        let page_no_1based = c.page_no_1based;
+        let page_id = *pages.get(&page_no_1based).context("page id for collected annotation")?;
+        let (rotation, w0, h0, ox, oy) = page_space.get(page_id, page_no_1based - 1)?;
+        {
             let mut m = Markup::from_annotation_dict(&dict);
             m.page = page_no_1based - 1;
+            // `/IRT`+`/RT /Group` (standards-based, externally visible) takes priority
+            // over a bare `/RLGroup` fallback (a prior redline-only save with no group
+            // link a foreign viewer can see) whenever both are present - see design doc
+            // §3 "Read", point 5.
+            let root = find(&mut parent, i);
+            if component_size.get(&root).copied().unwrap_or(1) >= 2 {
+                let gid = *group_ids.entry(root).or_insert_with(uuid::Uuid::new_v4);
+                m.group_id = Some(gid);
+            }
             // `from_annotation_dict` recovers geometry in the PDF's TRUE default user
             // space (from /RLRect, /L, /Vertices, /QuadPoints, /InkList, or a legacy/
             // foreign /Rect - all of those are true-space per spec). Convert to PDFium
@@ -2516,6 +2658,195 @@ pub(crate) mod tests {
                 "geometry must be pixel-stable across the migration save"
             );
         }
+    }
+
+    // --- Grouped markups: /IRT + /RT /Group round-trip (design doc 2026-08-11) ---
+
+    #[test]
+    fn write_markups_emits_irt_rt_group_for_a_two_member_group() {
+        let (mut doc, page_id) = one_page_doc();
+        let gid = uuid::Uuid::new_v4();
+        let mut a = redline_markup(0);
+        a.group_id = Some(gid);
+        let mut b = redline_markup(0);
+        b.group_id = Some(gid);
+        let markups = vec![a, b];
+
+        write_markups(&mut doc, &markups).unwrap();
+
+        let annots = page_annots(&doc, page_id).unwrap();
+        assert_eq!(annots.len(), 2);
+        let (head_oid, head_dict) = &annots[0];
+        let (_, follower_dict) = &annots[1];
+
+        assert!(
+            !head_dict.has(b"IRT") && !head_dict.has(b"RT"),
+            "the first member in slice order (the synthesized head) must carry neither \
+             /IRT nor /RT - matches every real corpus head"
+        );
+        assert_eq!(
+            follower_dict.get(b"RT").unwrap().as_name().unwrap(),
+            b"Group",
+            "follower must be tagged /RT /Group"
+        );
+        let irt = follower_dict.get(b"IRT").unwrap();
+        assert_eq!(
+            irt,
+            &Object::Reference(head_oid.expect("head must be an indirect object")),
+            "follower's /IRT must reference the head's own object id"
+        );
+        // /RLGroup stays too - belt-and-braces redline-only fallback (design doc §3).
+        assert!(head_dict.has(b"RLGroup") && follower_dict.has(b"RLGroup"));
+    }
+
+    #[test]
+    fn write_markups_supports_an_n_ary_star_group() {
+        // Mirrors the real corpus's 21-member "Consultant Stamp" compound tool: one
+        // head, many followers, all pointing /IRT at the SAME head object.
+        let (mut doc, page_id) = one_page_doc();
+        let gid = uuid::Uuid::new_v4();
+        let markups: Vec<Markup> = (0..5)
+            .map(|_| {
+                let mut m = redline_markup(0);
+                m.group_id = Some(gid);
+                m
+            })
+            .collect();
+
+        write_markups(&mut doc, &markups).unwrap();
+
+        let annots = page_annots(&doc, page_id).unwrap();
+        assert_eq!(annots.len(), 5);
+        let head_oid = annots[0].0.expect("head must be indirect");
+        for (oid, dict) in &annots[1..] {
+            assert_eq!(dict.get(b"RT").unwrap().as_name().unwrap(), b"Group");
+            assert_eq!(dict.get(b"IRT").unwrap(), &Object::Reference(head_oid));
+            assert_ne!(*oid, Some(head_oid), "followers must be distinct objects from the head");
+        }
+    }
+
+    #[test]
+    fn write_markups_leaves_an_ungrouped_markup_without_irt_rt() {
+        let (mut doc, page_id) = one_page_doc();
+        let markups = vec![redline_markup(0)];
+        write_markups(&mut doc, &markups).unwrap();
+        let annots = page_annots(&doc, page_id).unwrap();
+        let (_, dict) = &annots[0];
+        assert!(!dict.has(b"IRT") && !dict.has(b"RT"));
+    }
+
+    #[test]
+    fn write_markups_a_group_of_one_survivor_gets_no_irt_rt() {
+        // A group_id with no OTHER member surviving this particular save (e.g. its
+        // sibling was deleted) must not crash and must not emit a dangling /IRT.
+        let (mut doc, page_id) = one_page_doc();
+        let mut m = redline_markup(0);
+        m.group_id = Some(uuid::Uuid::new_v4());
+        write_markups(&mut doc, &[m]).unwrap();
+        let annots = page_annots(&doc, page_id).unwrap();
+        assert!(!annots[0].1.has(b"IRT") && !annots[0].1.has(b"RT"));
+    }
+
+    /// Build a two-annotation page directly (bypassing `write_markups`) with a real
+    /// `/IRT` object reference + `/RT /Group`, mimicking a genuine Bluebeam-authored
+    /// PDF - proves `read_markups` recovers group membership from foreign input, not
+    /// just from its own prior writes.
+    fn two_annot_grouped_doc() -> (Document, lopdf::ObjectId, lopdf::ObjectId, lopdf::ObjectId) {
+        let (mut doc, page_id) = one_page_doc();
+        let head_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Square",
+            "Rect" => vec![0.into(), 0.into(), 50.into(), 50.into()],
+            "NM" => Object::string_literal("head-nm"),
+            "F" => 4,
+        }));
+        let follower_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "FreeText",
+            "Rect" => vec![5.into(), 5.into(), 45.into(), 45.into()],
+            "NM" => Object::string_literal("follower-nm"),
+            "F" => 4,
+            "RT" => Object::Name(b"Group".to_vec()),
+            "IRT" => Object::Reference(head_id),
+        }));
+        let page = doc.get_dictionary_mut(page_id).unwrap();
+        page.set("Annots", Object::Array(vec![Object::Reference(head_id), Object::Reference(follower_id)]));
+        (doc, page_id, head_id, follower_id)
+    }
+
+    #[test]
+    fn read_markups_recovers_group_id_from_foreign_irt_rt() {
+        let (doc, _page_id, _head_id, _follower_id) = two_annot_grouped_doc();
+        let markups = read_markups(&doc).unwrap();
+        assert_eq!(markups.len(), 2);
+        assert!(markups[0].group_id.is_some(), "head must be assigned a group_id on read");
+        assert_eq!(
+            markups[0].group_id, markups[1].group_id,
+            "head and follower must share the SAME synthesized group_id"
+        );
+    }
+
+    #[test]
+    fn read_markups_a_lone_annotation_with_no_irt_has_no_group_id() {
+        let (mut doc, page_id) = one_page_doc();
+        let markups = vec![redline_markup(0)];
+        write_markups(&mut doc, &markups).unwrap();
+        let read = read_markups(&doc).unwrap();
+        assert_eq!(read.len(), 1);
+        assert!(read[0].group_id.is_none());
+        let _ = page_id;
+    }
+
+    #[test]
+    fn read_markups_ignores_irt_without_rt_group_an_ordinary_comment_reply() {
+        // /IRT alone (no /RT, or /RT /R) is an ordinary comment reply, NOT a group -
+        // must not be misread as grouping (design doc §1 "RT is Group... not a rare
+        // edge case" - the inverse mistake, treating a reply as a group, would be
+        // equally wrong).
+        let (mut doc, page_id) = one_page_doc();
+        let head_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Text",
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+            "NM" => Object::string_literal("head-nm"), "F" => 4,
+        }));
+        let reply_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Text",
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+            "NM" => Object::string_literal("reply-nm"), "F" => 4,
+            "IRT" => Object::Reference(head_id),
+            // no /RT at all - PDF default reply type is /R (comment reply)
+        }));
+        let page = doc.get_dictionary_mut(page_id).unwrap();
+        page.set("Annots", Object::Array(vec![Object::Reference(head_id), Object::Reference(reply_id)]));
+
+        let markups = read_markups(&doc).unwrap();
+        assert!(
+            markups.iter().all(|m| m.group_id.is_none()),
+            "an /IRT with no /RT /Group must not be treated as a group"
+        );
+    }
+
+    #[test]
+    fn full_cycle_group_round_trip_survives_write_read_write_read() {
+        let (mut doc, _page_id) = one_page_doc();
+        let gid = uuid::Uuid::new_v4();
+        let mut a = redline_markup(0);
+        a.group_id = Some(gid);
+        let mut b = redline_markup(0);
+        b.group_id = Some(gid);
+        write_markups(&mut doc, &[a, b]).unwrap();
+
+        let read1 = read_markups(&doc).unwrap();
+        assert_eq!(read1.len(), 2);
+        assert!(read1[0].group_id.is_some());
+        assert_eq!(read1[0].group_id, read1[1].group_id, "cycle 1: still grouped");
+
+        // Re-save with no edits, then re-read - the group link must not degrade.
+        write_markups(&mut doc, &read1).unwrap();
+        let read2 = read_markups(&doc).unwrap();
+        assert_eq!(read2.len(), 2);
+        assert!(read2[0].group_id.is_some());
+        assert_eq!(read2[0].group_id, read2[1].group_id, "cycle 2: still grouped after re-save");
     }
 }
 

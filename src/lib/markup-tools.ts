@@ -128,30 +128,56 @@ export function calloutGeometry(target: PdfPoint, anchor: PdfPoint): MarkupGeome
  *    different anchor convention this MVP does not need to solve).
  */
 export function translateToolGeometry(template: MarkupGeometry, clickPoint: PdfPoint): MarkupGeometry {
-  const shift = (anchor: PdfPoint): PdfPoint => ({ x: clickPoint.x - anchor.x, y: clickPoint.y - anchor.y });
-  const apply = (p: PdfPoint, d: PdfPoint): PdfPoint => ({ x: p.x + d.x, y: p.y + d.y });
+  const delta = toolPlacementDelta(template, clickPoint);
+  if (!delta) return template; // Quads - see doc comment.
+  return shiftGeometry(template, delta.dx, delta.dy);
+}
 
-  if ("Point" in template) {
-    return { Point: { x: clickPoint.x, y: clickPoint.y } };
-  }
-  if ("Rect" in template) {
-    const { min, max } = template.Rect;
-    const d = shift(min);
-    return { Rect: { min: apply(min, d), max: apply(max, d) } };
-  }
-  if ("Polyline" in template) {
-    const pts = template.Polyline;
-    const anchor = bboxMin(pts);
-    const d = shift(anchor);
-    return { Polyline: pts.map((p) => apply(p, d)) };
-  }
-  if ("Ink" in template) {
-    const strokes = template.Ink;
-    const anchor = bboxMin(strokes.flat());
-    const d = shift(anchor);
-    return { Ink: strokes.map((s) => s.map((p) => apply(p, d))) };
-  }
-  return template; // Quads - see doc comment.
+/**
+ * The anchor point `translateToolGeometry` uses for `template`'s geometry variant (see
+ * that function's doc comment for the per-variant convention), or `null` for Quads
+ * (no anchor convention defined - see doc comment).
+ */
+function toolTemplateAnchor(template: MarkupGeometry): PdfPoint | null {
+  if ("Point" in template) return template.Point;
+  if ("Rect" in template) return template.Rect.min;
+  if ("Polyline" in template) return bboxMin(template.Polyline);
+  if ("Ink" in template) return bboxMin(template.Ink.flat());
+  return null; // Quads
+}
+
+/**
+ * The `(dx, dy)` translation that `translateToolGeometry(template, clickPoint)` would
+ * apply, exposed separately so a GROUPED tool's placement (design doc
+ * `docs/design/2026-08-11-grouped-markups.md` §4) can compute it ONCE from the parent
+ * tool's own template and apply the SAME delta uniformly to every child's geometry too
+ * (via `shiftGeometry`, this module) - never each child's own independent anchor, which
+ * would collapse every member on top of the click point instead of preserving the
+ * group's relative layout. `null` for Quads (no anchor convention).
+ */
+export function toolPlacementDelta(template: MarkupGeometry, clickPoint: PdfPoint): { dx: number; dy: number } | null {
+  const anchor = toolTemplateAnchor(template);
+  if (!anchor) return null;
+  return { dx: clickPoint.x - anchor.x, dy: clickPoint.y - anchor.y };
+}
+
+/**
+ * Shift every coordinate in `g` by a fixed `(dx, dy)` - the uniform-translation
+ * primitive `translateToolGeometry`/`toolPlacementDelta` build on. Deliberately NOT
+ * imported from `markup-select.ts`'s equivalent `translateGeometry` (which already
+ * exists there) to avoid a circular module dependency - `markup-select.ts` already
+ * imports `DEFAULT_TEXT_BOX` from this file. Same Quads behaviour as the rest of this
+ * module: passed through untouched (no defined anchor/shift convention for it here).
+ * Exported so grouped-tool placement (`Viewport.svelte`) can apply the SAME delta to
+ * every child's geometry, not just the parent's.
+ */
+export function shiftGeometry(g: MarkupGeometry, dx: number, dy: number): MarkupGeometry {
+  const apply = (p: PdfPoint): PdfPoint => ({ x: p.x + dx, y: p.y + dy });
+  if ("Point" in g) return { Point: apply(g.Point) };
+  if ("Rect" in g) return { Rect: { min: apply(g.Rect.min), max: apply(g.Rect.max) } };
+  if ("Polyline" in g) return { Polyline: g.Polyline.map(apply) };
+  if ("Ink" in g) return { Ink: g.Ink.map((s) => s.map(apply)) };
+  return g; // Quads
 }
 
 /**
@@ -197,6 +223,11 @@ export function buildMarkup(opts: {
   countSet?: CountSet | null;
   /** Stamp's backing visual asset snapshot (Stamp/StampDynamic placement only). */
   stampAsset?: StampAsset | null;
+  /** Group id (G8, `/RLGroup` + real `/IRT`+`/RT /Group` on save) - set when this
+   *  markup is one member of a grouped-tool placement (design doc
+   *  `docs/design/2026-08-11-grouped-markups.md` §4). `null`/omitted for an
+   *  ordinary ungrouped markup, matching every prior call site. */
+  groupId?: string | null;
 }): Markup {
   return {
     id: opts.id,
@@ -214,7 +245,7 @@ export function buildMarkup(opts: {
     subject: null,
     layer: null,
     contents: opts.contents ?? null,
-    group_id: null,
+    group_id: opts.groupId ?? null,
     audit: {
       created_by: opts.identity,
       created_at: opts.now,

@@ -28,6 +28,7 @@ function tool(overrides: Partial<Tool> = {}): Tool {
     placement_mode: "Properties",
     geometry: null,
     stamp: null,
+    children: [],
     ...overrides,
   };
 }

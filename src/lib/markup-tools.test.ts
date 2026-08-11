@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { dragDrawGeometry, buildMarkup, bumpAudit, RECT_TOOLS, isDrawTool, MULTI_CLICK_TOOLS, isMultiClickTool, isInkTool, polylineGeometry, inkGeometry, minVertices, isMultiClickComplete, TEXT_TOOLS, isTextTool, textBoxGeometry, calloutGeometry, DEFAULT_TEXT_FONT, translateToolGeometry, extractPromptedLabels } from "./markup-tools";
+import { dragDrawGeometry, buildMarkup, bumpAudit, RECT_TOOLS, isDrawTool, MULTI_CLICK_TOOLS, isMultiClickTool, isInkTool, polylineGeometry, inkGeometry, minVertices, isMultiClickComplete, TEXT_TOOLS, isTextTool, textBoxGeometry, calloutGeometry, DEFAULT_TEXT_FONT, translateToolGeometry, extractPromptedLabels, toolPlacementDelta, shiftGeometry } from "./markup-tools";
 import { patchAppearance } from "./markup-properties";
 import type { Appearance, UserRef, PdfPoint, MarkupGeometry, DynamicField } from "./ipc";
 
@@ -53,6 +53,17 @@ describe("buildMarkup", () => {
     expect(m.subject).toBeNull();
     expect(m.contents).toBeNull();
     expect(m.measurement).toBeNull();
+    expect(m.group_id).toBeNull();
+  });
+
+  it("carries a supplied groupId through onto group_id (grouped-tool placement)", () => {
+    const m = buildMarkup({
+      markupType: "Rectangle", page: 0,
+      geometry: { Rect: { min: { x: 0, y: 0 }, max: { x: 1, y: 1 } } },
+      appearance: AP, identity: USER, now: "2026-06-14T00:00:00Z", id: "abc",
+      groupId: "22222222-2222-2222-2222-222222222222",
+    });
+    expect(m.group_id).toBe("22222222-2222-2222-2222-222222222222");
   });
 
   it("defaults stamp_asset to null when not supplied", () => {
@@ -336,5 +347,75 @@ describe("translateToolGeometry (Tool Chest Drawing-mode placement)", () => {
     const template: MarkupGeometry = { Polyline: [{ x: 100, y: 200 }, { x: 110, y: 210 }] };
     const g = translateToolGeometry(template, { x: 0, y: 0 });
     expect(g).toEqual({ Polyline: [{ x: 0, y: 0 }, { x: 10, y: 10 }] });
+  });
+
+  it("Quads template passes through untouched (no anchor convention)", () => {
+    const quads: MarkupGeometry = { Quads: [[{ x: 1, y: 1 }, { x: 2, y: 1 }, { x: 1, y: 2 }, { x: 2, y: 2 }]] };
+    expect(translateToolGeometry(quads, { x: 500, y: 500 })).toEqual(quads);
+  });
+});
+
+// --- toolPlacementDelta / shiftGeometry (grouped-tool placement, design doc
+// docs/design/2026-08-11-grouped-markups.md §4) ---
+
+describe("toolPlacementDelta", () => {
+  it("matches the delta translateToolGeometry itself applies, for every anchored variant", () => {
+    const cases: MarkupGeometry[] = [
+      { Point: { x: 5, y: 5 } },
+      { Rect: { min: { x: 10, y: 20 }, max: { x: 60, y: 70 } } },
+      { Polyline: [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 5, y: 10 }] },
+      { Ink: [[{ x: 2, y: 4 }, { x: 6, y: 4 }], [{ x: 4, y: 8 }]] },
+    ];
+    const click: PdfPoint = { x: 100, y: 100 };
+    for (const template of cases) {
+      const delta = toolPlacementDelta(template, click);
+      expect(delta).not.toBeNull();
+      const anchor = { x: click.x - delta!.dx, y: click.y - delta!.dy };
+      const anchoredResult = translateToolGeometry(template, anchor); // no-op shift for a template already at its own anchor
+      expect(anchoredResult).toEqual(template);
+    }
+  });
+
+  it("returns null for Quads (no defined anchor convention)", () => {
+    const quads: MarkupGeometry = { Quads: [[{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 0, y: 1 }, { x: 1, y: 1 }]] };
+    expect(toolPlacementDelta(quads, { x: 5, y: 5 })).toBeNull();
+  });
+});
+
+describe("shiftGeometry", () => {
+  it("shifts every coordinate variant by a fixed (dx, dy)", () => {
+    expect(shiftGeometry({ Point: { x: 1, y: 2 } }, 10, 20)).toEqual({ Point: { x: 11, y: 22 } });
+    expect(shiftGeometry({ Rect: { min: { x: 0, y: 0 }, max: { x: 5, y: 5 } } }, 1, 1)).toEqual({
+      Rect: { min: { x: 1, y: 1 }, max: { x: 6, y: 6 } },
+    });
+    expect(shiftGeometry({ Polyline: [{ x: 0, y: 0 }, { x: 1, y: 1 }] }, 2, 3)).toEqual({
+      Polyline: [{ x: 2, y: 3 }, { x: 3, y: 4 }],
+    });
+    expect(shiftGeometry({ Ink: [[{ x: 0, y: 0 }]] }, 5, 5)).toEqual({ Ink: [[{ x: 5, y: 5 }]] });
+  });
+
+  it("passes Quads through untouched", () => {
+    const quads: MarkupGeometry = { Quads: [[{ x: 1, y: 1 }, { x: 2, y: 1 }, { x: 1, y: 2 }, { x: 2, y: 2 }]] };
+    expect(shiftGeometry(quads, 100, 100)).toEqual(quads);
+  });
+
+  it("real-corpus-shaped scenario: applying the SAME delta to a parent + child preserves their relative layout", () => {
+    // Mirrors a real grouped tool: parent Square backing at [0,0]-[100,100], a child
+    // FreeText label offset -18/-46 from it (bench/corpus/btx sample values, §1 finding).
+    const parentTemplate: MarkupGeometry = { Rect: { min: { x: 0, y: 0 }, max: { x: 100, y: 100 } } };
+    const childTemplate: MarkupGeometry = { Rect: { min: { x: -18, y: -46 }, max: { x: 82, y: 54 } } };
+    const click: PdfPoint = { x: 300, y: 300 };
+    const delta = toolPlacementDelta(parentTemplate, click)!;
+
+    const placedParent = shiftGeometry(parentTemplate, delta.dx, delta.dy);
+    const placedChild = shiftGeometry(childTemplate, delta.dx, delta.dy);
+
+    expect(placedParent).toEqual({ Rect: { min: { x: 300, y: 300 }, max: { x: 400, y: 400 } } });
+    // The child's offset from the parent (-18, -46) must be UNCHANGED after placement -
+    // this is what a per-child independent translateToolGeometry call would break.
+    if ("Rect" in placedChild && "Rect" in placedParent) {
+      expect(placedChild.Rect.min.x - placedParent.Rect.min.x).toBe(-18);
+      expect(placedChild.Rect.min.y - placedParent.Rect.min.y).toBe(-46);
+    }
   });
 });

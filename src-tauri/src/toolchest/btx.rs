@@ -49,16 +49,18 @@
 //!   is UNVERIFIED against any real Bluebeam export - kept as defensive parsing, not
 //!   confirmed to occur in the wild).
 //! - Optionally one or more sibling `<Resources>` blocks (see "Stamp artwork" below).
-//! - Optionally a `<Child>` element - a SECOND, paired annotation (e.g. a shape + its
-//!   attached text label, or a callout + its leader arrow) that Bluebeam groups with the
-//!   parent as one visual unit. **NAMED, NOT FIXED**: measured at 33/77 (43%) of real
-//!   items across the sample corpus - not a rare edge case. `Tool` is architecturally 1:1
-//!   with a single `Markup`+geometry (`toolchest::mod`), so representing a `<Child>`
-//!   losslessly needs a data-model change (an optional linked/secondary markup on `Tool`)
-//!   AND a placement-time change (dropping two annotations, not one) - genuinely beyond
-//!   this importer module's own scope, not merely unimplemented. The child's entire
-//!   annotation is currently silently discarded; only the parent's own `<Raw>` becomes the
-//!   Tool. See `tests::grouped_child_annotation_is_named_not_fixed`.
+//! - Optionally one or more `<Child>` elements - each a SECOND, paired annotation (e.g. a
+//!   shape + its attached text label, or a callout + its leader arrow) that Bluebeam
+//!   groups with the parent as one visual unit. **FIXED 2026-08-11** (measured at 33/77,
+//!   43%, of real items across the sample corpus - not a rare edge case; some real items
+//!   carry up to 20 children, a "compound stamp" tool): `Tool::children: Vec<ToolChild>`
+//!   (`toolchest::mod`) captures every `<Child>`, each converted through the same
+//!   `Markup::from_annotation_dict` reuse the parent uses. Placement (frontend,
+//!   `Viewport.svelte::createPlacedMarkup`) drops one `Markup` per member (this tool +
+//!   every child) sharing a single fresh `group_id`, translated by the same click-anchor
+//!   delta - see design doc `docs/design/2026-08-11-grouped-markups.md` §4. A child whose
+//!   own `<Raw>` fails to decode is dropped, never fatal to the tool. See
+//!   `tests::grouped_child_annotation_is_captured_on_tool_children`.
 //!
 //! Custom estimating columns (`/BSIColumnData`): this module's ORIGINAL doc comment
 //! claimed it was a separate `<BSIColumnData>` XML element - WRONG, confirmed against the
@@ -97,7 +99,7 @@ use lopdf::{Dictionary, Object};
 use serde::Serialize;
 
 use crate::markup::Markup;
-use crate::toolchest::{PlacementMode, StampAsset, StampDef, Tool};
+use crate::toolchest::{PlacementMode, StampAsset, StampDef, Tool, ToolChild};
 
 /// One item that failed to import, with a human-readable reason (spec: "skipped-and-
 /// reported, not fatal").
@@ -294,6 +296,21 @@ fn import_item(item: roxmltree::Node, name: &str) -> Result<Tool, String> {
         asset: StampAsset::BluebeamFormXObject { root_id, objects: collect_bb_resources(item) },
     });
 
+    // Grouped/compound tools (module doc "<Child>", design doc §4): zero or more
+    // `<Child>` siblings, each a SECOND paired annotation Bluebeam groups with this
+    // one as one visual unit. Real corpus: 33/77 items carry at least one, up to 20 on
+    // a single "compound stamp" tool. Reuses the exact same per-Raw conversion as the
+    // parent above (subtype guard + `Markup::from_annotation_dict`) - no new dict-
+    // parsing logic, just applied once per child instead of once per item. A child
+    // whose own `<Raw>` fails to decode or names an unsupported subtype is dropped
+    // (never fatal to the whole tool - same never-fatal posture as everything else in
+    // this module) rather than failing the entire compound tool over one bad member.
+    let children: Vec<ToolChild> = item
+        .children()
+        .filter(|n| n.has_tag_name("Child"))
+        .filter_map(|child_node| import_child(child_node, item))
+        .collect();
+
     Ok(Tool {
         id: uuid::Uuid::new_v4(),
         name: display_name,
@@ -302,6 +319,44 @@ fn import_item(item: roxmltree::Node, name: &str) -> Result<Tool, String> {
         subject: markup.subject,
         placement_mode,
         geometry,
+        stamp,
+        children,
+    })
+}
+
+/// Parse one `<Child>` element into a [`ToolChild`]. `item` is the owning
+/// `<ToolChestItem>` - needed because `<Resources>` blocks (stamp artwork) are always
+/// siblings of the item itself, not nested inside `<Child>` (verified against the real
+/// corpus's `(Stamp, Stamp)` and `(Stamp, Square)` grouped pairs). Returns `None`
+/// (never an `Err`/panic) on any decode failure - the caller drops it silently, same
+/// never-fatal posture as a top-level item.
+fn import_child(child_node: roxmltree::Node, item: roxmltree::Node) -> Option<ToolChild> {
+    let raw = child_text(child_node, "Raw")?;
+    let dict = raw_to_dict(raw).ok()?;
+
+    match crate::document::annots::subtype(&dict) {
+        Some(st) if crate::document::annots::MARKUP_SUBTYPES.contains(&st.as_str()) => {}
+        _ => return None,
+    }
+
+    let markup = Markup::from_annotation_dict(&dict);
+    let stamp = bb_form_xobject_root_id(&dict).map(|root_id| StampDef::Static {
+        asset: StampAsset::BluebeamFormXObject { root_id, objects: collect_bb_resources(item) },
+    });
+
+    Some(ToolChild {
+        markup_type: markup.markup_type,
+        appearance: markup.appearance,
+        subject: markup.subject,
+        // A child's geometry is always captured, regardless of the PARENT tool's own
+        // placement_mode field - a childless Properties-mode tool carries no geometry
+        // by design (the user draws it fresh), but a grouped tool's members must keep
+        // their exact relative layout to remain a recognisable compound shape, which
+        // only a fixed geometry snapshot can preserve. Every real corpus group is a
+        // Drawing-mode tool (Mode drawing), so this has not been observed to diverge
+        // from the parent's mode in practice, but is not made conditional on it -
+        // groups without fixed geometry would be meaningless (nothing to offset by).
+        geometry: Some(markup.geometry),
         stamp,
     })
 }
@@ -1223,18 +1278,17 @@ mod tests {
     // --- Grouped/paired <Child> annotations (module doc "<Child>") - NAMED, NOT FIXED ---
 
     #[test]
-    fn grouped_child_annotation_is_named_not_fixed() {
-        // A <Child> represents a SECOND, paired annotation Bluebeam groups with the
-        // parent (measured: 33/77 = 43% of real items across the sample corpus carry
-        // one - not a rare edge case). `Tool` is architecturally 1:1 with a single
-        // Markup+geometry, so this cannot be losslessly represented without a data-model
-        // change - documenting the current (safe: no crash, no skip; incomplete: the
-        // child's entire annotation is silently discarded) behaviour rather than treating
-        // it as fixed.
+    fn grouped_child_annotation_is_captured_on_tool_children() {
+        // FIXED 2026-08-11 (design doc `docs/design/2026-08-11-grouped-markups.md`) -
+        // supersedes the former "named, not fixed" version of this test. A <Child>
+        // represents a SECOND, paired annotation Bluebeam groups with the parent
+        // (measured: 33/77 = 43% of real items across the sample corpus carry one -
+        // not a rare edge case). `Tool` now carries a `children: Vec<ToolChild>` for
+        // exactly this.
         let xml = r#"<BluebeamRevuToolSet Version="1">
           <ToolChestItem>
             <Name>Parent</Name>
-            <Mode>properties</Mode>
+            <Mode>drawing</Mode>
             <Raw><![CDATA[<< /Subtype /Polygon /Rect [0 0 50 50] /Subj (Cloud Shape) >>]]></Raw>
             <Child>
               <Type>Bluebeam.PDF.Annotations.AnnotationFreeText</Type>
@@ -1245,17 +1299,69 @@ mod tests {
 
         let report = parse_btx_xml(xml);
         assert!(report.skipped.is_empty(), "the parent still imports cleanly: {:?}", report.skipped);
-        assert_eq!(report.tools.len(), 1, "exactly the PARENT becomes a tool - the <Child> is not a second tool");
-        assert_eq!(report.tools[0].subject.as_deref(), Some("Cloud Shape"));
-        assert_eq!(
-            report.tools[0].markup_type,
-            crate::markup::MarkupType::Polygon,
-            "only the parent's own /Subtype Polygon is represented"
-        );
-        // The child's "Attached Label" text is nowhere in the imported Tool - this is the
-        // named, not-yet-fixed gap. There is deliberately no `Tool` field that COULD hold
-        // it today (see module doc); this assertion exists so a future fix that adds one
-        // has a red test to turn green, rather than this gap silently persisting forever.
+        assert_eq!(report.tools.len(), 1, "exactly the PARENT becomes a top-level tool - the <Child> is not a second tool");
+        let tool = &report.tools[0];
+        assert_eq!(tool.subject.as_deref(), Some("Cloud Shape"));
+        assert_eq!(tool.markup_type, crate::markup::MarkupType::Polygon);
+
+        assert_eq!(tool.children.len(), 1, "the <Child> must now be captured, not discarded");
+        let child = &tool.children[0];
+        assert_eq!(child.subject.as_deref(), Some("Attached Label"), "child's own /Subj must be preserved");
+        assert_eq!(child.markup_type, crate::markup::MarkupType::Text, "FreeText with no /CL maps to Text");
+        assert!(child.geometry.is_some(), "a Drawing-mode compound tool's child must carry a fixed geometry template");
+    }
+
+    #[test]
+    fn multiple_children_are_all_captured_not_just_the_first() {
+        // The real corpus has items with up to 20 <Child> elements (a "compound stamp"
+        // tool) - the importer must not silently drop all but one.
+        let xml = r#"<BluebeamRevuToolSet Version="1">
+          <ToolChestItem>
+            <Name>Parent</Name>
+            <Mode>drawing</Mode>
+            <Raw><![CDATA[<< /Subtype /Square /Rect [0 0 100 100] /Subj (Backing) >>]]></Raw>
+            <Child><Raw><![CDATA[<< /Subtype /FreeText /Rect [0 0 20 10] /Subj (Label A) >>]]></Raw></Child>
+            <Child><Raw><![CDATA[<< /Subtype /FreeText /Rect [0 0 20 10] /Subj (Label B) >>]]></Raw></Child>
+            <Child><Raw><![CDATA[<< /Subtype /Line /L [0 0 10 10] /Subj (Divider) >>]]></Raw></Child>
+          </ToolChestItem>
+        </BluebeamRevuToolSet>"#;
+
+        let report = parse_btx_xml(xml);
+        assert_eq!(report.tools.len(), 1);
+        let subjects: Vec<Option<&str>> = report.tools[0].children.iter().map(|c| c.subject.as_deref()).collect();
+        assert_eq!(subjects, vec![Some("Label A"), Some("Label B"), Some("Divider")]);
+    }
+
+    #[test]
+    fn a_child_with_an_unparseable_raw_is_dropped_not_fatal_to_the_tool() {
+        let xml = r#"<BluebeamRevuToolSet Version="1">
+          <ToolChestItem>
+            <Name>Parent</Name>
+            <Mode>drawing</Mode>
+            <Raw><![CDATA[<< /Subtype /Polygon /Rect [0 0 50 50] /Subj (Cloud Shape) >>]]></Raw>
+            <Child><Raw>not-valid-pdf-syntax-at-all</Raw></Child>
+          </ToolChestItem>
+        </BluebeamRevuToolSet>"#;
+
+        let report = parse_btx_xml(xml);
+        assert!(report.skipped.is_empty(), "a bad child must not fail the whole item");
+        assert_eq!(report.tools.len(), 1);
+        assert!(report.tools[0].children.is_empty(), "the unparseable child is dropped, not fabricated");
+    }
+
+    #[test]
+    fn a_tool_with_no_child_elements_has_an_empty_children_vec() {
+        let xml = r#"<BluebeamRevuToolSet Version="1">
+          <ToolChestItem>
+            <Name>Solo</Name>
+            <Mode>properties</Mode>
+            <Raw><![CDATA[<< /Subtype /Circle /Rect [0 0 10 10] /Subj (Just a circle) >>]]></Raw>
+          </ToolChestItem>
+        </BluebeamRevuToolSet>"#;
+
+        let report = parse_btx_xml(xml);
+        assert_eq!(report.tools.len(), 1);
+        assert!(report.tools[0].children.is_empty());
     }
 
     // --- Real-sample characterization (bench/corpus/btx/ - gitignored is NOT the case
@@ -1323,6 +1429,8 @@ mod tests {
             let mut stamps_total = 0usize;
             let mut stamps_with_artwork = 0usize;
             let mut name_differs_from_subj = 0usize;
+            let mut tools_with_children = 0usize;
+            let mut total_children = 0usize;
             for t in &report.tools {
                 if matches!(t.markup_type, crate::markup::MarkupType::Stamp | crate::markup::MarkupType::StampDynamic) {
                     stamps_total += 1;
@@ -1333,15 +1441,22 @@ mod tests {
                 if t.subject.as_deref() != Some(t.name.as_str()) {
                     name_differs_from_subj += 1;
                 }
+                if !t.children.is_empty() {
+                    tools_with_children += 1;
+                    total_children += t.children.len();
+                }
             }
             eprintln!(
-                "{:?}: tools={} skipped={} stamps={} stamps_with_artwork={} names_from_fallback_not_subj={}",
+                "{:?}: tools={} skipped={} stamps={} stamps_with_artwork={} names_from_fallback_not_subj={} \
+                 grouped_tools={} total_children_captured={}",
                 path.file_name().unwrap(),
                 report.tools.len(),
                 report.skipped.len(),
                 stamps_total,
                 stamps_with_artwork,
-                name_differs_from_subj
+                name_differs_from_subj,
+                tools_with_children,
+                total_children
             );
         }
     }

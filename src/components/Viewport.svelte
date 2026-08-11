@@ -31,6 +31,7 @@
     type MarkupGeometry,
     type DynamicField,
     type StampAsset,
+    type StampDef,
   } from "$lib/ipc";
   import {
     TILE_SIZE_CSS,
@@ -65,7 +66,7 @@
     isMultiClickTool, isInkTool, polylineGeometry, inkGeometry,
     isMultiClickComplete, type MultiClickTool,
     isTextTool, textBoxGeometry, calloutGeometry, DEFAULT_TEXT_FONT,
-    translateToolGeometry, extractPromptedLabels,
+    translateToolGeometry, extractPromptedLabels, toolPlacementDelta, shiftGeometry,
   } from "$lib/markup-tools";
   import { patchGroup } from "$lib/markup-properties";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
@@ -1851,9 +1852,12 @@
   /** The placing Tool's backing visual asset, if any (spec "Stamps" - Static carries a
    *  required asset, Dynamic an optional one; both mirror onto the placed Markup so the
    *  backend can render the real stamp graphic - see `appearance::build_ap_stream`). */
-  function stampAssetOf(toolDef: Tool): StampAsset | null {
-    if (!toolDef.stamp) return null;
-    return "Static" in toolDef.stamp ? toolDef.stamp.Static.asset : toolDef.stamp.Dynamic.asset;
+  /** Accepts a bare `StampDef` (not a whole `Tool`) so it also covers a grouped tool's
+   *  `ToolChild.stamp` (design doc §4) - the real corpus has `(Stamp, Stamp)` and
+   *  `(Stamp, Square)` grouped pairs, so a child can itself be a stamp. */
+  function stampAssetOf(stamp: StampDef | null): StampAsset | null {
+    if (!stamp) return null;
+    return "Static" in stamp ? stamp.Static.asset : stamp.Dynamic.asset;
   }
 
   /**
@@ -1870,6 +1874,11 @@
     const geometry = translateToolGeometry(toolDef.geometry, clickPoint);
 
     if (toolDef.stamp && "Dynamic" in toolDef.stamp) {
+      // A dynamic (prompted-text) stamp with children is not a shape the real corpus
+      // produces (dynamic stamps are user-authored via "save as tool", not `.btx`
+      // import - the only source of grouped `children`) - out of scope, named not
+      // silently mishandled: only the parent stamp places here, same as before this
+      // change. Revisit if a real dynamic-stamp-with-children case surfaces.
       const { fields, base_text } = toolDef.stamp.Dynamic;
       const labels = extractPromptedLabels(fields);
       if (labels.length > 0) {
@@ -1880,6 +1889,10 @@
       return;
     }
 
+    if (toolDef.children.length > 0) {
+      createPlacedMarkupGroup(toolDef, clickPoint, geometry);
+      return;
+    }
     createPlacedMarkup(toolDef, geometry, null);
   }
 
@@ -1916,9 +1929,68 @@
       now: new Date().toISOString(),
       id: crypto.randomUUID(),
       contents,
-      stampAsset: stampAssetOf(toolDef),
+      stampAsset: stampAssetOf(toolDef.stamp),
     });
     store.create(m);
+  }
+
+  /**
+   * Place a grouped/compound tool (design doc `docs/design/2026-08-11-grouped-markups.md`
+   * §4): one `Markup` per member (the parent tool + every `ToolChild`), sharing a single
+   * fresh `group_id` so G8's `expandSelectionToGroups` treats them as one selectable/
+   * movable unit with no further UI code needed. Every child is translated by the SAME
+   * click-anchor delta as the parent - never its own independent anchor, which would
+   * collapse every member on top of the click point instead of preserving the group's
+   * relative layout (real corpus: up to 20 children on one compound tool). A child with
+   * no `geometry` template (should not occur for a real corpus grouped tool - see
+   * `ToolChild.geometry`'s doc comment - but defensively skipped rather than crashing)
+   * is silently dropped, matching this module's existing never-fatal posture.
+   */
+  function createPlacedMarkupGroup(toolDef: Tool, clickPoint: PdfPoint, parentGeometry: MarkupGeometry) {
+    if (!identity || !toolDef.geometry) return;
+    const delta = toolPlacementDelta(toolDef.geometry, clickPoint);
+    if (!delta) {
+      // Quads has no anchor convention (see toolPlacementDelta's doc comment) - not a
+      // realistic grouped-tool geometry, but fall back to placing the parent alone
+      // rather than dropping the whole group silently.
+      createPlacedMarkup(toolDef, parentGeometry, null);
+      return;
+    }
+    const groupId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    store.create(
+      buildMarkup({
+        markupType: toolDef.markup_type,
+        page: pageIndex,
+        geometry: parentGeometry,
+        appearance: toolDef.appearance,
+        identity,
+        now,
+        id: crypto.randomUUID(),
+        contents: null,
+        stampAsset: stampAssetOf(toolDef.stamp),
+        groupId,
+      }),
+    );
+
+    for (const child of toolDef.children) {
+      if (!child.geometry) continue;
+      store.create(
+        buildMarkup({
+          markupType: child.markup_type,
+          page: pageIndex,
+          geometry: shiftGeometry(child.geometry, delta.dx, delta.dy),
+          appearance: child.appearance,
+          identity,
+          now,
+          id: crypto.randomUUID(),
+          contents: null,
+          stampAsset: stampAssetOf(child.stamp),
+          groupId,
+        }),
+      );
+    }
   }
 
   /** `StampPromptDialog` submit handler: complete the paused placement with the
