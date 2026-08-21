@@ -503,6 +503,50 @@ mod tests {
         eprintln!("G9 sample PDF written to: {out}");
     }
 
+    /// Round-trips the real BB-interop corpus reference PDFs (gitignored,
+    /// machine-local, `bench/corpus/bb-ref/`) through `save_with_markups` with an
+    /// EMPTY markup set - this adds nothing and keeps every foreign (non-redline)
+    /// annotation as-is (see `write_markups`'s `is_managed` gate), so the only thing
+    /// exercised is redline's own lopdf load -> rewrite -> save path against genuine
+    /// third-party (Bluebeam-authored) content. Produces a "redline-resaved" sibling
+    /// PDF next to each original for cross-viewer comparison: if redline's writer
+    /// altered anything a viewer can see, it shows up as a diff between the pair.
+    /// Skips silently (with a note) when the corpus isn't present locally. Run on
+    /// demand:
+    ///   cargo test emit_bb_corpus_roundtrip -- --ignored --nocapture
+    /// Writes into `$REDLINE_CROSSVIEWER_OUT` (default `/tmp/redline-crossviewer`).
+    #[test]
+    #[ignore]
+    fn emit_bb_corpus_roundtrip_for_external_viewer_check() {
+        let out_dir = std::env::var("REDLINE_CROSSVIEWER_OUT")
+            .unwrap_or_else(|_| "/tmp/redline-crossviewer".to_string());
+        let out_dir = std::path::PathBuf::from(out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let bb_ref_dir = manifest_dir.join("../bench/corpus/bb-ref");
+        let names = ["markup-test-original.pdf", "markup-test-bb-reduced.pdf"];
+        let mut wrote_any = false;
+        for name in names {
+            let src = bb_ref_dir.join(name);
+            if !src.exists() {
+                eprintln!("SKIP {name}: not found at {}", src.display());
+                continue;
+            }
+            let stem = name.trim_end_matches(".pdf");
+            let dest = out_dir.join(format!("{stem}-redline-resaved.pdf"));
+            save_with_markups(&src, &dest, &[]).unwrap();
+            eprintln!("wrote {} (round-trip of {name})", dest.display());
+            wrote_any = true;
+        }
+        if !wrote_any {
+            eprintln!(
+                "NOTE: no BB-interop corpus files found under {} - nothing round-tripped",
+                bb_ref_dir.display()
+            );
+        }
+    }
+
     /// One markup per G9 Bluebeam-interop defect (2026-07-12 fix), for the human
     /// Acrobat/Bluebeam re-check. Run on demand:
     ///   cargo test g9_emit_interop_sample -- --ignored --nocapture

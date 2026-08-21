@@ -932,6 +932,16 @@ pub(crate) mod tests {
             "Parent" => pages_id,
             "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
             "Contents" => content_id,
+            // A page dict without /Resources (even an empty one) is spec-invalid -
+            // qpdf --check flags every doc built from this helper as needing repair
+            // ("kid 0 Resources is missing or invalid"), found during the 2026-08-21
+            // cross-viewer verification pass. Harmless while the only content is
+            // empty `BT ET` and markup appearance streams carry their own
+            // self-contained /Resources (form XObjects), but it makes every fixture
+            // PDF built from this helper non-strictly-conformant - real source PDFs
+            // from any authoring tool always carry it, so this was a test-fixture
+            // gap, not a production code path issue.
+            "Resources" => dictionary! {},
         });
         doc.objects.insert(
             pages_id,
@@ -2229,6 +2239,70 @@ pub(crate) mod tests {
                     });
                 assert_markup_fidelity(m1, m2);
             }
+        }
+
+        /// Emits ONE PDF per `MarkupType` (20 files) plus one "all-types" PDF placing
+        /// every fixture from `full_fixture_set()` together on a real project-like
+        /// backdrop, for the cross-viewer verification pass (pdfium/mutool/poppler/
+        /// Chromium/Bluebeam/Acrobat). Every fixture already carries non-default
+        /// color/opacity/line-weight/font/measurement values - see `full_fixture_set`
+        /// above; nothing here diverges from what the round-trip test already exercises,
+        /// this just serializes the same set to disk instead of re-reading it in-process.
+        /// Run on demand:
+        ///   cargo test crossviewer_emit -- --ignored --nocapture
+        /// Writes into `$REDLINE_CROSSVIEWER_OUT` (default `/tmp/redline-crossviewer`).
+        #[test]
+        #[ignore]
+        fn emit_crossviewer_corpus() {
+            use crate::document::save::save_with_markups;
+            use std::path::PathBuf;
+
+            let out_dir = std::env::var("REDLINE_CROSSVIEWER_OUT")
+                .unwrap_or_else(|_| "/tmp/redline-crossviewer".to_string());
+            let out_dir = PathBuf::from(out_dir);
+            std::fs::create_dir_all(&out_dir).unwrap();
+
+            let fixtures = full_fixture_set();
+            assert_eq!(
+                fixtures.len(),
+                20,
+                "fixture set must cover all 20 MarkupType variants"
+            );
+
+            // Synthetic blank-page backdrop, reused for every single-type file.
+            let blank_backdrop = out_dir.join("_blank_backdrop.pdf");
+            {
+                let (mut doc, _pid) = one_page_doc();
+                doc.save(&blank_backdrop).unwrap();
+            }
+
+            // One PDF per type: a single non-default fixture on the blank backdrop, so
+            // each viewer comparison isolates exactly one MarkupType at a time.
+            for m in &fixtures {
+                let dest = out_dir.join(format!("{:?}.pdf", m.markup_type));
+                save_with_markups(&blank_backdrop, &dest, std::slice::from_ref(m)).unwrap();
+                eprintln!("wrote {}", dest.display());
+            }
+
+            // All-types page: every fixture together, on a real project plan PDF when the
+            // BB-interop corpus is present locally (gitignored, machine-local, see
+            // bench/README.md), else falling back to the synthetic blank backdrop.
+            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let real_backdrop =
+                manifest_dir.join("../bench/corpus/bb-ref/markup-test-original.pdf");
+            let backdrop_src = if real_backdrop.exists() {
+                real_backdrop
+            } else {
+                eprintln!(
+                    "NOTE: real BB-interop corpus not found at {}, using synthetic blank backdrop for AllTypes.pdf",
+                    real_backdrop.display()
+                );
+                blank_backdrop.clone()
+            };
+            let all_types_dest = out_dir.join("AllTypes.pdf");
+            save_with_markups(&backdrop_src, &all_types_dest, &fixtures).unwrap();
+            eprintln!("wrote {}", all_types_dest.display());
+            eprintln!("crossviewer corpus written to: {}", out_dir.display());
         }
     }
 
