@@ -136,11 +136,23 @@ pub fn run() {
     // vanishing into a release build's detached stderr.
     panic_guard::install_panic_hook();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_log::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_process::init());
+
+    // Tier-2 real-app E2E harness (WebdriverIO + @wdio/tauri-service, embedded provider) -
+    // debug-only, never registered in a release build. `tauri-plugin-wdio-webdriver` runs the
+    // embedded WebDriver server inside this process; `tauri-plugin-wdio` exposes
+    // `browser.tauri.execute()`/IPC-mock/log-capture to the WDIO side. See wdio.conf.js and
+    // docs/TESTING.md. Pattern copied verbatim from satchel-gui (PR #25).
+    #[cfg(debug_assertions)]
+    let builder = builder
+        .plugin(tauri_plugin_wdio_webdriver::init())
+        .plugin(tauri_plugin_wdio::init());
+
+    builder
         .setup(|app| {
             // Resolve the bundled PDFium path BEFORE spawning the render thread
             // (which loads PDFium). Needs the AppHandle for the resource dir, so it

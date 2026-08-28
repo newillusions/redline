@@ -41,3 +41,6 @@ Thumbs.db
 # Benchmark rendered output (PNG proofs, incl. nested dirs like render-matrix/)
 /bench/results/*.png
 /bench/results/**/*.png
+
+# WDIO E2E run logs (docs/TESTING.md Tier 2)
+/logs/

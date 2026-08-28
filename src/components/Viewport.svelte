@@ -2301,6 +2301,7 @@
 
 <div
   class="viewport-root"
+  data-doc-id={docInfo.doc_id}
   bind:this={containerEl}
   onmousedown={onMouseDown}
   onmousemove={onMouseMove}

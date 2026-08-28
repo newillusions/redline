@@ -36,6 +36,13 @@ tauri-plugin-log = "2.0.0-rc"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 
+# Tier-2 real-app E2E harness (WebdriverIO + @wdio/tauri-service, embedded provider). Both
+# gated cfg(debug_assertions) in lib.rs - never compiled into a release build, matching the
+# other debug-only wiring in this crate. Pattern + versions copied verbatim from satchel-gui
+# (forge.mms.name/emittiv/satchel PR #25) - see docs/TESTING.md.
+tauri-plugin-wdio-webdriver = "1"
+tauri-plugin-wdio = "1"
+
 # --- Async runtime ---
 tokio = { version = "1", features = ["full"] }
 
