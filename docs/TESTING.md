@@ -125,7 +125,7 @@ any of this to work at all in a debug e2e build - `wdio.conf.js` pins it to
 release binaries) so no per-machine setup step is needed; see the comment in `wdio.conf.js`
 for why a debug build has neither the runtime env var nor the compile-time default without it.
 
-### 2026-08-29 update: activation crash fixed; a real harness-plumbing gap found and fixed; a deeper upstream hang remains open
+### 2026-08-29 update: activation crash fixed; a real harness-plumbing gap found and fixed; the evaluate_js hang eliminated via a DirectEval rewrite (spec 1 now reliably passes)
 
 Two rounds of work happened between the paragraph above (2026-08-28's "spec 1 passes
 reliably") and now. The 2026-08-28 claim is **no longer accurate as written** - re-running
@@ -243,15 +243,54 @@ one-off WebKit flakiness) with the same `before()`-hook error as before either f
   flagged here as the concrete, well-evidenced next step rather than attempted speculatively
   against a session budget that has already been interrupted once by a usage limit.
 
-**Bottom line for whoever reads this next**: the crash is fixed and proven (unit tests, quoted
-above). The "core.invoke not available" harness-setup gap is fixed and proven (zero warnings,
-real `get_window_states` responses, quoted above). Specs 1-3 still do **not** produce a real
-pass on this Mac as of this PR - the blocker is now narrowly the `evaluate_js`/`find_element`
-hang described in Round 3, not the crash, not licensing, and not (as far as the crash-fixed,
-this-session evidence shows) the PDFium gap described below, which was never re-reached this
-session because `before()` never gets past its own wait.
+**Bottom line at the end of the 2026-08-29 (earlier) session**: the crash is fixed and proven
+(unit tests, quoted above). The "core.invoke not available" harness-setup gap is fixed and
+proven (zero warnings, real `get_window_states` responses, quoted above). Specs 1-3 still did
+**not** produce a real pass on this Mac as of that point - the blocker was narrowly the
+`evaluate_js`/`find_element` hang described in Round 3, not the crash, not licensing, and not
+(as far as the crash-fixed, that session's evidence showed) the PDFium gap described below,
+which was never re-reached that session because `before()` never got past its own wait.
 
-### PDFium in the e2e debug build (2026-08-28 finding, unconfirmed re-reachable this session)
+**Round 4 - the DirectEval rewrite, done, and it eliminates the hang.** `e2e/specs/app-launch.spec.js`
+was rewritten to remove every standard WebdriverIO element/action command
+(`browser.$()`, `.isExisting()`, `.getText()`, `.getAttribute()`, `.click()`, `.setValue()`,
+`.action("pointer", ...)`, and the sync `browser.execute()`) and replace them with
+`browser.tauri.execute()` calls - the plugin's DirectEval primitive (`callAsyncJavaScript` on
+macOS, proven working since Round 2's `get_window_states`), used in preference to
+`browser.executeAsync()` because it additionally carries the crate's own reclaim-retry logic for
+a documented cold-webview WebKit flake (`node_modules/@wdio/tauri-service`'s `execute()`, a
+4-attempt retry loop keyed on the *opaque* `"A JavaScript exception occurred"` error only - a
+real script error still fails immediately). `browser.tauri.execute((tauri, ...args) => { ... })`
+runs the callback as a real async IIFE inside the actual page (confirmed by reading
+`wrapScriptForDirectEval` in `@wdio/tauri-service`'s bundled source: `await (script)(__wdio_tauri,
+...__wdio_args)`), so it has full `document`/`window` access, not just Tauri's `core.invoke` -
+every element query, click, and value-set in the spec now happens via plain DOM APIs
+(`document.querySelector`, `.click()`, the native `HTMLInputElement.prototype.value` setter +
+a dispatched `input` event) inside these callbacks, and the rectangle-markup drag dispatches a
+real `PointerEvent` down/move.../up sequence directly on `svg.markup-overlay` from inside one
+`browser.tauri.execute()` call (coordinates from the element's own `getBoundingClientRect()`,
+computed in-page). `browser.waitUntil()` still wraps these for polling - it's plain Node-side
+control flow, not a WebDriver command, so it was never part of the hang.
+
+**Verified, this session, 4/4 consecutive `npm run e2e` runs against the as-shipped
+`wdio.conf.js` (no config changes needed for this fix)**: spec 1 ("launches and reaches a real
+terminal UI state") passes reliably in ~30s every time - zero hangs, zero
+`ensureActiveWindowFocus` "Tauri core.invoke not available" warnings. This is the concrete
+proof the `evaluate_js` hang class described in Round 3 is closed: the exact same `before()`
+wait that timed out at 60-140s on every attempt before this rewrite now resolves in well under
+a second of actual polling. The rectangle-drag `PointerEvent` sequence in spec 3 was also
+proven end-to-end in an ad-hoc run with PDFium available (see below) - `setPointerCapture`
+inside `Viewport.svelte`'s real `onOverlayPointerDown` handler accepted the synthetic,
+in-page-dispatched pointer session without incident, and the drag produced a real persisted
+`Rectangle` markup confirmed via `list_markups` over real IPC.
+
+Specs 2 and 3 still fail on this Mac's *default* `npm run e2e` (no PDFium bundled - see below) -
+but they now fail **fast and deterministically on a real, named, pre-existing error** (a real
+`.error-banner` reading "PDFium dynamic library not found", 4/4 runs, ~30s each), never on a
+hang. That distinction is the actual deliverable of this round: the harness now tells the truth
+about what's broken instead of timing out uninformatively.
+
+### PDFium in the e2e debug build (2026-08-28 finding; RE-TESTED 2026-08-29 under the fixed harness - the regression is real and still open)
 
 The previous session's runs, before either the crash or the harness-setup gap above were
 found, got far enough to reach specs 2/3 and observe:
@@ -265,22 +304,27 @@ place libpdfium alongside the binary. See bench/README.md for setup steps. ...
 `tauri build --no-bundle` (what `npm run e2e:build` runs) never populates the resource
 directory `src-tauri/src/lib.rs`'s `resolve_pdfium_path` looks in, because resource-copying is
 part of the bundling step `--no-bundle` explicitly skips - this is a pre-existing, licensing-
-unrelated gap in the e2e debug-build path. Setting `PDFIUM_DYNAMIC_LIB_PATH` in
-`wdio.conf.js`'s spawned-app `env` to a manually-copied `src-tauri/resources/libpdfium.dylib`
-DOES clear that specific error - but was found (2026-08-28, isolated across four otherwise-
-identical runs by toggling only that one var) to introduce a WORSE regression: with it set,
-the app never reaches ANY known UI state (`h1.gate-title` / `.empty-state`) within a 60-140s
-window under `@wdio/tauri-service`'s embedded WebKit spawn, despite the identical binary + env
-launching and reaching a working webview in under a second when run directly via a Terminal
-`exec` outside WDIO. **Given Round 3 above, this may well be the SAME underlying `evaluate_js`
-hang rather than a distinct PDFIUM_DYNAMIC_LIB_PATH-specific regression** - both produce an
-identical symptom ("never reaches any known UI state" within the same time order of
-magnitude) - but this was not re-tested this session since spec 1 never got that far.
-Deliberately left unset with the regression named in `wdio.conf.js`'s own comment, rather than
-"fixed" with an override that trades one real failure for a worse one. Follow-up (untried): try
-`tauri build --debug` (no `--no-bundle`) for the e2e binary, which should populate the
-resource dir the normal way and may sidestep the whole PDFIUM_DYNAMIC_LIB_PATH question -
-not attempted here since it changes what `e2e:build` produces beyond this PR's scope.
+unrelated gap in the e2e debug-build path. Setting `PDFIUM_DYNAMIC_LIB_PATH` to a manually-copied
+`src-tauri/resources/libpdfium.dylib` DOES clear that specific error - confirmed again this
+session, one clean 3/3-passing run in 261ms with it set, all three specs green including the
+real pointer-drag.
+
+**But it is flaky, and Round 3's open question is now answered: it is NOT simply the same
+`evaluate_js` bug fixed above.** Four consecutive runs with `PDFIUM_DYNAMIC_LIB_PATH` set (this
+session, against the *already-fixed* DirectEval harness): 1 pass, 3 failures - and the 3
+failures reproduce the exact same "worse regression" the 2026-08-28 finding described, `before()`
+timing out at the full 60s with **neither** `h1.gate-title` nor `.empty-state` ever appearing,
+i.e. the webview never rendering any real content at all. If this were downstream of the
+`evaluate_js` hang, the DirectEval rewrite above would have closed it the same way it closed
+spec 1 (4/4 clean, zero flakiness) - it did not. This is a **separate, still-open, genuinely
+intermittent regression** in how the embedded provider's WebKit spawn interacts with a
+PDFium-loading binary specifically, not resolved by this PR and out of this PR's scope (which
+was the WebDriver interaction-model rewrite). Deliberately left unset in `wdio.conf.js` as
+before, with this finding recorded rather than "fixed" with an override that fails 3 times out
+of 4. Follow-up (still untried): `tauri build --debug` (no `--no-bundle`) for the e2e binary,
+which should populate the resource dir the normal way and may sidestep
+`PDFIUM_DYNAMIC_LIB_PATH` (and this regression) entirely - not attempted here since it changes
+what `e2e:build` produces, beyond this PR's scope.
 
 `data-doc-id` on `Viewport.svelte`'s `.viewport-root` is a one-line, purely additive
 attribute added by this harness so spec 3 can address `list_markups` against the real open
