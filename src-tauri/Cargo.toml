@@ -29,7 +29,7 @@ tauri-build = { version = "2.2.0", features = [] }
 # --- Tauri core ---
 tauri = { version = "2.5.0", features = ["macos-private-api"] }
 tauri-plugin-dialog = "2.2.2"
-tauri-plugin-log = "2.0.0-rc"
+tauri-plugin-log = "2.9.0"
 # Auto-updater (checks update.json manifest on GitHub, downloads + verifies +
 # installs the signed release). tauri-plugin-process supplies relaunch() so
 # the frontend can restart into the new version after install.

@@ -9,22 +9,30 @@
 // IMPORTANT, read before trusting a green run: this repo ships an S2b client-entitlement
 // gate (src/components/ActivationGate.svelte) that blocks ALL app content - including the
 // REDLINE_OPEN_PDF auto-open - until `license_status` resolves "valid" or "grace" for this
-// specific device. This dev Mac has never been activated (no token under
-// `~/Library/Application Support/com.emittiv.redline/`; confirmed by
-// `recent-docs.json` predating the gate's introduction in PR #49). Producing an
-// activation code means calling the production emittiv-staff license service and
-// consuming/creating a real device-bound seat - that is an owner-gated production action,
-// not something this harness does on its own. So: spec 1 always runs and reports which of
-// the two real states the app actually reached; specs 2 and 3 need a licensed/grace device
-// and mark themselves `pending` (not `passed`, not silently skipped) via `this.skip()` with
-// an explicit reason when the gate is blocking, so a stale "all green" report is never
-// possible. Re-run after activating this device to get a true pass on 2 and 3.
+// specific device. If the gate is blocking AND the `REDLINE_E2E_ACTIVATION_CODE` env var is
+// set (an owner-issued, device-bound activation code - never printed, never committed, never
+// put in a fixture; see docs/TESTING.md "The S2b activation gate, and this dev Mac's real
+// activation"), `before()` below enters it
+// through the REAL ActivationGate UI (the same form a human fills in) and waits for the real
+// production emittiv-staff license service to respond. That is a genuine production action
+// (claims a real device seat) and is only attempted because the code was owner-issued
+// specifically for this purpose. If the env var is unset, or the server rejects the code, the
+// gate stays up and specs 2/3 fail loudly against it rather than silently reporting a pass -
+// this file never fakes a licensed run.
 
 describe("Redline app launch (Tier-2 real-app E2E)", () => {
-  /** True once we've confirmed the S2b activation gate is NOT blocking this run. */
+  /** True once we've confirmed the S2b activation gate is NOT blocking this run
+   * (already licensed/grace on entry, or activation succeeded in before()). */
   let licensed = false;
 
-  before(async () => {
+  before(async function () {
+    // Mocha's default hook timeout (mochaOpts.timeout, wdio.conf.js) is 60s. The initial
+    // gate/empty-state wait (up to 20s) plus a real activation round-trip to the production
+    // license service (up to 30s) can approach that budget on its own before accounting for
+    // webview/session startup overhead - extend this hook specifically rather than raising
+    // the suite-wide timeout for every test.
+    this.timeout(120000);
+
     // Real launch: wait for either real terminal state (never both, never neither - a
     // browser reaching `about:blank`/blank body forever means the harness itself is
     // broken, matching the exact failure class satchel-gui's TESTING.md documents).
@@ -33,30 +41,111 @@ describe("Redline app launch (Tier-2 real-app E2E)", () => {
     await browser.waitUntil(
       async () => (await gate.isExisting()) || (await empty.isExisting()),
       {
-        timeout: 20000,
+        // 20000 was the original value; raised because @wdio/tauri-service's per-command
+        // window-focus check (triggered by every `$`/`isExisting` call - see the
+        // mochaOpts.timeout comment in wdio.conf.js) adds ~5s of latency to EACH poll
+        // iteration of this waitUntil, so a slow first iteration alone can consume most of
+        // a 20s budget before the app has even had a chance to render.
+        timeout: 60000,
         timeoutMsg:
           "neither the S2b ActivationGate (h1.gate-title) nor the empty-state document " +
           "shell (.empty-state) appeared - the app failed to reach any known real state",
       },
     );
     licensed = await empty.isExisting();
-    console.log(
-      licensed
-        ? "REDLINE E2E: device is licensed/grace - empty-state (or auto-opened fixture) reached"
-        : "REDLINE E2E: S2b ActivationGate is blocking (device not activated) - specs 2 and 3 will be marked pending",
-    );
+
+    if (licensed) {
+      console.log(
+        "REDLINE E2E: device is already licensed/grace - empty-state (or auto-opened fixture) reached",
+      );
+    } else {
+      const activationCode = process.env.REDLINE_E2E_ACTIVATION_CODE;
+      if (!activationCode) {
+        console.log(
+          "REDLINE E2E: S2b ActivationGate is blocking (device not activated, no " +
+            "REDLINE_E2E_ACTIVATION_CODE set) - specs 2 and 3 will fail against the gate",
+        );
+      } else {
+        console.log(
+          "REDLINE E2E: S2b ActivationGate is blocking - activation code present, " +
+            "activating this device via the real ActivationGate UI (real production " +
+            "license-service call)",
+        );
+
+        // Fill and submit the REAL activation form - the same DOM a human fills in, not a
+        // shortcut IPC call. The code itself never appears in a log line, an assertion
+        // message, or a thrown Error below.
+        const codeInput = await browser.$("#activation-code");
+        await codeInput.waitForDisplayed({ timeout: 5000 });
+        await codeInput.setValue(activationCode);
+        const submitBtn = await browser.$(".gate-submit");
+        await submitBtn.waitForClickable({ timeout: 5000 });
+        await submitBtn.click();
+
+        // Real network round-trip to the production license service. Race the two possible
+        // real outcomes: the gate clears (h1.gate-title unmounts - activation succeeded and
+        // App.svelte swapped in real content), or a `.gate-error` appears (the server
+        // rejected the code - wrong/expired/already-claimed). Never assume success from a
+        // timeout alone.
+        let outcome = null;
+        await browser.waitUntil(
+          async () => {
+            if (!(await gate.isExisting())) {
+              outcome = "activated";
+              return true;
+            }
+            const err = await browser.$(".gate-error");
+            if (await err.isExisting()) {
+              outcome = "rejected";
+              return true;
+            }
+            return false;
+          },
+          {
+            timeout: 30000,
+            timeoutMsg:
+              "S2b activation neither cleared the gate nor showed .gate-error within 30s " +
+              "- the production license-service call may be hanging or unreachable",
+          },
+        );
+
+        if (outcome === "rejected") {
+          const msg = await (await browser.$(".gate-error")).getText();
+          throw new Error(`REDLINE E2E: activation was rejected by the license service - ${msg}`);
+        }
+
+        licensed = true;
+        console.log(
+          "REDLINE E2E: activation succeeded - device is now licensed; the token persists " +
+            "under ~/Library/Application Support/com.emittiv.redline/license/, so future " +
+            "runs on this Mac will reach empty-state directly without needing the code again",
+        );
+      }
+    }
   });
 
-  it("launches and reaches a real terminal UI state (licensed empty-state, or the S2b activation gate)", async () => {
+  it("launches and reaches a real terminal UI state (licensed empty-state / auto-opened fixture, or the S2b activation gate)", async () => {
     // The state itself was already established in `before()` against real IPC
-    // (`license_status`) - this test's job is just to assert exactly one landmark is
-    // visible and to name which, so a report reader never has to guess.
+    // (`license_status` / a real `activate_license` call) - this test's job is just to
+    // assert a real landmark is visible and to name which, so a report reader never has to
+    // guess.
     if (licensed) {
       const empty = await browser.$(".empty-state");
-      await expect(empty).toBeDisplayed();
-      // If REDLINE_OPEN_PDF's auto-open already fired (see wdio.conf.js), the app moved
-      // straight past the empty state into the fixture tab - both are valid "reached a
-      // real state" outcomes, so accept either without failing this specific assertion.
+      const viewportRoot = await browser.$(".viewport-root");
+      // REDLINE_OPEN_PDF's auto-open (wdio.conf.js) fires the instant the gate clears
+      // (App.svelte's maybeInitializeAppContent -> autoOpenIfRequested), so by the time this
+      // assertion runs the app may already have moved past the empty state into the fixture
+      // tab - both are valid "reached a real state" outcomes; accept either rather than
+      // asserting only the one that loses the auto-open race.
+      await browser.waitUntil(
+        async () => (await empty.isExisting()) || (await viewportRoot.isExisting()),
+        {
+          timeout: 15000,
+          timeoutMsg:
+            "licensed, but neither .empty-state nor .viewport-root appeared - the app did " +
+            "not reach a known post-activation state",
+        },
+      );
     } else {
       const gate = await browser.$("h1.gate-title");
       await expect(gate).toBeDisplayed();
@@ -68,13 +157,27 @@ describe("Redline app launch (Tier-2 real-app E2E)", () => {
     if (!licensed) {
       this.skip();
       // Reason (mocha does not carry a skip-reason string; logged for the report instead):
-      // S2b ActivationGate is blocking on this unlicensed dev Mac - see file header and
-      // docs/TESTING.md. REDLINE_OPEN_PDF's auto-open never runs while the gate is up
-      // (App.svelte's `maybeInitializeAppContent` gates on `isUsable(licenseState)`).
+      // S2b ActivationGate is still blocking - either REDLINE_E2E_ACTIVATION_CODE was unset
+      // (before() already logged this) or activation failed loudly via a thrown Error above,
+      // which would have already failed the suite before reaching this test. This skip only
+      // fires on the "no code supplied" path. REDLINE_OPEN_PDF's auto-open never runs while
+      // the gate is up (App.svelte's `maybeInitializeAppContent` gates on
+      // `isUsable(licenseState)`).
     }
 
     const canvas = await browser.$("canvas.tile-canvas");
-    await canvas.waitForDisplayed({ timeout: 20000 });
+    const displayed = await canvas.waitForDisplayed({ timeout: 20000 }).catch(() => false);
+    if (!displayed) {
+      // Diagnostic-only (temporary): report what state the app is actually in instead of
+      // just failing blind on the canvas wait.
+      const errorBanner = await browser.$(".error-banner");
+      const emptyState = await browser.$(".empty-state");
+      const viewportRoot = await browser.$(".viewport-root");
+      const bannerText = (await errorBanner.isExisting()) ? await errorBanner.getText() : null;
+      console.log(
+        `REDLINE E2E DIAG: canvas not displayed after 20s - .error-banner exists=${await errorBanner.isExisting()} text=${bannerText} | .empty-state exists=${await emptyState.isExisting()} | .viewport-root exists=${await viewportRoot.isExisting()}`,
+      );
+    }
     await expect(canvas).toBeDisplayed();
 
     // e2e-sample.pdf (e2e/fixtures/e2e-sample.pdf) is a single deterministic page.
