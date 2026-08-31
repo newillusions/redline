@@ -110,6 +110,23 @@ fn font_from_da(da: &str) -> Option<FontSpec> {
     Some(FontSpec { family, size_pt })
 }
 
+/// Best-effort glyph colour recovery from a foreign `/DA` string's `rg` operator (e.g.
+/// `"/Helv 12 Tf 0.5 0 1 rg"`, or the colour-only shape `"0.5 0 1 rg"` noted in
+/// `raw_da`'s doc comment - a real corpus shape, not hypothetical). Used only for a
+/// Text/Callout annotation with no `/RLType` (foreign, not redline-authored) and
+/// therefore no `/RLTextColor`, where `/C` itself is the annotation's background (ISO
+/// 32000-1 §12.5.6.6) and must NOT be read as the glyph colour. `g`/`G`/`k`/`K`
+/// operators are not handled - RGB `rg` covers the real-world DA shapes seen so far;
+/// falls through to the caller's own default otherwise.
+fn color_from_da(da: &str) -> Option<String> {
+    let rg_idx = da.find(" rg")?;
+    let mut tokens = da[..rg_idx].rsplit(' ');
+    let b: f64 = tokens.next()?.parse().ok()?;
+    let g: f64 = tokens.next()?.parse().ok()?;
+    let r: f64 = tokens.next()?.parse().ok()?;
+    Some(rgb_to_hex(&[r, g, b]))
+}
+
 // --- enum <-> tag --------------------------------------------------------------
 
 /// Exact `MarkupType` round-trips via `/RLType`, serialised through serde (the enum is
@@ -551,8 +568,37 @@ impl Markup {
         }
 
         // Appearance (colour / opacity / weight / fill / line-style).
-        if let Some(rgb) = hex_to_rgb(&self.appearance.color) {
-            d.set("C", Object::Array(rgb.iter().map(|v| real(*v)).collect()));
+        //
+        // /C semantics are NOT uniform across subtypes (ISO 32000-1 §12.5.6.6, Free Text
+        // Annotations): for every OTHER subtype we emit (Square/Circle/Polygon/Line/
+        // PolyLine/Ink/Highlight/Stamp), /C is the standard border/stroke colour and
+        // `appearance.color` is exactly that. But for FreeText (our Text/Callout) /C is
+        // the annotation's BACKGROUND colour - the same role /IC plays for Square/Circle.
+        // Writing the glyph colour to /C here unconditionally (pre-fix behaviour) meant
+        // any strict viewer that regenerates the appearance from the dictionary keys
+        // (Acrobat does this on every move/edit, since redline's own /AP is then stale)
+        // painted a fully opaque box in the STROKE colour over the text - the box "filled
+        // with blue and became unreadable" defect reported live against mr-desktop
+        // Acrobat. redline's own renderer never had this bug (markup-render.ts reads /C-
+        // sourced `appearance.color` only for the glyph, and `appearance.fill` - /IC on
+        // the wire, see below - for the box background), so it was invisible locally.
+        //
+        // Fix: for Text/Callout, /C carries the real background (`appearance.fill`) when
+        // set, and is OMITTED when unset - redline itself renders an unset fill as a
+        // transparent box (`fill ?? "none"` in `styleOf`), and a real background is
+        // spec-legal to leave absent. The glyph colour instead round-trips losslessly via
+        // the private `/RLTextColor` key below, independent of /C.
+        match t {
+            MarkupType::Text | MarkupType::Callout => {
+                if let Some(rgb) = self.appearance.fill.as_deref().and_then(hex_to_rgb) {
+                    d.set("C", Object::Array(rgb.iter().map(|v| real(*v)).collect()));
+                }
+            }
+            _ => {
+                if let Some(rgb) = hex_to_rgb(&self.appearance.color) {
+                    d.set("C", Object::Array(rgb.iter().map(|v| real(*v)).collect()));
+                }
+            }
         }
         // /CA (the standard annotation-level constant-opacity key) is fixed at 1.0, NOT
         // `self.appearance.opacity`. A viewer that honours /AP (PDFium, Acrobat, Bluebeam -
@@ -677,6 +723,19 @@ impl Markup {
         // above `display_to_true` in `document::annots` for the transform this gates.
         d.set("RLCoordV2", Object::Boolean(true));
         d.set("RLType", name(&type_tag(t)));
+        // Lossless glyph colour for Text/Callout, independent of /C now that /C carries
+        // the background there (see the /C block above). Always written (not gated on
+        // /DA/font being present) so the exact glyph colour round-trips even for a plain
+        // FreeText with no font size set. Stored as a literal hex string, mirroring the
+        // existing /RLOutlineColor convention, to avoid any real-number round-trip
+        // precision loss. A pre-fix file (no /RLTextColor) is read as /C == glyph colour
+        // on the legacy-compat branch below, then self-heals to this key on next save.
+        if matches!(t, MarkupType::Text | MarkupType::Callout) {
+            d.set(
+                "RLTextColor",
+                Object::string_literal(self.appearance.color.clone()),
+            );
+        }
         d.set("RLGeom", name(geom_tag(&self.geometry)));
         d.set("RLPage", Object::Integer(self.page as i64));
         d.set(
@@ -809,10 +868,6 @@ impl Markup {
             .and_then(|s| from_pdf_date(&s))
             .unwrap_or(created_at);
 
-        let color = get_reals(d, b"C")
-            .map(|c| rgb_to_hex(&c))
-            .unwrap_or_else(|| "#000000".to_string());
-        let fill = get_reals(d, b"IC").map(|c| rgb_to_hex(&c));
         let line_weight = d
             .get(b"BS")
             .ok()
@@ -847,6 +902,56 @@ impl Markup {
                 size_pt,
             })
             .or_else(|| da_string.as_deref().and_then(font_from_da));
+
+        // Colour + fill (background). /C's meaning is subtype-dependent (see the
+        // write-side /C comment in `to_annotation_dict`): the standard border/stroke
+        // colour everywhere EXCEPT Text/Callout, where it is the box BACKGROUND (ISO
+        // 32000-1 §12.5.6.6) - three cases for Text/Callout, in priority order:
+        let (color, fill) = if matches!(markup_type, MarkupType::Text | MarkupType::Callout) {
+            let ic_fill = get_reals(d, b"IC").map(|c| rgb_to_hex(&c));
+            if let Some(text_color) = get_string(d, b"RLTextColor") {
+                // 1. Post-fix redline file: the dedicated key carries the exact glyph
+                // colour; /IC (always written alongside /C for every markup type, old and
+                // new) carries the background.
+                (text_color, ic_fill)
+            } else if get_name(d, b"RLType").is_some() {
+                // 2. Pre-fix redline file (has other /RL* markers but no /RLTextColor):
+                // /C was written as the glyph colour by the old code path. Preserve that
+                // reading so the file's on-screen appearance in redline does not change
+                // on open; the very next save writes /RLTextColor and switches /C to
+                // background semantics, self-healing the file (mirrors the /RLCoordV2
+                // legacy-guard precedent above).
+                (
+                    get_reals(d, b"C")
+                        .map(|c| rgb_to_hex(&c))
+                        .unwrap_or_else(|| "#000000".to_string()),
+                    ic_fill,
+                )
+            } else {
+                // 3. Foreign FreeText (Bluebeam/Acrobat-authored, no /RL* markers at all):
+                // /C is a REAL background colour per spec and must round-trip untouched
+                // as `fill`, never be misread as the glyph colour - the same misconception
+                // this whole fix corrects, just biting on import instead of on save. /IC
+                // is not a standard FreeText entry so foreign producers essentially never
+                // write one; recover the glyph colour best-effort from a foreign /DA's
+                // `rg` operator when present (a real corpus shape, see `color_from_da`'s
+                // doc comment), defaulting to black otherwise.
+                let glyph = da_string
+                    .as_deref()
+                    .and_then(color_from_da)
+                    .unwrap_or_else(|| "#000000".to_string());
+                let fill = ic_fill.or_else(|| get_reals(d, b"C").map(|c| rgb_to_hex(&c)));
+                (glyph, fill)
+            }
+        } else {
+            (
+                get_reals(d, b"C")
+                    .map(|c| rgb_to_hex(&c))
+                    .unwrap_or_else(|| "#000000".to_string()),
+                get_reals(d, b"IC").map(|c| rgb_to_hex(&c)),
+            )
+        };
+
         let raw_da = if font.is_none() { da_string } else { None };
 
         // Count set: reconstruct from /RLCountSet* keys. Colour prefers the dedicated
@@ -1619,10 +1724,217 @@ mod tests {
             "/RLOutlineColor must carry the box border colour"
         );
         assert!(d.has(b"RLFillOpacity"), "/RLFillOpacity must be present");
-        // The text glyph colour stays on the standard /C key (unaffected by the outline).
-        assert!(d.has(b"C"), "glyph colour stays on /C");
+        // /C on a FreeText is the BACKGROUND (ISO 32000-1 §12.5.6.6, not the glyph
+        // colour) - fixture() sets fill = "#ffeecc" (distinct from color = "#3366ff"),
+        // so /C must carry the fill, and the glyph colour must be on /RLTextColor
+        // instead, never on /C. This is the exact defect this fix corrects (a strict
+        // viewer like Acrobat regenerating the appearance from /C painted the glyph
+        // colour as a solid opaque background box).
+        assert_eq!(
+            get_reals(&d, b"C").map(|c| rgb_to_hex(&c)).as_deref(),
+            Some("#ffeecc"),
+            "/C must be the background colour (appearance.fill), not the glyph colour"
+        );
+        assert_eq!(
+            get_string(&d, b"RLTextColor").as_deref(),
+            Some("#3366ff"),
+            "/RLTextColor must carry the exact glyph colour"
+        );
 
         assert_roundtrip(&m); // assert_roundtrip now also checks outline_color + fill_opacity
+    }
+
+    #[test]
+    fn freetext_c_is_background_not_glyph_colour_for_callout_too() {
+        // Same defect, same fix, for Callout (the other FreeText subtype) - a bare
+        // MarkupGeometry::Point is enough since geometry doesn't matter here.
+        let mut m = fixture(
+            MarkupGeometry::Point(PdfPoint { x: 5.0, y: 5.0 }),
+            MarkupType::Callout,
+        );
+        m.appearance.color = "#ff0000".into(); // glyph
+        m.appearance.fill = Some("#00ff00".into()); // background
+
+        let d = m.to_annotation_dict();
+        assert_eq!(
+            get_reals(&d, b"C").map(|c| rgb_to_hex(&c)).as_deref(),
+            Some("#00ff00"),
+            "/C must be the background for Callout too"
+        );
+        assert_eq!(get_string(&d, b"RLTextColor").as_deref(), Some("#ff0000"));
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn freetext_with_no_fill_omits_c_entirely() {
+        // redline itself renders a Text/Callout with no `fill` as a transparent box
+        // (`fill ?? "none"` in markup-render.ts's styleOf) - /C must be omitted rather
+        // than written as some colour Acrobat would then paint solid. This is the
+        // Acrobat-regeneration defect's exact live-reported shape: a bare FreeText with
+        // no background set must never gain one on save.
+        let mut m = fixture(
+            MarkupGeometry::Rect {
+                min: PdfPoint { x: 0.0, y: 0.0 },
+                max: PdfPoint { x: 50.0, y: 20.0 },
+            },
+            MarkupType::Text,
+        );
+        m.appearance.fill = None;
+
+        let d = m.to_annotation_dict();
+        assert!(
+            !d.has(b"C"),
+            "/C must be OMITTED for a FreeText with no background, not defaulted to a colour"
+        );
+        // The glyph colour must still be present via the dedicated key.
+        assert_eq!(get_string(&d, b"RLTextColor").as_deref(), Some("#3366ff"));
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn freetext_acrobat_regeneration_no_longer_paints_glyph_colour_as_background() {
+        // Simulates what the live-reported defect actually was: strip the /AP redline
+        // wrote (as Acrobat does on any move/edit, since it regenerates from the
+        // dictionary keys rather than trusting a stale appearance stream) and confirm
+        // the ONLY colour information left for a strict-viewer-regenerated background is
+        // /C == the real fill, never the stroke/glyph colour.
+        let mut m = fixture(
+            MarkupGeometry::Rect {
+                min: PdfPoint { x: 0.0, y: 0.0 },
+                max: PdfPoint { x: 80.0, y: 24.0 },
+            },
+            MarkupType::Text,
+        );
+        m.appearance.color = "#0000ff".into(); // the stroke/glyph colour that used to leak
+        m.appearance.fill = Some("#ffffff".into());
+
+        let mut d = m.to_annotation_dict();
+        d.remove(b"AP"); // annotation.rs never sets /AP itself, but be explicit either way
+
+        let c = get_reals(&d, b"C")
+            .map(|c| rgb_to_hex(&c))
+            .expect("/C must be present when a background is set");
+        assert_ne!(
+            c, "#0000ff",
+            "/C must never be the stroke/glyph colour - that IS the defect"
+        );
+        assert_eq!(c, "#ffffff", "/C must be the real background");
+    }
+
+    #[test]
+    fn legacy_pre_fix_freetext_reads_c_as_glyph_colour_then_self_heals() {
+        // A file saved by a pre-fix redline build: has other /RL* markers (proving
+        // redline authorship) but no /RLTextColor, and /C was written as the glyph
+        // colour by the old code path. Reading it must preserve that on-screen
+        // appearance exactly (never silently reinterpret /C as a background the user
+        // never set) - then the very next save must self-heal: /RLTextColor gets
+        // written and /C moves to background semantics.
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("FreeText"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(0.0), real(0.0), real(50.0), real(20.0)]),
+        );
+        d.set("RLType", name("Text")); // proves redline authorship, no /RLTextColor
+        d.set("RLPage", Object::Integer(0));
+        d.set(
+            "C",
+            Object::Array(vec![real(0.2), real(0.4), real(0.8)]), // old: glyph colour
+        );
+        d.set(
+            "IC",
+            Object::Array(vec![real(1.0), real(1.0), real(0.9)]), // background, via /IC
+        );
+
+        let back = Markup::from_annotation_dict(&d);
+        assert_eq!(
+            back.appearance.color, "#3366cc",
+            "legacy file: /C must still be read as the glyph colour"
+        );
+        assert_eq!(
+            back.appearance.fill.as_deref(),
+            Some("#ffffe5"),
+            "legacy file: background still comes from /IC, unaffected"
+        );
+
+        // Self-heal: re-serialising the imported markup must now write /RLTextColor
+        // and move /C to background semantics (matching what a fresh save would do).
+        let healed = back.to_annotation_dict();
+        assert_eq!(
+            get_string(&healed, b"RLTextColor").as_deref(),
+            Some("#3366cc"),
+            "self-heal must add /RLTextColor"
+        );
+        assert_eq!(
+            get_reals(&healed, b"C").map(|c| rgb_to_hex(&c)).as_deref(),
+            Some("#ffffe5"),
+            "self-heal must move /C to the background colour"
+        );
+    }
+
+    #[test]
+    fn foreign_freetext_c_recovered_as_background_glyph_from_da() {
+        // A genuinely foreign (Bluebeam/Acrobat-authored) FreeText: no /RL* markers at
+        // all, /C is a real background per spec, and /DA carries a colour-only `rg`
+        // operator (the real corpus shape noted on `raw_da`'s doc comment) as the only
+        // source of the glyph colour. /C must round-trip as `fill`, never as `color`.
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("FreeText"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(0.0), real(0.0), real(50.0), real(20.0)]),
+        );
+        d.set(
+            "C",
+            Object::Array(vec![real(1.0), real(0.0), real(0.0)]), // real background: red
+        );
+        d.set("DA", Object::string_literal("0 0.5 1 rg")); // glyph colour only, no Tf
+
+        let back = Markup::from_annotation_dict(&d);
+        assert_eq!(
+            back.appearance.fill.as_deref(),
+            Some("#ff0000"),
+            "foreign file: /C must round-trip as the background, not the glyph colour"
+        );
+        assert_eq!(
+            back.appearance.color, "#0080ff",
+            "foreign file: glyph colour recovered from /DA's rg operator"
+        );
+
+        // Round-trips through redline's own writer without losing the recovered
+        // background (fill survives even though /DA's colour-only string does not
+        // survive verbatim - font is None so raw_da preserves it separately; see
+        // `foreign_da_without_font_operator_preserves_raw_string_verbatim`).
+        let saved = back.to_annotation_dict();
+        assert_eq!(
+            get_reals(&saved, b"C").map(|c| rgb_to_hex(&c)).as_deref(),
+            Some("#ff0000"),
+            "re-save must keep the recovered background on /C"
+        );
+    }
+
+    #[test]
+    fn foreign_freetext_c_recovered_as_background_no_da_defaults_glyph_black() {
+        // Same foreign-file case with no /DA at all: glyph colour has no recoverable
+        // source, so it must default to black rather than fabricating a value or
+        // (the actual defect) inheriting the background colour.
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("FreeText"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(0.0), real(0.0), real(50.0), real(20.0)]),
+        );
+        d.set(
+            "C",
+            Object::Array(vec![real(0.0), real(1.0), real(0.0)]), // real background: green
+        );
+
+        let back = Markup::from_annotation_dict(&d);
+        assert_eq!(back.appearance.fill.as_deref(), Some("#00ff00"));
+        assert_eq!(
+            back.appearance.color, "#000000",
+            "no /DA colour to recover: glyph colour defaults to black, not the background"
+        );
     }
 
     #[test]
