@@ -1575,3 +1575,53 @@ exists yet to visually confirm the fix, since that's exactly what's blocked.
 
 ---
 *Updated: 2026-08-31*
+
+## Cross-viewer harness — unblocked, run completed, new Acrobat regression found (2026-08-31 ~19:00-19:30)
+
+Owner authorized force-terminating the named PIDs above ("kill them"). Re-verified each
+PID's process name first; killed 9/10 cleanly, one orphan (5692, inert) resisted
+termination with Access Denied from both session contexts and was later found gone on its
+own. Corpus restaged clean, full pipeline run completed.
+
+**Revu side: fully working, FreeText fix visually confirmed.** Bluebeam-GUI captured all
+22 files cleanly (settled:true, no errors). Visually inspected `Callout.png`/`Text.png`/
+`AllTypes.png` directly - all show a light cream background box with legible text, NOT the
+solid-blue-fill defect PR #88 fixed. This is genuine independent confirmation (Revu
+regenerates appearances from the annotation dictionary).
+
+**Acrobat side: NEW regression, all 22 files black (bright fraction 0).** Retested twice,
+including once on a fully clean mr-desktop with zero leftover processes - ruled out
+leftover-process interference. COM/IAC still reports correct page/annotation counts every
+time; only the paint/capture path fails. This is a real, reproducible regression from the
+same-day 11:59Z run's 14/24 success, not caused by the wedge/kill cleanup itself (confirmed
+on a genuinely clean slate). Cause unconfirmed - leading guess is a corrupted GPU/CEF
+rendering context from today's repeated abnormal terminations, possibly needing a reboot.
+Blocker: `blk-acrobat-black-pane-render` on the mission record.
+
+**Found and fixed a real bug**: `SearchExploration.ps1` line 160 had a literal em-dash in a
+`throw` string, which Windows PowerShell 5.1 (used by `PsGuiHost.exe`, deliberately not
+`pwsh`) misdecodes, breaking the parser. Fixed to a hyphen - **not yet committed**, sitting
+in worktree `.claude/worktrees/crossviewer-capture-run/`. Confirms the "hyphens not
+em-dashes" convention has a real PS5.1 technical reason, not just style.
+
+**SearchExploration.ps1 ran clean after the fix** (25s, Revu opened/closed politely).
+Findings: (1) Revu's Search panel defaults to whatever scope+folder was last used
+interactively (found Scope=Folder pointing at a real project path on mr-desktop's E: drive
+this run) - not Document/Open-Docs; (2) the Results panel / Check All / lightning-bolt menu
+are entirely invisible to standard .NET UI Automation (zero List/ListItem/CheckBox controls
+in a 191-element dump) - a future bulk-action automation pass needs a different technique
+than AutomationId targeting, not just real IDs to fill in.
+
+**Two harness hygiene gaps found, not yet fixed**: `run-crossviewer.mjs`'s own task
+registration re-enables all 5 standard tasks and never re-disables them (unlike
+`Invoke-CrossviewerTask.ps1`'s belt-and-suspenders behavior) - manually disabled this
+session. `AcrobatLeg.ps1`'s `App.Exit()` reported success twice this session without the
+process actually terminating, leaving Acrobat visibly open on the owner's monitor after the
+run finished until manually force-killed (safe here - it was this run's own just-spawned
+process).
+
+mr-desktop confirmed clean at end of session: zero Acrobat/AcroCEF/RdrCEF/Revu processes,
+all `redline-crossviewer-*` tasks Disabled. Full detail: `observation:01ta5fy04jnw4rrvqh9i`.
+
+---
+*Updated: 2026-08-31 (later same day)*
