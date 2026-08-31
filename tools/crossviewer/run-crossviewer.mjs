@@ -121,6 +121,18 @@ async function runLeg(leg, timeoutMs) {
   }
 }
 
+// Register-CrossviewerTask.ps1 registers (and thereby enables) all 5 standard tasks and
+// never disables them again; runLeg() leaves whichever task it drove sitting enabled too
+// (its own polling loop only cares about State === "Ready", which an enabled-but-idle task
+// also reports). Left uncorrected, every run-crossviewer.mjs invocation ends with every
+// harness task enabled on the owner's machine - found live 2026-08-31, had to be disabled
+// by hand. Call this once after the remote block, success or failure, so a task never
+// outlives this script's own run.
+async function disableAllTasks() {
+  await ps(`Get-ScheduledTask -TaskName '${TASK_PREFIX}-*' | Disable-ScheduledTask | Out-Null`)
+    .catch((e) => console.warn(`   (could not disable tasks: ${e.message})`));
+}
+
 async function collect(outDir) {
   console.log("== 4. pulling results back");
   await mkdir(outDir, { recursive: true });
@@ -232,15 +244,22 @@ async function main() {
 
   if (!has("--skip-corpus")) await generateCorpus();
   if (!has("--skip-remote")) {
-    await stage();
-    // One-shot (idempotent) task registration, so a fresh machine needs no manual step.
-    await ps(`& '${STAGING}\\scripts\\Register-CrossviewerTask.ps1' -StagingRoot '${STAGING}'`);
-    // Legs run one at a time on purpose: both drive GUI windows on the same physical
-    // display and screen-capture them, so overlapping them would photograph each other.
-    await runLeg("bluebeam", 2 * 60_000);          // licence probe only, seconds
-    await runLeg("acrobat", 45 * 60_000);
-    await runLeg("bluebeam-gui", 60 * 60_000);
-    await collect(outDir);
+    try {
+      await stage();
+      // One-shot (idempotent) task registration, so a fresh machine needs no manual step.
+      await ps(`& '${STAGING}\\scripts\\Register-CrossviewerTask.ps1' -StagingRoot '${STAGING}'`);
+      // Legs run one at a time on purpose: both drive GUI windows on the same physical
+      // display and screen-capture them, so overlapping them would photograph each other.
+      await runLeg("bluebeam", 2 * 60_000);          // licence probe only, seconds
+      await runLeg("acrobat", 45 * 60_000);
+      await runLeg("bluebeam-gui", 60 * 60_000);
+      await collect(outDir);
+    } finally {
+      // Runs on success AND on any thrown error above - a task must never outlive this
+      // script's own run, matching Invoke-CrossviewerTask.ps1's own enable/disable
+      // discipline (see the comment on disableAllTasks() for why this was missing).
+      await disableAllTasks();
+    }
   }
 
   const croppedDir = has("--skip-crop") ? outDir : await cropRenders(outDir);

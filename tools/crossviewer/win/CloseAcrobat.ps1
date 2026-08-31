@@ -28,10 +28,11 @@ try {
     for ($i = $n - 1; $i -ge 0; $i--) {
         try {
             $doc = $app.GetAVDoc($i)
-            $title = ''
-            try { $title = $doc.GetPDDoc().GetFileName() } catch { }
+            # Never log the filename here - GetFileName() can carry owner/client-sensitive
+            # project names, matching the never-log-titles convention every other leg in
+            # this harness follows (see DiagWindows.ps1/CloseRevu.ps1).
             $doc.Close($true) | Out-Null   # $true = discard changes, never prompt
-            Write-Output "closed [$i] $title"
+            Write-Output "closed [$i]"
         } catch {
             Write-Output "could not close [$i]: $($_.Exception.Message)"
         }

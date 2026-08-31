@@ -157,7 +157,7 @@ $dialogDir = Join-Path $OutputDir '_dialogs'
 
 $pdfs = @(Get-ChildItem -LiteralPath $InputDir -Filter $Filter -File | Sort-Object Name)
 Write-Log "found $($pdfs.Count) PDF(s) under $InputDir"
-if ($pdfs.Count -lt 2) { throw "need at least 2 PDFs (Open-Docs scope needs a second tab) — found $($pdfs.Count) in $InputDir" }
+if ($pdfs.Count -lt 2) { throw "need at least 2 PDFs (Open-Docs scope needs a second tab) - found $($pdfs.Count) in $InputDir" }
 
 $pre = Get-RevuProcess
 if ($pre) {

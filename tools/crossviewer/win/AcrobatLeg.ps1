@@ -625,9 +625,25 @@ try {
     }
 } finally {
     if ($null -ne $app) {
-        try { if ($null -ne $app) { $app.Exit() | Out-Null; Write-Log 'Acrobat exited' } }
+        # Snapshot before Exit() so we can check afterward whether it actually worked -
+        # App.Exit() has been observed to return without error while the underlying
+        # Acrobat/AcroCEF processes keep running (2026-08-31 session, three occurrences in
+        # one day). Never force-killed here; only reported, per this leg's own "never
+        # force-terminate a viewer" rule (see the header notes).
+        $preExitPids = @((Get-Process -Name 'Acrobat', 'AcroCEF' -ErrorAction SilentlyContinue).Id)
+        try { $app.Exit() | Out-Null; Write-Log 'App.Exit() called' }
         catch { Write-Log "App.Exit refused: $($_.Exception.Message) (leaving process alone - never force-killed)" }
         try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($app) } catch { }
+
+        if ($preExitPids.Count -gt 0) {
+            Start-Sleep -Seconds 2
+            $survivors = @($preExitPids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+            if ($survivors.Count -gt 0) {
+                Write-Log "App.Exit() did NOT terminate $($survivors.Count) process(es) (pid(s): $($survivors -join ', ')) - left running, never force-killed. Manual recovery: run CloseAcrobat.ps1 (API-only, safe) or, if that hangs too, verify no owner work is open before a manual Stop-Process."
+            } else {
+                Write-Log 'Acrobat exited (all tracked processes confirmed gone)'
+            }
+        }
     }
 }
 
