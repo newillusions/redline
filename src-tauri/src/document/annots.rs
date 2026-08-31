@@ -2304,6 +2304,517 @@ pub(crate) mod tests {
             eprintln!("wrote {}", all_types_dest.display());
             eprintln!("crossviewer corpus written to: {}", out_dir.display());
         }
+
+        // -------------------------------------------------------------------------
+        // Multi-cycle fidelity harness (2026-08-31, owner-reported "big issue" - verbatim:
+        // "when the markups are applied in redline, then the file is saved, closed and
+        // reopened, editing the markups causes issues, and then save, close and reopen
+        // again to see the inconsistencies"). `full_type_matrix_round_trips_every_field_
+        // and_is_idempotent_on_a_second_write` above proves ONE write->read round trip,
+        // entirely IN-MEMORY (a single `lopdf::Document`, never touching disk, and never
+        // editing the reread value before writing it back). It cannot catch a bug that
+        // only appears after: (1) a REAL save-to-disk + reopen-from-disk cycle, through
+        // `save_with_markups`/`load_markups_from` - the actual app code path, with real
+        // object ids/xref layout/file bytes, not just in-process dict mutation; (2)
+        // EDITING a markup that was reloaded from that saved file (not the pristine
+        // in-memory original - so any drift the first cycle introduced is baked into what
+        // gets edited); and (3) a THIRD cycle with no further edits, which is where the
+        // owner's "close and reopen AGAIN" step lands - proving generation 2 is a genuine
+        // fixed point, not merely self-consistent with generation 1.
+        // -------------------------------------------------------------------------
+        mod multicycle_fidelity {
+            use super::*;
+            use crate::document::save::{load_markups_from, save_with_markups};
+
+            /// Blank one-page backdrop PDF on disk (no markups) - the `src` every
+            /// generation-1 `save_with_markups` call starts from.
+            fn write_backdrop(path: &std::path::Path) {
+                let (mut doc, _page_id) = one_page_doc();
+                doc.save(path).unwrap();
+            }
+
+            fn reals(d: &Dictionary, key: &[u8]) -> Vec<f64> {
+                d.get(key)
+                    .unwrap_or_else(|_| panic!("{} missing", String::from_utf8_lossy(key)))
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|o| o.as_float().unwrap() as f64)
+                    .collect()
+            }
+
+            /// `/Rect` must equal `/AP /N /BBox` for every managed annotation (the
+            /// 2026-08-06 BB-interop invariant - `appearance::ap_bbox` is the single
+            /// shared source for both, see `to_annotation_dict`'s doc comment). Checked
+            /// fresh after EVERY generation's save, not just the first - a gen-2-specific
+            /// regression could reintroduce drift only once an edit forces the AP stream
+            /// to be re-derived from different geometry/appearance.
+            fn assert_rect_equals_ap_bbox(doc: &Document, dict: &Dictionary, ctx: &str) {
+                let rect = reals(dict, b"Rect");
+                let stream = resolve_ap_n_stream(doc, dict);
+                let bbox = reals(&stream.dict, b"BBox");
+                assert_eq!(rect.len(), 4, "{ctx}: /Rect must have 4 entries");
+                assert_eq!(bbox.len(), 4, "{ctx}: /AP /BBox must have 4 entries");
+                for i in 0..4 {
+                    assert!(
+                        (rect[i] - bbox[i]).abs() < 0.05,
+                        "{ctx}: /Rect[{i}]={} != /AP/BBox[{i}]={}",
+                        rect[i],
+                        bbox[i]
+                    );
+                }
+            }
+
+            /// Loads the saved PDF at `path` and checks the structural invariants a
+            /// second/third write generation could plausibly break: exactly
+            /// `expected_managed_count` managed (RLType-bearing) annotations (no
+            /// duplication - a naive "append instead of replace" bug would double this
+            /// every generation), every managed annotation carries a unique `/NM` (no
+            /// duplicate ids), and `/Rect` == `/AP /BBox` on each one.
+            fn assert_structural_invariants(
+                path: &std::path::Path,
+                expected_managed_count: usize,
+                ctx: &str,
+            ) {
+                let doc = Document::load(path)
+                    .unwrap_or_else(|e| panic!("{ctx}: reload {} failed: {e}", path.display()));
+                let page_id = *doc
+                    .get_pages()
+                    .values()
+                    .next()
+                    .unwrap_or_else(|| panic!("{ctx}: document has no pages"));
+                let annots = page_annots(&doc, page_id).unwrap();
+                let managed: Vec<&Dictionary> = annots
+                    .iter()
+                    .filter(|(_, d)| d.has(b"RLType"))
+                    .map(|(_, d)| d)
+                    .collect();
+                assert_eq!(
+                    managed.len(),
+                    expected_managed_count,
+                    "{ctx}: managed annotation count (duplicate-detection)"
+                );
+
+                let mut nms: Vec<String> = managed.iter().filter_map(|d| nm_of(d)).collect();
+                assert_eq!(
+                    nms.len(),
+                    managed.len(),
+                    "{ctx}: every managed annotation must carry /NM"
+                );
+                nms.sort();
+                let before = nms.len();
+                nms.dedup();
+                assert_eq!(
+                    nms.len(),
+                    before,
+                    "{ctx}: duplicate /NM values found (duplicate annotation)"
+                );
+
+                let managed_oids: std::collections::HashSet<ObjectId> = annots
+                    .iter()
+                    .filter(|(_, d)| d.has(b"RLType"))
+                    .filter_map(|(oid, _)| *oid)
+                    .collect();
+
+                for d in &managed {
+                    assert_rect_equals_ap_bbox(&doc, d, ctx);
+
+                    // /IRT + /RT /Group linkage (design doc 2026-08-11, `write_markups_
+                    // emits_irt_rt_group_for_a_two_member_group` etc.). `write_markups`
+                    // rewrites EVERY managed annotation to a fresh object id on every
+                    // save, so a second/third generation is exactly where a stale /IRT
+                    // - still pointing at a PRIOR generation's now-gone object id -
+                    // would surface. Checked here, at the raw PDF level, in addition to
+                    // `assert_markup_fidelity`'s Rust-level `group_id` equality check,
+                    // which proves the link survived but not that it points at a real,
+                    // currently-present object.
+                    if let Ok(irt) = d.get(b"IRT") {
+                        let head_ref = irt.as_reference().unwrap_or_else(|_| {
+                            panic!("{ctx}: /IRT must be an indirect reference")
+                        });
+                        assert!(
+                            managed_oids.contains(&head_ref),
+                            "{ctx}: /IRT references {head_ref:?}, not a managed annotation \
+                             present on this generation's page (stale group link)"
+                        );
+                        assert_eq!(
+                            d.get(b"RT").ok().and_then(|o| o.as_name().ok()),
+                            Some(&b"Group"[..]),
+                            "{ctx}: an annotation carrying /IRT must be tagged /RT /Group"
+                        );
+                        let head_dict = doc.get_dictionary(head_ref).unwrap_or_else(|e| {
+                            panic!("{ctx}: /IRT target {head_ref:?} does not resolve: {e}")
+                        });
+                        assert!(
+                            !head_dict.has(b"IRT") && !head_dict.has(b"RT"),
+                            "{ctx}: the head of a group must carry neither /IRT nor /RT"
+                        );
+                    }
+                }
+            }
+
+            fn avg(pts: impl Iterator<Item = PdfPoint>) -> PdfPoint {
+                let (mut sx, mut sy, mut n) = (0.0, 0.0, 0.0);
+                for p in pts {
+                    sx += p.x;
+                    sy += p.y;
+                    n += 1.0;
+                }
+                PdfPoint {
+                    x: sx / n,
+                    y: sy / n,
+                }
+            }
+
+            fn centroid(g: &MarkupGeometry) -> PdfPoint {
+                match g {
+                    MarkupGeometry::Point(p) => *p,
+                    MarkupGeometry::Rect { min, max } => PdfPoint {
+                        x: (min.x + max.x) / 2.0,
+                        y: (min.y + max.y) / 2.0,
+                    },
+                    MarkupGeometry::Polyline(pts) => avg(pts.iter().copied()),
+                    MarkupGeometry::Ink(strokes) => {
+                        avg(strokes.iter().flat_map(|s| s.iter().copied()))
+                    }
+                    MarkupGeometry::Quads(quads) => {
+                        avg(quads.iter().flat_map(|q| q.iter().copied()))
+                    }
+                }
+            }
+
+            fn translate(g: &MarkupGeometry, dx: f64, dy: f64) -> MarkupGeometry {
+                map_geometry(g, |p| PdfPoint {
+                    x: p.x + dx,
+                    y: p.y + dy,
+                })
+            }
+
+            fn scale_about(g: &MarkupGeometry, origin: PdfPoint, factor: f64) -> MarkupGeometry {
+                map_geometry(g, |p| PdfPoint {
+                    x: origin.x + (p.x - origin.x) * factor,
+                    y: origin.y + (p.y - origin.y) * factor,
+                })
+            }
+
+            /// Whole-second precision, deliberately - PDF date strings don't carry
+            /// sub-second precision (see `fixed_ts` above), and `Markup::touch`'s
+            /// `Utc::now()` does; comparing a live-clock timestamp against its own PDF
+            /// round-trip would spuriously fail on sub-second truncation that has nothing
+            /// to do with the bug under test.
+            fn edited_at() -> DateTime<Utc> {
+                fixed_ts(300)
+            }
+
+            /// Simulates a real user edit on a markup that was just reloaded from disk:
+            /// translate, resize (where the geometry has extent to resize), edit the note
+            /// text, and change several style properties - at minimum what the mission
+            /// asks for. Every fixture from `full_fixture_set()` has `contents`/`subject`
+            /// set and a non-default `full_appearance()`, so every branch below fires for
+            /// every one of the 20 types.
+            fn mutate_markup(m: &mut Markup) {
+                m.geometry = translate(&m.geometry, 18.0, -11.0);
+                if !matches!(m.geometry, MarkupGeometry::Point(_)) {
+                    let c = centroid(&m.geometry);
+                    m.geometry = scale_about(&m.geometry, c, 1.35);
+                }
+
+                if let Some(c) = m.contents.take() {
+                    m.contents = Some(format!("{c} :: gen2 edit"));
+                }
+                if let Some(s) = m.subject.take() {
+                    m.subject = Some(format!("{s} :: gen2 edit"));
+                }
+
+                m.appearance.color = "#ff2200".to_string();
+                m.appearance.opacity = 0.55;
+                m.appearance.line_weight += 1.25;
+                m.appearance.line_style = match m.appearance.line_style {
+                    LineStyle::Dashed => LineStyle::Dotted,
+                    _ => LineStyle::Dashed,
+                };
+                if m.appearance.fill.is_some() {
+                    m.appearance.fill = Some("#00aaff".to_string());
+                }
+                if m.appearance.fill_opacity.is_some() {
+                    m.appearance.fill_opacity = Some(0.3);
+                }
+                if m.appearance.outline_color.is_some() {
+                    m.appearance.outline_color = Some("#445566".to_string());
+                }
+                if let Some(f) = m.appearance.font.as_mut() {
+                    f.size_pt += 2.0;
+                }
+
+                m.audit.revision += 1;
+                m.audit.modified_by = user("Gen2 Editor");
+                m.audit.modified_at = edited_at();
+            }
+
+            /// Per-type: create -> save -> reload (gen1); mutate the RELOADED markup ->
+            /// save -> reload (gen2, the owner's "editing the markups causes issues"
+            /// step); re-save the gen2 value with NO further edits -> reload (gen3, the
+            /// owner's "save, close and reopen again" step - must be a fixed point of
+            /// gen2). One file per type per generation so a failure names exactly which
+            /// `MarkupType` and which generation broke.
+            #[test]
+            fn per_type_generation2_edit_round_trips_and_generation3_is_idempotent() {
+                let dir = tempfile::tempdir().unwrap();
+                let backdrop = dir.path().join("backdrop.pdf");
+                write_backdrop(&backdrop);
+
+                let fixtures = full_fixture_set();
+                assert_eq!(fixtures.len(), 20);
+
+                for orig in fixtures {
+                    let type_name = format!("{:?}", orig.markup_type);
+
+                    let file1 = dir.path().join(format!("{type_name}-gen1.pdf"));
+                    save_with_markups(&backdrop, &file1, std::slice::from_ref(&orig)).unwrap();
+                    let reread1 = load_markups_from(&file1, None).unwrap();
+                    assert_eq!(
+                        reread1.len(),
+                        1,
+                        "{type_name} gen1: markup missing after first save"
+                    );
+                    assert_markup_fidelity(&orig, &reread1[0]);
+                    assert_structural_invariants(&file1, 1, &format!("{type_name} gen1"));
+
+                    let mut mutated = reread1[0].clone();
+                    mutate_markup(&mut mutated);
+
+                    let file2 = dir.path().join(format!("{type_name}-gen2.pdf"));
+                    save_with_markups(&file1, &file2, std::slice::from_ref(&mutated)).unwrap();
+                    let reread2 = load_markups_from(&file2, None).unwrap();
+                    assert_eq!(
+                        reread2.len(),
+                        1,
+                        "{type_name} gen2: markup missing after edit+save"
+                    );
+                    assert_markup_fidelity(&mutated, &reread2[0]);
+                    assert_structural_invariants(&file2, 1, &format!("{type_name} gen2"));
+
+                    let file3 = dir.path().join(format!("{type_name}-gen3.pdf"));
+                    save_with_markups(&file2, &file3, &reread2).unwrap();
+                    let reread3 = load_markups_from(&file3, None).unwrap();
+                    assert_eq!(
+                        reread3.len(),
+                        1,
+                        "{type_name} gen3: markup missing on idempotent re-save"
+                    );
+                    assert_markup_fidelity(&reread2[0], &reread3[0]);
+                    assert_structural_invariants(&file3, 1, &format!("{type_name} gen3"));
+                }
+            }
+
+            /// All 20 fixtures on one page (a real project-like backdrop of overlapping
+            /// markups), mutating only a SUBSET across gen1->gen2 - the untouched majority
+            /// must be byte-for-byte fidelity-stable, not merely "still present". This is
+            /// the classic rewrite-the-whole-`/Annots`-array failure mode: editing one
+            /// markup must never perturb its neighbours. Gen2->gen3 (idempotent re-save,
+            /// no further edits) must hold for EVERY markup, mutated or not.
+            #[test]
+            fn combined_document_edit_subset_leaves_neighbours_stable_across_generations() {
+                let dir = tempfile::tempdir().unwrap();
+                let backdrop = dir.path().join("backdrop.pdf");
+                write_backdrop(&backdrop);
+
+                let originals = full_fixture_set();
+                assert_eq!(originals.len(), 20);
+
+                let file1 = dir.path().join("combined-gen1.pdf");
+                save_with_markups(&backdrop, &file1, &originals).unwrap();
+                let reread1 = load_markups_from(&file1, None).unwrap();
+                assert_eq!(reread1.len(), 20);
+                for orig in &originals {
+                    let got = reread1.iter().find(|m| m.id() == orig.id()).unwrap();
+                    assert_markup_fidelity(orig, got);
+                }
+                assert_structural_invariants(&file1, 20, "combined gen1");
+
+                // Mutate every 4th markup (5 of 20, incl. one member of the Rectangle/
+                // Ellipse group while its sibling stays untouched); the rest carry
+                // through UNCHANGED.
+                let mut gen2_set = reread1.clone();
+                let mut mutated_ids = std::collections::HashSet::new();
+                for (i, m) in gen2_set.iter_mut().enumerate() {
+                    if i % 4 == 0 {
+                        mutate_markup(m);
+                        mutated_ids.insert(m.id());
+                    }
+                }
+                assert_eq!(mutated_ids.len(), 5, "sanity: exactly 5 markups mutated");
+
+                let file2 = dir.path().join("combined-gen2.pdf");
+                save_with_markups(&file1, &file2, &gen2_set).unwrap();
+                let reread2 = load_markups_from(&file2, None).unwrap();
+                assert_eq!(reread2.len(), 20);
+                for expected in &gen2_set {
+                    let got = reread2.iter().find(|m| m.id() == expected.id()).unwrap();
+                    assert_markup_fidelity(expected, got);
+                }
+                // Untouched markups: identical to their gen1 reread values, proving the
+                // gen2 write did not perturb anything it wasn't asked to change.
+                for orig1 in &reread1 {
+                    if mutated_ids.contains(&orig1.id()) {
+                        continue;
+                    }
+                    let got = reread2.iter().find(|m| m.id() == orig1.id()).unwrap();
+                    assert_markup_fidelity(orig1, got);
+                }
+                assert_structural_invariants(&file2, 20, "combined gen2");
+
+                // Generation 3: idempotent re-save, no further edits - every markup
+                // (mutated AND untouched) must be a fixed point of generation 2.
+                let file3 = dir.path().join("combined-gen3.pdf");
+                save_with_markups(&file2, &file3, &reread2).unwrap();
+                let reread3 = load_markups_from(&file3, None).unwrap();
+                assert_eq!(reread3.len(), 20);
+                for m2 in &reread2 {
+                    let got = reread3.iter().find(|m| m.id() == m2.id()).unwrap();
+                    assert_markup_fidelity(m2, got);
+                }
+                assert_structural_invariants(&file3, 20, "combined gen3");
+            }
+
+            /// Extends `orphaned_popup_on_a_managed_markup_is_dropped_foreign_popup_kept`
+            /// (single write cycle, in-memory) across TWO real disk-backed edit
+            /// generations: a foreign tool (e.g. Bluebeam) adds a Link + a Popup parented
+            /// to redline's managed markup between redline sessions; redline reopens,
+            /// edits, and saves (gen2) - the managed markup is rewritten to a fresh object
+            /// id every save, so the popup (parented to the OLD id) must be dropped, not
+            /// resurrected, and must STAY dropped on gen3's idempotent re-save. The
+            /// foreign Link (never RLType-tagged, never rewritten) must survive both
+            /// generations untouched.
+            #[test]
+            fn orphaned_popup_and_no_duplicates_hold_across_a_second_edit_generation() {
+                let dir = tempfile::tempdir().unwrap();
+                let backdrop = dir.path().join("backdrop.pdf");
+                write_backdrop(&backdrop);
+
+                let orig = matrix_markup(
+                    MarkupType::Rectangle,
+                    MarkupGeometry::Rect {
+                        min: PdfPoint { x: 20.0, y: 20.0 },
+                        max: PdfPoint { x: 120.0, y: 90.0 },
+                    },
+                    user("Alice"),
+                );
+
+                let file1 = dir.path().join("popup-gen1.pdf");
+                save_with_markups(&backdrop, &file1, std::slice::from_ref(&orig)).unwrap();
+
+                // A foreign tool opens file1 and adds a Link (always survives) + a Popup
+                // parented to redline's managed markup (Bluebeam auto-creates one per
+                // markup it opens).
+                {
+                    let mut doc = Document::load(&file1).unwrap();
+                    let page_id = *doc.get_pages().values().next().unwrap();
+                    let managed_id = page_annots(&doc, page_id)
+                        .unwrap()
+                        .into_iter()
+                        .find(|(_, d)| d.has(b"RLType"))
+                        .and_then(|(oid, _)| oid)
+                        .expect("managed annot must be indirect");
+
+                    let link_id = doc.add_object(Object::Dictionary(link_dict()));
+                    let popup_id = doc.add_object(Object::Dictionary(dictionary! {
+                        "Type" => "Annot",
+                        "Subtype" => "Popup",
+                        "Parent" => managed_id,
+                        "Rect" => vec![0.into(), 0.into(), 50.into(), 30.into()],
+                    }));
+
+                    let page_dict = doc.get_dictionary_mut(page_id).unwrap();
+                    let mut arr = page_dict
+                        .get(b"Annots")
+                        .unwrap()
+                        .as_array()
+                        .unwrap()
+                        .clone();
+                    arr.push(Object::Reference(link_id));
+                    arr.push(Object::Reference(popup_id));
+                    page_dict.set("Annots", Object::Array(arr));
+                    doc.save(&file1).unwrap();
+                }
+
+                // Generation 2: redline reopens file1 (sees the foreign Link+Popup), the
+                // user edits the markup, redline saves - the managed markup is rewritten
+                // to a fresh object id, orphaning the popup parented to the old one.
+                let reread1 = load_markups_from(&file1, None).unwrap();
+                assert_eq!(reread1.len(), 1);
+                let mut mutated = reread1[0].clone();
+                mutate_markup(&mut mutated);
+
+                let file2 = dir.path().join("popup-gen2.pdf");
+                save_with_markups(&file1, &file2, std::slice::from_ref(&mutated)).unwrap();
+
+                {
+                    let doc = Document::load(&file2).unwrap();
+                    let page_id = *doc.get_pages().values().next().unwrap();
+                    let annots = page_annots(&doc, page_id).unwrap();
+                    assert_eq!(
+                        annots.iter().filter(|(_, d)| d.has(b"RLType")).count(),
+                        1,
+                        "gen2: exactly one managed annotation, not duplicated"
+                    );
+                    assert_eq!(
+                        annots
+                            .iter()
+                            .filter(|(_, d)| subtype(d).as_deref() == Some("Popup"))
+                            .count(),
+                        0,
+                        "gen2: the orphaned popup (parented to the pre-edit object id) must \
+                         be dropped"
+                    );
+                    assert_eq!(
+                        annots
+                            .iter()
+                            .filter(|(_, d)| subtype(d).as_deref() == Some("Link"))
+                            .count(),
+                        1,
+                        "gen2: the foreign Link (never RLType-tagged) must survive untouched"
+                    );
+                }
+                assert_structural_invariants(&file2, 1, "popup gen2");
+
+                // Generation 3: idempotent re-save, no further edits - the popup must stay
+                // gone (not resurrected) and still no duplicates; the reloaded markup must
+                // still be a fidelity fixed point of gen2.
+                let reread2 = load_markups_from(&file2, None).unwrap();
+                let file3 = dir.path().join("popup-gen3.pdf");
+                save_with_markups(&file2, &file3, &reread2).unwrap();
+
+                let doc3 = Document::load(&file3).unwrap();
+                let page_id3 = *doc3.get_pages().values().next().unwrap();
+                let annots3 = page_annots(&doc3, page_id3).unwrap();
+                assert_eq!(
+                    annots3.iter().filter(|(_, d)| d.has(b"RLType")).count(),
+                    1,
+                    "gen3: exactly one managed annotation, not duplicated"
+                );
+                assert_eq!(
+                    annots3
+                        .iter()
+                        .filter(|(_, d)| subtype(d).as_deref() == Some("Popup"))
+                        .count(),
+                    0,
+                    "gen3: no popup resurrection"
+                );
+                assert_eq!(
+                    annots3
+                        .iter()
+                        .filter(|(_, d)| subtype(d).as_deref() == Some("Link"))
+                        .count(),
+                    1,
+                    "gen3: foreign Link still present"
+                );
+                assert_structural_invariants(&file3, 1, "popup gen3");
+
+                let reread3 = load_markups_from(&file3, None).unwrap();
+                assert_markup_fidelity(&reread2[0], &reread3[0]);
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2923,4 +3434,3 @@ pub(crate) mod tests {
         assert_eq!(read2[0].group_id, read2[1].group_id, "cycle 2: still grouped after re-save");
     }
 }
-

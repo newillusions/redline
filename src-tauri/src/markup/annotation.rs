@@ -705,12 +705,22 @@ impl Markup {
             d.set("RLGroup", Object::string_literal(gid.to_string()));
         }
 
-        // Count set (spec §7): the set assignment + symbol via private /RLCountSet* keys.
-        // The set COLOUR is carried by the standard /C key (appearance.color == set.color),
-        // so external viewers render the marker in the set colour with no extra mapping.
+        // Count set (spec §7): the set assignment + symbol + colour via private
+        // /RLCountSet* keys. The colour is ALSO carried by the standard /C key
+        // (appearance.color) so external viewers render the marker in the set colour
+        // with no extra mapping - but /RLCountSetColor is the one redline itself reads
+        // back (multi-cycle fidelity fix, 2026-08-31: the set colour used to be derived
+        // FROM /C on read instead of persisted independently, so editing a single Count
+        // marker's own stroke colour - a normal per-marker restyle - silently rewrote
+        // `count_set.color` on that marker's next save/reopen even though the set
+        // definition itself, shared by every OTHER marker carrying the same
+        // `count_set.id`, was never touched. See
+        // `document::annots::tests::fidelity_matrix::multicycle_fidelity` for the
+        // regression test that caught this on a second edit-then-reload cycle).
         if let Some(cs) = &self.count_set {
             d.set("RLCountSetId", Object::string_literal(cs.id.to_string()));
             d.set("RLCountSetName", Object::string_literal(cs.name.clone()));
+            d.set("RLCountSetColor", Object::string_literal(cs.color.clone()));
             d.set("RLCountSymbol", name(count_symbol_tag(cs.symbol)));
         }
 
@@ -839,13 +849,17 @@ impl Markup {
             .or_else(|| da_string.as_deref().and_then(font_from_da));
         let raw_da = if font.is_none() { da_string } else { None };
 
-        // Count set: reconstruct from /RLCountSet* keys; the colour comes from /C (== `color`).
+        // Count set: reconstruct from /RLCountSet* keys. Colour prefers the dedicated
+        // /RLCountSetColor key (see the write-side comment in `to_annotation_dict` for
+        // why deriving it from /C == `color` instead was a cross-markup fidelity bug);
+        // falls back to /C for a file saved by a pre-fix redline build, where the two
+        // were always kept equal by construction so the fallback is exact.
         let count_set = get_string(d, b"RLCountSetId")
             .and_then(|s| uuid::Uuid::parse_str(&s).ok())
             .map(|set_id| CountSet {
                 id: set_id,
                 name: get_string(d, b"RLCountSetName").unwrap_or_default(),
-                color: color.clone(),
+                color: get_string(d, b"RLCountSetColor").unwrap_or_else(|| color.clone()),
                 symbol: count_symbol_from_tag(&get_name(d, b"RLCountSymbol").unwrap_or_default()),
             });
 
