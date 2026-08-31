@@ -1,0 +1,43 @@
+{
+  "$comment": [
+    "The cross-viewer visual checklist, in the form the vision model is asked to answer.",
+    "This is the machine-readable version of what the manual pass checked by eye when a",
+    "human opened each staged PDF in Acrobat and Bluebeam. Each item must be answerable",
+    "from a single rendered page image alone - anything needing the annotation dictionary",
+    "belongs in src-tauri/tests/bb_interop_conformance.rs (the PRIMARY, structural check),",
+    "and anything needing the viewer's own report belongs in the Acrobat leg's JSON."
+  ],
+  "version": 1,
+  "items": [
+    {
+      "id": "page-renders",
+      "question": "Does this page render actual content, or is it blank/white/garbled? Answer BLANK only if the page is essentially empty.",
+      "fail_when": "blank, garbled, or corrupt"
+    },
+    {
+      "id": "markups-visible",
+      "question": "Are annotation markups (shapes, lines, clouds, text notes, stamps, measurements) visibly drawn on the page? Roughly how many distinct markups can you count?",
+      "fail_when": "no markups visible at all"
+    },
+    {
+      "id": "markups-not-empty-boxes",
+      "question": "Do any markups render as empty rectangles, hollow placeholder boxes, or boxes containing only a label where artwork or content is expected? This specifically catches the stamp-renders-as-empty-box defect.",
+      "fail_when": "any empty placeholder box present"
+    },
+    {
+      "id": "text-legible",
+      "question": "Is text inside text-bearing markups (notes, callouts, free text, measurement labels) legible and correctly positioned, rather than clipped, overlapping, or reduced to boxes?",
+      "fail_when": "text clipped, missing, or illegible"
+    },
+    {
+      "id": "measurements-legible",
+      "question": "If measurement markups are present, are their dimension labels readable and attached to the right geometry?",
+      "fail_when": "labels missing or detached"
+    },
+    {
+      "id": "geometry-on-page",
+      "question": "Do all markups sit within the page area and appear positioned over the drawing content, rather than shifted off-page, stacked in a corner, or mirrored?",
+      "fail_when": "markups off-page or obviously mispositioned"
+    }
+  ]
+}

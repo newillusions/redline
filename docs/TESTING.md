@@ -15,6 +15,192 @@ human Acrobat/Bluebeam visual check (see CLAUDE.md "Current phase").
 - Ceiling: neither exercises the real Rust `#[tauri::command]` functions through real IPC, a
   real webview, or real OS dialogs/permissions.
 
+## Tier 2.5 - Cross-viewer harness (Acrobat / Bluebeam on mr-desktop)
+
+`tools/crossviewer/` automates the manual "open every staged PDF in Acrobat and Bluebeam and
+look at it" pass. It matters because Acrobat and Revu REGENERATE markup appearances from the
+annotation dictionary, whereas every engine in `tools/crossviewer-render-matrix.mjs` mostly
+blits our stored `/AP` - so a page can look right there while the data model is wrong, which
+is the shape of every real G9 defect so far.
+
+```bash
+node tools/crossviewer/run-crossviewer.mjs
+```
+
+Corpus is regenerated from the repo's own `#[ignore]`d emitters (24 PDFs: one per
+`MarkupType`, an all-types page, the blank backdrop, and two Bluebeam-reference round-trips),
+staged to mr-desktop, run there as Session-1 scheduled tasks because GUI apps cannot run in
+the Session 0 context SSH lands in, then screened through a local vision model against
+`tools/crossviewer/checklist.json`.
+
+Proven on real hardware 2026-08-29: Session-1 invocation, Acrobat DC 26.1 over COM/IAC
+(`AllTypes.pdf` -> `pages=1 annots=20`, matching all 20 fixtures), and the vision-review leg
+end to end (`qwen3.8:27b`, ~51s/page, structured per-item verdicts). The vision review has
+NOT yet been run against an Acrobat capture - see the open blocker below.
+
+**2026-08-31: Fit Page + symmetric crop, closing the "Revu missing the lower-left cluster"
+question from 2026-08-30.** Root cause was a viewport artifact, not a Bluebeam render
+defect: `win/BluebeamGuiLeg.ps1` never sent a Fit Page command, so Revu opened at whatever
+zoom it last remembered and the page ran on well past the bottom of the window - proven by
+comparing the captured render against Revu's own page thumbnail, which already showed the
+"missing" cluster. Fixed by sending `Ctrl+9` (Fit Page - confirmed against Bluebeam's own
+Keyboard Shortcuts Guide; `Ctrl+0` is Fit *Width*, a different command) before every
+capture. Both legs' renders are then cropped to just the page rectangle
+(`tools/crossviewer/crop-to-page.mjs`, ray-cast from image centre with a debounce
+calibrated against a real measured failure - see its module header) before vision-review or
+any comparison runs, since both legs photograph the whole application window and a fair
+comparison needs the same content on both sides. `tools/crossviewer/compare-alltypes.mjs`
+adds a standing, no-model-call pixel check of the lower-left cluster specifically. Full
+writeup: `tools/crossviewer/README.md` "Status as of 2026-08-31".
+
+Captures are placed on a landscape display (mr-desktop has a portrait panel), defaulting to
+`\\.\DISPLAY1`, the owner's review monitor. Displays must be enumerated from inside
+Session 1 - over SSH `Screen.AllScreens` returns a single fake `WinDisc 1024x768`.
+
+**Display sizes depend on DPI awareness.** The same three panels report 2560x1440 /
+1440x2560 / 5120x1440 to a DPI-unaware process and 3840x2160 / 2160x3840 / 7680x2160 once
+`SetProcessDPIAware` has been called - the machine runs at 150% scaling. An earlier note in
+this file recorded the scaled figures and concluded "there is no 3840x2160 monitor"; that was
+a DPI artifact, and DISPLAY1 is in fact a 4K panel. Screen capture addresses PHYSICAL pixels,
+so the legs call `Enable-DpiAwareness` before reading any rectangle. Never self-test window
+placement by creating a window - an unpumped WinForms window wedges Session-1 task launching
+entirely; see the README.
+
+### Rendering is by screen capture, and every capture must be proven
+
+`saveAs(..., 'com.adobe.acrobat.png')` is dead as a render primitive: it never returns, with
+Acrobat visible or hidden (two runs, 0 PNGs from 9 attempts). Pages are therefore captured
+from Acrobat's own window. Three guards exist because each caught a real failure that looked
+exactly like success:
+
+- **Verify-on-top.** `SetForegroundWindow` is refused to a background process, so a scheduled
+  task cannot raise a window that way. The first capture run produced a valid 415 KB PNG of
+  the owner's Microsoft Teams window. Captures now force the window topmost via
+  `SetWindowPos(HWND_TOPMOST)` and prove ownership by resolving five sample points through
+  `WindowFromPoint` + `GetAncestor(GA_ROOT)`; an obstructed window is a hard failure.
+  A blocker is logged by window class and process name only - never its title, which would put
+  the owner's correspondent into a log file.
+- **Page-visible check.** Window title, class, handle, rectangle and Z-order were all correct
+  while the pane was blank, so no window property can settle this. `Test-PageVisible` samples
+  the pixels and requires a bright fraction consistent with a page being displayed. A capture
+  with no page in it is kept as `REJECTED-<name>.png` - never counted as a render.
+- **Run control.** `Invoke-CrossviewerTask.ps1` is the only sanctioned way to start a leg: it
+  enables exactly one task, enforces a hard timeout, disables the task again in a `finally`,
+  and terminates only viewer processes whose start time is after the run began. `AcroCEF` is
+  in that list - Acrobat renders its document pane in CEF children, and killing only the
+  parent orphans them.
+
+### Acrobat host preference: `bSDIMode` (owner-authorised config change, 2026-08-30)
+
+The harness requires one change to the **owner's Acrobat install** on mr-desktop. It is
+recorded here because it lives outside the repo and will not travel with a checkout.
+
+| | |
+|---|---|
+| Key | `HKCU\Software\Adobe\Adobe Acrobat\DC\AVGeneral` |
+| Value | `bSDIMode`, `REG_DWORD` |
+| Before | **absent** (Acrobat's default: tabbed viewing) |
+| After | `1` |
+| Meaning | `1` = Single Document Interface: a PDF opens in its **own document window**. `0`/absent = documents open as tabs in one frame. |
+| Backup | `H:\redline-crossviewer\backup-acrobat-prefs-<timestamp>.reg` (full `AVGeneral` key export, taken immediately before the write) |
+| Rollback | Delete the `bSDIMode` value - it did not exist before - or re-import the `.reg`. Acrobat must be closed for either to stick. |
+
+Why this preference and not a "hide the home screen" one: there is no such preference on this
+install. The live `HKCU` Acrobat tree was dumped for every value name matching
+`Home|Tab|Welcome|Startup|FirstView|OpenIn` and contains no `bShowHomeScreen`,
+`bDisableHomeScreen`, `bSuppressHomeScreen` or `bOpenInNewTab`. `bSDIMode` attacks the
+observed mechanism instead: the document was **always open** - COM reported `pages=1
+annots=20` against a live `AVPageView` - it simply was not the *selected tab*, because the
+frame stayed on Home. With SDI there is no shared frame and no Home tab to lose to.
+
+Verification caveat, stated rather than glossed: Adobe's own ETK preference reference
+(`adobe.com/devnet-docs/acrobatetk/.../AVGeneral.html`, `FeatureLockDown.html`) timed out on
+four separate 60 s fetch attempts and direct `curl` is blocked from the dev sandbox, so the
+key was confirmed against two independent Adobe Support Community threads that agree exactly
+on path, name, type and semantics - **not** read off Adobe's documentation page. Treat it as
+corroborated, not officially cited.
+
+Set it only with Acrobat fully closed (`Acrobat`, `AcroCEF`, `RdrCEF` all at 0); Acrobat
+rewrites `AVGeneral` from memory on exit and will discard a write made while it is running.
+
+### RESOLVED - Acrobat renders. IAC's `AVDoc.Open` never creates a document window
+
+Superseded the "viewer never paints" blocker on 2026-08-30. The pane was not failing to
+paint; **there was no document window at all.**
+
+With `bSDIMode=1` set and `AllTypes.pdf` open - COM reporting `pages=1 annots=20`,
+`GetAVPageView()` returning a live view - the leg enumerated every top-level window owned by
+every Acrobat process and found exactly **one**:
+
+```
+candidate hwnd=9769156 pid=58576 3840x2064 class=AcrobatSDIWindow title='Adobe Acrobat (64-bit)'
+```
+
+That is the empty application shell. No document window existed, so no amount of
+`BringToFront`, tab selection, zoom or waiting could ever have produced a page. Every
+window property was correct because the window we were photographing was real - just not
+the document's.
+
+Launching Acrobat with the file as a **command-line argument** creates one immediately:
+
+```
+candidate hwnd=8066690 pid=67144 3840x2064 class=AcrobatSDIWindow title='AllTypes.pdf - Adobe Acrobat (64-bit)'
+...
+waiting for page paint: bright fraction 0.5005
+page painted after 2s
+captured page 1/1 -> AllTypes.png (281858 bytes, settled=True, frames=4, bright=0.5005)
+```
+
+First non-zero bright fraction in the project's history. `-LaunchViaCommandLine` on
+`AcrobatLeg.ps1` selects this path.
+
+#### The remaining blocker: the two launch paths are mutually exclusive
+
+Once Acrobat is running from a command-line launch, `New-Object -ComObject AcroExch.App`
+fails with `0x80080005 CO_E_SERVER_EXEC_FAILURE` - the running instance does not serve
+automation. So today the harness can have **either** the annotation scan (IAC, no picture)
+**or** the picture (command line, no annotation scan). Under `-LaunchViaCommandLine` COM is
+best-effort: when it is unavailable the leg still places, proves and photographs the real
+document window, and reports `pages`/`annots` as null rather than inventing them.
+
+The likely cause is Acrobat's **Protected Mode** sandbox (`bProtectedMode=1` is set on this
+install; Adobe's guidance is that IAC/OLE requires it off). That was **deliberately not
+changed** - disabling a sandbox on the owner's daily workstation is a security decision, not
+a harness convenience. It needs an explicit owner call. Until then, a two-phase run (IAC
+pass for annotation counts, close, command-line pass for renders) is the obvious workaround
+and is **not yet built**.
+
+#### Two smaller findings from the same session
+
+- Acrobat raises a modal **`Scanned Page Alert`** dialog (class `#32770`, 744x240) over the
+  document on every command-line open of `AllTypes.pdf`. It did not block this capture, but
+  it sits mid-frame and will contaminate any vision review of this fixture.
+- Acrobat's Comments panel counts **19** comments where the IAC annotation scan counts
+  **20**. Unexplained; worth pinning down before either number is treated as authoritative.
+
+#### First vision review: FAIL, with a large caveat
+
+`vision-review.mjs` on the render returned `overall: fail` (`qwen3.8:27b`): `page-renders`,
+`markups-visible` and `geometry-on-page` pass; `markups-not-empty-boxes`, `text-legible` and
+`measurements-legible` fail, on "overlapping, illegible annotations and empty placeholder
+boxes in the bottom-left corner".
+
+Do not read that as a proven redline defect. Two confounders have to be removed first:
+(1) the capture is the **whole application window** - left tool rail, right Comments panel,
+title bar - not the page rectangle, so the model is reviewing chrome it was never given a
+checklist for; cropping to the page before review is the obvious fix and is not yet done.
+(2) `AllTypes.pdf` is a synthetic every-annotation-type fixture whose markups genuinely do
+overlap in one corner by construction. The harness's own rule applies: a FAIL is a prompt to
+look at the named page, not proof of a defect.
+
+Bluebeam's Script Engine remains gated behind a higher subscription tier - `ScriptEngine.exe`
+exits `-4` with "This feature requires a maximum subscription level" for any invocation.
+`BluebeamGuiLeg.ps1` (GUI automation via the same capture helper) is committed but **has not
+been run**.
+
+Ceiling: the vision review is a screening layer, not an oracle - a FAIL is a prompt to look
+at the named page, not proof of a defect.
+
 ## Tier 1.5 — Mocked-IPC frontend harness (`tools/gui-harness.mjs`)
 
 Loads the real Vite dev app in headless Chromium with a `window.__TAURI_INTERNALS__` shim
