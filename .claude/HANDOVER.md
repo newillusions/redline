@@ -1,6 +1,335 @@
 # Redline - Handover Notes
 
-## Current Status
+## Current Status (2026-08-31, dispatched session - v0.3.15 release + macOS install)
+
+**Owner-authorized ("push the new redline build when it's ready, install it on the Mac").
+Shipped v0.3.15 from main@29116fc0 - bundles #85 (crossviewer harness), #86 (search parity),
+#87 (multicycle fidelity + CountSet.color fix), #88 (FreeText /C fix). Tag pushed to both
+remotes, GitHub Actions build green (run 33401479243, ~15min), Forgejo release v0.3.15
+published (4 assets), update.json live on GitHub main. Installed to
+`/Applications/Redline.app` on mr-mac-mini (fresh install), version confirmed 0.3.15 via
+Info.plist, process launched and stayed running.**
+
+Gotcha for next release: only the git TAG needs pushing to `github` remote, not `main` -
+`github/main` only ever receives the bot's `update.json` commits and diverges from
+`origin/main` otherwise (attempting `git push github main` gets correctly rejected,
+non-fast-forward - don't force it, just skip that step).
+
+Gotcha: `gh auth setup-git` wires a correct per-URL `credential.https://github.com.helper`
+into `~/.gitconfig`, but in this environment git did not invoke it when reading from the
+file (git 2.50.1/Apple Git-155) - `git credential fill` failed with "could not read
+Username... Device not configured" even though `gh auth git-credential get` worked
+standalone and the config file was byte-clean. Workaround: pass the same helper via
+`-c` on the command line (`git -c "credential.https://github.com.helper=!/opt/homebrew/bin/gh auth git-credential" push github <ref>`)
+- this worked immediately. Root cause not isolated.
+
+FreeText /C fix verification: GUI-level exercise of the installed app wasn't feasible
+non-interactively (AppleScript/System-Events window targeting hung ~2min, likely an
+unanswerable Accessibility permission prompt). Verified instead at the PDF-dictionary level
+- 10/10 relevant Rust tests (`freetext_c_is_background_not_glyph_colour_for_callout_too`
+and 9 others) pass against cd6ef2d, the exact commit tagged v0.3.15.
+
+**Self-reported incident, contained same turn:** after the AppleScript hang, a fallback
+full-screen `screencapture -x` (no window isolation) briefly exposed unrelated private
+content (mail inbox subject lines/names, other app windows) alongside the Redline window.
+Recognized immediately, deleted the file (confirmed gone), never reused as evidence, no
+further capture attempts. Matches the known screen-capture privacy-incident class
+(obs:nwf32d193g3h8d52xxy6) - next session doing any screenshot work on an owner-used Mac
+should target the specific window via a non-Accessibility-dependent method (e.g. Quartz
+window list) rather than falling back to full-screen.
+
+KB: `observation:r261uz46h7uhwlj49soo`. Mission record narrative + `ns-freetext-c-fix` /
+`ns-search-parity` / `ns-multicycle-fidelity` next-steps updated to reflect release.
+
+---
+
+## Current Status (2026-08-31, dispatched session - FreeText /C background-colour fix)
+
+**Dispatched by team-lead on a live owner-witnessed defect (mr-desktop Acrobat, verbatim):
+"when I selected and moved the comment from redline, the entire comment block filled with
+blue and became unreadable." PR #88 open, mergeable, gates green, head
+`f87274ce89939cf7c3d1bbea704d8db15ed802f7`, base `main@0c5261ffa1686a9d8c79072b85a25a837003535f`
+- https://forge.mms.name/emittiv/redline/pulls/88. NOT merged (dispatch scope).**
+
+Root cause (`markup/annotation.rs` `to_annotation_dict`): `/C` was written as
+`appearance.color` (stroke/glyph) unconditionally for every subtype. Per ISO 32000-1
+§12.5.6.6, `/C` on a FreeText annotation is the BACKGROUND colour (same role `/IC` plays
+for Square/Circle), not stroke. redline's own renderer never showed the bug (reads
+`color`/`fill` straight from the model, never from `/C`), but Acrobat regenerates the
+appearance from the dictionary on any move/edit and painted the stroke colour as a solid
+background.
+
+Fix: for `Text|Callout`, `/C` now carries `appearance.fill` (background) when set, omitted
+when unset; glyph colour moved to a new private `/RLTextColor` key. Read side: 3 cases -
+post-fix file (`/RLTextColor` present), pre-fix redline file (`/RLType` present, no
+`/RLTextColor` - `/C` still read as glyph colour, self-heals next save), foreign file (no
+`/RL*` markers - `/C` read as real background, glyph best-effort recovered from a foreign
+`/DA`'s `rg` operator via new `color_from_da` helper). 10 new/updated tests; full lib suite
+524/524 passing (incl. `fidelity_matrix`/`multicycle_fidelity`, unaffected); fmt+clippy
+clean. Only file touched: `src-tauri/src/markup/annotation.rs` (+320/-8 vs origin/main).
+
+`bb_interop_conformance.rs` (real-Bluebeam-corpus harness) NOT run - gated on
+`bench/corpus/btx/`, machine-local/gitignored, absent in this environment.
+
+KB: `observation:d487fa2eh4fyu712pd5x` (solution, project-scoped). Mission record's
+`ns-freetext-c-fix` next-step marked done.
+
+---
+
+## Current Status (2026-08-31, dispatched session - multi-cycle markup fidelity harness + a real fix)
+
+**Dispatched by team-lead to reproduce the owner's "big issue" verbatim - save/close/reopen,
+edit a markup, save/close/reopen again shows inconsistencies - as a real disk-backed harness,
+and fix whatever it caught. PR #87 open, mergeable, gates green, head
+`d0c566c5e236458b8aad5cd96a319a45e245b853`, base `main@83d36afbc2b727e16e4a70f7afd87ef19bb7555c`
+- https://forge.mms.name/emittiv/redline/pulls/87. NOT merged (dispatch scope).**
+
+New test module `document::annots::tests::fidelity_matrix::multicycle_fidelity` (3 tests), all
+through real `save_with_markups`/`load_markups_from` disk round trips (not the existing
+in-memory single-cycle test): per-type gen1(create)/gen2(edit the reloaded value)/gen3(idempotent
+re-save) for all 20 `MarkupType` variants; a combined-document case proving an edit to a SUBSET
+of markups leaves the rest byte-stable across generations; and the existing single-cycle
+orphaned-popup test extended across two real edit generations. Structural invariants re-checked
+every generation: no duplicate managed annots, `/Rect == /AP/BBox`, and (main already has real
+`/IRT`+`/RT`/`Group` PDF group linkage, design doc 2026-08-11 - discovered mid-session, see
+below) a grouped follower's `/IRT` resolves to a currently-present head.
+
+**Harness went red on first run, as expected - the owner has seen this bug.** Root cause:
+`CountSet.color` (`markup/annotation.rs`) was never persisted on its own PDF key - it was
+re-derived from `/C` (== `appearance.color`) on every read. Editing a `MeasurementCount`
+marker's own stroke colour - an ordinary restyle, not a count-set edit - silently rewrote
+`count_set.color` on that marker's next reload, and since `count_set.id` ties multiple markers
+together, this could corrupt ANOTHER marker's set-colour without it ever being touched. Fixed:
+persist via a dedicated `/RLCountSetColor` key, fall back to `/C` for pre-fix files.
+
+**Method note - worktree/branch mismatch, worth reading before the next dispatch into this
+repo:** the shared working directory at dispatch time was checked out on
+`fix/bb-interop-datamodel-wave` (1 local unpushed commit ahead of its own origin, itself
+diverged from `main`), not `main` as instructed. Built the harness there first; discovered
+main already had substantial functionality (the `/IRT`/`/RT` group linkage above) absent from
+that branch - the tell that the base was wrong. Recovered before pushing anything: restored the
+shared working tree to its exact original state, built a fresh `git worktree add <path> -b
+<branch> origin/main`, reapplied the change there (1 trivial EOF-only patch conflict), extended
+the harness for main's own group feature, re-ran every gate against the correct base. **Check
+which branch a dispatched session actually lands on before writing code** - `git log <cwd>
+--oneline -3` vs the instructed base, not just trusting the checkout.
+
+**Still open (owner-gated):** an in-GUI smoke test - apply a markup, save/close/reopen, edit,
+save/close/reopen again - to confirm the reported symptom is gone. This fix addresses ONE
+verified drift class (Count-marker colour); it is not proven to be the ONLY cause of the
+owner's original report.
+
+KB: `observation:9e5kk1bpwe6z5l0o5qbl` (pinned, project-scoped). Mission record's
+`ns-multicycle-fidelity` next-step marked done; `current_focus` updated.
+
+---
+
+## Current Status (2026-08-30, dispatched session - cross-viewer harness: both legs proven, first-ever Revu render)
+
+**Dispatched by team-lead to run the cross-viewer capture for real on mr-desktop (owner-idle
+window, Martin: "mr-desktop idle"). PR #85 unchanged, head `81f1aaf10f8ee5911fec72718187bdb5781249ac`,
+not merged (dispatch scope).**
+
+Acrobat and Bluebeam Revu were already running as MARTIN'S OWN live processes when the run
+started (he'd opened them himself to help with the test). Both harness scripts refuse/risk
+touching a session they didn't start (Revu hard-refuses; Acrobat's command-line-launch mode
+has a latent gap that could photograph whatever tab Martin currently had open - same failure
+class as the 2026-08-29 Teams-photograph incident). Reported the blocker instead of pushing
+through. Martin's direct reply: **"kill acrobat+revu"** - re-verified each of the 3 named PIDs
+by process name immediately before killing, `Stop-Process` by PID only (never by name), machine
+confirmed clean before either leg ran.
+
+**Both legs then PASSED, first time in the same session:**
+- **Acrobat** (command-line launch, `-LaunchViaCommandLine`): real page render, bright fraction
+  0.5005, verified-on-top 5/5, painted in 2s, 274,200 b. COM/IAC still unavailable in this launch
+  mode (`0x80080005 CO_E_SERVER_EXEC_FAILURE`) - matches the already-documented limitation, not new.
+- **Bluebeam Revu GUI leg** - **first time this leg has ever completed successfully.** Launched,
+  placed on DISPLAY1, render settled (6 polls), captured 170,607 b, closed itself gracefully
+  (WM_CLOSE). Zero dialogs, zero errors.
+
+**New finding, NOT yet root-caused:** the two renders disagree. Acrobat shows the full markup
+set (2 Highlight bars + a lower-left cluster of Rectangle/Arrow/Text/StampDynamic). Revu shows
+ONLY the 2 Highlight bars - the lower-left cluster is blank in Revu's main viewport, though
+Revu's own page thumbnail hints the content exists. Not flagged as a script error
+(`settled=true`, 0 dialogs). Could be a genuine Bluebeam-interop rendering defect (exactly what
+G9 exists to catch) or a capture-viewport artifact - flagged for follow-up, not diagnosed.
+
+Artifacts (both renders, both results.json, a comparison-summary.md) staged at
+`/Volumes/base/clouds/oc/Personal/Sync/claude/redline-crossviewer-2026-08-30/`. All 7
+`redline-crossviewer-*` scheduled tasks confirmed Disabled at end; machine confirmed clean
+(0 Acrobat/AcroCEF/RdrCEF/Revu). Task arguments that were temporarily extended for both legs
+were restored exactly (`RESTORE_OK: True` both times). KB observation:
+`observation:6vlfocvtwpz58dov3fif`.
+
+**Next step for a future session:** investigate the Revu render-completeness gap - is it a real
+interop defect (crop + re-run vision-review on both renders would be the cheapest next probe)
+or a viewport/zoom artifact of the automated capture.
+
+---
+
+## Current Status (2026-08-29, dispatched session - E2E DirectEval rewrite, eliminates the evaluate_js hang)
+
+**Dispatched by team-lead to continue the E2E harness work below (PR #83), picking up from a
+root-cause brief written by a prior session that was itself blocked by a mid-session TCC
+filesystem-access revocation before it could implement anything. PR #84 open, mergeable, CI
+green (test-rust 33s, test-frontend 26s), head `e8aa4762d5ce78e9efdb67a9a41d1968857411d6`, base
+`main@ea26131f` - https://forge.mms.name/emittiv/redline/pulls/84. NOT merged (dispatch scope).**
+
+**The evaluate_js hang (item 3 in the entry below) is FIXED.** Rewrote
+`e2e/specs/app-launch.spec.js` to eliminate every WebdriverIO command that routes through
+`tauri-plugin-wdio-webdriver`'s `evaluate_js` (`browser.$()`, `.isExisting()`, `.getText()`,
+`.getAttribute()`, `.click()`, `.setValue()`, `.action("pointer", ...)`, sync `browser.execute()`)
+and replaced them exclusively with `browser.tauri.execute()` (DirectEval, `callAsyncJavaScript`-
+backed, with the crate's own 4-attempt reclaim-retry) - every element query/click/value-set now
+runs as plain DOM ops inside DirectEval callbacks, and the rectangle-markup drag dispatches a
+real `PointerEvent` down/move/up sequence directly on `svg.markup-overlay` from inside one
+DirectEval call.
+
+**Verified 4/4 consecutive `npm run e2e` runs against the UNMODIFIED `wdio.conf.js`**: spec 1
+passes reliably in ~30s every time, zero hangs (was 100% hang rate at 60-140s on every attempt).
+An ad-hoc check with `PDFIUM_DYNAMIC_LIB_PATH` set (not committed) proved the full interaction
+rewrite works end-to-end - one clean run, all 3 specs green in 261ms including the real pointer
+drag producing a persisted Rectangle markup via `list_markups` over real IPC - but 3 further such
+runs hit a SEPARATE, genuinely intermittent PDFium-specific regression (`before()` never reaching
+any known UI state). This DEFINITIVELY ANSWERS the open question in docs/TESTING.md's Round 3:
+it is NOT the same evaluate_js bug (if it were, the DirectEval fix would have closed it the same
+way it closed spec 1). Left unresolved, documented, out of this PR's scope.
+
+**Specs 2/3 still fail on this Mac's default `npm run e2e`** (no PDFium bundled - the
+pre-existing, separately-scoped `tauri build --no-bundle` resource gap named in the entry below)
+- but now fail FAST and DETERMINISTICALLY on a real named error (`.error-banner` = "PDFium
+dynamic library not found"), never on a hang. That is the actual deliverable here: the harness
+tells the truth about what's broken instead of timing out uninformatively.
+
+Full detail + evidence trail: `docs/TESTING.md` "Round 4". KB observation:
+`observation:438zgj9xgz6d0rs3i9wl`. Mission record `next_step_elem ns-ui-test-harness` updated
+to `done`.
+
+Gates run: `cargo test --workspace` 545 passed, 0 failed. `cargo clippy --workspace --all-targets
+-D warnings` clean. `npm test` 749 passed/46 files. `npm run check` 0 errors (23 pre-existing
+warnings untouched).
+
+---
+
+## Current Status (2026-08-29, dispatched session - E2E crash fix + harness bridge, resumed after usage-limit kill)
+
+**Dispatched by team-lead to resume the 2026-08-28 S2b activation E2E work. PR #83 open,
+mergeable, head `fe7bf44`, base `main@0995984` - https://forge.mms.name/emittiv/redline/pulls/83.
+NOT merged (dispatch scope).**
+
+This dev Mac IS now activated (a real, owner-issued activation code was entered through the
+real ActivationGate UI in the prior session; the token persists under
+`~/Library/Application Support/com.emittiv.redline/license/activation.json`). Two real,
+independent bugs were found and fixed on top of that; a third, deeper one was found and
+documented but NOT fixed - `npm run e2e` still does not produce a real pass.
+
+1. **Fixed a real SIGABRT crash.** Root-caused via `fern` 0.7.1's own source: its
+   `backup_logging` panics if BOTH a log write AND its stderr fallback fail - which happened
+   under `@wdio/tauri-service`'s piped-stdio spawn (stdout/stderr both EPIPE), and our own
+   `panic_guard.rs` hook then re-triggered the SAME failure by calling `log::error!` again
+   while already unwinding the first panic - a panic-while-panicking, unconditionally fatal in
+   Rust. Fixed: wrapped the hook's reporting calls in `catch_unwind`
+   (`run_without_escalating`). 5 new unit tests reproduce the double-panic shape directly.
+
+2. **Fixed "Tauri core.invoke not available after 5s timeout"** blocking 100% of wdio
+   commands. `@wdio/tauri-plugin` (the frontend package `@wdio/tauri-service`'s own docs
+   require) was never installed or imported at all. Added as a devDependency, imported in
+   `main.ts` gated on `import.meta.env.MODE === "e2e"` (verified dead-code-eliminated from the
+   production bundle by content-hash). Added `wdio:default`/`core:window:default` capability
+   permissions. Bumped Rust `tauri-plugin-log` 2.0.0-rc→2.9.0 to match a JS version the new
+   package pulled in (real version-skew guard failure, not optional). Verified: zero
+   "Failed to get window states" warnings post-fix (was 100%), real `get_window_states`
+   responses in `~/Library/Logs/com.emittiv.redline/Redline.log`.
+
+3. **NOT FIXED - real blocker remains, root-caused, documented in `docs/TESTING.md`.**
+   `npm run e2e` still hangs identically (reproduced 4/4 consecutive runs - deterministic on
+   this Mac). `browser.$()`/`isExisting()` routes through the third-party
+   `tauri-plugin-wdio-webdriver` crate's `evaluate_js`, which uses plain
+   `WKWebView.evaluateJavaScript(_:completionHandler:)` - its completion never fires under a
+   background-spawned window (zero log activity for the full 60s wait, matching 2×30s script
+   timeouts exactly). `browser.tauri.execute()` (DirectEval, `callAsyncJavaScript` +
+   message-handler) DOES complete - proven by fix #2 above working. **Concrete next step**
+   (not attempted this session): rewrite `e2e/specs/app-launch.spec.js`'s element queries to
+   use DirectEval instead of `browser.$()`. Spec 3's real pointer-drag
+   (`browser.action("pointer", ...)`) is a separate Actions-API endpoint, not audited.
+
+Gates run: `cargo test -p redline` 515 passed (9 in `panic_guard::tests`), `cargo test
+--workspace` all green, `cargo clippy --workspace --all-targets -D warnings` clean, `npm test`
+749 passed/46 files, `npm run check` 0 errors (added `src/vite-env.d.ts`, was missing
+entirely), `npm run e2e:build` compiles clean. KB observation: `observation:bfqepdfj9qulk023rv6y`.
+
+---
+
+## Current Status (2026-08-28, dispatched session - WDIO harness + grouped-markups recovery)
+
+**Dispatched by team-lead, two deliverables, no merges (per dispatch scope).**
+
+1. **Grouped/layered markups was NOT lost - it was already merged.** The 2026-08-21 recon
+   note below ("stalled 10 days, environment access block") was stale. Verified: branch
+   `fix/grouped-layered-markups` (commit `20d308f`) was merged to `main` via PR #79 (merge
+   commit `5421489961d0902e015a24cff28fe8ffce1ff377b`) on **2026-08-11 itself** - the same
+   day it was built. A duplicate PR #80 opened later found and self-closed on the same
+   fact. The "not pushed" state was just a stale LOCAL clone (`git fetch` + fast-forward
+   fixed it in seconds). Mission record `next_step_elem ns-grouped-layered-markups-2026-08-11`
+   marked `done`.
+
+2. **Tier-2 real-app WDIO E2E harness adopted** from `satchel-gui`'s PR #25 pattern
+   (owner-authorised 2026-08-22). PR **#82 open**, mergeable, head `57a5d7f`, base
+   `main@3b486d4` - https://forge.mms.name/emittiv/redline/pulls/82. NOT merged (orchestrator
+   owns merge/deploy). Full battery green: `cargo test --workspace` 534/0/18-ignored,
+   clippy 0, `npm test` 749/749, `npm run check` 0 errors. `npm run e2e` produced a REAL
+   WebKit/macOS WebDriver session against the compiled binary (Session ID
+   `dc138915-d84f-420c-8e60-830024c8bf40`).
+   - **Important limitation, documented not hidden** (`docs/TESTING.md`): this dev Mac has
+     never been activated against the real S2b production license service (no token under
+     `~/Library/Application Support/com.emittiv.redline/`). Spec 1 (reaches a real terminal
+     state) passes for real. Specs 2-3 (open fixture + render; place a Rectangle markup and
+     verify it persists) correctly report `pending` via `this.skip()` - producing an
+     activation code is a production action, not attempted. **Next session with a
+     licensed/grace device: re-run `npm run e2e` to get a true pass on specs 2-3.**
+   - New files: `wdio.conf.js`, `src-tauri/tauri.e2e.conf.json`, `e2e/specs/app-launch.spec.js`,
+     `e2e/fixtures/e2e-sample.pdf`, `docs/TESTING.md`. One additive test hook:
+     `data-doc-id` on `Viewport.svelte`'s `.viewport-root`.
+
+---
+
+## Current Status (2026-08-21, recon run - read-only, superseded above for the grouped-markups item)
+
+**First `/recon` run for redline, dispatched by the orchestrator.** No code changes - this
+was a read-only competitive/currency study. Full report:
+`/Users/martin/dev-reports/2026-08-21-recon-redline.md`; KB observation
+`observation:8jugmmbiqp4rkp61z3ey`.
+
+**Verdict: fundamentals solid.** M1-M6 shipped, 0 open PRs (confirmed via `list_pull_requests`),
+main at `26807f4` - PR #78 already closed the BB-interop harness's first-run findings (`/F`,
+`/DA`, `/RC`, `/BE`, `/OC` all now preserved on round-trip), so the mission record's
+`current_focus` (still describing those as open) was stale and has been refreshed.
+
+**Two proposals added to the mission record's `next_steps` (both `dispatch_state: proposed`,
+NOT yet authorized/dispatched):**
+1. `recon-2026-08-pdfium-upgrade` - move off `pdfium-render` 0.8.28 (currently 2 minors behind;
+   0.9.x fixes the lifetime/threading issues behind this project's own documented SIGSEGV and
+   debug-mode-panic traps, and 0.8.32+ added native Form XObject support redline hand-rolled a
+   workaround for). Medium effort.
+2. `recon-2026-08-ai-diff-summary` - scope an AI-assisted summary on top of the existing M6
+   Compare panel (Bluebeam's new 2026 Max tier sells exactly this as its headline feature).
+   Effort unknown - needs scoping before any build.
+
+**Explicitly considered and dropped** (see report for full reasoning): real-time
+collaboration/cloud sync (already a deliberate v1 non-goal, spec §2) and AI-driven takeoff
+automation (wrong job - redline's spec scopes takeoff as supporting, not primary; that's a GC
+estimating problem, not this project's).
+
+**Process finding, not a recon proposal (already in-flight, just stalled):**
+`fix/grouped-layered-markups` (the 33/77-corpus grouped-annotation gap) was designed and built
+2026-08-11 with a full green test battery, but was never pushed to an open PR - blocked
+mid-session on environment access, and has sat unshipped for 10 days. Mission record still
+shows `ns-grouped-layered-markups-2026-08-11` as `dispatched`. Worth the orchestrator checking
+whether the environment block has cleared.
+
+---
+
+## Current Status (previous, 2026-08-11 - PR #77/#78 wave, superseded above where noted)
 
 **PR #77 (self-service Bluebeam-interop validation harness, new dispatch 2026-08-11)
 open, mergeable, head `df4c727e83f6637e2f39fbe95dcbe8f381c71396`, based on
@@ -1182,3 +1511,67 @@ Before the first tagged Windows/macOS release:
 
 ---
 *Updated: 2026-08-06 (PR #69: image-aware Optimize - real JPEG downsample+recompress fixes the "reduced by 9kb" report; PR #67/#68 now confirmed merged to main)*
+
+## Cross-viewer harness — Acrobat renders (2026-08-30)
+
+**Status: SOLVED, with one owner-gated blocker.** Acrobat produced its first real page render
+under the harness. Commit `81f1aaf` on `feat/crossviewer-automated-harness` (PR #85, not merged,
+CI not checked).
+
+Root cause: **IAC's `AVDoc.Open` never creates a document window.** With the doc open and COM
+reporting `pages=1 annots=20`, enumerating every top-level Acrobat window found exactly one —
+the empty shell `'Adobe Acrobat (64-bit)'`. Nothing existed that could paint. Launching Acrobat
+with the file as a command-line argument creates `'AllTypes.pdf - Adobe Acrobat (64-bit)'`, which
+paints in 2s: `bright=0.5005`, `AllTypes.png` 281,858 b, verify-on-top 5/5.
+
+**Owner-authorised host pref (outside the repo):** `HKCU\Software\Adobe\Adobe Acrobat\DC\AVGeneral`
+→ `bSDIMode` REG_DWORD **absent → 1**. Backup `H:\redline-crossviewer\backup-acrobat-prefs-20260830-051402.reg`;
+rollback = delete the value. It removed the Home tab strip but was NOT sufficient on its own.
+
+**Blocker (needs Martin):** IAC and command-line launch are mutually exclusive —
+`AcroExch.App` fails `0x80080005` once Acrobat runs normally. So annotation counts OR renders,
+not both. Likely Protected Mode (`bProtectedMode=1`); disabling that sandbox on his daily
+workstation was deliberately not done.
+
+### Next Steps
+1. Decide Protected Mode, or build the decision-free two-phase run: IAC pass for counts → close → command-line pass for renders (as of 2026-08-30)
+2. Crop captures to the page rectangle before vision review — the current capture is the whole app window (tool rail + Comments panel), which confounded the first review into a FAIL (as of 2026-08-30)
+3. Explain the count discrepancy: Acrobat Comments panel says 19, IAC annotation scan says 20 (as of 2026-08-30)
+4. Handle the modal `Scanned Page Alert` dialog Acrobat raises on every command-line open of AllTypes.pdf (as of 2026-08-30)
+5. Prune the mission record — 71 next_steps, API is emitting code-churn lint warnings (as of 2026-08-30)
+
+*Batch of 24 not started. mr-desktop left clean: Acrobat 0, AcroCEF 0, RdrCEF 0, Revu 0, all tasks Disabled, task args restored.*
+
+---
+*Updated: 2026-08-30*
+
+## Cross-viewer harness — full clean run BLOCKED, mr-desktop wedged (2026-08-31 ~18:12-18:35)
+
+A subsequent run on 2026-08-31 (report generated 11:59:53Z, before this entry) got 14/24
+Acrobat renders + 24/24 Revu (Fit Page/crop from PR #85 confirmed working live) but was left
+running - Acrobat with 16 open document windows plus one unidentified modal dialog (class
+`#32770`, 496x170), Revu alive but with 0 enumerable windows. A follow-up dispatch to run
+the "owed full clean" pass (post PR #85 + #88) found this state on arrival and could NOT
+clear it: `CloseAcrobat.ps1` hung twice (90s and 150s timeouts) with `GetNumAVDocs()` never
+returning - consistent with the modal dialog blocking Acrobat's COM thread, a different
+failure shape than the documented IAC-vs-command-line 0x80080005 mutual exclusivity above.
+This also blocks restaging the corpus (`scp` fails on files Acrobat has open).
+
+New recovery script added (uncommitted, in worktree
+`.claude/worktrees/crossviewer-capture-run/`): `tools/crossviewer/win/CloseRevu.ps1` (WM_CLOSE
+companion to `CloseAcrobat.ps1`) — ran clean but found 0 windows to close on Revu, so it
+could not recover Revu either. `DiagWindows.ps1` (read-only window dump) added alongside it.
+
+**PR #88 (FreeText `/C` fix) confirmed merged and present** (`63ad31e`, ancestor of HEAD
+`29116fc`); fresh 22-file corpus regenerated reflecting it (`Callout.pdf`/`Text.pdf` grew
+vs the stale Aug-29 corpus, matching the new `/RLTextColor` key) — but no viewer render
+exists yet to visually confirm the fix, since that's exactly what's blocked.
+
+**Needs Martin**: hands-on look at mr-desktop (dismiss the unknown dialog, close Acrobat's
+16 tabs, restart Revu) or explicit authorization to force-terminate named PIDs (Acrobat
+58484/52968/5692-orphan + 6 AcroCEF children, Revu 54320). Full detail:
+`observation:oezc33hr7nuvvxk6nb26`. Corpus + scripts already staged on mr-desktop; all
+`redline-crossviewer-*` tasks confirmed left Disabled.
+
+---
+*Updated: 2026-08-31*
