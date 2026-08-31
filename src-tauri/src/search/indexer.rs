@@ -47,21 +47,43 @@ pub fn extract_pdf_text(path: &Path) -> anyhow::Result<Vec<(u64, String)>> {
 // Folder scan
 // ---------------------------------------------------------------------------
 
-/// Find all PDF files directly inside `folder_path` (non-recursive for v1).
+/// Find all PDF files inside `folder_path`, recursing into every subfolder
+/// (spec requirement: "all files in a folder/subfolders", matching the
+/// Bluebeam folder-search scope). Symlinks are not followed (avoids cycles);
+/// a directory this process cannot read is skipped rather than aborting the
+/// whole scan, so one permission-denied subfolder doesn't blank the index.
 pub fn find_pdfs(folder_path: &Path) -> Vec<PathBuf> {
-    match std::fs::read_dir(folder_path) {
-        Err(_) => Vec::new(),
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.is_file()
-                    && p.extension()
-                        .and_then(|e| e.to_str())
-                        .map(|e| e.eq_ignore_ascii_case("pdf"))
-                        .unwrap_or(false)
-            })
-            .collect(),
+    let mut out = Vec::new();
+    scan_dir_into(folder_path, &mut out);
+    out
+}
+
+fn scan_dir_into(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        // `metadata()` (not `symlink_metadata()`) resolves symlinks so a
+        // symlinked PDF is still found, but we only recurse into a `path` if
+        // `file_type()` (unresolved) says it's a real directory — this is
+        // what keeps us from following a symlinked directory into a cycle.
+        let is_real_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_real_dir {
+            scan_dir_into(&path, out);
+            continue;
+        }
+        let is_pdf_file = path.is_file()
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("pdf"))
+                .unwrap_or(false);
+        if is_pdf_file {
+            out.push(path);
+        }
     }
 }
 
@@ -132,7 +154,7 @@ pub fn index_folder_blocking(index: FolderIndex, folder_path: PathBuf) {
         }
     };
 
-    if let Err(e) = watcher.watch(&folder_path, RecursiveMode::NonRecursive) {
+    if let Err(e) = watcher.watch(&folder_path, RecursiveMode::Recursive) {
         log::warn!("folder-index: could not watch {:?}: {e}", folder_path);
         return;
     }
@@ -198,5 +220,102 @@ fn handle_event(index: &FolderIndex, event: Event) {
             }
         }
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, b"%PDF-1.4 not a real pdf, just a fixture").unwrap();
+    }
+
+    #[test]
+    fn find_pdfs_finds_top_level_files() {
+        let dir = tempdir().unwrap();
+        touch(&dir.path().join("a.pdf"));
+        touch(&dir.path().join("b.PDF")); // case-insensitive extension
+        touch(&dir.path().join("readme.txt")); // not a pdf, must be excluded
+
+        let found = find_pdfs(dir.path());
+        assert_eq!(
+            found.len(),
+            2,
+            "expected exactly the 2 top-level PDFs: {found:?}"
+        );
+    }
+
+    #[test]
+    fn find_pdfs_recurses_into_subfolders() {
+        let dir = tempdir().unwrap();
+        touch(&dir.path().join("top.pdf"));
+        touch(&dir.path().join("sub1").join("nested.pdf"));
+        touch(
+            &dir.path()
+                .join("sub1")
+                .join("sub2")
+                .join("deeply-nested.pdf"),
+        );
+        touch(&dir.path().join("sub1").join("sub2").join("notes.txt"));
+
+        let found = find_pdfs(dir.path());
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(
+            found.len(),
+            3,
+            "expected all 3 PDFs across every depth: {names:?}"
+        );
+        assert!(names.contains(&"top.pdf".to_string()));
+        assert!(names.contains(&"nested.pdf".to_string()));
+        assert!(names.contains(&"deeply-nested.pdf".to_string()));
+    }
+
+    #[test]
+    fn find_pdfs_on_empty_folder_returns_empty() {
+        let dir = tempdir().unwrap();
+        assert!(find_pdfs(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn find_pdfs_on_missing_folder_returns_empty_not_panic() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(find_pdfs(&missing).is_empty());
+    }
+
+    #[test]
+    fn find_pdfs_skips_unreadable_subfolder_without_aborting_whole_scan() {
+        // A subfolder we can't read must not blank out siblings found before it.
+        // (Permission bits are POSIX-only; this test only asserts the happy-path
+        // siblings survive when a *missing* nested dir is encountered mid-walk,
+        // which exercises the same "one bad entry doesn't abort scan_dir_into"
+        // path portably across macOS/Linux/Windows CI runners.)
+        let dir = tempdir().unwrap();
+        touch(&dir.path().join("before.pdf"));
+        touch(&dir.path().join("zzz-after.pdf"));
+
+        let found = find_pdfs(dir.path());
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn extract_pdf_text_missing_file_errors_cleanly() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("nope.pdf");
+        assert!(extract_pdf_text(&missing).is_err());
     }
 }

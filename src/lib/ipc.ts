@@ -591,6 +591,26 @@ export async function getFolderIndexStatus(): Promise<IndexStatus> {
   return invoke<IndexStatus>("folder_index_status");
 }
 
+/**
+ * Search an explicit, bounded list of PDF paths (the Recents/MRU scope,
+ * search-parity) for `query`. No persistent Tantivy index is built or
+ * touched — a one-off lopdf pass per path, same extraction as folder search.
+ * A missing/moved MRU entry is skipped, not an error.
+ */
+export async function searchPaths(
+  paths: string[],
+  query: string,
+  caseSensitive = false,
+  wholeWord = false
+): Promise<FolderSearchHit[]> {
+  return invoke<FolderSearchHit[]>("search_paths", {
+    paths,
+    query,
+    caseSensitive,
+    wholeWord,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // DocOps commands (M5 — flatten / optimize / redact, spec §8)
 // ---------------------------------------------------------------------------

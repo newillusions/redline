@@ -86,6 +86,7 @@
     takeoffStore = new TakeoffStore(),
     searchHits = [],
     activeSearchHitIdx = null,
+    jumpRequest = null,
     initialState = undefined,
     onviewportchange = undefined,
   }: {
@@ -96,6 +97,21 @@
     searchHits?: SearchHit[];
     /** Index into searchHits that is currently focused (rendered with a stronger highlight). */
     activeSearchHitIdx?: number | null;
+    /**
+     * Search-result navigation request (search parity: click-to-navigate).
+     * `nonce` must be bumped on every request — including a repeat click on the
+     * same page/rect — so the $effect below fires even when the target is
+     * unchanged from the last jump. Provide `rect` (PDF user-space, text hits)
+     * to center the viewport on that rect; provide `markupId` (markup hits) to
+     * select the markup instead, reusing the existing selection-chrome
+     * highlight rather than drawing a new one.
+     */
+    jumpRequest?: {
+      page: number;
+      rect?: [number, number, number, number];
+      markupId?: string;
+      nonce: number;
+    } | null;
     /**
      * Viewport state to restore on mount (zoom, pageIndex, scrollX, scrollY).
      * Used by tab switching to preserve per-document view position.
@@ -502,15 +518,23 @@
   // ---------------------------------------------------------------------------
   // Load page size on mount / docInfo change
   // ---------------------------------------------------------------------------
-  async function loadPageSize() {
+  /**
+   * `centerRect`, when given (search-result navigation), centers the viewport
+   * on that PDF-user-space rect instead of the default reset-to-top-left —
+   * requires pageWidthPts/pageHeightPts to already be loaded, so it's applied
+   * AFTER getPageSize resolves, same as the existing reset-scroll branch.
+   */
+  async function loadPageSize(centerRect?: [number, number, number, number]) {
     if (!docInfo) return;
     try {
       const ps = await getPageSize(docInfo.doc_id, pageIndex);
       pageWidthPts  = ps.width_pts;
       pageHeightPts = ps.height_pts;
-      // Reset scroll on page change — but preserve initialState.scrollX/Y on the
-      // very first load so tab-switching restores the scroll position correctly.
-      if (_firstPageLoad) {
+      if (centerRect) {
+        centerOnRect(centerRect);
+      } else if (_firstPageLoad) {
+        // Reset scroll on page change — but preserve initialState.scrollX/Y on the
+        // very first load so tab-switching restores the scroll position correctly.
         _firstPageLoad = false;
       } else {
         scrollX = 0;
@@ -521,6 +545,64 @@
       console.error("getPageSize failed:", e);
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // Search-result navigation (search parity: click-to-navigate + highlight)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Set scrollX/scrollY so `rect` (PDF user space) is centered in the
+   * container, at the current zoom level. Inverse of pdfUserSpaceToScreen's
+   * transform — solving `screenX = pdfX*zoom - scrollX` for scrollX with
+   * screenX pinned to the container centre (same for Y, with the PDF
+   * bottom-left→top-left y-flip).
+   */
+  function centerOnRect(rect: [number, number, number, number]) {
+    const [left, bottom, right, top] = rect;
+    const centerPdfX = (left + right) / 2;
+    const centerPdfY = (bottom + top) / 2;
+    scrollX = centerPdfX * zoom - containerWidth / 2;
+    scrollY = (pageHeightPts - centerPdfY) * zoom - containerHeight / 2;
+    clampScroll();
+  }
+
+  let _lastAppliedJumpNonce = -1;
+
+  /** Navigate to a search-result target: switch page if needed, then center/select. */
+  async function applyJumpRequest(req: {
+    page: number;
+    rect?: [number, number, number, number];
+    markupId?: string;
+  }) {
+    const target = Math.max(0, Math.min(req.page, docInfo.page_count - 1));
+    if (target !== pageIndex) {
+      pageIndex = target;
+      invalidateTiles();
+      await loadPageSize(req.rect);
+    } else if (req.rect) {
+      centerOnRect(req.rect);
+      requestTiles();
+    }
+    if (req.markupId) {
+      // Switch to the select tool FIRST: a separate $effect clears selectedIds
+      // whenever activeTool isn't "select" (see "Clear selection when switching
+      // AWAY from the select tool" below), so setting selection while still on
+      // e.g. the default "hand" tool would be wiped out on that effect's next run.
+      store.activeTool = "select";
+      store.selectedIds = new Set([req.markupId]);
+    }
+  }
+
+  // Fires whenever App.svelte issues a new navigation request (nonce bumped on
+  // every click, including a repeat click on the same result, so this always
+  // re-runs rather than being deduped by object-shape equality).
+  $effect(() => {
+    const req = jumpRequest;
+    if (req && req.nonce !== _lastAppliedJumpNonce) {
+      _lastAppliedJumpNonce = req.nonce;
+      void applyJumpRequest(req);
+    }
+  });
 
   // ---------------------------------------------------------------------------
   // Tile loading

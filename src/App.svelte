@@ -23,7 +23,7 @@
    * Svelte 5 runes: $state / $derived / $effect throughout.
    */
   import "$lib/styles.css";
-  import { onMount, onDestroy } from "svelte";
+  import { onMount, onDestroy, tick } from "svelte";
   import Viewport from "./components/Viewport.svelte";
   import ToolPalette from "./components/ToolPalette.svelte";
   import PropertiesPanel from "./components/PropertiesPanel.svelte";
@@ -33,13 +33,17 @@
   import SavePromptDialog from "./components/SavePromptDialog.svelte";
   import PasswordPromptDialog from "./components/PasswordPromptDialog.svelte";
   import ConfirmDialog from "./components/ConfirmDialog.svelte";
-  import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD } from "$lib/ipc";
+  import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity } from "$lib/ipc";
+  import type { IndexStatus } from "$lib/ipc";
+  import SearchPanel from "./components/SearchPanel.svelte";
+  import { SearchStore, computeViewportSearchOverlay, type UnifiedSearchHit, type SearchGroup, type DocSearchInput } from "$lib/search-store.svelte";
   import { createPasswordCache, getCachedPassword, setCachedPassword } from "$lib/password-cache";
   import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import type { DocumentInfo, ImageQualityPreset } from "$lib/ipc";
   import { MarkupStore } from "$lib/markup-store.svelte";
+  import { buildMarkup } from "$lib/markup-tools";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
   import { DocTabStore } from "$lib/doc-tabs.svelte";
   import type { ViewportSnapshot } from "$lib/viewport";
@@ -57,7 +61,7 @@
   import { getLicenseStatus, checkInIfActivated, isUsable } from "$lib/license";
   import type { LicenseState } from "$lib/license";
   import UndoRedoControls from "./components/UndoRedoControls.svelte";
-  import { resolveUndoRedoShortcut } from "$lib/keyboard-shortcuts";
+  import { resolveUndoRedoShortcut, resolveSearchShortcut } from "$lib/keyboard-shortcuts";
   import { runDocOpAndReseed, formatBytes } from "$lib/docops-handlers";
 
   // ---------------------------------------------------------------------------
@@ -86,6 +90,189 @@
   // Tool Chest (spec "Tools & Tool Sets") - workspace-level, not per-document; one
   // instance lives for the app's lifetime and is shared across every open tab.
   const toolChestStore = new ToolChestStore();
+
+  // ---------------------------------------------------------------------------
+  // Search (search-parity dispatch: current doc / open docs / folder+subfolders,
+  // grouped-by-file results, click-to-navigate, markup-text search layer).
+  // ---------------------------------------------------------------------------
+  const searchStore = new SearchStore({ searchDocument, searchFolder, searchPaths });
+  let searchPanelVisible = $state(false);
+  let searchFolderPath = $state<string | null>(null);
+  let searchFolderIndexStatus = $state<IndexStatus | null>(null);
+  let searchJumpNonce = 0;
+  let viewportJumpRequest = $state<
+    { page: number; rect?: [number, number, number, number]; markupId?: string; nonce: number } | null
+  >(null);
+  let folderIndexPollTimer: ReturnType<typeof setInterval> | null = null;
+
+  function docSearchInput(tab: { docId: string; doc: DocumentInfo; store: MarkupStore }): DocSearchInput {
+    return {
+      docId: tab.docId,
+      label: tab.doc.path.split(/[\\/]/).pop() ?? tab.doc.path,
+      path: tab.doc.path,
+      markups: tab.store.markups,
+    };
+  }
+
+  // Search-result highlight overlay for the active tab (PR #86 review fix,
+  // 2026-08-31: Viewport already renders searchHits/activeSearchHitIdx as
+  // on-page highlight rects — jumpRequest alone only centers the viewport,
+  // it never draws the box the owner's directive explicitly asks for).
+  // Computation lives in computeViewportSearchOverlay (search-store.svelte.ts)
+  // so it's unit-testable without mounting the whole app.
+  const searchOverlay = $derived(
+    computeViewportSearchOverlay(
+      searchStore.groups,
+      searchStore.flatHits,
+      searchStore.activeFlatIndex,
+      activeTab?.docId ?? null,
+      activeTab?.doc.path ?? null
+    )
+  );
+
+  /** Run a search for searchStore.query against searchStore's current scope. */
+  async function runSearch() {
+    if (searchStore.scope === "document") {
+      if (!activeTab) return;
+      await searchStore.run({ scope: "document", doc: docSearchInput(activeTab) });
+    } else if (searchStore.scope === "page") {
+      if (!activeTab) return;
+      await searchStore.run({
+        scope: "page",
+        doc: docSearchInput(activeTab),
+        page: activeTab.viewportSnapshot.pageIndex,
+      });
+    } else if (searchStore.scope === "open") {
+      await searchStore.run({ scope: "open", docs: tabStore.tabs.map(docSearchInput) });
+    } else if (searchStore.scope === "recents") {
+      await searchStore.run({ scope: "recents", paths: recentDocs.map((d) => d.path) });
+    } else {
+      await searchStore.run({ scope: "folder" });
+    }
+  }
+
+  /** Open the search panel (toolbar button / Cmd/Ctrl+F), auto-expanding the left panel. */
+  async function openSearchPanel() {
+    searchPanelVisible = true;
+    if (leftCollapsed) leftCollapsed = false;
+    await tick();
+    (document.querySelector('[data-testid="search-input"]') as HTMLInputElement | null)?.focus();
+  }
+
+  function pollFolderIndexStatus() {
+    if (folderIndexPollTimer) clearInterval(folderIndexPollTimer);
+    folderIndexPollTimer = setInterval(async () => {
+      const status = await getFolderIndexStatus();
+      searchFolderIndexStatus = status;
+      if (status.state.kind !== "Indexing" && folderIndexPollTimer) {
+        clearInterval(folderIndexPollTimer);
+        folderIndexPollTimer = null;
+      }
+    }, 1000);
+  }
+
+  /** Folder-scope search: pick a folder, open its Tantivy index, poll indexing progress. */
+  async function pickSearchFolder() {
+    const selected = await open({ directory: true, multiple: false, title: "Choose a folder to search" });
+    if (!selected || Array.isArray(selected)) return;
+    searchFolderPath = selected as string;
+    searchFolderIndexStatus = await openFolderIndex(searchFolderPath);
+    pollFolderIndexStatus();
+    if (searchStore.query.trim()) await runSearch();
+  }
+
+  /**
+   * A search result was clicked/keyboard-activated: resolve its navigation
+   * target (already-open tab by docId, or a folder-scope file path that may
+   * need opening), switch to it, then hand Viewport a fresh jump request.
+   */
+  async function handleSearchJump(hit: UnifiedSearchHit, _group: SearchGroup) {
+    if (hit.docId) {
+      tabStore.switchTab(hit.docId);
+    } else if (hit.filePath) {
+      await openFilePath(hit.filePath);
+      if (!tabStore.findByPath(hit.filePath)) return; // open failed — openError already shown
+    } else {
+      return;
+    }
+    searchJumpNonce += 1;
+    viewportJumpRequest = { page: hit.page, rect: hit.rect, markupId: hit.markupId, nonce: searchJumpNonce };
+  }
+
+  /** F3 / Shift+F3 — jump to the next/prev result without touching the panel. */
+  function stepSearchResult(dir: "next" | "prev") {
+    const ref = dir === "next" ? searchStore.focusNext() : searchStore.focusPrev();
+    if (ref) void handleSearchJump(ref.hit, searchStore.groups[ref.groupIndex]);
+  }
+
+  /**
+   * "Check Options" -> Highlight Checked (Bluebeam parity, confirmed via the
+   * official "How to Search PDFs" / "How To Use Visual Search" tutorials:
+   * check results, apply Highlight/Underline/Hyperlink/etc to all of them at
+   * once — this build ships Highlight, the rest are named follow-ups).
+   *
+   * Scoped to kind==="text" hits belonging to an ALREADY-OPEN tab (`docId`
+   * set) — a folder/recents-scope hit for a file that isn't open has no
+   * MarkupStore to write into. Auto-opening every referenced file for a bulk
+   * action was judged too surprising for a first pass; skipped hits are
+   * counted and reported rather than silently dropped.
+   */
+  async function applyHighlightToChecked() {
+    const checked = searchStore.checkedHits;
+    if (checked.length === 0) return;
+
+    let identity;
+    try {
+      identity = await getUserIdentity();
+    } catch (e) {
+      docOpsStatus = `Highlight Checked failed: could not load user identity (${e})`;
+      return;
+    }
+
+    let applied = 0;
+    let skipped = 0;
+    const now = new Date().toISOString();
+
+    for (const ref of checked) {
+      const hit = ref.hit;
+      if (hit.kind !== "text" || !hit.rect || !hit.docId) {
+        skipped += 1;
+        continue;
+      }
+      const tab = tabStore.tabs.find((t) => t.docId === hit.docId);
+      if (!tab) {
+        skipped += 1;
+        continue;
+      }
+      const [left, bottom, right, top] = hit.rect;
+      const m = buildMarkup({
+        markupType: "Highlight",
+        page: hit.page,
+        geometry: {
+          Quads: [
+            [
+              { x: left, y: top },
+              { x: right, y: top },
+              { x: left, y: bottom },
+              { x: right, y: bottom },
+            ],
+          ],
+        },
+        appearance: tab.store.draftAppearance,
+        identity,
+        now,
+        id: crypto.randomUUID(),
+      });
+      tab.store.create(m);
+      applied += 1;
+    }
+
+    searchStore.uncheckAll();
+    docOpsStatus =
+      skipped > 0
+        ? `Highlighted ${applied} result${applied !== 1 ? "s" : ""}; skipped ${skipped} not currently open.`
+        : `Highlighted ${applied} result${applied !== 1 ? "s" : ""}.`;
+  }
 
   // Per-operation busy flags (apply to the active tab's document).
   let openError = $state<string | null>(null);
@@ -228,7 +415,10 @@
     await maybeInitializeAppContent(licenseState);
   });
 
-  onDestroy(() => { _dropUnlisten?.(); });
+  onDestroy(() => {
+    _dropUnlisten?.();
+    if (folderIndexPollTimer) clearInterval(folderIndexPollTimer);
+  });
 
   // Panel collapse state
   let leftCollapsed  = $state(false);
@@ -654,6 +844,23 @@
   function handleKeydown(e: KeyboardEvent) {
     const mod = e.metaKey || e.ctrlKey;
 
+    // Cmd/Ctrl+F — open/focus search; F3 / Shift+F3 — next/prev
+    // result. See keyboard-shortcuts.ts for why "next"/"prev" aren't gated on editable
+    // targets (Find-next legitimately fires while e.g. a markup comment field has focus).
+    const searchAction = resolveSearchShortcut(e);
+    if (searchAction === "open") {
+      e.preventDefault();
+      void openSearchPanel();
+      return;
+    }
+    if (searchAction === "next" || searchAction === "prev") {
+      if (searchStore.flatHits.length > 0) {
+        e.preventDefault();
+        stepSearchResult(searchAction);
+        return;
+      }
+    }
+
     // Cmd/Ctrl+Z — undo; Cmd/Ctrl+Shift+Z / Cmd/Ctrl+Y — redo. Resolver returns null (and
     // does nothing here) while a text/callout inline editor or other input has focus, so
     // the field keeps its own native undo (see keyboard-shortcuts.ts).
@@ -719,6 +926,13 @@
       <span class="app-name">Redline</span>
       <button class="btn-toolbar" onclick={handleOpenFile} disabled={isOpening}>
         {isOpening ? "Opening…" : "Open PDF"}
+      </button>
+      <button
+        class="btn-toolbar"
+        onclick={() => (searchPanelVisible ? (searchPanelVisible = false) : void openSearchPanel())}
+        title="Find (Cmd/Ctrl+F)"
+      >
+        {searchPanelVisible ? "🔍 Find ▲" : "🔍 Find"}
       </button>
       <button class="btn-toolbar" onclick={handleSave} disabled={!activeTab || isSaving} title="Save (Cmd/Ctrl+S)">
         {isSaving ? "Saving…" : "Save"}
@@ -851,6 +1065,27 @@
     <!-- Left panel -->
     {#if !leftCollapsed}
       <aside class="panel panel-left">
+        <!-- Search (search-parity: current doc / open docs / folder+subfolders). Placed
+             first — the toolbar Find button / Cmd-Ctrl-F is the primary way in. -->
+        {#if searchPanelVisible}
+          <div class="panel-section panel-section--search">
+            <div class="panel-header">
+              Search
+              <button class="btn-icon-close" onclick={() => (searchPanelVisible = false)} aria-label="Close search">✕</button>
+            </div>
+            <div class="panel-body panel-body-flush">
+              <SearchPanel
+                store={searchStore}
+                folderPath={searchFolderPath}
+                folderIndexStatus={searchFolderIndexStatus}
+                onSearch={runSearch}
+                onPickFolder={pickSearchFolder}
+                onJump={handleSearchJump}
+                onHighlightChecked={applyHighlightToChecked}
+              />
+            </div>
+          </div>
+        {/if}
         <!-- Document History section (MRU list) -->
         <div class="panel-section">
           <div class="panel-header">Recent Documents</div>
@@ -897,6 +1132,9 @@
             takeoffStore={activeTab.takeoffStore}
             initialState={activeTab.viewportSnapshot}
             onviewportchange={handleViewportChange}
+            jumpRequest={viewportJumpRequest}
+            searchHits={searchOverlay.hits}
+            activeSearchHitIdx={searchOverlay.activeIdx}
           />
         {/key}
       {:else}
@@ -1216,6 +1454,30 @@
   .panel-section--secondary {
     flex: 1;
     overflow: hidden;
+  }
+  /* Search is the primary feature while open — give it more room than the
+     default first-child 55% cap, and don't let other sections shrink it. */
+  .panel-section.panel-section--search {
+    flex: 2;
+    max-height: 75%;
+    overflow: hidden;
+  }
+  .panel-section--search .panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .btn-icon-close {
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: inherit;
+    line-height: 1;
+    padding: 0;
+  }
+  .btn-icon-close:hover {
+    color: var(--color-text);
   }
   .panel-body-flush {
     padding: 0;

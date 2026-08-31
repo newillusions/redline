@@ -228,6 +228,7 @@ pub fn run() {
             commands::search::open_folder_index,
             commands::search::search_folder,
             commands::search::folder_index_status,
+            commands::search::search_paths,
             // DocOps commands (M5)
             commands::docops::flatten_document,
             commands::docops::optimize_document,

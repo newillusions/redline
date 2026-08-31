@@ -1,380 +1,351 @@
 // @vitest-environment jsdom
 /**
- * SearchPanel tests (M4 S3 + M4 S4).
+ * SearchPanel tests (search-parity dispatch).
  *
- * - Mounts the real SearchPanel.svelte with controlled props.
- * - Mocks $lib/ipc so search calls are captured, not executed.
- * - S3 covers: initial render, search submission, result list, clear, options,
- *   result click invokes onJump, Escape clears, no-results state.
- * - S4 covers: folder mode tab, folder search call, cross-file results,
- *   folder result click invokes onFolderJump.
+ * Mounts the real SearchPanel.svelte with a REAL SearchStore (deps injected,
+ * matching MarkupStore's/SearchStore's own test convention — no $lib/ipc
+ * mocking needed since SearchStore already owns that boundary).
+ *
+ * Covers: scope tabs, debounced search-as-you-type, Enter-to-search-immediately,
+ * grouped result rendering + collapse, click-to-jump, F3-equivalent next/prev
+ * buttons, markup-kind labeling, folder-picker prompt when no folder chosen.
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/svelte";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, fireEvent, waitFor } from "@testing-library/svelte";
 import { tick } from "svelte";
 import SearchPanel from "./SearchPanel.svelte";
+import { SearchStore, type SearchDeps, type UnifiedSearchHit, type SearchGroup } from "$lib/search-store.svelte";
 import type { SearchHit, FolderSearchHit } from "$lib/ipc";
 
-// ---------------------------------------------------------------------------
-// Mock $lib/ipc
-// ---------------------------------------------------------------------------
-
-const FIXTURE_HITS: SearchHit[] = [
-  { page: 0, rect: [10, 20, 80, 35], snippet: "hello world" },
-  { page: 1, rect: [5, 40, 60, 55], snippet: "hello again" },
-];
-
-const FIXTURE_FOLDER_HITS: FolderSearchHit[] = [
-  { file_path: "/docs/plan.pdf", page_number: 3, snippet: "concrete <b>foundation</b>", source: "lopdf" },
-  { file_path: "/docs/spec.pdf", page_number: 7, snippet: "steel <b>foundation</b> detail", source: "lopdf" },
-];
-
-const mockSearchDocument = vi.fn<
-  (docId: string, query: string, caseSensitive: boolean, wholeWord: boolean) => Promise<SearchHit[]>
->();
-
-const mockSearchFolder = vi.fn<
-  (query: string, limit?: number) => Promise<FolderSearchHit[]>
->();
-
-vi.mock("$lib/ipc", () => ({
-  searchDocument: (
-    docId: string,
-    query: string,
-    caseSensitive: boolean,
-    wholeWord: boolean
-  ) => mockSearchDocument(docId, query, caseSensitive, wholeWord),
-  searchFolder: (query: string, limit?: number) =>
-    mockSearchFolder(query, limit),
-  // other ipc stubs required by potential transitive imports
-  getPageSize: vi.fn(),
-  renderTile: vi.fn(),
-  processRssMb: vi.fn(),
-  getUserIdentity: vi.fn(),
-  openDocument: vi.fn(),
-  closeDocument: vi.fn(),
-}));
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function mountPanel({
-  docId = "doc-1",
-  pageCount = 5,
-  onHits = vi.fn(),
-  onJump = vi.fn(),
-} = {}) {
-  return render(SearchPanel, {
-    props: { docId, pageCount, onHits, onJump },
-  });
+function hit(page: number, snippet = "hit"): SearchHit {
+  return { page, rect: [0, 0, 1, 1], snippet };
 }
 
-function mountPanelWithFolder({
-  docId = "doc-1",
-  pageCount = 5,
-  folderPath = "/docs",
-  onHits = vi.fn(),
-  onJump = vi.fn(),
-  onFolderHits = vi.fn(),
-  onFolderJump = vi.fn(),
-} = {}) {
-  return render(SearchPanel, {
-    props: { docId, pageCount, folderPath, onHits, onJump, onFolderHits, onFolderJump },
-  });
+function fakeDeps(overrides: Partial<SearchDeps> = {}): SearchDeps {
+  return {
+    searchDocument: vi.fn(async () => []),
+    searchFolder: vi.fn(async () => []),
+    searchPaths: vi.fn(async () => []),
+    ...overrides,
+  };
 }
 
-async function typeQuery(input: HTMLElement, value: string) {
-  await fireEvent.input(input, { target: { value } });
-  // Svelte bind:value uses the change event in some environments; cover both.
-  await fireEvent.change(input, { target: { value } });
-  await tick();
+function mountPanel(store: SearchStore, extra: Partial<Parameters<typeof render>[1]["props"]> = {}) {
+  const onSearch = vi.fn(() => {
+    // Simulate App.svelte's real wiring: onSearch triggers the actual store.run()
+    // against whatever context this test's onSearch override doesn't replace.
+  });
+  const onPickFolder = vi.fn();
+  const onJump = vi.fn();
+  const onHighlightChecked = vi.fn();
+  const result = render(SearchPanel, {
+    props: {
+      store,
+      folderPath: null,
+      folderIndexStatus: null,
+      onSearch,
+      onPickFolder,
+      onJump,
+      onHighlightChecked,
+      ...extra,
+    },
+  });
+  return { ...result, onSearch, onPickFolder, onJump, onHighlightChecked };
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+beforeEach(() => {
+  vi.useFakeTimers();
+  try {
+    localStorage.clear();
+  } catch {
+    // ignore
+  }
+});
 
-describe("SearchPanel", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mockSearchDocument.mockResolvedValue(FIXTURE_HITS);
-    mockSearchFolder.mockResolvedValue(FIXTURE_FOLDER_HITS);
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("SearchPanel — scope tabs", () => {
+  it("renders all five scope tabs, Document active by default", () => {
+    const store = new SearchStore(fakeDeps());
+    const { getByTestId } = mountPanel(store);
+    expect(getByTestId("scope-tab-document").getAttribute("aria-selected")).toBe("true");
+    expect(getByTestId("scope-tab-page").getAttribute("aria-selected")).toBe("false");
+    expect(getByTestId("scope-tab-open").getAttribute("aria-selected")).toBe("false");
+    expect(getByTestId("scope-tab-recents").getAttribute("aria-selected")).toBe("false");
+    expect(getByTestId("scope-tab-folder").getAttribute("aria-selected")).toBe("false");
   });
 
-  it("renders the query input and Find button", () => {
-    mountPanel();
-    expect(screen.getByRole("searchbox")).toBeTruthy();
-    expect(screen.getByRole("button", { name: /find/i })).toBeTruthy();
+  it("clicking a scope tab switches store.scope", async () => {
+    const store = new SearchStore(fakeDeps());
+    const { getByTestId } = mountPanel(store, { folderPath: "/plans" });
+    await fireEvent.click(getByTestId("scope-tab-open"));
+    expect(store.scope).toBe("open");
   });
 
-  it("Find button is disabled when query is empty", () => {
-    mountPanel();
-    const btn = screen.getByRole("button", { name: /find/i }) as HTMLButtonElement;
-    expect(btn.disabled).toBe(true);
+  it("clicking Folder with no folder chosen calls onPickFolder", async () => {
+    const store = new SearchStore(fakeDeps());
+    const { getByTestId, onPickFolder } = mountPanel(store, { folderPath: null });
+    await fireEvent.click(getByTestId("scope-tab-folder"));
+    expect(onPickFolder).toHaveBeenCalled();
   });
 
-  it("calls searchDocument with correct args and shows results", async () => {
-    const onHits = vi.fn();
-    mountPanel({ onHits });
-
-    const input = screen.getByRole("searchbox");
-    await typeQuery(input, "hello");
-    const btn = screen.getByRole("button", { name: /find/i }) as HTMLButtonElement;
-    expect(btn.disabled).toBe(false);
-
-    await fireEvent.click(btn);
-    await tick();
-    await tick(); // allow promise to resolve
-
-    expect(mockSearchDocument).toHaveBeenCalledWith("doc-1", "hello", false, false);
-    expect(onHits).toHaveBeenCalledWith(FIXTURE_HITS);
-
-    // Results should appear
-    expect(screen.getByText("hello world")).toBeTruthy();
-    expect(screen.getByText("hello again")).toBeTruthy();
-  });
-
-  it("shows correct hit count summary", async () => {
-    mountPanel();
-    const input = screen.getByRole("searchbox");
-    await typeQuery(input, "hello");
-    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
-    await tick();
-    await tick();
-
-    // 2 results on 2 pages
-    const summary = screen.getByText(/2 result/i);
-    expect(summary).toBeTruthy();
-  });
-
-  it("shows 'No results' when search returns empty", async () => {
-    mockSearchDocument.mockResolvedValue([]);
-    mountPanel();
-    const input = screen.getByRole("searchbox");
-    await typeQuery(input, "xyz_notfound");
-    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
-    await tick();
-    await tick();
-
-    expect(screen.getByText(/no results/i)).toBeTruthy();
-  });
-
-  it("Enter key triggers search", async () => {
-    const onHits = vi.fn();
-    mountPanel({ onHits });
-    const input = screen.getByRole("searchbox");
-    await typeQuery(input, "hello");
-    await fireEvent.keyDown(input, { key: "Enter" });
-    await tick();
-    await tick();
-
-    expect(mockSearchDocument).toHaveBeenCalledOnce();
-    expect(onHits).toHaveBeenCalledWith(FIXTURE_HITS);
-  });
-
-  it("Escape key clears query and results", async () => {
-    const onHits = vi.fn();
-    mountPanel({ onHits });
-    const input = screen.getByRole("searchbox");
-    await typeQuery(input, "hello");
-    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
-    await tick();
-    await tick();
-
-    // Results are present; now Escape
-    await fireEvent.keyDown(input, { key: "Escape" });
-    await tick();
-
-    expect(onHits).toHaveBeenLastCalledWith([]);
-  });
-
-  it("clicking a result row calls onJump with the correct page and index", async () => {
-    const onJump = vi.fn();
-    mountPanel({ onJump });
-    const input = screen.getByRole("searchbox");
-    await typeQuery(input, "hello");
-    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
-    await tick();
-    await tick();
-
-    const firstResult = screen.getByText("hello world").closest("li")!;
-    await fireEvent.click(firstResult);
-    await tick();
-
-    // idx=0, page=0 (FIXTURE_HITS[0].page)
-    expect(onJump).toHaveBeenCalledWith(0, 0);
-  });
-
-  it("second result click calls onJump with correct page", async () => {
-    const onJump = vi.fn();
-    mountPanel({ onJump });
-    const input = screen.getByRole("searchbox");
-    await typeQuery(input, "hello");
-    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
-    await tick();
-    await tick();
-
-    const secondResult = screen.getByText("hello again").closest("li")!;
-    await fireEvent.click(secondResult);
-    await tick();
-
-    // idx=1, page=1 (FIXTURE_HITS[1].page)
-    expect(onJump).toHaveBeenCalledWith(1, 1);
-  });
-
-  it("case-sensitive checkbox passes caseSensitive=true", async () => {
-    mountPanel();
-    const input = screen.getByRole("searchbox");
-    await typeQuery(input, "Hello");
-
-    // Toggle case-sensitive option
-    const checkbox = screen.getByRole("checkbox", { hidden: true, name: /aa/i });
-    if (checkbox) {
-      await fireEvent.click(checkbox);
-      await tick();
-    }
-
-    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
-    await tick();
-    await tick();
-
-    // caseSensitive arg should be true
-    const call = mockSearchDocument.mock.calls[0];
-    expect(call[2]).toBe(true);
-  });
-
-  it("shows error message when searchDocument rejects", async () => {
-    mockSearchDocument.mockRejectedValue(new Error("PDFium failed"));
-    const onHits = vi.fn();
-    mountPanel({ onHits });
-    const input = screen.getByRole("searchbox");
-    await typeQuery(input, "crash");
-    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
-    await tick();
-    await tick();
-
-    expect(screen.getByRole("alert")).toBeTruthy();
-    expect(onHits).toHaveBeenCalledWith([]);
-  });
-
-  it("page numbers show 1-based in result list", async () => {
-    mountPanel();
-    const input = screen.getByRole("searchbox");
-    await typeQuery(input, "hello");
-    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
-    await tick();
-    await tick();
-
-    // Page 0 → "p.1", page 1 → "p.2"
-    expect(screen.getByText("p.1")).toBeTruthy();
-    expect(screen.getByText("p.2")).toBeTruthy();
+  it("re-runs the search immediately on scope switch when a query is already present", async () => {
+    const store = new SearchStore(fakeDeps());
+    store.query = "concrete";
+    const { getByTestId, onSearch } = mountPanel(store, { folderPath: "/plans" });
+    await fireEvent.click(getByTestId("scope-tab-open"));
+    expect(onSearch).toHaveBeenCalledTimes(1);
   });
 });
 
-// ---------------------------------------------------------------------------
-// Folder search mode (M4 S4)
-// ---------------------------------------------------------------------------
+describe("SearchPanel — debounced search", () => {
+  it("debounces search-as-you-type by 300ms", async () => {
+    const store = new SearchStore(fakeDeps());
+    const { getByTestId, onSearch } = mountPanel(store);
+    const input = getByTestId("search-input") as HTMLInputElement;
 
-describe("SearchPanel folder search mode", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mockSearchDocument.mockResolvedValue(FIXTURE_HITS);
-    mockSearchFolder.mockResolvedValue(FIXTURE_FOLDER_HITS);
+    await fireEvent.input(input, { target: { value: "concrete" } });
+    expect(onSearch).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(299);
+    expect(onSearch).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(2);
+    expect(onSearch).toHaveBeenCalledTimes(1);
   });
 
-  it("does not show mode tabs when folderPath is not provided", () => {
-    mountPanel();
-    expect(screen.queryByRole("tab")).toBeNull();
+  it("Enter searches immediately, bypassing the debounce", async () => {
+    const store = new SearchStore(fakeDeps());
+    store.query = "concrete";
+    const { getByTestId, onSearch } = mountPanel(store);
+    const input = getByTestId("search-input") as HTMLInputElement;
+    await fireEvent.keyDown(input, { key: "Enter" });
+    expect(onSearch).toHaveBeenCalledTimes(1);
   });
 
-  it("shows Doc and Folder tabs when folderPath is provided", () => {
-    mountPanelWithFolder();
-    expect(screen.getByRole("tab", { name: /doc/i })).toBeTruthy();
-    expect(screen.getByRole("tab", { name: /folder/i })).toBeTruthy();
+  it("clearing the query to blank cancels the pending debounce and clears results", async () => {
+    const store = new SearchStore(fakeDeps());
+    const { getByTestId, onSearch } = mountPanel(store);
+    const input = getByTestId("search-input") as HTMLInputElement;
+
+    await fireEvent.input(input, { target: { value: "x" } });
+    await fireEvent.input(input, { target: { value: "" } });
+    vi.advanceTimersByTime(400);
+    expect(onSearch).not.toHaveBeenCalled();
   });
 
-  it("clicking Folder tab switches to folder mode (placeholder shows 'folder')", async () => {
-    mountPanelWithFolder();
-    await fireEvent.click(screen.getByRole("tab", { name: /folder/i }));
+  it("Escape clears the query and results", async () => {
+    const store = new SearchStore(fakeDeps());
+    store.query = "concrete";
+    store.groups = [{ key: "d1", label: "a.pdf", hits: [] }];
+    const { getByTestId } = mountPanel(store);
+    const input = getByTestId("search-input") as HTMLInputElement;
+    await fireEvent.keyDown(input, { key: "Escape" });
+    expect(store.query).toBe("");
+    expect(store.groups).toEqual([]);
+  });
+});
+
+describe("SearchPanel — grouped result rendering", () => {
+  function hitOf(kind: "text" | "markup", page: number, snippet: string): UnifiedSearchHit {
+    return kind === "text"
+      ? { kind, page, snippet, snippetHtml: false, docId: "d1", rect: [0, 0, 1, 1], checked: false }
+      : { kind, page, snippet, snippetHtml: false, docId: "d1", markupId: "m1", checked: false };
+  }
+
+  it("document scope (single group) renders results WITHOUT a group header", async () => {
+    const store = new SearchStore(fakeDeps());
+    store.query = "x";
+    store.groups = [{ key: "d1", label: "a.pdf", hits: [hitOf("text", 0, "hello world")] }];
+    const { container } = mountPanel(store);
     await tick();
-    const input = screen.getByRole("searchbox") as HTMLInputElement;
-    expect(input.placeholder.toLowerCase()).toContain("folder");
+    expect(container.querySelector(".group-header")).toBeNull();
+    expect(container.querySelectorAll(".search-result")).toHaveLength(1);
   });
 
-  it("folder mode calls searchFolder (not searchDocument)", async () => {
-    const onFolderHits = vi.fn();
-    mountPanelWithFolder({ onFolderHits });
-
-    await fireEvent.click(screen.getByRole("tab", { name: /folder/i }));
+  it("open/folder scope renders a group header per file with a match count", async () => {
+    const store = new SearchStore(fakeDeps());
+    store.setScope("open");
+    store.query = "x";
+    store.groups = [
+      { key: "d1", label: "a.pdf", hits: [hitOf("text", 0, "hit1"), hitOf("text", 2, "hit2")] },
+      { key: "d2", label: "b.pdf", hits: [hitOf("text", 1, "hit3")] },
+    ];
+    const { container } = mountPanel(store, { folderPath: null });
     await tick();
-
-    const input = screen.getByRole("searchbox");
-    await typeQuery(input, "foundation");
-    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
-    await tick();
-    await tick();
-
-    expect(mockSearchFolder).toHaveBeenCalledOnce();
-    expect(mockSearchDocument).not.toHaveBeenCalled();
-    expect(onFolderHits).toHaveBeenCalledWith(FIXTURE_FOLDER_HITS);
+    const headers = container.querySelectorAll(".group-header");
+    expect(headers).toHaveLength(2);
+    expect(headers[0].textContent).toContain("a.pdf");
+    expect(headers[0].textContent).toContain("2");
+    expect(headers[1].textContent).toContain("b.pdf");
+    expect(headers[1].textContent).toContain("1");
   });
 
-  it("folder results show file name and page number", async () => {
-    mountPanelWithFolder();
-
-    await fireEvent.click(screen.getByRole("tab", { name: /folder/i }));
+  it("clicking a group header collapses it, hiding its results", async () => {
+    const store = new SearchStore(fakeDeps());
+    store.setScope("open");
+    store.query = "x";
+    store.groups = [{ key: "d1", label: "a.pdf", hits: [hitOf("text", 0, "hello")] }];
+    const { container } = mountPanel(store);
     await tick();
+    expect(container.querySelectorAll(".search-result")).toHaveLength(1);
 
-    const input = screen.getByRole("searchbox");
-    await typeQuery(input, "foundation");
-    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
+    await fireEvent.click(container.querySelector(".group-header")!);
     await tick();
-    await tick();
+    expect(container.querySelectorAll(".search-result")).toHaveLength(0);
 
-    // File names (basename of path)
-    expect(screen.getByText("plan.pdf")).toBeTruthy();
-    expect(screen.getByText("spec.pdf")).toBeTruthy();
-    // 1-based page numbers from FIXTURE_FOLDER_HITS
-    expect(screen.getByText("p.3")).toBeTruthy();
-    expect(screen.getByText("p.7")).toBeTruthy();
+    await fireEvent.click(container.querySelector(".group-header")!);
+    await tick();
+    expect(container.querySelectorAll(".search-result")).toHaveLength(1);
   });
 
-  it("clicking folder result calls onFolderJump with filePath and pageNumber", async () => {
-    const onFolderJump = vi.fn();
-    mountPanelWithFolder({ onFolderJump });
-
-    await fireEvent.click(screen.getByRole("tab", { name: /folder/i }));
+  it("labels a markup-kind hit distinctly from a text hit", async () => {
+    const store = new SearchStore(fakeDeps());
+    store.query = "x";
+    store.groups = [
+      { key: "d1", label: "a.pdf", hits: [hitOf("text", 0, "doc text"), hitOf("markup", 1, "a comment")] },
+    ];
+    const { container } = mountPanel(store);
     await tick();
-
-    const input = screen.getByRole("searchbox");
-    await typeQuery(input, "foundation");
-    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
-    await tick();
-    await tick();
-
-    // Click the first result row (plan.pdf, page 3)
-    const firstResult = screen.getByText("plan.pdf").closest("li")!;
-    await fireEvent.click(firstResult);
-    await tick();
-
-    expect(onFolderJump).toHaveBeenCalledWith("/docs/plan.pdf", 3);
+    const kindLabels = container.querySelectorAll(".search-result-kind");
+    expect(kindLabels).toHaveLength(1);
+    expect(kindLabels[0].textContent).toBe("markup");
   });
 
-  it("folder mode shows cross-file summary", async () => {
-    mountPanelWithFolder();
-
-    await fireEvent.click(screen.getByRole("tab", { name: /folder/i }));
+  it("clicking a result calls onJump with that hit and its group", async () => {
+    const store = new SearchStore(fakeDeps());
+    store.query = "x";
+    const g: SearchGroup = { key: "d1", label: "a.pdf", hits: [hitOf("text", 3, "found it")] };
+    store.groups = [g];
+    const { container, onJump } = mountPanel(store);
     await tick();
+    await fireEvent.click(container.querySelector(".search-result")!);
+    expect(onJump).toHaveBeenCalledWith(g.hits[0], g);
+  });
 
-    const input = screen.getByRole("searchbox");
-    await typeQuery(input, "foundation");
-    await fireEvent.click(screen.getByRole("button", { name: /find/i }));
+  it("renders an HTML snippet with {@html} only when snippetHtml is true", async () => {
+    const store = new SearchStore(fakeDeps());
+    store.query = "x";
+    store.groups = [
+      {
+        key: "d1",
+        label: "a.pdf",
+        hits: [{ kind: "text", page: 0, snippet: "<b>bold</b>", snippetHtml: true, filePath: "/a.pdf", checked: false }],
+      },
+    ];
+    const { container } = mountPanel(store, { folderPath: "/plans" });
     await tick();
-    await tick();
+    const snippetEl = container.querySelector(".search-result-snippet")!;
+    expect(snippetEl.querySelector("b")).not.toBeNull();
+  });
+});
 
-    // FIXTURE_FOLDER_HITS has 2 results across 2 files
-    expect(screen.getByText(/2 result/i)).toBeTruthy();
-    expect(screen.getByText(/2 file/i)).toBeTruthy();
+describe("SearchPanel — next/prev navigation controls", () => {
+  it("shows a position indicator and Next/Prev buttons only when there are results", async () => {
+    const store = new SearchStore(fakeDeps());
+    const { container, rerender } = mountPanel(store);
+    await tick();
+    expect(container.querySelector(".search-nav")).toBeNull();
+
+    store.query = "x";
+    store.groups = [{ key: "d1", label: "a.pdf", hits: [{ kind: "text", page: 0, snippet: "a", snippetHtml: false, checked: false }] }];
+    store.activeFlatIndex = 0;
+    await rerender({});
+    await tick();
+    expect(container.querySelector(".search-nav")).not.toBeNull();
+    expect(container.querySelector(".nav-pos")?.textContent).toBe("1 / 1");
+  });
+
+  it("Next button calls onJump for the next flat hit", async () => {
+    const store = new SearchStore(fakeDeps());
+    store.query = "x";
+    store.groups = [
+      { key: "d1", label: "a.pdf", hits: [
+        { kind: "text", page: 0, snippet: "a", snippetHtml: false, checked: false },
+        { kind: "text", page: 1, snippet: "b", snippetHtml: false, checked: false },
+      ] },
+    ];
+    store.activeFlatIndex = 0;
+    const { container, onJump } = mountPanel(store);
+    await tick();
+    await fireEvent.click(container.querySelector(".nav-btn:last-child")!);
+    expect(onJump).toHaveBeenCalled();
+    expect(store.activeFlatIndex).toBe(1);
+  });
+});
+
+describe("SearchPanel — Check Options (Bluebeam bulk-action parity)", () => {
+  function seeded(): SearchStore {
+    const store = new SearchStore(fakeDeps());
+    store.query = "x";
+    store.groups = [
+      {
+        key: "d1",
+        label: "a.pdf",
+        hits: [
+          { kind: "text", page: 0, snippet: "a", snippetHtml: false, checked: false },
+          { kind: "text", page: 1, snippet: "b", snippetHtml: false, checked: false },
+        ],
+      },
+    ];
+    return store;
+  }
+
+  it("clicking a result checkbox toggles it WITHOUT triggering navigation", async () => {
+    const store = seeded();
+    const { container, onJump } = mountPanel(store);
+    await tick();
+    const checkbox = container.querySelector(".search-result-check") as HTMLInputElement;
+    await fireEvent.click(checkbox);
+    expect(store.groups[0].hits[0].checked).toBe(true);
+    expect(onJump).not.toHaveBeenCalled();
+  });
+
+  it("Check All / Uncheck All buttons operate on every result", async () => {
+    const store = seeded();
+    const { container } = mountPanel(store);
+    await tick();
+    const [checkAllBtn, uncheckAllBtn] = container.querySelectorAll(".check-opt-btn");
+    await fireEvent.click(checkAllBtn);
+    expect(store.checkedHits).toHaveLength(2);
+    await fireEvent.click(uncheckAllBtn);
+    expect(store.checkedHits).toHaveLength(0);
+  });
+
+  it("Collapse All / Expand All buttons operate on every group", async () => {
+    const store = seeded();
+    const { container } = mountPanel(store);
+    await tick();
+    const buttons = container.querySelectorAll(".check-opt-btn");
+    const collapseBtn = Array.from(buttons).find((b) => b.textContent?.includes("Collapse"))!;
+    const expandBtn = Array.from(buttons).find((b) => b.textContent?.includes("Expand"))!;
+    await fireEvent.click(collapseBtn);
+    expect(store.isGroupCollapsed("d1")).toBe(true);
+    await fireEvent.click(expandBtn);
+    expect(store.isGroupCollapsed("d1")).toBe(false);
+  });
+
+  it("Highlight Checked is disabled with zero checked results, enabled once one is checked", async () => {
+    const store = seeded();
+    const { container } = mountPanel(store);
+    await tick();
+    const highlightBtn = container.querySelector(".check-opt-btn--primary") as HTMLButtonElement;
+    expect(highlightBtn.disabled).toBe(true);
+
+    store.toggleChecked(0, 0);
+    await tick();
+    expect(highlightBtn.disabled).toBe(false);
+    expect(highlightBtn.textContent).toContain("(1)");
+  });
+
+  it("Highlight Checked button click calls onHighlightChecked", async () => {
+    const store = seeded();
+    store.toggleChecked(0, 0);
+    const { container, onHighlightChecked } = mountPanel(store);
+    await tick();
+    const highlightBtn = container.querySelector(".check-opt-btn--primary") as HTMLButtonElement;
+    await fireEvent.click(highlightBtn);
+    expect(onHighlightChecked).toHaveBeenCalled();
   });
 });

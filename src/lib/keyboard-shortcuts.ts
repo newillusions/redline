@@ -48,3 +48,52 @@ export function resolveUndoRedoShortcut(e: UndoRedoKeyEvent): UndoRedoAction {
   if (key === "y") return "redo";
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// Search parity (owner directive: match + improve on Bluebeam's search)
+// ---------------------------------------------------------------------------
+
+export type SearchShortcut = "open" | "next" | "prev" | null;
+
+/** Minimal shape App.svelte's real `KeyboardEvent` satisfies. */
+export interface SearchKeyEvent {
+  key: string;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+}
+
+/**
+ * Resolves the search panel's global keyboard surface:
+ *   - Cmd/Ctrl+F -> "open" (open/focus the search panel; fires even while an
+ *                   editable field has focus, matching Bluebeam/every other
+ *                   app's global-Find convention)
+ *   - F3         -> "next" result
+ *   - Shift+F3   -> "prev" result
+ *
+ * Deliberately does NOT bind Cmd/Ctrl+G / Cmd/Ctrl+Shift+G, despite Bluebeam
+ * itself using Ctrl+G for "find next" in some contexts — Viewport.svelte
+ * already binds Cmd/Ctrl+G to group selected markups and Cmd/Ctrl+Shift+G to
+ * ungroup (its own separate `window` keydown listener, registered
+ * independently of App.svelte's `<svelte:window>` handler). Both listeners
+ * would fire on the same keystroke since neither checks `defaultPrevented`
+ * and `preventDefault()` doesn't stop a second listener on the same target —
+ * so with the search bindings in place, pressing Cmd+G while search results
+ * exist AND markups are selected would jump to the next result AND commit a
+ * real group-markups mutation to the undo stack in one keystroke (PR #86
+ * review, 2026-08-31). F3/Shift+F3 alone already give this full next/prev
+ * coverage, so the least-surprise fix is dropping Cmd+G/Cmd+Shift+G from
+ * search entirely rather than adding propagation-stopping machinery whose
+ * listener-registration-order safety would need its own test.
+ *
+ * "next"/"prev" are resolved unconditionally here — App.svelte gates them on
+ * whether the search panel actually has results, since an editable-target
+ * check would incorrectly block F3 while e.g. a markup comment field has
+ * focus, and Find-next legitimately should still work there.
+ */
+export function resolveSearchShortcut(e: SearchKeyEvent): SearchShortcut {
+  const mod = e.metaKey || e.ctrlKey;
+  if (mod && !e.shiftKey && e.key.toLowerCase() === "f") return "open";
+  if (e.key === "F3") return e.shiftKey ? "prev" : "next";
+  return null;
+}
