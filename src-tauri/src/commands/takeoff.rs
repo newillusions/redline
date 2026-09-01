@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use tauri::State;
 
+use crate::markup::Markup;
 use crate::sidecar::{load_meta, save_meta};
 use crate::takeoff::{ScaleMethod, ScaleRecord, ScaleTarget};
 use crate::AppState;
@@ -137,10 +138,21 @@ pub async fn export_markup_list(
     format: ExportFormat,
 ) -> Result<(), String> {
     let markups = state.markups.list(&doc_id)?;
-    let out = PathBuf::from(&path);
+    export_markup_list_to(&markups, &PathBuf::from(&path), format)
+}
+
+/// Core of [`export_markup_list`], extracted so it can be called with just a markup
+/// slice - no `State`/`AppState` dependency - by the MCP bridge's `export_markup_schedule`
+/// tool (`rpc::tools`, MCP server design §3: "wraps the existing M3 export command - no
+/// new export logic"), sharing exactly this code path with the Tauri command above.
+pub fn export_markup_list_to(
+    markups: &[Markup],
+    path: &std::path::Path,
+    format: ExportFormat,
+) -> Result<(), String> {
     match format {
-        ExportFormat::Xlsx => export_xlsx(&markups, &out).map_err(|e| e.to_string()),
-        ExportFormat::Csv => export_csv(&markups, &out).map_err(|e| e.to_string()),
+        ExportFormat::Xlsx => export_xlsx(markups, path).map_err(|e| e.to_string()),
+        ExportFormat::Csv => export_csv(markups, path).map_err(|e| e.to_string()),
     }
 }
 

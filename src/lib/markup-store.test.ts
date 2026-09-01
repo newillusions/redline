@@ -15,7 +15,7 @@ function countMk(id: string, set: CountSet | null): Markup {
   };
 }
 
-function mk(id: string, contents: string | null = null): Markup {
+function mk(id: string, contents: string | null = null, annot_flags?: number): Markup {
   return {
     id, markup_type: "Rectangle", page: 0,
     geometry: { Rect: { min: { x: 0, y: 0 }, max: { x: 10, y: 10 } } },
@@ -23,8 +23,12 @@ function mk(id: string, contents: string | null = null): Markup {
     subject: null, layer: null, contents, group_id: null,
     audit: { created_by: { user_id: "u", display_name: "U" }, created_at: "", modified_by: { user_id: "u", display_name: "U" }, modified_at: "", revision: 0, origin: "Desktop" },
     workflow: { status: "None", assignee: null, thread: [] }, measurement: null,
+    annot_flags,
   };
 }
+
+/** Locked (bit 8, 0x80) - see `mk`'s `annot_flags` param. */
+const LOCKED = 0x80;
 
 function fakeIpc() {
   return {
@@ -84,6 +88,38 @@ describe("MarkupStore", () => {
     s.create(mk("a"));
     await expect(s.flush()).rejects.toThrow("boom");
     expect(s.mirrorError).toContain("boom");
+  });
+
+  it("a markup_locked-shaped rejection discards the op and keeps draining later ops (does not freeze the queue)", async () => {
+    // Exercises runDrain's defense-in-depth backstop directly (the "MarkupStore lock
+    // guard" describe block below covers the up-front check that normally prevents a
+    // locked op from ever reaching this point). create() carries no lock check by
+    // design (nothing to lock before a markup exists - same as the Rust create_markup),
+    // so it's a clean way to make the BACKEND reject with the structured markup_locked
+    // shape without fighting the frontend's own guard.
+    const ipc = fakeIpc();
+    ipc.add.mockRejectedValueOnce(
+      new Error('{"error":"markup_locked","markup_id":"a","flag":"Locked"}')
+    );
+    const s = new MarkupStore("doc1", ipc);
+    s.create(mk("a"));
+    s.create(mk("b")); // a later, unrelated op - must NOT be blocked by the rejected one
+
+    await s.flush(); // must resolve, not reject - the queue fully drains
+    expect(ipc.add).toHaveBeenCalledWith("doc1", expect.objectContaining({ id: "b" }));
+    expect(s.mirrorError).toContain("markup_locked");
+  });
+
+  it("a non-definitive rejection still halts the drain (existing retry behaviour preserved)", async () => {
+    const ipc = fakeIpc();
+    ipc.add.mockRejectedValueOnce(new Error("network hiccup"));
+    const s = new MarkupStore("doc1", ipc);
+    s.create(mk("a"));
+    await expect(s.flush()).rejects.toThrow("network hiccup");
+    // Unlike a definitive rejection, the op is NOT discarded - it stays queued for retry.
+    ipc.add.mockResolvedValueOnce(undefined);
+    await s.flush();
+    expect(ipc.add).toHaveBeenCalledTimes(2);
   });
 
   it("enqueue during drain still drains in order", async () => {
@@ -261,6 +297,140 @@ describe("MarkupStore.deleteSelected", () => {
     await s.flush();
     expect(ipc.remove).not.toHaveBeenCalled();
     expect(s.markups).toHaveLength(1);
+  });
+});
+
+describe("MarkupStore lock guard (review finding, PR #92 2026-09-01)", () => {
+  it("update refuses a locked markup up front - no optimistic apply, no IPC call", async () => {
+    const ipc = fakeIpc();
+    const s = new MarkupStore("doc1", ipc);
+    const a = mk("a", "original", LOCKED);
+    s.create(a);
+    await s.flush();
+    ipc.update.mockClear();
+
+    s.update(a, { ...a, contents: "attempted edit" });
+
+    expect(s.markups[0].contents).toBe("original"); // not optimistically applied
+    expect(s.mirrorError).toContain("locked");
+    await s.flush();
+    expect(ipc.update).not.toHaveBeenCalled();
+  });
+
+  it("update proceeds normally for an unlocked markup (control case)", async () => {
+    const ipc = fakeIpc();
+    const s = new MarkupStore("doc1", ipc);
+    const a = mk("a", "original");
+    s.create(a);
+    await s.flush();
+
+    s.update(a, { ...a, contents: "edited" });
+
+    expect(s.markups[0].contents).toBe("edited");
+    await s.flush();
+    expect(ipc.update).toHaveBeenCalledWith("doc1", expect.objectContaining({ contents: "edited" }));
+  });
+
+  it("delete refuses a locked markup up front - no optimistic removal, no IPC call", async () => {
+    const ipc = fakeIpc();
+    const s = new MarkupStore("doc1", ipc);
+    s.create(mk("a", null, LOCKED));
+    await s.flush();
+    ipc.remove.mockClear();
+
+    s.delete("a");
+
+    expect(s.markups).toHaveLength(1); // not optimistically removed
+    expect(s.mirrorError).toContain("locked");
+    await s.flush();
+    expect(ipc.remove).not.toHaveBeenCalled();
+  });
+
+  it("delete proceeds normally for an unlocked markup (control case)", async () => {
+    const ipc = fakeIpc();
+    const s = new MarkupStore("doc1", ipc);
+    s.create(mk("a"));
+    await s.flush();
+
+    s.delete("a");
+
+    expect(s.markups).toHaveLength(0);
+    await s.flush();
+    expect(ipc.remove).toHaveBeenCalledWith("doc1", "a");
+  });
+
+  it("applyBatch skips only the locked pair and still applies the rest", async () => {
+    const ipc = fakeIpc();
+    const s = new MarkupStore("doc1", ipc);
+    const a = mk("a", "old-a", LOCKED);
+    const b = mk("b", "old-b");
+    s.create(a);
+    s.create(b);
+    await s.flush();
+    ipc.update.mockClear();
+
+    s.applyBatch([
+      { before: a, after: { ...a, contents: "new-a" } },
+      { before: b, after: { ...b, contents: "new-b" } },
+    ]);
+
+    expect(s.markups.find((m) => m.id === "a")!.contents).toBe("old-a"); // skipped
+    expect(s.markups.find((m) => m.id === "b")!.contents).toBe("new-b"); // applied
+    expect(s.mirrorError).toContain("a");
+    await s.flush();
+    expect(ipc.update).toHaveBeenCalledTimes(1);
+    expect(ipc.update).toHaveBeenCalledWith("doc1", expect.objectContaining({ id: "b" }));
+  });
+
+  it("applyBatch with every pair locked applies nothing and sets mirrorError", async () => {
+    const ipc = fakeIpc();
+    const s = new MarkupStore("doc1", ipc);
+    const a = mk("a", "old-a", LOCKED);
+    s.create(a);
+    await s.flush();
+    ipc.update.mockClear();
+
+    s.applyBatch([{ before: a, after: { ...a, contents: "new-a" } }]);
+
+    expect(s.markups[0].contents).toBe("old-a");
+    expect(s.mirrorError).toContain("locked");
+    await s.flush();
+    expect(ipc.update).not.toHaveBeenCalled();
+  });
+
+  it("deleteSelected skips locked selections, deletes the rest, and always clears selection", async () => {
+    const ipc = fakeIpc();
+    const s = new MarkupStore("doc1", ipc);
+    s.create(mk("a", null, LOCKED));
+    s.create(mk("b"));
+    s.selectedIds = new Set(["a", "b"]);
+    await s.flush();
+    ipc.remove.mockClear();
+
+    s.deleteSelected();
+
+    expect(s.markups.map((m) => m.id)).toEqual(["a"]); // b deleted, a (locked) survives
+    expect(s.selectedIds.size).toBe(0); // selection cleared regardless
+    expect(s.mirrorError).toContain("locked");
+    await s.flush();
+    expect(ipc.remove).toHaveBeenCalledTimes(1);
+    expect(ipc.remove).toHaveBeenCalledWith("doc1", "b");
+  });
+
+  it("deleteSelected with only locked markups selected deletes nothing but clears selection", async () => {
+    const ipc = fakeIpc();
+    const s = new MarkupStore("doc1", ipc);
+    s.create(mk("a", null, LOCKED));
+    s.selectedIds = new Set(["a"]);
+    await s.flush();
+    ipc.remove.mockClear();
+
+    s.deleteSelected();
+
+    expect(s.markups).toHaveLength(1);
+    expect(s.selectedIds.size).toBe(0);
+    await s.flush();
+    expect(ipc.remove).not.toHaveBeenCalled();
   });
 });
 

@@ -1056,6 +1056,14 @@
     <div class="error-banner">{openError}</div>
   {/if}
 
+  {#if activeTab?.store.mirrorError}
+    <!-- Markup sync/lock refusal feedback (review finding, PR #92 2026-09-01): mirrorError
+         was previously set by markup-store.svelte.ts but never read anywhere in the
+         frontend - a locked-markup edit or a genuine sync failure had no visible signal
+         at all. Reuses the existing error-banner style. -->
+    <div class="error-banner">{activeTab.store.mirrorError}</div>
+  {/if}
+
   {#if docOpsStatus}
     <div class="docops-status-banner">{docOpsStatus}</div>
   {/if}

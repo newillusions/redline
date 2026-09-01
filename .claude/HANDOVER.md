@@ -1,5 +1,33 @@
 # Redline - Handover Notes
 
+## Current Status (2026-09-01, dispatched session - MCP server Phase 1 build)
+
+**Dispatched by team-lead ("Build redline MCP phase 1"). PR #92 open, mergeable
+(`feat/mcp-server-phase1`, head `462a032`, base `main@ff3287e7`) -
+https://forge.mms.name/emittiv/redline/pulls/92. Full owner-decided scope in one PR:
+markup lock guard (build prerequisite), companion-process socket bridge, and all ten
+tools (4 read-only + 4 mutating + flatten + reduce-file-size).**
+
+Key facts for the next session touching this area:
+- Lock guard lives in `markup::check_not_locked`, wired into `MarkupStore::update`/
+  `delete` - the one choke point both the GUI commands and the MCP bridge share. Fixes
+  a pre-existing GUI gap (locked annotations were never enforced before this PR).
+- `flatten_document`/`reduce_file_size` MCP tools wrap the ALREADY-EXISTING
+  `commands::docops::flatten_document`/`optimize_document` - no new PDF primitives.
+- New code: `src-tauri/src/rpc/` (protocol, dispatch, tools) + new `[[bin]]`
+  `redline-mcp` (`src-tauri/src/bin/redline_mcp.rs`). Socket:
+  `$TMPDIR/redline-mcp.sock` (Unix, 0600), started once from `setup()`.
+- **Windows named-pipe path is UNVERIFIED** - written but never compiled/run (macOS-only
+  session). Needs the Windows testbench before it can be trusted.
+- **No live GUI round trip run** - the socket bridge itself has not been exercised
+  end-to-end against a real `cargo tauri dev` session. 611 tests green, clippy clean,
+  but this is unit/integration-level verification only.
+- Full detail + named deviations from the design sketch:
+  `docs/superpowers/specs/2026-09-01-mcp-server-design.md`, "Implementation notes
+  (Phase 1)" section (added this session).
+
+---
+
 ## Current Status (2026-09-01, dispatched session - markup round-trip follow-ups)
 
 **Owner-authorized ("run the redline follow-ups"). Three follow-ups from the 08-31

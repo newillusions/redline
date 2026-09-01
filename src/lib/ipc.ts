@@ -267,6 +267,28 @@ export interface Markup {
    * Absent/null for every other markup type and for stamps placed without an asset.
    */
   stamp_asset?: StampAsset | null;
+  /**
+   * Standard `/F` annotation flags (ISO 32000-1 §12.5.3 table 165), mirrors Rust
+   * `Markup.annot_flags`. Optional here because older test/mock fixtures construct a
+   * `Markup` without it; `isMarkupLocked`/`isMarkupContentsLocked` below treat an absent
+   * value as unlocked (matches the backend's unlocked default, `4`/Print-only).
+   */
+  annot_flags?: number;
+}
+
+/** ISO 32000-1 Table 165 bit 8, `Locked` (decimal `128`/`0x80`) - mirrors Rust
+ *  `Markup::is_locked`. The frontend must check this BEFORE optimistically applying an
+ *  edit (MCP server design §4; review finding on PR #92, 2026-09-01) - the backend's
+ *  own refusal is a dead end for the mirror queue once an op is already enqueued, see
+ *  `markup-store.svelte.ts`. */
+export function isMarkupLocked(m: Pick<Markup, "annot_flags">): boolean {
+  return ((m.annot_flags ?? 0) & 0x80) !== 0;
+}
+
+/** ISO 32000-1 Table 165 bit 10, `LockedContents` (decimal `512`/`0x200`) - mirrors Rust
+ *  `Markup::is_contents_locked`. Independent of [`isMarkupLocked`]. */
+export function isMarkupContentsLocked(m: Pick<Markup, "annot_flags">): boolean {
+  return ((m.annot_flags ?? 0) & 0x200) !== 0;
 }
 
 // ---------------------------------------------------------------------------

@@ -134,7 +134,10 @@ impl MarkupStore {
         Ok(())
     }
 
-    /// Replace a markup by id. Errors on unknown doc or absent id.
+    /// Replace a markup by id. Errors on unknown doc or absent id, or if the existing
+    /// markup is locked (MCP server design §4 - the shared lock guard; this is the one
+    /// choke point both the GUI's `update_markup` Tauri command and the MCP bridge call
+    /// through, so refusing here fixes the gap for both surfaces from one change).
     ///
     /// This is a verbatim swap, not a `Markup::touch()`. The frontend store is the
     /// in-session source of truth and bumps audit fields (revision / modified_*) before
@@ -149,21 +152,26 @@ impl MarkupStore {
             .iter_mut()
             .find(|x| x.id() == m.id())
             .ok_or_else(|| format!("unknown markup id {}", m.id()))?;
+        crate::markup::check_not_locked(slot).map_err(|e| e.to_string())?;
         *slot = m;
         Ok(())
     }
 
-    /// Remove a markup by id. Errors on unknown doc or absent id.
+    /// Remove a markup by id. Errors on unknown doc or absent id, or if the markup is
+    /// locked (MCP server design §4 - see the doc comment on [`Self::update`], the same
+    /// guard applies here).
     pub fn delete(&self, doc_id: &str, id: Uuid) -> Result<(), String> {
         let mut g = self.docs.lock().unwrap();
         let e = g
             .get_mut(doc_id)
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
-        let before = e.markups.len();
+        let existing = e
+            .markups
+            .iter()
+            .find(|x| x.id() == id)
+            .ok_or_else(|| format!("unknown markup id {id}"))?;
+        crate::markup::check_not_locked(existing).map_err(|e| e.to_string())?;
         e.markups.retain(|x| x.id() != id);
-        if e.markups.len() == before {
-            return Err(format!("unknown markup id {id}"));
-        }
         Ok(())
     }
 
@@ -397,6 +405,141 @@ mod tests {
         let s = MarkupStore::default();
         // Must not panic - the entry may have been removed mid-save.
         s.end_save("nope");
+    }
+
+    // --- MCP server design §4: lock guard wired into update/delete (the single choke
+    // point both the GUI's update_markup/delete_markup commands and the MCP bridge call
+    // through). Four cases per the design's own rollout gate (§6): a locked foreign
+    // (Bluebeam-authored) annotation, a locked redline-authored one, an unlocked control,
+    // and LockedContents-only. ---
+
+    fn locked_markup(flags: i32, origin: crate::markup::Origin) -> Markup {
+        let mut m = markup();
+        m.annot_flags = flags;
+        m.audit.origin = origin;
+        m
+    }
+
+    #[test]
+    fn update_refuses_locked_foreign_bluebeam_authored_markup() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let m = locked_markup(0x80, crate::markup::Origin::FieldApp);
+        let id = m.id();
+        s.add("d1", m.clone()).unwrap();
+
+        let mut edited = m;
+        edited.contents = Some("attempted edit".into());
+        let err = s.update("d1", edited).unwrap_err();
+        assert!(err.contains("markup_locked"), "got: {err}");
+        assert!(err.contains(&id.to_string()));
+
+        // Refused, not silently applied - the store must still hold the original.
+        let stored = s.list("d1").unwrap();
+        assert_eq!(stored[0].contents, None);
+    }
+
+    #[test]
+    fn update_refuses_locked_redline_authored_markup_too() {
+        // Origin-agnostic: a markup redline itself created and locked is refused
+        // exactly like a foreign one - proves the guard doesn't special-case origin.
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let m = locked_markup(0x80, crate::markup::Origin::Desktop);
+        s.add("d1", m.clone()).unwrap();
+
+        let mut edited = m;
+        edited.contents = Some("attempted edit".into());
+        assert!(s.update("d1", edited).is_err());
+    }
+
+    #[test]
+    fn update_allows_unlocked_control_case() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let m = markup(); // default annot_flags = 4 (Print), not locked
+        s.add("d1", m.clone()).unwrap();
+
+        let mut edited = m;
+        edited.contents = Some("a real edit".into());
+        s.update("d1", edited).unwrap();
+        assert_eq!(
+            s.list("d1").unwrap()[0].contents,
+            Some("a real edit".into())
+        );
+    }
+
+    #[test]
+    fn update_refuses_locked_contents_only_markup() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let m = locked_markup(0x200, crate::markup::Origin::Desktop);
+        s.add("d1", m.clone()).unwrap();
+
+        let mut edited = m;
+        edited.contents = Some("attempted edit".into());
+        let err = s.update("d1", edited).unwrap_err();
+        assert!(err.contains("LockedContents"), "got: {err}");
+    }
+
+    #[test]
+    fn delete_refuses_locked_foreign_bluebeam_authored_markup() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let m = locked_markup(0x80, crate::markup::Origin::FieldApp);
+        let id = m.id();
+        s.add("d1", m).unwrap();
+
+        let err = s.delete("d1", id).unwrap_err();
+        assert!(err.contains("markup_locked"), "got: {err}");
+        assert_eq!(s.list("d1").unwrap().len(), 1, "must not be deleted");
+    }
+
+    #[test]
+    fn delete_refuses_locked_redline_authored_markup_too() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let m = locked_markup(0x80, crate::markup::Origin::Desktop);
+        let id = m.id();
+        s.add("d1", m).unwrap();
+
+        assert!(s.delete("d1", id).is_err());
+        assert_eq!(s.list("d1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_allows_unlocked_control_case() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let m = markup();
+        let id = m.id();
+        s.add("d1", m).unwrap();
+
+        s.delete("d1", id).unwrap();
+        assert!(s.list("d1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_refuses_locked_contents_only_markup() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let m = locked_markup(0x200, crate::markup::Origin::Desktop);
+        let id = m.id();
+        s.add("d1", m).unwrap();
+
+        let err = s.delete("d1", id).unwrap_err();
+        assert!(err.contains("LockedContents"), "got: {err}");
+    }
+
+    #[test]
+    fn update_and_delete_unknown_markup_id_still_report_unknown_not_locked() {
+        // A not-found error must not be confused with a lock refusal - distinct error
+        // shapes matter to a calling agent.
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let err = s.delete("d1", uuid::Uuid::new_v4()).unwrap_err();
+        assert!(err.contains("unknown markup id"), "got: {err}");
+        assert!(!err.contains("markup_locked"));
     }
 
     #[test]

@@ -22,6 +22,15 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "bench"
 path = "src/bin/bench.rs"
 
+# MCP stdio server (MCP server design, 2026-09-01, docs/superpowers/specs/
+# 2026-09-01-mcp-server-design.md §2). Pure protocol translator - no PDFium/Tauri
+# dependency of its own - so it links fast and stays independently distributable from
+# the GUI bundle (open question in the design doc §"Open questions for the owner" 2,
+# not yet resolved by the owner: same installer vs separate package).
+[[bin]]
+name = "redline-mcp"
+path = "src/bin/redline_mcp.rs"
+
 [build-dependencies]
 tauri-build = { version = "2.2.0", features = [] }
 

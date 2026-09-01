@@ -605,3 +605,31 @@ describe("tool chest ipc wrappers (Tauri v2 camelCase keys)", () => {
     expect(result).toEqual(set);
   });
 });
+
+describe("isMarkupLocked / isMarkupContentsLocked (ISO 32000-1 Table 165 bits 8/10)", () => {
+  it("is not locked either way when annot_flags is absent", () => {
+    expect(ipc.isMarkupLocked({})).toBe(false);
+    expect(ipc.isMarkupContentsLocked({})).toBe(false);
+  });
+
+  it("is not locked either way for the default Print-only value (4)", () => {
+    expect(ipc.isMarkupLocked({ annot_flags: 4 })).toBe(false);
+    expect(ipc.isMarkupContentsLocked({ annot_flags: 4 })).toBe(false);
+  });
+
+  it("detects Locked (0x80) independently of LockedContents", () => {
+    expect(ipc.isMarkupLocked({ annot_flags: 0x80 })).toBe(true);
+    expect(ipc.isMarkupContentsLocked({ annot_flags: 0x80 })).toBe(false);
+  });
+
+  it("detects LockedContents (0x200) independently of Locked", () => {
+    expect(ipc.isMarkupLocked({ annot_flags: 0x200 })).toBe(false);
+    expect(ipc.isMarkupContentsLocked({ annot_flags: 0x200 })).toBe(true);
+  });
+
+  it("detects both bits set together, alongside unrelated flag bits", () => {
+    const flags = 4 | 0x80 | 0x200; // Print + Locked + LockedContents
+    expect(ipc.isMarkupLocked({ annot_flags: flags })).toBe(true);
+    expect(ipc.isMarkupContentsLocked({ annot_flags: flags })).toBe(true);
+  });
+});

@@ -4,8 +4,42 @@
  * MirrorOp is drained through an ordered FIFO to the Rust store (the save buffer) via the
  * injected IPC. flush() awaits a full drain — App.svelte calls it before save_document.
  */
-import type { Markup, Appearance, CountSet, CountSymbol, Tool } from "./ipc";
+import { isMarkupContentsLocked, isMarkupLocked, type Markup, type Appearance, type CountSet, type CountSymbol, type Tool } from "./ipc";
 import { History, CreateCmd, UpdateCmd, DeleteCmd, type MarkupSink, type MirrorOp } from "./markup-commands";
+
+/**
+ * Up-front lock refusal message for `m`, or `null` if unlocked. Checked BEFORE any
+ * optimistic apply/enqueue (review finding on PR #92, 2026-09-01): the backend's own
+ * `markup_locked` refusal arrives asynchronously, after the edit has already been
+ * applied to the reactive `markups` array and queued - by then the only options are a
+ * permanently wedged mirror queue or a discard-after-the-fact revert. Refusing here
+ * means a locked markup never enters that path at all.
+ */
+function lockRefusalMessage(m: Markup): string | null {
+  if (isMarkupLocked(m)) return `Markup ${m.id} is locked and cannot be edited or deleted.`;
+  if (isMarkupContentsLocked(m)) return `Markup ${m.id}'s contents are locked and cannot be edited.`;
+  return null;
+}
+
+/**
+ * Backend rejections that can never succeed by retrying - `runDrain` must discard the
+ * op and keep draining, not halt the whole queue forever on one unfixable item (review
+ * finding on PR #92, 2026-09-01). `lockRefusalMessage` above should catch a locked
+ * markup before it is ever enqueued, but this is the defense-in-depth backstop for any
+ * mutation that reaches the backend anyway (a race, or a future caller that bypasses
+ * the store's own mutation methods) and any other structurally permanent refusal from
+ * `document::store::MarkupStore` (`update`/`delete`/`add` in `document/store.rs`).
+ * Anything NOT matched here is treated as possibly-transient and keeps the existing
+ * halt-and-retry-on-next-enqueue behaviour.
+ */
+function isDefinitiveRejection(err: unknown): boolean {
+  const text = err instanceof Error ? err.message : String(err);
+  return (
+    text.includes('"error":"markup_locked"') ||
+    /unknown (markup id|doc_id)/.test(text) ||
+    text.includes("duplicate markup id")
+  );
+}
 
 /** Default colour rotation for newly-created count sets (distinct, legible hues). */
 export const COUNT_SET_PALETTE: readonly string[] = [
@@ -158,8 +192,26 @@ export class MarkupStore implements MarkupSink {
 
   // --- Mutations (undoable + mirrored) ---
   create(m: Markup) { this.dirty = true; this.enqueue(this.history.push(new CreateCmd(m))); this.historyVersion++; }
-  update(before: Markup, after: Markup) { this.dirty = true; this.enqueue(this.history.push(new UpdateCmd(before, after))); this.historyVersion++; }
-  delete(id: string) { const m = this.getById(id); if (m) { this.dirty = true; this.enqueue(this.history.push(new DeleteCmd(m))); this.historyVersion++; } }
+
+  /** Refuses (sets `mirrorError`, no-op) if `before` is locked - see `lockRefusalMessage`. */
+  update(before: Markup, after: Markup) {
+    const refusal = lockRefusalMessage(before);
+    if (refusal) { this.mirrorError = refusal; return; }
+    this.dirty = true;
+    this.enqueue(this.history.push(new UpdateCmd(before, after)));
+    this.historyVersion++;
+  }
+
+  /** Refuses (sets `mirrorError`, no-op) if the markup is locked - see `lockRefusalMessage`. */
+  delete(id: string) {
+    const m = this.getById(id);
+    if (!m) return;
+    const refusal = lockRefusalMessage(m);
+    if (refusal) { this.mirrorError = refusal; return; }
+    this.dirty = true;
+    this.enqueue(this.history.push(new DeleteCmd(m)));
+    this.historyVersion++;
+  }
 
   /** Undo the last frame (which may be 1 or N commands). Each op is enqueued in order. */
   undo() { const ops = this.history.undo(); if (ops) { this.dirty = true; ops.forEach((op) => this.enqueue(op)); this.historyVersion++; } }
@@ -179,11 +231,21 @@ export class MarkupStore implements MarkupSink {
   /**
    * Apply a batch of before/after update pairs as ONE undo frame.
    * Enqueues each update op in forward order. Empty pairs array is a no-op.
+   * Pairs whose `before` is locked are skipped (not applied, not enqueued) and reported
+   * via `mirrorError` - the rest of the batch still proceeds (matches Bluebeam-style
+   * "skip what's locked, do the rest" rather than refusing the whole batch for one
+   * locked item).
    */
   applyBatch(pairs: { before: Markup; after: Markup }[]): void {
     if (pairs.length === 0) return;
+    const locked = pairs.filter((p) => lockRefusalMessage(p.before) !== null);
+    const allowed = pairs.filter((p) => lockRefusalMessage(p.before) === null);
+    if (locked.length > 0) {
+      this.mirrorError = `${locked.length} locked markup(s) skipped: ${locked.map((p) => p.before.id).join(", ")}`;
+    }
+    if (allowed.length === 0) return;
     this.dirty = true;
-    const cmds = pairs.map(({ before, after }) => new UpdateCmd(before, after));
+    const cmds = allowed.map(({ before, after }) => new UpdateCmd(before, after));
     const ops = this.history.pushBatch(cmds);
     ops.forEach((op) => this.enqueue(op));
     this.historyVersion++;
@@ -191,17 +253,25 @@ export class MarkupStore implements MarkupSink {
 
   /**
    * Delete all currently-selected markups as ONE undo frame. Clears selectedIds.
-   * If nothing is selected, this is a no-op.
+   * If nothing is selected, this is a no-op. Locked selections are skipped (not
+   * deleted) and reported via `mirrorError`; unlocked selections still proceed - see
+   * `applyBatch`'s doc comment for the same "skip locked, do the rest" rationale.
    */
   deleteSelected(): void {
     const targets = this.selectedMarkups;
     if (targets.length === 0) return;
+    const locked = targets.filter((m) => lockRefusalMessage(m) !== null);
+    const deletable = targets.filter((m) => lockRefusalMessage(m) === null);
+    if (locked.length > 0) {
+      this.mirrorError = `${locked.length} locked markup(s) skipped: ${locked.map((m) => m.id).join(", ")}`;
+    }
+    this.selectedIds = new Set();
+    if (deletable.length === 0) return;
     this.dirty = true;
-    const cmds = targets.map((m) => new DeleteCmd(m));
+    const cmds = deletable.map((m) => new DeleteCmd(m));
     const ops = this.history.pushBatch(cmds);
     ops.forEach((op) => this.enqueue(op));
     this.historyVersion++;
-    this.selectedIds = new Set();
   }
 
   // --- Ordered async mirror ---
@@ -213,6 +283,11 @@ export class MarkupStore implements MarkupSink {
   }
 
   private async runDrain(): Promise<void> {
+    // Tracks whether a definitively-rejected op was discarded this drain - if so, the
+    // loop-exit success path below must NOT clear mirrorError, or the refusal message
+    // would vanish before the UI ever gets a chance to show it (see isDefinitiveRejection's
+    // doc comment).
+    let hadDiscard = false;
     while (this.queue.length > 0) {
       const op = this.queue[0];
       try {
@@ -221,11 +296,18 @@ export class MarkupStore implements MarkupSink {
         else await this.ipc.remove(this.docId, op.id);
       } catch (e) {
         this.mirrorError = `Sync failed: ${e instanceof Error ? e.message : String(e)}`;
-        return; // halt; queue head stays; startDrain() inside flush() or the next enqueue will retry
+        if (isDefinitiveRejection(e)) {
+          // Can never succeed by retrying - discard and keep draining the rest of the
+          // queue rather than freezing every later op behind this one forever.
+          hadDiscard = true;
+          this.queue.shift();
+          continue;
+        }
+        return; // possibly-transient; halt: queue head stays, next enqueue/flush retries
       }
       this.queue.shift();
     }
-    this.mirrorError = null;
+    if (!hadDiscard) this.mirrorError = null;
   }
 
   /** Await a full drain of pending mirror ops (call before save). Throws if the queue

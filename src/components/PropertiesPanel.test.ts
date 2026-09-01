@@ -33,6 +33,11 @@ vi.mock("$lib/ipc", () => ({
   saveDocumentAs: vi.fn(),
   updateMarkup: vi.fn(),
   deleteMarkup: vi.fn(),
+  // Pure lock-flag bit tests (markup-store.svelte.ts's guard depends on these) -
+  // real logic, not a stub, since it's the exact behaviour under test elsewhere
+  // (ipc.test.ts) and other tests here rely on unlocked markups passing through.
+  isMarkupLocked: (m: { annot_flags?: number }) => ((m.annot_flags ?? 0) & 0x80) !== 0,
+  isMarkupContentsLocked: (m: { annot_flags?: number }) => ((m.annot_flags ?? 0) & 0x200) !== 0,
 }));
 
 import * as ipcMocks from "$lib/ipc";

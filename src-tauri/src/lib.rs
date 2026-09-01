@@ -29,6 +29,7 @@ mod identity;
 pub mod license;
 mod panic_guard;
 pub mod render;
+pub mod rpc;
 pub mod sidecar;
 pub mod updater_rollback;
 
@@ -176,6 +177,12 @@ pub fn run() {
                 toolchest,
                 sequence_counters: SequenceCounters::new(),
             });
+            // MCP companion bridge (design §2/§5) - started once, after AppState is
+            // managed (the bridge dispatches into it), lives for the app's lifetime
+            // (see rpc module doc comment for the v1 per-app-vs-per-document
+            // simplification). Errors are logged inside rpc::start, never fatal to
+            // the GUI's own startup.
+            rpc::start(app.handle());
             info!("Redline started");
             Ok(())
         })

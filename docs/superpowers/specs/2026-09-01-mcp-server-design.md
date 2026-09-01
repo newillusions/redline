@@ -242,6 +242,91 @@ in this project has been gated (see the mission record's `architect-gate-2026-07
 "no large-set doc-surgery features without a docops backend decision" — the same posture
 applies here: design first, gate, then build).
 
+## Implementation notes (Phase 1, 2026-09-01)
+
+Phase 1 shipped the FULL tool surface in one PR, per the owner's scope decision
+(2026-09-01, "We need mutation as well... And the ability to flatten and reduce file
+size through the mcp."), not the read-only-first/mutation-gated rollout §6 above
+originally proposed - the lock guard was built as a build prerequisite instead, per
+that same decision, and every mutating tool ships behind it from day one.
+
+**Flatten/reduce-file-size assessment (§3's owner-added pair): both primitives already
+existed.** `commands::docops::flatten_document`/`optimize_document` (M5, PR #67/#69)
+were already full, tested, shipped Tauri commands wrapping `docops::flatten_annotations`/
+`optimize_in_place_with_images`. No new core PDF logic was needed - both MCP tools
+(`flatten_document`, `reduce_file_size`) are thin pass-throughs to these exact existing
+commands via `AppHandle::state()`. Neither is a phase-2 deferral.
+
+**Lock guard**: `Markup::is_locked`/`is_contents_locked` (§4 items 1-2) landed in
+`markup/mod.rs`, and the refusal (§4 items 3-4, structured `markup_locked` error) is
+wired into `document::store::MarkupStore::update`/`delete` - the single choke point both
+`commands::document::update_markup`/`delete_markup` (GUI) and the MCP bridge's
+`update_markup`/`delete_markup` tools call through, closing the GUI gap in the same
+change as designed. `create_markup` has no lock check (nothing to lock before a markup
+exists). TDD per §6's four cases (locked foreign, locked redline-authored, unlocked
+control, LockedContents-only) at both the `markup::check_not_locked` level and the
+`MarkupStore` level.
+
+**Architecture as designed**: `redline-mcp` (new `[[bin]]`, pure protocol translator,
+no PDFium/Tauri dependency) speaks MCP JSON-RPC 2.0 over stdio to its Claude Code
+parent, and line-delimited JSON (`rpc::protocol::RpcRequest`/`RpcResponse`) over a local
+socket to the running GUI app. Every tool call resolves to the exact existing
+`commands::*`/`MarkupStore` functions the Svelte frontend already invokes - no parallel
+mutation path.
+
+**Named deviations from the design's illustrative sketch** (§3 said schemas were
+"sketched... not to freeze wire format" - these are the concrete choices made filling
+that in):
+- **Socket lifecycle is per-app, not per-document.** §2/§6 described starting the
+  bridge when a document opens and tearing it down when the last one closes. Phase 1
+  starts it once in `setup()`, for the app's full lifetime. The security posture is
+  identical (filesystem-permission gated either way) and a call against an unopened
+  `doc_id` still gets the exact "unknown doc_id" refusal the design requires - see
+  `rpc` module's doc comment for the full reasoning.
+- **`search_markups` searches markup subject/contents text, not raw PDF text**, and
+  only `scope: "document"` is implemented - `page`/`open_docs`/`recents`/`folder` are
+  named in the schema but refused with a clear error, not silently narrowed.
+- **`export_markup_schedule` takes no path input; it generates one** next to the source
+  document (`<stem>-markup-schedule-<timestamp>.<ext>`) and returns it - matching the
+  design's stated OUTPUT ("file path of the generated export") rather than the
+  underlying `export_markup_list` Tauri command's GUI-dialog-supplied-path shape.
+- **`update_markup` is a v1-simplified partial merge**: a field can be SET but not
+  cleared back to `None` (no JSON null-vs-absent distinction implemented) - pass an
+  empty string to blank `contents`.
+- **doc_id was added to `read_markup`/`update_markup`/`delete_markup`/`save_document`**
+  (the design's illustrative tables showed some of these keyed by `markup_id` alone) -
+  `MarkupStore` is doc-scoped, so this is required, not optional.
+- **Socket endpoint**: `$TMPDIR/redline-mcp.sock` (Unix) / `\\.\pipe\redline-mcp`
+  (Windows) - a fixed, single-instance-assumption path both binaries compute
+  independently with zero shared runtime state, since `redline-mcp` has no Tauri
+  context to derive an app-scoped directory from.
+
+**Windows named-pipe path: UNVERIFIED, named plainly.** This build/test environment is
+macOS-only for this session - the Windows server (`rpc::run_windows`) and client
+(`redline_mcp::connect` under `cfg(windows)`) branches were written from documented API
+shapes but never compiled or run against a Windows target. They also fall short of the
+design's explicit ACL requirement (§5: "a named pipe with an ACL restricted to the
+current user's SID") - `ServerOptions` uses tokio's defaults rather than a custom
+security descriptor, which needs `windows-sys` calls this session could not verify.
+Flagged as a real follow-up (compile + fix + tighten the ACL on the Windows testbench),
+not shipped-and-proven coverage. The Unix domain socket path (macOS/Linux) is fully
+built and unit-tested.
+
+**Verified this session** (all quoted from this session's own tool output): `cargo test
+--workspace --all-targets` - 611 passing, 0 failed (7 pdf-diff-lib + 14 pdf-diff-tests +
+586 redline_lib + 4 redline-mcp bin, plus 18 pre-existing corpus-gated `#[ignore]`
+tests, unchanged); `cargo clippy --all-targets` - 0 warnings; `cargo build --bins` -
+all three binaries (`redline`, `bench`, `redline-mcp`) link successfully.
+
+**Not verified / out of reach in this environment, named honestly:**
+- No live `cargo tauri dev` GUI session was run - the socket bridge, a real
+  `redline-mcp` <-> app round trip, and the lock guard's effect on the actual GUI
+  Properties panel are unexercised end-to-end. Same class of gap named in every prior
+  docops PR in this repo's history (obs:3dw1ojc5vtw8cdklhlla, obs:t5g42nvkczmj5p12hhrt).
+- The Windows named-pipe path, as stated above.
+- Multi-document / multi-instance behaviour beyond what's noted above (open questions 2
+  and 3 below remain genuinely open).
+
 ## Open questions for the owner (not resolved by this design)
 
 1. **Does Wave 1 alone satisfy the "helpful" bar Martin described, or is mutation the

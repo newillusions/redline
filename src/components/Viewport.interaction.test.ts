@@ -55,6 +55,11 @@ vi.mock("$lib/ipc", () => ({
   saveDocumentAs: vi.fn(),
   updateMarkup: vi.fn(),
   deleteMarkup: vi.fn(),
+  // Pure lock-flag bit tests (markup-store.svelte.ts's guard depends on these) -
+  // real logic, not a stub, since every markup fixture here is unlocked (no
+  // annot_flags set) and must pass through untouched.
+  isMarkupLocked: (m: { annot_flags?: number }) => ((m.annot_flags ?? 0) & 0x80) !== 0,
+  isMarkupContentsLocked: (m: { annot_flags?: number }) => ((m.annot_flags ?? 0) & 0x200) !== 0,
   // M3 takeoff IPC
   addScale: vi.fn(async () => ({
     id: "scale-1", applies_to: { kind: "DocumentDefault" }, method: "TwoPoint",

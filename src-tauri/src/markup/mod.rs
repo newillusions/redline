@@ -438,6 +438,82 @@ impl Markup {
         self.audit.modified_by = modified_by;
         self.audit.modified_at = Utc::now();
     }
+
+    /// ISO 32000-1 §12.5.3 Table 165 bit 8, `Locked` (decimal `128` / `0x80`): the
+    /// annotation may not be deleted or have any of its properties modified by the
+    /// user, other than `/Contents` (MCP server design, 2026-09-01, §4).
+    pub fn is_locked(&self) -> bool {
+        self.annot_flags & 0x80 != 0
+    }
+
+    /// ISO 32000-1 §12.5.3 Table 165 bit 10, `LockedContents` (decimal `512` /
+    /// `0x200`): `/Contents` (and the appearance it drives) may not be modified, but
+    /// other properties - including deletion - remain editable (MCP server design,
+    /// 2026-09-01, §4). Independent of [`Markup::is_locked`] - either, both, or
+    /// neither bit may be set.
+    pub fn is_contents_locked(&self) -> bool {
+        self.annot_flags & 0x200 != 0
+    }
+}
+
+/// Structured refusal for a locked-markup mutation attempt (MCP server design §4 item
+/// 4). Serializes to `{"error":"markup_locked","markup_id":"...","flag":"Locked"}` (or
+/// `"LockedContents"`) - a calling agent gets something concrete to relay back to the
+/// user, never a silent no-op and never a partial write.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MarkupLockError {
+    pub error: &'static str,
+    pub markup_id: String,
+    pub flag: &'static str,
+}
+
+impl std::fmt::Display for MarkupLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            serde_json::to_string(self).unwrap_or_else(|_| "markup_locked".to_string())
+        )
+    }
+}
+
+impl std::error::Error for MarkupLockError {}
+
+/// Shared lock-respect guard (MCP server design §4, items 1-3) - the one choke point
+/// both the GUI's mutation commands and the MCP bridge must call through, so the fix
+/// closes the gap for both surfaces from a single change rather than an MCP-only check
+/// a future GUI code path could still bypass. Wired into `MarkupStore::update`/
+/// `MarkupStore::delete` (`document::store`), which both `commands::document::
+/// update_markup`/`delete_markup` (GUI, via Tauri `invoke`) and the MCP bridge
+/// (`rpc::tools`) call through - there is no other path to mutate a markup.
+///
+/// v1 treats `Locked` OR `LockedContents` as "refuse the whole mutation" rather than
+/// honouring the ISO spec's finer per-property distinction (`LockedContents` still
+/// permits deletion and non-content edits) - a deliberate simplification, not a
+/// misreading: `update_markup` replaces the whole annotation state in one call with no
+/// field-level patch API yet, so partial honouring risks a "the caller only meant to
+/// move it but the whole call got through and also changed the locked note" gap. Refuse
+/// more than the spec strictly requires, never less; revisit if a field-level patch
+/// tool is ever proposed.
+///
+/// `create_markup` has no target to check - there is nothing to lock before it exists -
+/// so this guard is deliberately only wired into update/delete, not creation.
+pub fn check_not_locked(existing: &Markup) -> Result<(), MarkupLockError> {
+    if existing.is_locked() {
+        return Err(MarkupLockError {
+            error: "markup_locked",
+            markup_id: existing.id().to_string(),
+            flag: "Locked",
+        });
+    }
+    if existing.is_contents_locked() {
+        return Err(MarkupLockError {
+            error: "markup_locked",
+            markup_id: existing.id().to_string(),
+            flag: "LockedContents",
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -713,5 +789,91 @@ mod tests {
         let json = serde_json::to_string(&m).expect("serialize");
         let back: Markup = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(m, back);
+    }
+
+    // --- MCP server design §4: markup lock guard ---
+
+    #[test]
+    fn unlocked_control_case_is_not_locked_either_way() {
+        // Default annot_flags is 4 (Print only) - the control case.
+        let m = sample();
+        assert!(!m.is_locked());
+        assert!(!m.is_contents_locked());
+        assert!(check_not_locked(&m).is_ok());
+    }
+
+    #[test]
+    fn locked_bit_8_is_detected() {
+        let mut m = sample();
+        m.annot_flags = 0x80; // Locked only
+        assert!(m.is_locked());
+        assert!(!m.is_contents_locked());
+    }
+
+    #[test]
+    fn locked_contents_bit_10_is_detected_independently() {
+        let mut m = sample();
+        m.annot_flags = 0x200; // LockedContents only
+        assert!(!m.is_locked());
+        assert!(m.is_contents_locked());
+    }
+
+    #[test]
+    fn both_lock_bits_combine_with_other_flags_losslessly() {
+        // Print (4) + Locked (0x80) + LockedContents (0x200), a realistic combination
+        // since annot_flags round-trips the raw /F bit field alongside these two bits.
+        let mut m = sample();
+        m.annot_flags = 4 | 0x80 | 0x200;
+        assert!(m.is_locked());
+        assert!(m.is_contents_locked());
+    }
+
+    #[test]
+    fn check_not_locked_refuses_locked_bluebeam_authored_markup() {
+        // "Foreign (Bluebeam-authored)" is simulated by origin - the guard is a pure
+        // bit test and must not special-case origin either way (see the next test).
+        let mut m = sample();
+        m.audit.origin = Origin::FieldApp; // stand-in for "not authored by this session"
+        m.annot_flags = 0x80;
+        let err = check_not_locked(&m).expect_err("locked markup must be refused");
+        assert_eq!(err.error, "markup_locked");
+        assert_eq!(err.flag, "Locked");
+        assert_eq!(err.markup_id, m.id().to_string());
+    }
+
+    #[test]
+    fn check_not_locked_refuses_locked_redline_authored_markup_too() {
+        // The guard is origin-agnostic: a markup redline itself created and locked
+        // must be refused exactly like a foreign one - proves there is no accidental
+        // "only foreign annotations are locked" special-casing.
+        let mut m = sample();
+        assert_eq!(m.audit.origin, Origin::Desktop);
+        m.annot_flags = 0x80;
+        assert!(check_not_locked(&m).is_err());
+    }
+
+    #[test]
+    fn check_not_locked_refuses_locked_contents_only() {
+        let mut m = sample();
+        m.annot_flags = 0x200;
+        let err = check_not_locked(&m).expect_err("LockedContents-only must be refused");
+        assert_eq!(err.flag, "LockedContents");
+    }
+
+    #[test]
+    fn check_not_locked_allows_unlocked_control_case() {
+        let m = sample(); // default annot_flags = 4 (Print), no lock bits
+        assert!(check_not_locked(&m).is_ok());
+    }
+
+    #[test]
+    fn markup_lock_error_serializes_to_the_documented_shape() {
+        let mut m = sample();
+        m.annot_flags = 0x80;
+        let err = check_not_locked(&m).unwrap_err();
+        let json: serde_json::Value = serde_json::from_str(&err.to_string()).unwrap();
+        assert_eq!(json["error"], "markup_locked");
+        assert_eq!(json["flag"], "Locked");
+        assert_eq!(json["markup_id"], m.id().to_string());
     }
 }
