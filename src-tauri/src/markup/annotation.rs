@@ -910,10 +910,33 @@ impl Markup {
         let (color, fill) = if matches!(markup_type, MarkupType::Text | MarkupType::Callout) {
             let ic_fill = get_reals(d, b"IC").map(|c| rgb_to_hex(&c));
             if let Some(text_color) = get_string(d, b"RLTextColor") {
-                // 1. Post-fix redline file: the dedicated key carries the exact glyph
-                // colour; /IC (always written alongside /C for every markup type, old and
-                // new) carries the background.
-                (text_color, ic_fill)
+                // 1. Post-fix redline file: /IC (always written alongside /C by redline
+                // itself) normally carries the background and is kept in lockstep with /C
+                // on every redline save. But /IC is a private, non-standard key that a
+                // foreign editor (Bluebeam/Acrobat) has no reason to know about - if the
+                // user edits the FreeText background in one of those viewers, ONLY /C
+                // changes; /IC is left stale. The write side (`to_annotation_dict` above)
+                // only ever emits /IC when `appearance.fill` is `Some`, so /IC's mere
+                // PRESENCE here already proves the file was written with a background at
+                // some point - which makes the two foreign-edit shapes unambiguous once
+                // /RLTextColor confirms this is a post-fix file:
+                //   - /C present, differs from /IC -> a foreign RECOLOUR; /C wins (the new
+                //     background), and the stale /IC is what's wrong, not /C.
+                //   - /C absent (but /IC present, proving a fill existed) -> a foreign
+                //     REMOVAL, since redline itself never omits /C while a fill is set
+                //     (see the /C write-side comment above) - /IC is what's now stale, and
+                //     the removal must win rather than resurrecting the old background from
+                //     the private key the foreign viewer never touched.
+                // Either way the very next redline save re-converges both keys to the
+                // winning value (write side: /C and /IC together, or neither when fill is
+                // None) - self-healing rather than a permanent split.
+                let c_fill = get_reals(d, b"C").map(|c| rgb_to_hex(&c));
+                let fill = match &c_fill {
+                    Some(c) if Some(c) != ic_fill.as_ref() => c_fill,
+                    Some(_) => ic_fill,
+                    None => None,
+                };
+                (text_color, fill)
             } else if get_name(d, b"RLType").is_some() {
                 // 2. Pre-fix redline file (has other /RL* markers but no /RLTextColor):
                 // /C was written as the glyph colour by the old code path. Preserve that
@@ -1702,6 +1725,98 @@ mod tests {
         assert!(Markup::from_annotation_dict(&d).count_set.is_none());
     }
 
+    #[test]
+    fn foreign_save_strips_rlcountsetcolor_falls_back_to_c_gracefully() {
+        // Resilience test (PR #87 follow-up, 2026-08-31 review cycle): simulate a
+        // foreign save that drops the private /RLCountSetColor key while leaving the
+        // rest of the /RLCountSet* markers (and /RLType) intact - the documented
+        // fallback path (write-side comment above `d.set("RLCountSetColor", ...)`)
+        // says the standard /C key ALSO carries the set colour precisely so a viewer
+        // that strips unknown private keys still leaves enough for redline to recover
+        // a sane colour, rather than corrupting or panicking.
+        use super::super::{CountSet, CountSymbol};
+        let g = MarkupGeometry::Point(PdfPoint { x: 10.0, y: 10.0 });
+        let mut m = fixture(g, MarkupType::MeasurementCount);
+        m.appearance.color = "#7b2ff7".into();
+        let cs = CountSet {
+            id: uuid::Uuid::new_v4(),
+            name: "Type-B fixture".into(),
+            color: "#7b2ff7".into(), // == appearance.color, as redline always writes it
+            symbol: CountSymbol::Square,
+        };
+        m.count_set = Some(cs.clone());
+
+        let mut d = m.to_annotation_dict();
+        assert!(
+            d.has(b"RLCountSetColor"),
+            "sanity: key exists before the strip"
+        );
+        d.remove(b"RLCountSetColor"); // simulated foreign strip of just this key
+
+        let back = Markup::from_annotation_dict(&d);
+        let restored = back
+            .count_set
+            .as_ref()
+            .expect("RLCountSetId/Name/Symbol survived - set membership must not be lost");
+        assert_eq!(
+            restored.id, cs.id,
+            "set id unaffected by the stripped colour key"
+        );
+        assert_eq!(
+            restored.color, "#7b2ff7",
+            "documented fallback: colour recovers from the standard /C key"
+        );
+        assert_eq!(restored.symbol, CountSymbol::Square);
+    }
+
+    #[test]
+    fn foreign_save_strips_all_rl_keys_from_count_marker_degrades_to_plain_stamp() {
+        // Harsher resilience case: a foreign viewer that regenerates the annotation
+        // dictionary from its OWN model (rather than selectively dropping one unknown
+        // key) keeps only standard PDF keys and discards every /RL* extension key,
+        // including /RLType itself. Losing /RLType means redline can no longer tell
+        // this was ever a MeasurementCount marker - proving that degrades to a plain,
+        // well-formed markup (never a panic, never a corrupted/garbage count_set) is
+        // the graceful-fallback contract this test locks in.
+        use super::super::{CountSet, CountSymbol};
+        let g = MarkupGeometry::Point(PdfPoint { x: 10.0, y: 10.0 });
+        let mut m = fixture(g, MarkupType::MeasurementCount);
+        m.count_set = Some(CountSet {
+            id: uuid::Uuid::new_v4(),
+            name: "Type-C fixture".into(),
+            color: "#3366ff".into(),
+            symbol: CountSymbol::Circle,
+        });
+
+        let mut d = m.to_annotation_dict();
+        let rl_keys: Vec<Vec<u8>> = d
+            .iter()
+            .map(|(k, _)| k.clone())
+            .filter(|k| k.starts_with(b"RL"))
+            .collect();
+        assert!(
+            !rl_keys.is_empty(),
+            "sanity: some /RL* keys exist before the strip"
+        );
+        for k in rl_keys {
+            d.remove(&k);
+        }
+
+        // Must not panic, and must fall back to the standard-key-derived reading
+        // (Subtype "Stamp" -> MarkupType::Stamp) rather than yielding a MeasurementCount
+        // with a corrupted or dangling count_set reference.
+        let back = Markup::from_annotation_dict(&d);
+        assert_eq!(
+            back.markup_type,
+            MarkupType::Stamp,
+            "with no /RLType left, the standard /Subtype Stamp must be trusted instead"
+        );
+        assert!(
+            back.count_set.is_none(),
+            "no /RLCountSetId survives the strip - count_set must be None, not stale/garbage"
+        );
+    }
+
     // --- Text-box outline colour + fill alpha round-trip ---
 
     #[test]
@@ -1870,6 +1985,169 @@ mod tests {
             Some("#ffffe5"),
             "self-heal must move /C to the background colour"
         );
+    }
+
+    #[test]
+    fn bluebeam_edits_c_on_reopen_of_post_fix_file_win_over_stale_ic() {
+        // A post-fix redline file (has /RLTextColor), then re-opened after a foreign
+        // viewer (Bluebeam/Acrobat) edited the FreeText background. The foreign editor
+        // only knows about the standard /C key - it has no reason to touch our private
+        // /IC - so after such an edit /C and /IC disagree. The read side must trust /C
+        // (the foreign edit), not the now-stale /IC, or the edit is silently dropped the
+        // moment redline reopens the file (PR #88 follow-up, 2026-08-31 review cycle).
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("FreeText"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(0.0), real(0.0), real(50.0), real(20.0)]),
+        );
+        d.set("RLType", name("Text"));
+        d.set("RLPage", Object::Integer(0));
+        d.set("RLTextColor", Object::string_literal("#3366ff")); // glyph, untouched
+        d.set(
+            "IC",
+            Object::Array(vec![real(1.0), real(1.0), real(0.9)]), // stale: old background (#ffffe5)
+        );
+        d.set(
+            "C",
+            Object::Array(vec![real(0.0), real(1.0), real(0.0)]), // Bluebeam's edit: new background (#00ff00)
+        );
+
+        let back = Markup::from_annotation_dict(&d);
+        assert_eq!(
+            back.appearance.color, "#3366ff",
+            "glyph colour must still come from /RLTextColor, untouched by the /C edit"
+        );
+        assert_eq!(
+            back.appearance.fill.as_deref(),
+            Some("#00ff00"),
+            "the Bluebeam-edited /C must win as the new background over the stale /IC"
+        );
+
+        // Re-converge: the very next redline save must write both /C and /IC back to
+        // the winning value, so the split self-heals rather than persisting forever.
+        let healed = back.to_annotation_dict();
+        assert_eq!(
+            get_reals(&healed, b"C").map(|c| rgb_to_hex(&c)).as_deref(),
+            Some("#00ff00"),
+            "self-heal: /C must carry the converged background"
+        );
+        assert_eq!(
+            get_reals(&healed, b"IC").map(|c| rgb_to_hex(&c)).as_deref(),
+            Some("#00ff00"),
+            "self-heal: /IC must converge to match /C"
+        );
+    }
+
+    #[test]
+    fn freetext_c_matching_ic_is_unaffected_by_the_bluebeam_edit_check() {
+        // Control case: /C and /IC agree (the normal, un-edited-by-a-foreign-viewer
+        // shape every redline save produces). The new "/C wins on mismatch" logic must
+        // not disturb this - it only fires on a genuine disagreement.
+        let g = MarkupGeometry::Rect {
+            min: PdfPoint { x: 0.0, y: 0.0 },
+            max: PdfPoint { x: 40.0, y: 16.0 },
+        };
+        let mut m = fixture(g, MarkupType::Text);
+        m.appearance.color = "#123456".into();
+        m.appearance.fill = Some("#abcdef".into());
+
+        assert_roundtrip(&m); // to_annotation_dict always writes /C == /IC for Text/Callout
+    }
+
+    #[test]
+    fn bluebeam_removes_c_on_reopen_of_post_fix_file_wins_over_stale_ic() {
+        // PR #91 review finding: the recolour case (/C present, differs from /IC) was
+        // fixed, but a foreign REMOVAL of the background - expressed per ISO 32000-1
+        // §12.5.6.6 by omitting /C entirely, not by setting it to some sentinel - was not.
+        // Reading fell through to the stale /IC, silently resurrecting a background the
+        // user had just cleared in Bluebeam/Acrobat. /IC's mere presence already proves a
+        // fill existed at some point (the write side never emits /IC without /C - see the
+        // write-side /IC comment), so /C absent + /IC present is unambiguous evidence of a
+        // foreign removal, not of a background that was never set.
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("FreeText"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(0.0), real(0.0), real(50.0), real(20.0)]),
+        );
+        d.set("RLType", name("Text"));
+        d.set("RLPage", Object::Integer(0));
+        d.set("RLTextColor", Object::string_literal("#3366ff")); // glyph, untouched
+        d.set(
+            "IC",
+            Object::Array(vec![real(1.0), real(1.0), real(0.9)]), // stale: the old background (#ffffe5)
+        );
+        // No /C at all - Bluebeam's edit: the user cleared the background.
+
+        let back = Markup::from_annotation_dict(&d);
+        assert_eq!(
+            back.appearance.color, "#3366ff",
+            "glyph colour must still come from /RLTextColor, untouched by the removal"
+        );
+        assert_eq!(
+            back.appearance.fill, None,
+            "the Bluebeam removal (/C absent) must win over the stale /IC, not resurrect it"
+        );
+
+        // Re-converge: the very next redline save must write neither /C nor /IC (fill is
+        // None), so the removal self-heals into a consistent no-fill file rather than the
+        // stale /IC surviving to cause the same bug again on a third open.
+        let healed = back.to_annotation_dict();
+        assert!(
+            !healed.has(b"C"),
+            "self-heal: /C must stay omitted (no fill)"
+        );
+        assert!(
+            !healed.has(b"IC"),
+            "self-heal: /IC must be dropped, not carried forward stale"
+        );
+
+        // Third open: re-reading the healed dict must reproduce the same no-fill result,
+        // proving the split is fully resolved rather than merely deferred.
+        let reopened = Markup::from_annotation_dict(&healed);
+        assert_eq!(
+            reopened.appearance.fill, None,
+            "third open must remain stable at None"
+        );
+    }
+
+    #[test]
+    fn freetext_genuinely_never_had_fill_is_unaffected_by_the_removal_check() {
+        // Control case for the removal fix: a post-fix file that never had a background at
+        // all (no /C, no /IC - the genuine "no fill was ever set" shape, distinct from the
+        // "/C removed but /IC still stale" shape above only by /IC's absence). Must read as
+        // fill == None, exactly as it always has - the new None-on-/C-absent branch must
+        // not be reachable any differently here since /IC is also absent.
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("FreeText"));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(0.0), real(0.0), real(50.0), real(20.0)]),
+        );
+        d.set("RLType", name("Text"));
+        d.set("RLPage", Object::Integer(0));
+        d.set("RLTextColor", Object::string_literal("#3366ff"));
+        // No /C, no /IC - never had a background.
+
+        let back = Markup::from_annotation_dict(&d);
+        assert_eq!(back.appearance.color, "#3366ff");
+        assert_eq!(
+            back.appearance.fill, None,
+            "never-had-fill file must read as no fill"
+        );
+
+        // Stays fill == None through a real save/reload cycle. (Not `assert_roundtrip`
+        // here: `back`'s audit timestamps come from the `Utc::now()` fallback since `d`
+        // carries no /CreationDate or /M, and that fallback's sub-second precision doesn't
+        // survive the PDF date string's whole-second serialisation - an unrelated
+        // round-trip mismatch this test isn't about. `legacy_pre_fix_freetext_reads_c_as_
+        // glyph_colour_then_self_heals` above avoids `assert_roundtrip` for the same
+        // reason.)
+        let resaved = back.to_annotation_dict();
+        assert!(!resaved.has(b"C"));
+        assert!(!resaved.has(b"IC"));
+        assert_eq!(Markup::from_annotation_dict(&resaved).appearance.fill, None);
     }
 
     #[test]

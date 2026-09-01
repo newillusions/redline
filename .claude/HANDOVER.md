@@ -1,5 +1,119 @@
 # Redline - Handover Notes
 
+## Current Status (2026-09-01, dispatched session - markup round-trip follow-ups)
+
+**Owner-authorized ("run the redline follow-ups"). Three follow-ups from the 08-31
+review cycle (PR #88's non-blocking finding + PR #87's named follow-ups), on branch
+`fix/markup-followups-08-31` off `main@36a1b5a3`. Items 1-2 fixed + tested; item 3
+assessed and deferred (reasoning in the PR description).**
+
+1. **Bluebeam-edits-/C-on-reopen gap (fixed).** `Markup::from_annotation_dict`
+   (`src-tauri/src/markup/annotation.rs`) case 1 (post-fix file, `/RLTextColor`
+   present) previously sourced the FreeText background fill from `/IC` only. A
+   foreign viewer editing the background writes only the standard `/C` key (it has
+   no reason to know about our private `/IC`), so that edit was silently discarded
+   on reopen. Fix: when `/C` is present and differs from `/IC`, `/C` wins as the new
+   fill; the next redline save re-converges both keys (self-heals). New tests:
+   `bluebeam_edits_c_on_reopen_of_post_fix_file_win_over_stale_ic` (edit wins +
+   self-heal) and `freetext_c_matching_ic_is_unaffected_by_the_bluebeam_edit_check`
+   (control: unedited round-trip unchanged).
+2. **BB-strips-/RLCountSetColor resilience (verified, already graceful; test added).**
+   Two new tests prove graceful degradation, no corruption: stripping just
+   `/RLCountSetColor` falls back to the standard `/C` key exactly as the write-side
+   comment documents (`foreign_save_strips_rlcountsetcolor_falls_back_to_c_gracefully`);
+   stripping every `/RL*` key (including `/RLType`) degrades the marker to a plain
+   `MarkupType::Stamp` with `count_set: None` rather than a corrupted/dangling
+   reference (`foreign_save_strips_all_rl_keys_from_count_marker_degrades_to_plain_stamp`).
+   No code change was needed - the existing fallback chain already handled both cases;
+   this closes the coverage gap only.
+3. **count_set per-marker duplication (assessed, deferred).** `CountSet` is embedded
+   as a full copy inside every member `Markup` (`count_set: Option<CountSet>`,
+   `src-tauri/src/markup/mod.rs`), reconstructed by scanning all markups
+   (`reconstructCountSets` in `src/lib/markup-store.svelte.ts`) rather than stored
+   once. PR #87 already stopped the *colour-corruption* bug (restyling one member's
+   own `/C` no longer bleeds into the read-back set colour, since `/RLCountSetColor`
+   is now persisted independently) - confirmed by tracing both the write path
+   (`to_annotation_dict`) and read path (`from_annotation_dict`) end to end. What
+   remains is real architectural duplication (N copies of one logical set), not an
+   observable bug. Fixing that properly means a single source of truth: splitting
+   `count_set: Option<CountSet>` into a membership id plus a document-level
+   `count_sets: Vec<CountSet>` catalog - which touches the Rust model, the PDF
+   persistence shape (a new top-level catalog structure, since sets are currently
+   *reconstructed* by scanning rather than stored anywhere on their own), the serde
+   wire format the frontend depends on, `markup-store.svelte.ts`, `ipc.ts`, and needs
+   a read-side back-compat/migration path for existing files saved under the current
+   per-markup-embedded model. That is a cross-cutting frontend+backend+PDF-schema
+   refactor, not a bounded `annotation.rs` change - named here as deferred rather than
+   forced into this PR's scope.
+
+Gates: full lib suite 542/542 (baseline was 538 before this PR's 4 new tests - counted
+via the actual `cargo test --lib` summary line, not hand-added), `cargo fmt` clean,
+`cargo clippy --lib` clean (no findings anywhere in the crate, not just the touched
+file). Only file touched: `src-tauri/src/markup/annotation.rs`. The real-Bluebeam-corpus
+harness (`bb_interop_conformance.rs`) was NOT run - gated on `bench/corpus/btx/`,
+machine-local/gitignored, absent in this environment; a corpus conformance run is
+separately queued on mr-desktop's next session per the dispatch note.
+
+Note for the next session touching this file: `.claude/HANDOVER.md` carried an
+uncommitted entry describing PR #90 (MCP server design) when this session started -
+real, dated, accurate content that the design/mcp-server session apparently forgot to
+commit alongside its doc commit (`e65f65f6` does not include it). Preserved it below
+rather than discarding orphaned work; flagged to the team-lead in the RETURN payload.
+
+---
+
+## Current Status (2026-09-01, dispatched session - MCP server design, doc-only)
+
+**Dispatched by team-lead to design (not build) the redline MCP server per charter
+decision `decision:pkyh3se8vqcjdv5ft1je` (Martin, 2026-08-31: "including an mcp would be
+very helpful, i think"). PR #90 open, mergeable, doc-only (`design/mcp-server`, head
+`e65f65f63b0df544e3332215d09f548a3a9832fc`, base `main@36a1b5a3`) -
+https://forge.mms.name/emittiv/redline/pulls/90. No code changed.**
+
+Full doc: `docs/superpowers/specs/2026-09-01-mcp-server-design.md`. Key call:
+**recommend an embedded companion process, not a standalone binary that opens `.pdf`
+files directly.** `document/store.rs`'s `MarkupStore` is explicitly in-memory-only for
+unsaved edits, with no lock/lease protocol for a second writer - a standalone binary
+(even though the crate already proves that pattern is viable, `src-tauri/src/bin/bench.rs`
+drives `redline_lib::render` headlessly with no Tauri) risks a silent dual-writer
+lost-update race the moment the GUI has the same file open with unsaved changes, which is
+strictly worse than the lock-respect question alone. Recommended shape instead: a new
+`redline-mcp` bin is the actual MCP stdio server, but it's a pure protocol translator to
+a local socket the running app exposes - all mutations still go through the one process
+(`MarkupStore` + the existing `document::save` pipeline) regardless of caller.
+
+**Named plainly: redline has no markup-lock concept today.** `Markup::annot_flags: i32`
+round-trips the raw ISO 32000-1 `/F` bits losslessly (confirmed via grep across
+`src-tauri/src` - no `is_locked()` accessor anywhere, no enforcement in any
+`commands/*.rs` file, no GUI enforcement either). Designed the minimal
+`is_locked()`/`is_contents_locked()` contract as a SHARED `redline_lib` guard (fixes the
+GUI gap too, not MCP-only) - directly answering the charter decision's own citation of
+Bluebeam 21.10's "MCP could override locked markups when executing prompts" bug. v1
+treats `Locked` OR `LockedContents` as "refuse the whole mutation" (deliberate
+simplification, named as such, given `update_markup` has no field-level patch API yet).
+
+**v1 tool surface, 8 tools in two waves**: Wave 1 read-only (`list_markups`,
+`read_markup`, `search_markups`, `export_markup_schedule` - all wrapping infra that
+already exists and is shipped, no new domain logic) ships first. Wave 2 mutating
+(`create_markup`, `update_markup`, `delete_markup`, `save_document`) ships only after
+the lock guard exists with its own TDD pass (locked-foreign, locked-redline, unlocked
+control, LockedContents-only cases).
+
+Auth: local-only stdio, loopback socket (0600) / named pipe (user ACL), no network
+exposure, no credentials - matches the existing cloud/collaboration non-goal.
+
+Three open questions left for the owner at the end of the doc: whether read-only alone
+meets the "helpful" bar or mutation is the actual point; `redline-mcp`
+packaging/distribution; multi-document-tab scoping for `doc_id`-less calls. **This
+design pass does not authorize starting implementation** - it is the gate the charter
+decision itself asked for before grooming a build.
+
+KB: `observation:bufy8o1h4hcu0266ie3u` (decision, project-scoped). Mission record's
+`current_focus`/`last_session_summary` updated; new next-step `ns-mcp-server-design`
+added (`proposed`).
+
+---
+
 ## Current Status (2026-08-31, dispatched session - v0.3.15 release + macOS install)
 
 **Owner-authorized ("push the new redline build when it's ready, install it on the Mac").
