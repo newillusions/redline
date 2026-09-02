@@ -52,7 +52,18 @@ pub async fn dispatch(app: &AppHandle, req: RpcRequest) -> Result<Value, Value> 
         "delete_markup" => {
             let p: tools::DeleteMarkupParams = parse(req.params)?;
             let state = app.state::<AppState>();
-            to_value(tools::delete_markup(&state.markups, &p).map(|()| Value::Null))
+            // NOT `Value::Null` - found live 2026-09-02 exercising the MCP round trip.
+            // `RpcResponse.result` is `Option<Value>`; serde_json's Option<T> collapses
+            // a JSON `null` to `None` on deserialize regardless of T, so a genuinely
+            // successful delete (whose only "data" is the unit `()`) was indistinguishable
+            // on redline-mcp's client side from an absent response - `call_bridge`'s
+            // `(None, None) => Err("empty_response")` fired even though the delete had
+            // already succeeded server-side. A non-null object sentinel round-trips
+            // through `Option<Value>` correctly in both directions.
+            to_value(
+                tools::delete_markup(&state.markups, &p)
+                    .map(|()| serde_json::json!({ "deleted": true })),
+            )
         }
         "save_document" => {
             let p: tools::SaveDocumentParams = parse(req.params)?;

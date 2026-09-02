@@ -71,6 +71,14 @@ pub async fn open_document(
         .markups
         .register(&doc_id, path.clone(), effective_password);
 
+    // Info-level so an MCP caller (or a human tailing the log) can discover the
+    // doc_id for an already-open document - the RPC bridge (rpc/mod.rs) has no
+    // `list_open_documents` tool in v1, and doc_id is otherwise only ever returned
+    // to whichever frontend IPC call opened the file. Found live 2026-09-02 while
+    // exercising the MCP round trip: there was no way to learn the doc_id a
+    // REDLINE_OPEN_PDF auto-open produced other than reading this log.
+    log::info!("document opened: doc_id={doc_id} path={}", path.display());
+
     Ok(DocumentInfo {
         doc_id,
         path: path.to_string_lossy().into_owned(),

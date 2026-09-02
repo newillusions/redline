@@ -84,4 +84,32 @@ mod tests {
         assert_eq!(back.error.unwrap()["flag"], "Locked");
         assert!(back.result.is_none());
     }
+
+    /// Documents the root cause of a live bug found 2026-09-02 (delete_markup): serde's
+    /// `Option<T>` deserialization always collapses a JSON `null` to `None`, regardless
+    /// of `T`. A success response carrying `result: Some(serde_json::Value::Null)` -
+    /// exactly what `Ok(()).map(|()| Value::Null)` produces - therefore round-trips
+    /// through the wire as INDISTINGUISHABLE from a response with no result field at
+    /// all, and `redline-mcp`'s `call_bridge` (`(None, None) => Err("empty_response")`)
+    /// reports a genuinely successful call as a failure. This is a property of
+    /// `Option<serde_json::Value>` itself, not a bug in this struct's derive - callers
+    /// on the server side (`rpc::dispatch`) must never map a unit-returning success to
+    /// `Value::Null`; use a non-null sentinel (e.g. `json!({"deleted": true})`) instead.
+    #[test]
+    fn a_null_result_value_is_indistinguishable_from_no_result_after_round_tripping() {
+        let resp = RpcResponse {
+            id: 10,
+            result: Some(serde_json::Value::Null),
+            error: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: RpcResponse = serde_json::from_str(&json).unwrap();
+        // This is the trap: `result` was `Some(Null)` before the wire, `None` after.
+        assert!(
+            back.result.is_none(),
+            "serde_json collapsed Some(Value::Null) to None on deserialize, as expected - \
+             this is why dispatch.rs must never use Value::Null for a success result"
+        );
+        assert!(back.error.is_none());
+    }
 }

@@ -1,6 +1,114 @@
 # Redline - Handover Notes
 
+## Current Status (as of 2026-09-02, dispatched session - MCP server Phase 1 LIVE round trip)
+
+**Dispatched by team-lead to prove MCP server Phase 1 (PR #92, merged to main
+2026-09-01T11:58+04:00 as `1805b1a`) works LIVE end to end on macOS, not just in unit
+tests. PR NOT yet opened at time of writing this entry - opened as the final step of
+this dispatch, see the entry's own PR reference once available. Branch
+`fix/mcp-live-roundtrip` off `main@1805b1a`, worktree-isolated. Two real defects found
+and fixed; the live round trip itself passed for all 10 tools plus the lock guard.**
+
+**PASS: real `redline` + `redline-mcp` + a real open document, all 10 tools, the lock
+guard.** Build path that actually works for manual live testing: `npm run e2e:build`
+(`tauri build --no-bundle --debug --config src-tauri/tauri.e2e.conf.json`) - NOT a bare
+`cargo build --bin redline`, which produced a **silently blank webview** (`location.href`
+stuck at `about:blank`, zero navigation, zero errors in the Rust log) when launched
+outside `cargo tauri`/`tauri-cli` tooling; root cause not fully isolated (plausibly
+missing `TAURI_ENV_*` vars the CLI sets for asset-protocol resolution) but the workaround
+is proven and cheap - always launch via a tauri-cli-driven build (`cargo tauri dev` or
+`npm run e2e:build`'s output) for any future live/manual verification of this app,
+never a bare `cargo build --bin redline`. `cargo tauri dev` itself was ALSO blocked once
+current node_modules was in a broken state - `@wdio/tauri-plugin` was in `package-lock.json`
+but not actually materialized on disk (a stale/partial prior `npm install`); vite dev
+correctly failed loudly with "Failed to resolve import" rather than silently. A plain
+`npm install` (fresh, not `--no-save`) fixed it in this worktree. Neither of these two
+build-path traps is a code defect - named here so the next session doesn't lose an hour
+rediscovering them.
+
+**Two real defects found live, both fixed and covered by a new/existing test:**
+1. **`delete_markup` always reported failure even on success** (`src-tauri/src/rpc/dispatch.rs`).
+   Root cause: `Ok(()).map(|()| Value::Null)` produced `RpcResponse{result: Some(Value::Null)}`
+   on the wire, but `redline-mcp`'s client deserializes `RpcResponse.result: Option<Value>`,
+   and serde_json's `Option<T>` deserialization ALWAYS collapses JSON `null` to `None`
+   regardless of `T` - so a genuinely successful delete round-tripped as indistinguishable
+   from "no result field", tripping `call_bridge`'s `(None, None) => Err("empty_response")`.
+   Proven live: `list_markups` after a "failed" `delete_markup` call showed the markup really
+   was gone. Fixed by returning `json!({"deleted": true})` instead of `Value::Null`. New
+   regression test `rpc::protocol::tests::a_null_result_value_is_indistinguishable_from_no_result_after_round_tripping`
+   documents the serde mechanism directly so this class doesn't recur on any other
+   unit-returning tool.
+2. **No way to discover the `doc_id` of an already-open document.** The MCP tool surface
+   has no `list_open_documents`, and `doc_id` (a random UUIDv4) was previously only ever
+   returned to whichever frontend `invoke("open_document", ...)` call opened the file -
+   invisible to an MCP caller connecting to an already-running app. Fixed with one
+   info-level log line in `commands::document::open_document`
+   (`src-tauri/src/commands/document.rs`): `document opened: doc_id=... path=...`. Not a
+   full fix (no query tool), but unblocks live use/debugging today; a proper
+   `list_open_documents` (or similar) tool is a good Phase 2 candidate - named, not built,
+   here (small-fix budget for this dispatch).
+
+**Acceptance checklist, all against real running processes (see PR body for the full
+proving JSON-RPC lines):**
+
+| Tool | Result |
+|---|---|
+| `tools/list` | PASS - 10 tools, matches the scope decision |
+| `list_markups` | PASS (empty doc, then a real created markup, then a real locked one: `locked:true`) |
+| `read_markup` | PASS - full envelope |
+| `search_markups` | PASS - matched on contents text |
+| `export_markup_schedule` (Csv) | PASS - real file written next to the source PDF |
+| `create_markup` | PASS - real `Markup` returned with a fresh id |
+| `update_markup` (unlocked) | PASS |
+| `update_markup` (LOCKED markup) | PASS - refused, `{"error":"markup_locked","flag":"Locked",...}` |
+| `delete_markup` (unlocked) | PASS after fix (see defect 1 above) |
+| `delete_markup` (LOCKED markup) | PASS - refused, same structured error |
+| `save_document` | PASS - `{"saved":true,"markup_count":...}` |
+| `flatten_document` | PASS - `{"flattened_count":1}` on a throwaway doc |
+| `reduce_file_size` (level 2) | PASS - real before/after byte counts |
+
+**Lock guard, exercised against a REAL locked annotation** (not a mocked flag): built a
+fixture PDF with a genuine FreeText annotation carrying `/F 128` (ISO 32000-1 `Locked` bit)
+via `pypdf`, opened it in the running app through its own real `open_document` +
+`load_markups` Tauri IPC (driven via the debug build's WebDriver bridge, `window.__wdio_original_core__.invoke(...)`
+- not a mock, not screen capture, the same mechanism this repo's own E2E harness uses),
+confirmed `annot_flags: 128` round-tripped correctly on read, then confirmed both
+`update_markup` and `delete_markup` via the MCP bridge were refused with the structured
+`markup_locked` error naming the markup id and flag. This closes the "no live GUI round
+trip" gap named in the entry below for exactly the lock-guard claim that mattered most.
+
+**Windows named-pipe path: still UNVERIFIED** - out of scope for this dispatch (macOS-only
+session, explicitly named as a separate follow-up, not attempted). See the entry below for
+the same caveat, unchanged.
+
+**Gates**: `cargo test --workspace --all-targets` - 626 passed, 0 failed, 18 ignored
+(summed across all 11 test binaries: 7 pdf-diff-lib + 14 pdf-diff-tests + 597 redline_lib
+[+11 vs the 586 in the entry below, net of the new protocol.rs test - the rest of the
+delta predates this session and was not investigated, out of scope] + 8 redline-mcp bin +
+0 across the 3 corpus-gated integration-test binaries, all `#[ignore]`d as before).
+`cargo clippy --all-targets` - 0 warnings. `cargo fmt --check` on the 3 touched files only
+(`rpc/dispatch.rs`, `rpc/protocol.rs`) - clean; `commands/document.rs` carries pre-existing
+formatting drift in code this session did not touch (verified: the drift is present on
+`origin/main` before this branch's commit, well away from this session's added lines) -
+not fixed here, out of scope, flagged for a separate `cargo fmt` pass across the whole
+crate if that drift is ever meant to be zero.
+
+Two disposable local artifacts used for the live test (a locked-annotation fixture and a
+flatten/reduce scratch copy) lived only in the session scratchpad, never committed. The
+one committed fixture that WAS mutated during the run (`e2e/fixtures/e2e-sample.pdf`, via
+a real create+delete+save cycle) was restored to its exact committed bytes (`git checkout`)
+before this branch was pushed - `git status` on this worktree shows only the 4 real source
+changes (3 Rust files + `package-lock.json`'s stale `0.3.14`→`0.3.15` version-stamp fix,
+found and corrected in passing; `package.json` itself was already at 0.3.15).
+
+---
+
 ## Current Status (2026-09-01, dispatched session - MCP server Phase 1 build)
+
+**MERGED (as of 2026-09-02): PR #92 merged to `main` as `1805b1a`
+(2026-09-01T11:58+04:00) - was open/mergeable when this entry was first written; the
+"PR #92 open" line below is preserved as the historical record of that session, not
+current state. See the entry above for the live-round-trip session that followed.**
 
 **Dispatched by team-lead ("Build redline MCP phase 1"). PR #92 open, mergeable
 (`feat/mcp-server-phase1`, head `462a032`, base `main@ff3287e7`) -
