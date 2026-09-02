@@ -90,15 +90,20 @@ pub async fn dispatch(app: &AppHandle, req: RpcRequest) -> Result<Value, Value> 
         "reduce_file_size" => {
             let p: tools::ReduceFileSizeParams = parse(req.params)?;
             let state = app.state::<AppState>();
-            crate::commands::docops::optimize_document(
+            // Route through `to_value` rather than `.unwrap_or(Value::Null)` inline -
+            // same null-result-collapse class as `delete_markup` (see the comment on
+            // that arm above and `to_value`'s doc comment below): a genuine success
+            // must never render as `Value::Null`, or `redline-mcp`'s client sees
+            // `Some(Null)` collapse to `None` on deserialize and reports
+            // "empty_response" for a call that actually succeeded.
+            let result = crate::commands::docops::optimize_document(
                 state,
                 p.doc_id,
                 p.level.unwrap_or(2),
                 p.image_preset,
             )
-            .await
-            .map(|report| serde_json::to_value(report).unwrap_or(Value::Null))
-            .map_err(to_err)
+            .await;
+            to_value(result)
         }
         other => Err(serde_json::json!({ "error": "unknown_op", "op": other })),
     }
@@ -109,9 +114,19 @@ fn parse<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, Value> {
         .map_err(|e| serde_json::json!({ "error": "bad_params", "detail": e.to_string() }))
 }
 
+/// Never let a serialization failure collapse to `Value::Null` - that is the same
+/// null-result-collapse class fixed for `delete_markup` in PR #93
+/// (observation:61enky22o8fzwky1p3as): `RpcResponse.result` is `Option<Value>`, and
+/// serde_json's `Option<T>` deserialization collapses a JSON `null` back to `None`
+/// regardless of `T`, so a `Some(Value::Null)` success is indistinguishable on the
+/// client side from no response at all. `serde_json::to_value` failing here is rare
+/// (a well-formed `Serialize` type essentially can't fail to encode; the reachable
+/// case is a map with non-string keys), but the old `.unwrap_or(Value::Null)`
+/// silently turned that rare failure into a reported success with an empty payload
+/// instead of surfacing the error - propagate it as an error instead.
 fn to_value<T: serde::Serialize>(result: Result<T, String>) -> Result<Value, Value> {
     result
-        .map(|v| serde_json::to_value(v).unwrap_or(Value::Null))
+        .and_then(|v| serde_json::to_value(v).map_err(|e| format!("result_serialize_failed: {e}")))
         .map_err(to_err)
 }
 
@@ -147,5 +162,62 @@ mod tests {
         // A pure routing check - doesn't touch AppState, so no Tauri app needed.
         let err = serde_json::json!({ "error": "unknown_op", "op": "not_a_real_tool" });
         assert_eq!(err["error"], "unknown_op");
+    }
+
+    #[test]
+    fn to_value_propagates_serialization_failure_as_error_not_null() {
+        // Before this fix `to_value` mapped a `serde_json::to_value` failure to
+        // `Ok(Value::Null)` via `.unwrap_or(Value::Null)` - the same null-result-collapse
+        // class as `delete_markup` (observation:61enky22o8fzwky1p3as / PR #93): a client
+        // sees `Some(Null)` collapse to `None` on deserialize (see protocol.rs's
+        // `a_null_result_value_is_indistinguishable_from_no_result_after_round_tripping`),
+        // so a real failure was silently reported as an empty success instead of an
+        // error the caller could see.
+        //
+        // `AlwaysFailsToSerialize` below is the reliable way to force
+        // `serde_json::to_value` to return `Err`: a map with non-string keys does NOT
+        // work (serde_json stringifies integer/other scalar keys rather than erroring),
+        // and NaN/Infinity floats don't work either (serde_json silently encodes those
+        // as JSON `null` rather than erroring - a legitimate value, not a failure).
+        struct AlwaysFailsToSerialize;
+
+        impl serde::Serialize for AlwaysFailsToSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom(
+                    "synthetic serialization failure for test",
+                ))
+            }
+        }
+
+        let result: Result<AlwaysFailsToSerialize, String> = Ok(AlwaysFailsToSerialize);
+
+        let out = to_value(result);
+
+        assert!(
+            out.is_err(),
+            "a value serde_json cannot encode must propagate as an error, never silently become Value::Null"
+        );
+        let err = out.unwrap_err();
+        assert!(
+            err["error"]
+                .as_str()
+                .unwrap()
+                .contains("result_serialize_failed"),
+            "expected a result_serialize_failed error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn to_value_still_serializes_a_normal_success_value_unchanged() {
+        // Regression guard: the fix must not disturb the ordinary success path used by
+        // list_markups/read_markup/search_markups/export_markup_schedule/
+        // create_markup/update_markup/reduce_file_size.
+        let result: Result<serde_json::Value, String> =
+            Ok(serde_json::json!({ "flattened_count": 3 }));
+        let out = to_value(result).expect("well-formed value must serialize successfully");
+        assert_eq!(out["flattened_count"], 3);
     }
 }
