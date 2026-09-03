@@ -117,6 +117,61 @@ fn resolve_pdfium_path(app: &tauri::App) {
     );
 }
 
+/// Resolve the bundled Tesseract tessdata directory and export it via
+/// `TESSDATA_PREFIX` (Tesseract's own standard lookup env var — see the
+/// `ocr` module doc comment) so `OcrEngineHandle::load(None)` finds
+/// `eng.traineddata` without a caller having to pass an explicit path.
+/// No-op if the env var is already set (dev override / floor-machine
+/// runbook), mirroring `resolve_pdfium_path` above.
+///
+/// Lookup order (first existing wins), same shape as `resolve_pdfium_path`:
+///   1. Existing `TESSDATA_PREFIX` (respected, never overwritten).
+///   2. Tauri resource dir `resources/ocr/tessdata` (the bundled directory —
+///      `scripts/fetch-ocr-tessdata.sh` populates `src-tauri/resources/ocr/
+///      tessdata/eng.traineddata`, and `tauri.conf.json`'s
+///      `bundle.resources` wholesale-maps `resources/` into the bundle).
+///   3. Next to the executable `resources/ocr/tessdata` (portable layout).
+///
+/// If none resolve AND the `ocr` feature is compiled in, this logs loudly
+/// (`log::error!`) rather than panicking: OCR is off by default (Phase 2a/2b
+/// ship no auto-trigger or UI yet — see docs/ocr.md), so a missing tessdata
+/// directory must not block the rest of the app from starting. The actual
+/// fail-loud behavior for an end user attempting to run OCR happens at the
+/// point of use, in `OcrEngineHandle::load`'s own error message (Phase 2c's
+/// invoke command surfaces that error to the UI).
+#[cfg(feature = "ocr")]
+fn resolve_tessdata_dir(app: &tauri::App) {
+    if std::env::var_os("TESSDATA_PREFIX").is_some() {
+        info!("TESSDATA_PREFIX already set — using it");
+        return;
+    }
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(res_dir) = app.path().resource_dir() {
+        candidates.push(res_dir.join("resources").join("ocr").join("tessdata"));
+        candidates.push(res_dir.join("ocr").join("tessdata"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("resources").join("ocr").join("tessdata"));
+            candidates.push(dir.join("ocr").join("tessdata"));
+        }
+    }
+
+    for c in &candidates {
+        if c.join("eng.traineddata").exists() {
+            info!("Bundled tessdata found: {:?}", c);
+            std::env::set_var("TESSDATA_PREFIX", c);
+            return;
+        }
+    }
+    log::error!(
+        "No bundled tessdata found ({} candidates checked); OCR will fail at first use \
+         unless TESSDATA_PREFIX is set or a system Tesseract install provides eng.traineddata",
+        candidates.len()
+    );
+}
+
 /// Platform-specific PDFium shared-library filename.
 fn pdfium_lib_filename() -> &'static str {
     #[cfg(target_os = "windows")]
@@ -162,6 +217,8 @@ pub fn run() {
             // (which loads PDFium). Needs the AppHandle for the resource dir, so it
             // must run here, not before the builder.
             resolve_pdfium_path(app);
+            #[cfg(feature = "ocr")]
+            resolve_tessdata_dir(app);
             let render = RenderHandle::spawn().expect("failed to start render thread");
             let toolchest = app
                 .path()
