@@ -8,12 +8,34 @@ on:
   push:
     tags:
       - 'v*'
+  # Auto-OCR Phase 2b bundling proof leg (2026-09-03): a manual
+  # workflow_dispatch run with build_ocr=true builds with `--features ocr`
+  # on both desktop legs and runs the ocr-selftest bundling smoke test,
+  # WITHOUT cutting a release - no signing, no Gitea/GitHub asset upload, no
+  # update.json commit. See the "Determine OCR proof mode" step in
+  # build-macos/build-windows and the `if: steps.ocr_mode.outputs.enabled
+  # != 'true'` guards added to every publish-oriented step below. The
+  # default (tag-triggered) release path is functionally unchanged:
+  # ocr_mode.enabled evaluates false there, so every existing step's
+  # condition is unaffected.
+  #
+  # Deliberately NOT a `push: branches: [feat/**]` trigger (that was tried
+  # first, 2026-09-03, and removed on review feedback): it fired a full
+  # macOS+Windows GitHub Actions build on every push to any feat/** branch,
+  # workspace-wide, whether or not that push touched OCR at all - expensive
+  # and surprising. workflow_dispatch is opt-in per run. See docs/ocr.md
+  # "Triggering the OCR proof leg by hand" for the exact command.
   workflow_dispatch:
     inputs:
       version:
         description: 'Version to build (e.g., 0.2.0)'
         required: true
         default: '0.2.0'
+      build_ocr:
+        description: 'OCR proof leg: build with --features ocr, run the bundling smoke test, skip signing/upload (no release cut)'
+        type: boolean
+        required: false
+        default: false
 
 env:
   GITEA_SERVER: https://forge.mms.name
@@ -33,9 +55,34 @@ jobs:
             pdfium_target: mac-arm64
     outputs:
       sig-aarch64: ${{ steps.get_sig.outputs.sig_aarch64 }}
+      ocr-proof: ${{ steps.ocr_mode.outputs.enabled }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # Auto-OCR Phase 2b: see the `on:` block comment above. Every step from
+      # here down that publishes/signs/uploads a release artifact is gated
+      # `if: steps.ocr_mode.outputs.enabled != 'true'` so the tag-triggered
+      # release path is unaffected; every new OCR-only step is gated the
+      # opposite way.
+      - name: Determine OCR proof mode
+        id: ocr_mode
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.build_ocr }}" = "true" ]; then
+            ENABLED=true
+          else
+            ENABLED=false
+          fi
+          echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
+          if [ "$ENABLED" = "true" ]; then
+            # --bundles app (not the config's default app+dmg+nsis targets):
+            # the proof leg only needs the .app to bundle dylibs into and run
+            # the smoke test against - a DMG buys nothing here.
+            echo "build_args=--features ocr --bundles app" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_args=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -52,6 +99,14 @@ jobs:
 
       - name: Fetch PDFium (${{ matrix.pdfium_target }})
         run: scripts/fetch-pdfium.sh ${{ matrix.pdfium_target }}
+
+      - name: Install Tesseract (Homebrew, OCR proof leg only)
+        if: steps.ocr_mode.outputs.enabled == 'true'
+        run: brew install tesseract
+
+      - name: Fetch OCR tessdata (OCR proof leg only)
+        if: steps.ocr_mode.outputs.enabled == 'true'
+        run: scripts/fetch-ocr-tessdata.sh
 
       - name: Get version
         id: version
@@ -70,9 +125,96 @@ jobs:
           # this, a macOS release build has NO baked default and license checks only work
           # via a runtime env override (src-tauri/src/license/client.rs).
           REDLINE_LICENSE_API_URL_DEFAULT: https://staff.emittiv.studio
-        run: npm run tauri:build -- --target ${{ matrix.target }}
+        run: npm run tauri:build -- --target ${{ matrix.target }} ${{ steps.ocr_mode.outputs.build_args }}
+
+      - name: Bundle Tesseract + Leptonica dylibs into the .app (OCR proof leg only)
+        if: steps.ocr_mode.outputs.enabled == 'true'
+        run: |
+          # `leptess`/tesseract-plumbing links Tesseract + Leptonica as DYNAMIC
+          # libraries via pkg-config at their absolute Homebrew paths - a
+          # released .app can't rely on Homebrew being installed on the end
+          # user's Mac. dylibbundler (https://github.com/SCG82/macdylibbundler,
+          # verified 2026-09-03) is the standard tool for this: `-b` walks
+          # `otool -L` recursively, copies every non-system dylib into `-d`,
+          # and rewrites BOTH the executable's and each copied dylib's load
+          # commands to `-p` (@executable_path/../Frameworks) - so this
+          # doesn't touch tauri.conf.json's frameworks config at all.
+          brew install dylibbundler
+
+          APP_PATH=$(find target/${{ matrix.target }}/release/bundle/macos -name "*.app" -type d | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: no .app bundle found under target/${{ matrix.target }}/release/bundle/macos"
+            exit 1
+          fi
+          echo "App: $APP_PATH"
+
+          # CRITICAL: Cargo's `ocr` feature is crate-wide, not per-binary - a
+          # `--features ocr` build links Tesseract/Leptonica into EVERY
+          # binary Tauri places in Contents/MacOS (bench, gen-ocr-fixtures,
+          # ocr-selftest, redline, redline-mcp - Tauri bundles every [[bin]]
+          # target declared in Cargo.toml, not just the app's main binary;
+          # verified via `otool -L` on all 5 this session - all 5 link
+          # libtesseract/libleptonica, not just the app itself). An EARLIER
+          # version of this step ran dylibbundler against only the first
+          # executable `find` returned (alphabetically "bench"), which fixed
+          # bench's load commands but left the REAL app binary ("redline",
+          # confirmed via `Contents/Info.plist`'s CFBundleExecutable key)
+          # still pointing at absolute Homebrew paths - the actual shipped
+          # app would have failed to launch OCR on a machine without
+          # Homebrew, despite the smoke test passing (the smoke test ran via
+          # `cargo run`, a fresh link against the CI runner's live Homebrew
+          # install, so it never exercised the bundled/rewritten paths at
+          # all). Fixed 2026-09-03 by looping dylibbundler over every
+          # executable in Contents/MacOS instead of picking just one.
+          mkdir -p "$APP_PATH/Contents/Frameworks"
+          for EXE_PATH in "$APP_PATH/Contents/MacOS/"*; do
+            if [ -f "$EXE_PATH" ] && [ -x "$EXE_PATH" ]; then
+              echo "--- dylibbundler: $EXE_PATH ---"
+              # -of (overwrite-files), NOT -od (overwrite-dir, which WIPES
+              # the whole dest dir - would undo every prior iteration's
+              # work). Verified locally: without -of, the 2nd+ iteration
+              # errors "File .../libsharpyuv....dylib already exists" and
+              # aborts, since dylibbundler's default is to refuse silently
+              # overwriting an existing copy rather than skip/reuse it.
+              dylibbundler -b -of \
+                -x "$EXE_PATH" \
+                -d "$APP_PATH/Contents/Frameworks/" \
+                -p "@executable_path/../Frameworks/"
+            fi
+          done
+
+          echo "Bundled dylibs:"
+          ls -la "$APP_PATH/Contents/Frameworks/"
+          MAIN_EXE_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Contents/Info.plist")
+          echo "Main app executable (CFBundleExecutable): $MAIN_EXE_NAME"
+          echo "Its dependent libraries after bundling:"
+          otool -L "$APP_PATH/Contents/MacOS/$MAIN_EXE_NAME"
+
+      - name: OCR bundling smoke test (OCR proof leg only)
+        if: steps.ocr_mode.outputs.enabled == 'true'
+        run: |
+          # Runs the ACTUAL bundled+dylib-rewritten copy of ocr-selftest
+          # inside the .app (Contents/MacOS/ocr-selftest), NOT `cargo run`
+          # (which would freshly link against the runner's live Homebrew
+          # install and prove nothing about whether the bundling/rewriting
+          # above actually works - see the dylibbundler step's comment for
+          # why that was wrong in an earlier version of this leg). If the
+          # install_name_tool rewrite is broken or a dylib is missing from
+          # Contents/Frameworks, dyld resolution fails here even though
+          # Homebrew's originals are still physically present on this
+          # runner, because a rewritten @executable_path-relative load
+          # command does not fall back to the pre-rewrite absolute path.
+          APP_PATH=$(find target/${{ matrix.target }}/release/bundle/macos -name "*.app" -type d | head -1)
+          TESSDATA_DIR="$APP_PATH/Contents/Resources/resources/ocr/tessdata"
+          if [ ! -f "$TESSDATA_DIR/eng.traineddata" ]; then
+            echo "ERROR: bundled tessdata not found at $TESSDATA_DIR"
+            find "$APP_PATH/Contents/Resources" -maxdepth 4
+            exit 1
+          fi
+          "$APP_PATH/Contents/MacOS/ocr-selftest" --tessdata-dir "$TESSDATA_DIR"
 
       - name: Fix code signature
+        if: steps.ocr_mode.outputs.enabled != 'true'
         run: |
           # Find the .app bundle (workspace root target/, not src-tauri/target/)
           APP_PATH=$(find target/${{ matrix.target }}/release/bundle/macos -name "*.app" -type d | head -1)
@@ -83,6 +225,7 @@ jobs:
           fi
 
       - name: Recreate DMG with fixed signature
+        if: steps.ocr_mode.outputs.enabled != 'true'
         run: |
           DMG_PATH=$(find target/${{ matrix.target }}/release/bundle/dmg -name "*.dmg" | head -1)
           APP_PATH=$(find target/${{ matrix.target }}/release/bundle/macos -name "*.app" -type d | head -1)
@@ -97,6 +240,7 @@ jobs:
           fi
 
       - name: Create archive name
+        if: steps.ocr_mode.outputs.enabled != 'true'
         id: archive
         run: |
           if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
@@ -108,6 +252,7 @@ jobs:
           fi
 
       - name: Find artifacts
+        if: steps.ocr_mode.outputs.enabled != 'true'
         id: find_artifacts
         run: |
           DMG_PATH=$(find target/${{ matrix.target }}/release/bundle/dmg -name "*.dmg" | head -1)
@@ -118,6 +263,7 @@ jobs:
           echo "SIG_PATH=$SIG_PATH" >> $GITHUB_OUTPUT
 
       - name: Get signature
+        if: steps.ocr_mode.outputs.enabled != 'true'
         id: get_sig
         run: |
           if [ -f "${{ steps.find_artifacts.outputs.SIG_PATH }}" ]; then
@@ -130,11 +276,13 @@ jobs:
           fi
 
       - name: Create checksum
+        if: steps.ocr_mode.outputs.enabled != 'true'
         run: |
           cd $(dirname "${{ steps.find_artifacts.outputs.DMG_PATH }}")
           shasum -a 256 $(basename "${{ steps.find_artifacts.outputs.DMG_PATH }}") > ${{ steps.archive.outputs.NAME }}.dmg.sha256
 
       - name: Upload to Gitea Release
+        if: steps.ocr_mode.outputs.enabled != 'true'
         run: |
           MAX_RETRIES=5
           RETRY_DELAY=5
@@ -197,7 +345,7 @@ jobs:
 
       - name: Upload artifacts (GitHub)
         uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.ocr_mode.outputs.enabled != 'true'
         with:
           name: macos-${{ steps.archive.outputs.ARCH }}
           path: |
@@ -210,9 +358,28 @@ jobs:
     runs-on: windows-latest
     outputs:
       sig-windows: ${{ steps.get_sig.outputs.sig_windows }}
+      ocr-proof: ${{ steps.ocr_mode.outputs.enabled }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # Auto-OCR Phase 2b: mirrors build-macos's "Determine OCR proof mode" -
+      # see the `on:` block comment at the top of this file.
+      - name: Determine OCR proof mode
+        id: ocr_mode
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.build_ocr }}" = "true" ]; then
+            ENABLED=true
+          else
+            ENABLED=false
+          fi
+          echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
+          if [ "$ENABLED" = "true" ]; then
+            echo "build_args=--features ocr" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_args=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -228,6 +395,43 @@ jobs:
       - name: Fetch PDFium (win-x64)
         shell: bash
         run: scripts/fetch-pdfium.sh win-x64
+
+      # Windows-latest ships vcpkg preinstalled at C:\vcpkg with
+      # VCPKG_INSTALLATION_ROOT already set (verified 2026-09-03,
+      # actions/runner-images Windows2022-Readme.md) - alias it to VCPKG_ROOT,
+      # which is what the `vcpkg` Rust crate actually reads (verified via its
+      # docs.rs page: VCPKG_ROOT first, then user-wide `vcpkg integrate
+      # install`, then a cargo-vcpkg tree). tesseract-sys's build.rs (verified
+      # against its own source, ccouzens/tesseract-sys) calls
+      # `vcpkg::Config::new().find_package("tesseract")` on Windows - no
+      # manual TESSERACT_INCLUDE_PATHS/TESSERACT_LINK_PATHS/TESSERACT_LINK_LIBS
+      # env vars needed as long as vcpkg finds the port.
+      #
+      # STATIC linking (`x64-windows-static-md`, the vcpkg crate's own DEFAULT
+      # triplet for 64-bit Windows when VCPKGRS_DYNAMIC is unset) is chosen
+      # deliberately over the dynamic `x64-windows` triplet leptess's own
+      # README example uses: Tesseract's real dependency tree (leptonica plus
+      # its own image-format libs) is large enough that dynamic linking would
+      # mean bundling and NSIS-packaging a matching set of DLLs (the same
+      # problem dylibbundler solves on macOS, with no equivalent tool in this
+      # pipeline) - static linking bakes everything into redline.exe instead,
+      # needing zero extra DLL-bundling work. This is unverified against a
+      # real vcpkg build of the tesseract PORT until this workflow actually
+      # runs - some vcpkg ports don't support every triplet cleanly - which is
+      # exactly what this OCR-proof leg exists to prove or disprove.
+      - name: Install Tesseract (vcpkg, OCR proof leg only)
+        if: steps.ocr_mode.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
+          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install tesseract:x64-windows-static-md
+          if ($LASTEXITCODE -ne 0) { Write-Error "vcpkg install tesseract failed"; exit 1 }
+
+      - name: Fetch OCR tessdata (OCR proof leg only)
+        if: steps.ocr_mode.outputs.enabled == 'true'
+        shell: bash
+        run: scripts/fetch-ocr-tessdata.sh
 
       - name: Get version
         id: version
@@ -248,7 +452,30 @@ jobs:
           # entitlement gate with no user-set REDLINE_LICENSE_API_URL env var. The runtime
           # env var still overrides this at call time if ever set.
           REDLINE_LICENSE_API_URL_DEFAULT: https://staff.emittiv.studio
-        run: npm run tauri:build
+        run: npm run tauri:build -- ${{ steps.ocr_mode.outputs.build_args }}
+
+      - name: OCR bundling smoke test (OCR proof leg only)
+        if: steps.ocr_mode.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          # Unlike macOS (where tauri build's .app bundle IS the final
+          # artifact and already contains Contents/Resources), Windows'
+          # bundled resource layout only materializes after the NSIS
+          # installer actually runs - installing it silently on a CI runner
+          # is its own source of flakiness (UAC/elevation prompts against
+          # `installMode: perMachine`). To keep this leg's failure signal
+          # narrowly about "does the vcpkg-linked Tesseract binary actually
+          # recognize text on Windows" - the genuinely unproven, risky part -
+          # this instead exercises the RAW build output plus a manually
+          # placed resources/ dir, mirroring the "next to the executable"
+          # portable-layout candidate `lib.rs::resolve_tessdata_dir` already
+          # checks (its 3rd candidate). Proving the NSIS-installed layout
+          # end-to-end is flagged as a residual gap for a follow-up, not
+          # silently assumed to work.
+          mkdir -p target/release/resources/ocr/tessdata
+          cp src-tauri/resources/ocr/tessdata/eng.traineddata target/release/resources/ocr/tessdata/
+          cargo run --release --features ocr --bin ocr-selftest -- \
+            --tessdata-dir target/release/resources/ocr/tessdata
 
       # --- Windows Authenticode signing (self-signed cert, obs:z6byyxo59r0ilt2bq397) ---
       # `tauri:build` above already produced the NSIS installer AND its Tauri-updater
@@ -290,7 +517,7 @@ jobs:
       # File"). This also drops the `choco install osslsigncode` step entirely - nothing left
       # to install.
       - name: Sign Windows installer (Authenticode)
-        if: steps.sign_check.outputs.available == 'true'
+        if: steps.sign_check.outputs.available == 'true' && steps.ocr_mode.outputs.enabled != 'true'
         id: sign
         # shell: pwsh - NOT bash. Git-Bash/MSYS rewrites any argument starting with
         # "/" into a Windows path, so signtool's /fd /tr /td flags never reached it
@@ -334,7 +561,7 @@ jobs:
           Write-Host "Signed $($nsis.FullName)"
 
       - name: Regenerate updater signature (post-Authenticode)
-        if: steps.sign_check.outputs.available == 'true' && steps.sign.outputs.signed == 'true'
+        if: steps.sign_check.outputs.available == 'true' && steps.sign.outputs.signed == 'true' && steps.ocr_mode.outputs.enabled != 'true'
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -346,6 +573,7 @@ jobs:
           npm run tauri -- signer sign -k "$TAURI_SIGNING_PRIVATE_KEY" -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$NSIS_PATH"
 
       - name: Find installers
+        if: steps.ocr_mode.outputs.enabled != 'true'
         id: find_installers
         shell: bash
         run: |
@@ -355,6 +583,7 @@ jobs:
           echo "NSIS_SIG=$NSIS_SIG" >> $GITHUB_OUTPUT
 
       - name: Get signature
+        if: steps.ocr_mode.outputs.enabled != 'true'
         id: get_sig
         shell: bash
         run: |
@@ -364,6 +593,7 @@ jobs:
           fi
 
       - name: Upload to Gitea Release
+        if: steps.ocr_mode.outputs.enabled != 'true'
         shell: bash
         run: |
           MAX_RETRIES=5
@@ -412,7 +642,7 @@ jobs:
 
       - name: Upload artifacts (GitHub)
         uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.ocr_mode.outputs.enabled != 'true'
         with:
           name: windows
           path: |
@@ -425,7 +655,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    if: always() && needs.build-macos.result != 'cancelled' && needs.build-windows.result != 'cancelled'
+    # Auto-OCR Phase 2b: never runs for the OCR-proof leg (no tag, no release,
+    # no manifest to publish) - `needs.build-macos.outputs.ocr-proof` is this
+    # job's only signal for that, since it has no event context of its own
+    # beyond what its `needs:` jobs computed.
+    if: always() && needs.build-macos.result != 'cancelled' && needs.build-windows.result != 'cancelled' && needs.build-macos.outputs.ocr-proof != 'true'
     steps:
       - name: Get version
         id: version

@@ -42,6 +42,20 @@ path = "src/bin/redline_mcp.rs"
 name = "gen-ocr-fixtures"
 path = "src/bin/gen_ocr_fixtures.rs"
 
+# Phase 2b bundling smoke test: loads a bundled Tesseract engine + tessdata
+# and recognizes a tiny embedded fixture (tools/fixtures/ocr/selftest.png).
+# Run against a CI-built release bundle (see .github/workflows/
+# build-releases.yml's OCR-proof-leg steps) to prove the SHIPPED app can
+# actually locate its bundled OCR resources, not just that the code compiles.
+# Deliberately NOT `required-features = ["ocr"]` - see ocr_selftest.rs's
+# module doc comment: that gate broke `cargo tauri build` for the DEFAULT
+# (ocr off) release path, because Tauri's bundler expects every declared
+# [[bin]] to have a build artifact regardless of feature flags. The binary
+# always compiles; its real logic is internally #[cfg(feature = "ocr")]-gated.
+[[bin]]
+name = "ocr-selftest"
+path = "src/bin/ocr_selftest.rs"
+
 [build-dependencies]
 tauri-build = { version = "2.2.0", features = [] }
 

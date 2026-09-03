@@ -38,8 +38,10 @@ Thumbs.db
 /src-tauri/resources/libpdfium.so
 /src-tauri/resources/pdfium.dll
 
-# OCR models (.rten, ~12 MB total) — downloaded via scripts/fetch-ocr-models.sh,
-# not committed. See the `ocr` module doc comment.
+# OCR tessdata (eng.traineddata, ~3.9 MB) — downloaded via
+# scripts/fetch-ocr-tessdata.sh, not committed. Stale reference to Phase 1's
+# `.rten` ocrs models removed 2026-09-03 (Phase 2a switched engines to
+# Tesseract/leptess — see docs/ocr.md).
 /src-tauri/resources/ocr/
 
 # Benchmark rendered output (PNG proofs, incl. nested dirs like render-matrix/)
