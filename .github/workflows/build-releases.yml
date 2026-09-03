@@ -129,20 +129,12 @@ jobs:
           # `leptess`/tesseract-plumbing links Tesseract + Leptonica as DYNAMIC
           # libraries via pkg-config at their absolute Homebrew paths - a
           # released .app can't rely on Homebrew being installed on the end
-          # user's Mac. `brew install tesseract` alone pulls a large transitive
-          # dependency tree (cairo, pango, glib, harfbuzz, icu4c, fontconfig,
-          # freetype, gettext, libarchive - 37 recursive runtime deps per
-          # `brew info tesseract`, verified 2026-09-03), too many to hand-list
-          # in tauri.conf.json's `bundle.macOS.frameworks` (built for a small
-          # fixed set, not a sprawling Homebrew tree, and versioned .dylib
-          # filenames would drift on every Homebrew bump anyway).
-          # dylibbundler (https://github.com/SCG82/macdylibbundler, verified
-          # 2026-09-03) is the standard tool for exactly this: `-b` walks
+          # user's Mac. dylibbundler (https://github.com/SCG82/macdylibbundler,
+          # verified 2026-09-03) is the standard tool for this: `-b` walks
           # `otool -L` recursively, copies every non-system dylib into `-d`,
           # and rewrites BOTH the executable's and each copied dylib's load
-          # commands to `-p` (@executable_path/../Frameworks, matching the app
-          # bundle's MacOS/ + Frameworks/ layout) - so this doesn't touch
-          # tauri.conf.json's frameworks config at all.
+          # commands to `-p` (@executable_path/../Frameworks) - so this
+          # doesn't touch tauri.conf.json's frameworks config at all.
           brew install dylibbundler
 
           APP_PATH=$(find target/${{ matrix.target }}/release/bundle/macos -name "*.app" -type d | head -1)
@@ -150,28 +142,64 @@ jobs:
             echo "ERROR: no .app bundle found under target/${{ matrix.target }}/release/bundle/macos"
             exit 1
           fi
-          EXE_PATH=$(find "$APP_PATH/Contents/MacOS" -maxdepth 1 -type f -perm -111 | head -1)
-          if [ -z "$EXE_PATH" ]; then
-            echo "ERROR: no executable found under $APP_PATH/Contents/MacOS"
-            exit 1
-          fi
-          echo "App:        $APP_PATH"
-          echo "Executable: $EXE_PATH"
+          echo "App: $APP_PATH"
 
+          # CRITICAL: Cargo's `ocr` feature is crate-wide, not per-binary - a
+          # `--features ocr` build links Tesseract/Leptonica into EVERY
+          # binary Tauri places in Contents/MacOS (bench, gen-ocr-fixtures,
+          # ocr-selftest, redline, redline-mcp - Tauri bundles every [[bin]]
+          # target declared in Cargo.toml, not just the app's main binary;
+          # verified via `otool -L` on all 5 this session - all 5 link
+          # libtesseract/libleptonica, not just the app itself). An EARLIER
+          # version of this step ran dylibbundler against only the first
+          # executable `find` returned (alphabetically "bench"), which fixed
+          # bench's load commands but left the REAL app binary ("redline",
+          # confirmed via `Contents/Info.plist`'s CFBundleExecutable key)
+          # still pointing at absolute Homebrew paths - the actual shipped
+          # app would have failed to launch OCR on a machine without
+          # Homebrew, despite the smoke test passing (the smoke test ran via
+          # `cargo run`, a fresh link against the CI runner's live Homebrew
+          # install, so it never exercised the bundled/rewritten paths at
+          # all). Fixed 2026-09-03 by looping dylibbundler over every
+          # executable in Contents/MacOS instead of picking just one.
           mkdir -p "$APP_PATH/Contents/Frameworks"
-          dylibbundler -od -b \
-            -x "$EXE_PATH" \
-            -d "$APP_PATH/Contents/Frameworks/" \
-            -p "@executable_path/../Frameworks/"
+          for EXE_PATH in "$APP_PATH/Contents/MacOS/"*; do
+            if [ -f "$EXE_PATH" ] && [ -x "$EXE_PATH" ]; then
+              echo "--- dylibbundler: $EXE_PATH ---"
+              # -of (overwrite-files), NOT -od (overwrite-dir, which WIPES
+              # the whole dest dir - would undo every prior iteration's
+              # work). Verified locally: without -of, the 2nd+ iteration
+              # errors "File .../libsharpyuv....dylib already exists" and
+              # aborts, since dylibbundler's default is to refuse silently
+              # overwriting an existing copy rather than skip/reuse it.
+              dylibbundler -b -of \
+                -x "$EXE_PATH" \
+                -d "$APP_PATH/Contents/Frameworks/" \
+                -p "@executable_path/../Frameworks/"
+            fi
+          done
 
           echo "Bundled dylibs:"
           ls -la "$APP_PATH/Contents/Frameworks/"
-          echo "Executable's dependent libraries after bundling:"
-          otool -L "$EXE_PATH"
+          MAIN_EXE_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Contents/Info.plist")
+          echo "Main app executable (CFBundleExecutable): $MAIN_EXE_NAME"
+          echo "Its dependent libraries after bundling:"
+          otool -L "$APP_PATH/Contents/MacOS/$MAIN_EXE_NAME"
 
       - name: OCR bundling smoke test (OCR proof leg only)
         if: steps.ocr_mode.outputs.enabled == 'true'
         run: |
+          # Runs the ACTUAL bundled+dylib-rewritten copy of ocr-selftest
+          # inside the .app (Contents/MacOS/ocr-selftest), NOT `cargo run`
+          # (which would freshly link against the runner's live Homebrew
+          # install and prove nothing about whether the bundling/rewriting
+          # above actually works - see the dylibbundler step's comment for
+          # why that was wrong in an earlier version of this leg). If the
+          # install_name_tool rewrite is broken or a dylib is missing from
+          # Contents/Frameworks, dyld resolution fails here even though
+          # Homebrew's originals are still physically present on this
+          # runner, because a rewritten @executable_path-relative load
+          # command does not fall back to the pre-rewrite absolute path.
           APP_PATH=$(find target/${{ matrix.target }}/release/bundle/macos -name "*.app" -type d | head -1)
           TESSDATA_DIR="$APP_PATH/Contents/Resources/resources/ocr/tessdata"
           if [ ! -f "$TESSDATA_DIR/eng.traineddata" ]; then
@@ -179,8 +207,7 @@ jobs:
             find "$APP_PATH/Contents/Resources" -maxdepth 4
             exit 1
           fi
-          cargo run --release --target ${{ matrix.target }} --features ocr --bin ocr-selftest -- \
-            --tessdata-dir "$TESSDATA_DIR"
+          "$APP_PATH/Contents/MacOS/ocr-selftest" --tessdata-dir "$TESSDATA_DIR"
 
       - name: Fix code signature
         if: steps.ocr_mode.outputs.enabled != 'true'

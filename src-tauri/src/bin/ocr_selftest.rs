@@ -3,13 +3,32 @@
 //! run against the CI-built release bundle (or a local dev build) rather
 //! than only compiling against dev-machine Homebrew/apt Tesseract. See
 //! docs/ocr.md "Phase 2b: bundling into the shipped app" and
-//! `.github/workflows/build-releases.yml`'s `build-ocr-check` steps, which
-//! invoke this binary with `--tessdata-dir` (or `TESSDATA_PREFIX`) pointed
-//! at the just-built bundle's extracted `resources/ocr/tessdata` directory.
+//! `.github/workflows/build-releases.yml`'s OCR-proof-leg steps, which
+//! invoke this binary with `--tessdata-dir` pointed at the just-built
+//! bundle's `resources/ocr/tessdata` directory.
 //!
-//! Feature-gated (`required-features = ["ocr"]` in Cargo.toml) — this binary
-//! does not exist in a default (`ocr` off) build, so `cargo build`/`cargo
-//! tauri build` without `--features ocr` never touches it.
+//! ALWAYS COMPILES, regardless of the `ocr` feature (deliberately NOT gated
+//! via Cargo.toml `required-features` — see below for why). The real
+//! `ocr`-dependent logic is behind `#[cfg(feature = "ocr")]` internally;
+//! without the feature, `main` just prints that OCR is disabled and exits 0.
+//!
+//! # Why this must always compile (2026-09-03 incident, fixed same day)
+//! An earlier version of this binary used `required-features = ["ocr"]` in
+//! Cargo.toml. That broke `cargo tauri build` for the DEFAULT (no
+//! `--features ocr`) release path: Tauri's bundler enumerates every `[[bin]]`
+//! target declared in `Cargo.toml` (plus anything under `src/bin/`) and
+//! expects a build artifact for each one when copying binaries into the
+//! `.app`/NSIS bundle — verified locally by reproducing the exact failure
+//! (`npm run tauri:build -- --target aarch64-apple-darwin --bundles app`,
+//! no `--features` flag: "Failed to copy binary from
+//! .../release/ocr_selftest: ... does not exist"). The installed
+//! `@tauri-apps/cli` version here (`^2.5.0`) does not skip a
+//! required-features-gated bin when the feature is off — whether that is a
+//! version-specific gap or intended behavior wasn't chased further, because
+//! either way, a bundling step that hard-depends on Cargo feature-flag
+//! bookkeeping it doesn't control is fragile. Making the binary
+//! unconditionally buildable sidesteps the whole question and can never
+//! regress the tag-triggered release path again.
 //!
 //! Usage: `ocr-selftest [--tessdata-dir <path>]`
 //!   - `--tessdata-dir` is optional; when absent, `OcrEngineHandle::load(None)`
@@ -32,106 +51,119 @@
 //! a rendered font size, which is exactly the kind of low-stakes noise this
 //! test is NOT meant to gate on.
 
-use std::path::PathBuf;
-use std::process::ExitCode;
+#[cfg(not(feature = "ocr"))]
+fn main() {
+    println!("ocr-selftest: `ocr` feature not enabled in this build — nothing to test.");
+}
 
-use redline_lib::ocr::OcrEngineHandle;
-use redline_lib::render::PageRaster;
+#[cfg(feature = "ocr")]
+fn main() -> std::process::ExitCode {
+    ocr_impl::run()
+}
 
-const FIXTURE_PNG: &[u8] = include_bytes!("../../../tools/fixtures/ocr/selftest.png");
-const EXPECT_SUBSTRINGS: [&str; 2] = ["REDLINE", "OCR"];
+#[cfg(feature = "ocr")]
+mod ocr_impl {
+    use std::path::PathBuf;
+    use std::process::ExitCode;
 
-fn main() -> ExitCode {
-    let mut tessdata_dir: Option<PathBuf> = None;
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--tessdata-dir" => {
-                tessdata_dir = args.next().map(PathBuf::from);
+    use redline_lib::ocr::OcrEngineHandle;
+    use redline_lib::render::PageRaster;
+
+    const FIXTURE_PNG: &[u8] = include_bytes!("../../../tools/fixtures/ocr/selftest.png");
+    const EXPECT_SUBSTRINGS: [&str; 2] = ["REDLINE", "OCR"];
+
+    pub fn run() -> ExitCode {
+        let mut tessdata_dir: Option<PathBuf> = None;
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--tessdata-dir" => {
+                    tessdata_dir = args.next().map(PathBuf::from);
+                }
+                other => {
+                    eprintln!("ocr-selftest: unknown argument {other:?}");
+                    return ExitCode::FAILURE;
+                }
             }
-            other => {
-                eprintln!("ocr-selftest: unknown argument {other:?}");
+        }
+
+        println!(
+            "ocr-selftest: tessdata_dir={:?} TESSDATA_PREFIX={:?}",
+            tessdata_dir,
+            std::env::var("TESSDATA_PREFIX").ok()
+        );
+
+        let mut engine = match OcrEngineHandle::load(tessdata_dir.as_deref()) {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("ocr-selftest: FAIL — OcrEngineHandle::load: {err:#}");
                 return ExitCode::FAILURE;
             }
-        }
-    }
+        };
 
-    println!(
-        "ocr-selftest: tessdata_dir={:?} TESSDATA_PREFIX={:?}",
-        tessdata_dir,
-        std::env::var("TESSDATA_PREFIX").ok()
-    );
+        let img = match image::load_from_memory(FIXTURE_PNG) {
+            Ok(i) => i.to_rgb8(),
+            Err(err) => {
+                eprintln!("ocr-selftest: FAIL — decoding embedded fixture PNG: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let (width_px, height_px) = (img.width(), img.height());
+        // dpi/scale are arbitrary here (only recognition text matters, not
+        // bbox-to-PDF mapping) but kept internally consistent with the
+        // documented `scale = dpi / 72.0` / `pts = px / scale` relationship
+        // (see `render::PageRaster`'s doc comment) rather than left at 0, so
+        // downstream bbox math never divides by zero.
+        let dpi = 300.0_f32;
+        let scale = dpi / 72.0;
+        let raster = PageRaster {
+            doc_id: "ocr-selftest".to_string(),
+            page_index: 0,
+            rgb: img.into_raw(),
+            width_px,
+            height_px,
+            dpi,
+            scale,
+            page_width_pts: width_px as f64 / scale as f64,
+            page_height_pts: height_px as f64 / scale as f64,
+        };
 
-    let mut engine = match OcrEngineHandle::load(tessdata_dir.as_deref()) {
-        Ok(e) => e,
-        Err(err) => {
-            eprintln!("ocr-selftest: FAIL — OcrEngineHandle::load: {err:#}");
-            return ExitCode::FAILURE;
-        }
-    };
+        let lines = match engine.recognize_page(&raster) {
+            Ok(l) => l,
+            Err(err) => {
+                eprintln!("ocr-selftest: FAIL — recognize_page: {err:#}");
+                return ExitCode::FAILURE;
+            }
+        };
 
-    let img = match image::load_from_memory(FIXTURE_PNG) {
-        Ok(i) => i.to_rgb8(),
-        Err(err) => {
-            eprintln!("ocr-selftest: FAIL — decoding embedded fixture PNG: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let (width_px, height_px) = (img.width(), img.height());
-    // dpi/scale are arbitrary here (only recognition text matters, not
-    // bbox-to-PDF mapping) but kept internally consistent with the
-    // documented `scale = dpi / 72.0` / `pts = px / scale` relationship
-    // (see `render::PageRaster`'s doc comment) rather than left at 0, so
-    // downstream bbox math never divides by zero.
-    let dpi = 300.0_f32;
-    let scale = dpi / 72.0;
-    let raster = PageRaster {
-        doc_id: "ocr-selftest".to_string(),
-        page_index: 0,
-        rgb: img.into_raw(),
-        width_px,
-        height_px,
-        dpi,
-        scale,
-        page_width_pts: width_px as f64 / scale as f64,
-        page_height_pts: height_px as f64 / scale as f64,
-    };
-
-    let lines = match engine.recognize_page(&raster) {
-        Ok(l) => l,
-        Err(err) => {
-            eprintln!("ocr-selftest: FAIL — recognize_page: {err:#}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let joined = lines
-        .iter()
-        .map(|l| l.text.to_uppercase())
-        .collect::<Vec<_>>()
-        .join(" ");
-    println!(
-        "ocr-selftest: recognized {} line(s): {:?}",
-        lines.len(),
-        joined
-    );
-
-    let missing: Vec<&str> = EXPECT_SUBSTRINGS
-        .iter()
-        .filter(|s| !joined.contains(*s))
-        .copied()
-        .collect();
-    if missing.is_empty() {
+        let joined = lines
+            .iter()
+            .map(|l| l.text.to_uppercase())
+            .collect::<Vec<_>>()
+            .join(" ");
         println!(
-            "ocr-selftest: PASS — found {:?} in recognized text",
-            EXPECT_SUBSTRINGS
+            "ocr-selftest: recognized {} line(s): {:?}",
+            lines.len(),
+            joined
         );
-        ExitCode::SUCCESS
-    } else {
-        eprintln!(
-            "ocr-selftest: FAIL — missing {:?} in recognized text {:?}",
-            missing, joined
-        );
-        ExitCode::FAILURE
+
+        let missing: Vec<&str> = EXPECT_SUBSTRINGS
+            .iter()
+            .filter(|s| !joined.contains(*s))
+            .copied()
+            .collect();
+        if missing.is_empty() {
+            println!(
+                "ocr-selftest: PASS — found {:?} in recognized text",
+                EXPECT_SUBSTRINGS
+            );
+            ExitCode::SUCCESS
+        } else {
+            eprintln!(
+                "ocr-selftest: FAIL — missing {:?} in recognized text {:?}",
+                missing, joined
+            );
+            ExitCode::FAILURE
+        }
     }
 }
