@@ -159,6 +159,41 @@ pub struct PageSize {
     pub height_pts: f64,
 }
 
+/// A whole-page (non-tiled) raster export at a fixed DPI. Distinct from the
+/// tiled `RenderedTile` path (which always rasterizes a bounded viewport
+/// region for on-screen display): this always rasterizes the FULL page in one
+/// shot, at a resolution independent of viewer zoom/DPR, for a full-page-image
+/// consumer such as OCR (`ocr` module, feature `ocr`). Not cached — a caller
+/// that needs repeated access should cache the result itself.
+#[derive(Debug, Clone)]
+pub struct PageRaster {
+    pub doc_id: String,
+    pub page_index: u32,
+    /// RGB8 pixel data, row-major, no row padding
+    /// (`width_px * height_px * 3` bytes).
+    pub rgb: Vec<u8>,
+    pub width_px: u32,
+    pub height_px: u32,
+    /// DPI requested for this render.
+    pub dpi: f32,
+    /// The exact `device_px = pdf_user_space_pt * scale` factor actually used
+    /// (`dpi / 72.0`). A caller mapping a pixel-space result (e.g. an OCR
+    /// engine's detected `RotatedRect`, in image pixel coordinates with the
+    /// origin at the top-left and y increasing downward) back to PDF
+    /// user-space (origin bottom-left, y increasing upward) must apply:
+    /// ```text
+    /// x_pdf = x_px / scale
+    /// y_pdf = page_height_pts - (y_px / scale)
+    /// ```
+    /// PDFium's own matrix-render path already performs the PDF-y-up ->
+    /// device-y-down flip once internally (see `render_tile`'s module comment
+    /// on the same point) - the inverse above flips y back exactly once, not
+    /// twice, and must not be applied a second time.
+    pub scale: f32,
+    pub page_width_pts: f64,
+    pub page_height_pts: f64,
+}
+
 /// Request for a single tile.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TileRequest {
@@ -961,6 +996,84 @@ impl RenderEngine {
             page_index,
             width_pts: size.width().value as f64,
             height_pts: size.height().value as f64,
+        })
+    }
+
+    /// Rasterize the FULL page (not a tile) at `dpi` dots-per-inch. Used by the
+    /// `ocr` module (feature `ocr`) to get one whole-page bitmap to hand to the
+    /// OCR engine; not tied to viewer zoom/DPR.
+    ///
+    /// Uses the same page-handle cache as tiled rendering (`doc.page()`), so a
+    /// page already open for viewing doesn't pay a second PDFium parse.
+    /// Deliberately mirrors `render_tile`'s explicit-matrix approach (fixed
+    /// target size + a plain scale matrix, annotations/form-data off) rather
+    /// than PDFium's own auto-scaling fit-to-size, so the caller gets back an
+    /// EXACT, independently-computable pixel <-> PDF-user-space mapping
+    /// (`PageRaster::scale`) instead of having to reverse-engineer PDFium's
+    /// internal scale choice.
+    pub fn render_page_full(
+        &mut self,
+        doc_id: &str,
+        page_index: u32,
+        dpi: f32,
+    ) -> Result<PageRaster> {
+        let doc = self
+            .documents
+            .get_mut(doc_id)
+            .with_context(|| format!("Unknown doc_id: {doc_id}"))?;
+        let page = doc.page(page_index)?;
+
+        let page_size = page.page_size();
+        let page_w_pts = page_size.width().value as f64;
+        let page_h_pts = page_size.height().value as f64;
+        if page_w_pts <= 0.0 || page_h_pts <= 0.0 {
+            anyhow::bail!(
+                "page {page_index} has a non-positive dimension ({page_w_pts} x {page_h_pts})"
+            );
+        }
+
+        let scale = dpi / 72.0;
+        let target_w = ((page_w_pts as f32) * scale).round().max(1.0) as i32;
+        let target_h = ((page_h_pts as f32) * scale).round().max(1.0) as i32;
+
+        // Same plain scale matrix as render_tile, but with a zero translate —
+        // this covers the WHOLE page rather than one tile's pixel-origin slice.
+        // See render_tile's comment block for why the matrix does not also flip
+        // y: pdfium-render's apply_matrix path already performs the PDF y-up ->
+        // device y-down flip itself.
+        let matrix = PdfMatrix::new(scale, 0.0, 0.0, scale, 0.0, 0.0);
+
+        let render_config = PdfRenderConfig::new()
+            .set_fixed_size(target_w, target_h)
+            // Opaque white ("paper"), not transparent — OCR needs a real
+            // background to threshold against, unlike the isolated-stamp path
+            // (rasterize_pdf_bytes) which deliberately renders transparent.
+            .set_clear_color(PdfColor::new(255, 255, 255, 255))
+            .render_form_data(false) // required: matrix path only applies when form data is off (see render_tile)
+            // OCR reads the SOURCE scan content, not markups baked on top of
+            // it — same reasoning as render_tile's render_annotations(false)
+            // (avoids the frozen-ghost double-render bug documented there).
+            .render_annotations(false)
+            .apply_matrix(matrix)
+            .context("failed to set full-page render matrix")?;
+
+        let bitmap = page
+            .render_with_config(&render_config)
+            .context("PDFium full-page render failed")?;
+
+        let rgb = bitmap.as_image().into_rgb8();
+        let (width_px, height_px) = rgb.dimensions();
+
+        Ok(PageRaster {
+            doc_id: doc_id.to_string(),
+            page_index,
+            rgb: rgb.into_raw(),
+            width_px,
+            height_px,
+            dpi,
+            scale,
+            page_width_pts: page_w_pts,
+            page_height_pts: page_h_pts,
         })
     }
 

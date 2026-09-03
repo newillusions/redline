@@ -38,6 +38,10 @@ Thumbs.db
 /src-tauri/resources/libpdfium.so
 /src-tauri/resources/pdfium.dll
 
+# OCR models (.rten, ~12 MB total) — downloaded via scripts/fetch-ocr-models.sh,
+# not committed. See the `ocr` module doc comment.
+/src-tauri/resources/ocr/
+
 # Benchmark rendered output (PNG proofs, incl. nested dirs like render-matrix/)
 /bench/results/*.png
 /bench/results/**/*.png

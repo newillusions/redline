@@ -31,6 +31,17 @@ path = "src/bin/bench.rs"
 name = "redline-mcp"
 path = "src/bin/redline_mcp.rs"
 
+# Dev tool: regenerates the scanned-CAD OCR fixture corpus (tools/fixtures/ocr/).
+# Builds small synthetic text PDFs with lopdf, rasterizes each via the existing
+# PDFium render path, then re-wraps the raster as a flattened image-only PDF (no
+# text layer) - i.e. a synthetic "scan". Needs only default-feature deps
+# (lopdf/pdfium-render/image), not the `ocr` feature itself - it never runs OCR,
+# only produces the corpus OCR is benchmarked against. Requires
+# PDFIUM_DYNAMIC_LIB_PATH. Run: `cargo run --bin gen-ocr-fixtures`.
+[[bin]]
+name = "gen-ocr-fixtures"
+path = "src/bin/gen_ocr_fixtures.rs"
+
 [build-dependencies]
 tauri-build = { version = "2.2.0", features = [] }
 
@@ -130,29 +141,29 @@ reqwest = { version = "0.12", features = ["json"] }
 # commands can be tested against a fake without a live HTTP call).
 async-trait = "0.1"
 
-# --- Deferred: OCR (decision:tntyyjau94smf6r6jitq chose leptess 0.14, 2026-06-25;
-# investigated + formally descoped 2026-08-04, wave-2 portfolio review; the `ocr`
-# module + this feature stub were removed rather than left as dead scaffolding).
-# NOT a "not needed" call - it's a real spec-mandated v1 feature (spec §14, §219)
-# with no engineering blocker on Linux, but three real blockers found on the
-# actual release path before it can ship:
-#   1. Forgejo CI (.forgejo/workflows/ci.yml, ubuntu-latest) has no
-#      tesseract-ocr/libtesseract-dev/libleptonica-dev apt step - `--features ocr`
-#      would not even compile in CI today.
-#   2. .github/workflows/build-releases.yml's build-macos job has no
-#      `brew install tesseract` (or vendored equivalent) step.
-#   3. build-windows has no vcpkg/tesseract bootstrap at all - leptess on Windows
-#      is the hard case (static vs dynamic linking, VCPKG_ROOT/TESSDATA_PREFIX env
-#      wiring) and untested in this repo.
-# Plus tessdata (eng.traineddata, ~12MB) is not staged anywhere for
-# tauri.bundle.resources. Re-enabling needs all four addressed, in that order
-# (Linux CI first - cheapest signal), each verified by an actual green CI/release
-# run, not just a local compile. See CLAUDE.md "Deferred: OCR" for the full note.
-# leptess = { version = "0.14", optional = true }
+# --- OCR (Phase 2a, 2026-09-02; supersedes the Phase 1 `ocrs` engine choice -
+# decision:h6k4psk6n7xegql9ya9g, observation:lr0cwsixkpbzei7vthon). A 2026-09-02
+# bake-off (dev-reports/2026-09-02-redline-ocr-bakeoff.md) measured `ocrs` 0.13
+# topping out at 30% overall recall against this crate's own scanned-CAD fixture
+# corpus even with a rotate-4x fix pass (0% baseline vertical recall, its
+# per-line RotatedRect detection notwithstanding - the recognition model itself
+# is the bottleneck, not the geometry). Tesseract 5 via `leptess` cleared
+# 93%/98% (baseline/rotate-4x) on the same corpus at a real but bounded
+# native-dependency cost (pkg-config + system tesseract/leptonica; owner
+# decision 2026-09-02 "switch to Tesseract"). Unlike ocrs, Tesseract has no
+# per-line rotation detection (whole-page OSD only), so the `ocr` module
+# implements its own rotate-4x-and-merge pass over whole-page rasters - see the
+# module doc comment. `leptess` has no Cargo feature flags of its own; it links
+# system tesseract/leptonica via `tesseract-plumbing`'s pkg-config-driven
+# build.rs (verified against leptess v0.14.0's own Cargo.toml this session -
+# only dependencies are `tesseract-plumbing ~0.8` + `thiserror 1`, no vendored
+# build). Feature stays OFF by default: no `-ocr.pdf` writer, no UI, no
+# auto-trigger yet - see the `ocr` module doc comment for phase scope.
+leptess = { version = "0.14", optional = true }
 
 [features]
 default = []
-# ocr = ["dep:leptess"]  # see the Deferred: OCR note above before re-enabling
+ocr = ["dep:leptess"]
 
 [dev-dependencies]
 tempfile = "3"

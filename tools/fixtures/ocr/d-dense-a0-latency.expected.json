@@ -1,0 +1,166 @@
+{
+  "description": "Dense A0-style sheet (40 room labels) for latency measurement — rendered at 150 DPI, see source comment for why",
+  "render_dpi": 150.0,
+  "lines": [
+    {
+      "text": "ROOM 101",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 102",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 103",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 104",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 105",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 106",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 107",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 108",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 109",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 110",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 111",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 112",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 113",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 114",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 115",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 116",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 117",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 118",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 119",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 120",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 121",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 122",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 123",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 124",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 125",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 126",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 127",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 128",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 129",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 130",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 131",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 132",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 133",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 134",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 135",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 136",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 137",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 138",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 139",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 140",
+      "orientation": "horizontal"
+    }
+  ]
+}

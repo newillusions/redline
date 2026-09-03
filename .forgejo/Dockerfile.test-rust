@@ -2,6 +2,14 @@ FROM rust:1.89-slim
 
 # Tauri 2 system deps required even for cargo test --lib (tauri-build links against webkit/GTK).
 # libayatana-appindicator3-dev omitted (Ubuntu-only; tray-icon feature not enabled).
+# clang + libtesseract-dev + libleptonica-dev are the `leptess` crate's native
+# build deps (Auto-OCR `ocr` feature, Phase 2a - bindgen needs clang; the
+# tesseract-plumbing/leptonica-plumbing -sys crates find the libs via
+# pkg-config, already installed below). tesseract-ocr-eng is the RUNTIME
+# English tessdata the `ocr` feature's tests need, not just a build dep - see
+# the `ocr` module doc comment. Installed unconditionally (both the default
+# test-rust job and the opt-in ocr leg share this image) - see the ARG-gated
+# RUN block at the bottom of this file for what actually exercises them.
 RUN apt-get update -qq && apt-get install -y -qq \
   pkg-config \
   libssl-dev \
@@ -11,6 +19,10 @@ RUN apt-get update -qq && apt-get install -y -qq \
   file \
   libxdo-dev \
   librsvg2-dev \
+  clang \
+  libtesseract-dev \
+  libleptonica-dev \
+  tesseract-ocr-eng \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
@@ -30,10 +42,38 @@ COPY --chown=root:root tools/fixtures tools/fixtures
 
 ENV CARGO_TARGET_DIR=/target
 
-# Run both workspace crates.
+# Run both workspace crates. This is the `test-rust` job in ci.yml - its
+# command and behaviour are UNCHANGED by the ocr leg below (same two
+# invocations, same env, same assertions).
 # PDFIUM_DYNAMIC_LIB_PATH is deliberately unset: PDFium-dependent tests in
 # src-tauri skip gracefully via early-return when the env var is absent
 # (matching the render::tests::corpus() helper pattern).
 # pdf-diff tests are all pure-Rust (pixel math + serde) and run unconditionally;
 # the single engine_new test handles Ok/Err without panic.
 RUN cargo test --lib -p redline && cargo test --lib -p pdf-diff
+
+# OCR leg (the `ocr` job in ci.yml, opt-in via `--build-arg RUN_OCR_TESTS=1`;
+# defaults to 0 so the `test-rust` job's image/behaviour above is unchanged -
+# Docker's build-arg-keyed layer cache gives each job its own cached layer).
+# Compiles and runs the `ocr` feature's unit tests (pure logic - TSV parsing,
+# rotate-4x geometry, no Tesseract binary needed) PLUS the full corpus
+# accuracy benchmark (tests/ocr_benchmark.rs, normally #[ignore]'d - needs
+# PDFium + a real Tesseract recognition pass, both set up here). Fetches the
+# SAME pinned PDFium release scripts/fetch-pdfium.sh uses (chromium/7869,
+# linux-x64) rather than duplicating that script's logic into a second file.
+# TESSDATA_PREFIX is resolved from the actually-installed tesseract-ocr-eng
+# package path via `dpkg -L` rather than a hardcoded path, since the Debian
+# tessdata directory layout differs by tesseract major version.
+ARG RUN_OCR_TESTS=0
+RUN if [ "$RUN_OCR_TESTS" = "1" ]; then \
+      set -eu; \
+      TESSDATA_DIR="$(dirname "$(dpkg -L tesseract-ocr-eng | grep 'tessdata/eng\.traineddata$')")" && \
+      echo "Resolved TESSDATA_PREFIX=$TESSDATA_DIR" && \
+      export TESSDATA_PREFIX="$TESSDATA_DIR" && \
+      wget -q --timeout=60 -O /tmp/pdfium.tgz \
+        "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F7869/pdfium-linux-x64.tgz" && \
+      mkdir -p /tmp/pdfium && tar -xzf /tmp/pdfium.tgz -C /tmp/pdfium && \
+      export PDFIUM_DYNAMIC_LIB_PATH=/tmp/pdfium/lib/libpdfium.so && \
+      cargo test --lib -p redline --features ocr && \
+      cargo test --features ocr --test ocr_benchmark -- --ignored --nocapture ; \
+    fi

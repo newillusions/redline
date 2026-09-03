@@ -1,0 +1,14 @@
+{
+  "description": "One 90-degree rotated CAD dimension string plus a small horizontal label",
+  "render_dpi": 300.0,
+  "lines": [
+    {
+      "text": "D1",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "DIM 3650 MM",
+      "orientation": "vertical"
+    }
+  ]
+}

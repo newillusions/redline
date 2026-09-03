@@ -11,13 +11,14 @@
 //!   docops    — flatten/optimize/redact trait (M5)
 //!   compare   — page-pair diff rendering (M6 / Phase 1.1)
 //!   storage   — local-first file + version management (M4)
+//!   ocr       — scanned-page text recognition (Phase 2a, feature `ocr`, off by default)
 //!
-//! No `ocr` module: Tesseract-via-leptess OCR was decided (decision:
-//! tntyyjau94smf6r6jitq) but never built, and was formally descoped 2026-08-04
-//! after investigation found the release pipeline unready on all three legs
-//! (Forgejo CI, macOS build, Windows build - see CLAUDE.md "Deferred: OCR" and
-//! the Cargo.toml `leptess`/`ocr`-feature comment for the specifics). Re-add the
-//! module when re-enabling, not before.
+//! `ocr` runs Tesseract 5 via `leptess`, with a rotate-4x-and-merge pass for
+//! rotated/vertical CAD text — Phase 2a (2026-09-02), switched from Phase 1's
+//! `ocrs` engine after a bake-off found `ocrs`'s recognition accuracy
+//! insufficient (observation:lr0cwsixkpbzei7vthon; decision:h6k4psk6n7xegql9ya9g).
+//! Engine wrapper + rotate-4x + benchmark only so far. No `-ocr.pdf` writer,
+//! no UI, no auto-trigger yet — see the module's own doc comment.
 
 use log::{info, warn};
 use tauri::Manager;
@@ -27,6 +28,8 @@ pub mod document;
 pub mod geometry;
 mod identity;
 pub mod license;
+#[cfg(feature = "ocr")]
+pub mod ocr;
 mod panic_guard;
 pub mod render;
 pub mod rpc;

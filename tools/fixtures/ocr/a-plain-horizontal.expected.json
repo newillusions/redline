@@ -1,0 +1,26 @@
+{
+  "description": "Plain horizontal text page (drawing title block callouts)",
+  "render_dpi": 300.0,
+  "lines": [
+    {
+      "text": "FLOOR PLAN LEVEL 2",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "SCALE 1 TO 100",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "PROJECT NO 2026 118",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "DRAWN BY MR CHECKED BY JR",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "NORTH",
+      "orientation": "horizontal"
+    }
+  ]
+}

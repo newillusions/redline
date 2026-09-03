@@ -41,6 +41,41 @@ jobs:
             -f .forgejo/Dockerfile.test-rust \
             .
 
+  ocr:
+    # Auto-OCR `ocr` feature (Tesseract via leptess) leg - separate job so a
+    # regression here doesn't block the default test-rust job, and so the
+    # heavier apt/PDFium/tessdata setup only runs when this leg is invoked.
+    # Runs the ocr module's unit tests plus the full corpus accuracy
+    # benchmark (tests/ocr_benchmark.rs, asserts >=90% overall recall - see
+    # the `ocr` module doc comment) via the same Dockerfile.test-rust image,
+    # opted in with --build-arg RUN_OCR_TESTS=1 (default-off, so the
+    # test-rust job above is unaffected).
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_HOST: tcp://10.0.23.137:2376
+      DOCKER_TLS_VERIFY: "1"
+      DOCKER_CERT_PATH: /certs/client-primary
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Docker CLI
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq docker.io > /dev/null 2>&1
+          echo "Docker CLI version: $(docker --version)"
+          echo "DOCKER_HOST: $DOCKER_HOST"
+          docker info --format 'Remote daemon: {{.ServerVersion}} OS={{.OperatingSystem}}'
+
+      - name: Build and run ocr feature tests + benchmark
+        run: |
+          docker build \
+            --network=host \
+            --progress=plain \
+            --build-arg RUN_OCR_TESTS=1 \
+            -t redline-test-ocr \
+            -f .forgejo/Dockerfile.test-rust \
+            .
+
   test-frontend:
     runs-on: ubuntu-latest
     steps:

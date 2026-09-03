@@ -1,0 +1,26 @@
+{
+  "description": "Small-font (6pt) title-block crop",
+  "render_dpi": 300.0,
+  "lines": [
+    {
+      "text": "DWG NO A 101",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "SCALE AS NOTED",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "DATE 2026 09 02",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "REV A",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "DRAWN MR",
+      "orientation": "horizontal"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "description": "Mixed sheet: horizontal room callouts + two 90-degree rotated dimension strings",
+  "render_dpi": 300.0,
+  "lines": [
+    {
+      "text": "ROOM 101 OFFICE",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "ROOM 102 MEETING",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "CORRIDOR",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "DIM 5000 MM",
+      "orientation": "vertical"
+    },
+    {
+      "text": "DIM 3200 MM",
+      "orientation": "vertical"
+    }
+  ]
+}
