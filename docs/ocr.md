@@ -187,19 +187,43 @@ layout end-to-end is a residual gap**, not silently assumed to work — see
 
 #### Proving both legs without cutting a release
 
-`.github/workflows/build-releases.yml` gained a `push: branches: [feat/**]`
-trigger and a `workflow_dispatch` boolean input `build_ocr`; either sets a
-per-job `Determine OCR proof mode` step's `enabled` output, which:
-adds `--features ocr` (macOS also adds `--bundles app`, skipping the DMG —
-nothing in this leg needs one) to the `Build Tauri app` step, runs the new
-Tesseract-install/tessdata-fetch/dylib-bundle/smoke-test steps above, and
-gates OFF every publish-oriented step (code signing, DMG recreation,
-Authenticode signing, Gitea/GitHub asset upload, the `update-manifest`
-job) via `if: steps.ocr_mode.outputs.enabled != 'true'` — no signing, no
-upload, no release cut. The tag-triggered release path's steps are
-functionally unchanged: `ocr_mode.enabled` evaluates `false` there, so every
-existing step's condition is unaffected and the feature stays off, exactly
-as before this phase.
+`.github/workflows/build-releases.yml` gained a `workflow_dispatch` boolean
+input `build_ocr`, which sets a per-job `Determine OCR proof mode` step's
+`enabled` output: adds `--features ocr` (macOS also adds `--bundles app`,
+skipping the DMG — nothing in this leg needs one) to the `Build Tauri app`
+step, runs the Tesseract-install/tessdata-fetch/dylib-bundle/smoke-test
+steps above, and gates OFF every publish-oriented step (code signing, DMG
+recreation, Authenticode signing, Gitea/GitHub asset upload, the
+`update-manifest` job) via `if: steps.ocr_mode.outputs.enabled != 'true'` —
+no signing, no upload, no release cut. The tag-triggered release path's
+steps are functionally unchanged: `ocr_mode.enabled` evaluates `false`
+there, so every existing step's condition is unaffected and the feature
+stays off, exactly as before this phase.
+
+An earlier version of this leg used a `push: branches: [feat/**]` trigger
+instead — removed on review feedback the same day it landed, because it
+fired a full macOS+Windows GitHub Actions build (the expensive, slow leg)
+on every push to ANY `feat/**` branch workspace-wide, whether or not that
+push had anything to do with OCR. `workflow_dispatch` is opt-in per run.
+
+**Triggering the OCR proof leg by hand:**
+
+```bash
+gh workflow run build-releases.yml \
+  --repo newillusions/redline \
+  --ref <your-branch> \
+  -f version=0.0.0-ocr-proof \
+  -f build_ocr=true
+```
+
+`version` is a required input even though the proof leg never uses it
+(no release is cut, so no version string is embedded anywhere) — any
+placeholder value works. Or via the GitHub Actions UI: Actions tab →
+"Build macOS and Windows Releases" → "Run workflow" → pick the branch →
+toggle "OCR proof leg" on → Run workflow. Poll with `gh run list --repo
+newillusions/redline --workflow build-releases.yml` /
+`gh run watch <run-id> --repo newillusions/redline`, or the GitHub API
+(`GET /repos/newillusions/redline/actions/runs`).
 
 ## Rotate-4x strategy
 
@@ -293,5 +317,31 @@ benchmark.
   should either silently-install the NSIS output on the CI runner and repeat
   the smoke test against that layout, or accept the current portable-layout
   proof as sufficient and say so explicitly (owner call).
+- **Codesigning + dylib bundling are mutually exclusive today, on macOS.**
+  The OCR-proof leg's `Bundle Tesseract + Leptonica dylibs into the .app`
+  step is gated OFF for real releases along with every other publish-step
+  (see "Proving both legs" above) — it has never run in the SAME build as
+  the existing `Fix code signature`/notarization steps. Turning `ocr` on
+  for a real signed release therefore needs the dylib-bundling step wired
+  into the actual release path (not just the proof leg), placed BEFORE code
+  signing (dylibbundler rewrites load commands, invalidating any prior
+  signature — matching the existing re-sign-after-build pattern this repo
+  already uses for the CSResourcesFileMapped fix), and the combined result
+  re-verified end-to-end (signed + bundled + smoke-tested) — none of which
+  has been done. An OCR-enabled release cannot be shipped signed until this
+  lands.
+- **Installer size deltas are unmeasured.** The macOS proof leg bundles 15
+  dylibs into `Contents/Frameworks` (measured locally 2026-09-03: libarchive,
+  libb2, libgif, libjpeg, libleptonica, liblz4, liblzma, libopenjp2, libpng16,
+  libsharpyuv, libtesseract, libtiff, libwebp, libwebpmux, libzstd — NOT the
+  ~37 recursive Homebrew *runtime* dependencies `brew info tesseract` reports,
+  which include cairo/pango/glib/harfbuzz/icu4c/etc. that turned out to be
+  needed by Tesseract's optional training-tool binaries, not the
+  `libtesseract.dylib` this build actually links against). No DMG or NSIS
+  installer has been built WITH the `ocr` feature (the proof leg uses
+  `--bundles app` on macOS specifically to skip DMG creation, and the
+  Windows leg never reaches the "Find installers"/size-reporting step,
+  which is gated off). The actual installed-size and download-size impact
+  is real but not yet measured — do that as part of wiring signing above.
 - Non-English language support (only `eng.traineddata` is wired anywhere in
   this repo or its CI).

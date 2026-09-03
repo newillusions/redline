@@ -8,17 +8,23 @@ on:
   push:
     tags:
       - 'v*'
-    # Auto-OCR Phase 2b bundling proof leg (2026-09-03): pushing a feat/**
-    # branch here builds with `--features ocr` on both desktop legs and runs
-    # the ocr-selftest bundling smoke test, WITHOUT cutting a release - no
-    # signing, no Gitea/GitHub asset upload, no update.json commit. See the
-    # "Determine OCR proof mode" step in build-macos/build-windows and the
-    # `if: steps.ocr_mode.outputs.enabled != 'true'` guards added to every
-    # publish-oriented step below. The default (tag-triggered) release path
-    # is functionally unchanged: ocr_mode.enabled evaluates false there, so
-    # every existing step's condition is unaffected.
-    branches:
-      - 'feat/**'
+  # Auto-OCR Phase 2b bundling proof leg (2026-09-03): a manual
+  # workflow_dispatch run with build_ocr=true builds with `--features ocr`
+  # on both desktop legs and runs the ocr-selftest bundling smoke test,
+  # WITHOUT cutting a release - no signing, no Gitea/GitHub asset upload, no
+  # update.json commit. See the "Determine OCR proof mode" step in
+  # build-macos/build-windows and the `if: steps.ocr_mode.outputs.enabled
+  # != 'true'` guards added to every publish-oriented step below. The
+  # default (tag-triggered) release path is functionally unchanged:
+  # ocr_mode.enabled evaluates false there, so every existing step's
+  # condition is unaffected.
+  #
+  # Deliberately NOT a `push: branches: [feat/**]` trigger (that was tried
+  # first, 2026-09-03, and removed on review feedback): it fired a full
+  # macOS+Windows GitHub Actions build on every push to any feat/** branch,
+  # workspace-wide, whether or not that push touched OCR at all - expensive
+  # and surprising. workflow_dispatch is opt-in per run. See docs/ocr.md
+  # "Triggering the OCR proof leg by hand" for the exact command.
   workflow_dispatch:
     inputs:
       version:
@@ -64,8 +70,6 @@ jobs:
         shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.build_ocr }}" = "true" ]; then
-            ENABLED=true
-          elif [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/heads/feat/* ]]; then
             ENABLED=true
           else
             ENABLED=false
@@ -366,8 +370,6 @@ jobs:
         shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.build_ocr }}" = "true" ]; then
-            ENABLED=true
-          elif [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/heads/feat/* ]]; then
             ENABLED=true
           else
             ENABLED=false
