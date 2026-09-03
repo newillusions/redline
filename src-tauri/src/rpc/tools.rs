@@ -435,6 +435,367 @@ pub struct ReduceFileSizeParams {
     pub image_preset: Option<crate::docops::ImageQualityPreset>,
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2b (2026-09-03): search, takeoff, page ops, compare, docops,
+// save_document_as. Param shapes only, same pattern as the block above -
+// execution needs the full AppState (render engine / PDFium / file I/O /
+// search index / scale store) and is a thin pass-through in
+// `dispatch::dispatch` to the EXISTING Tauri command functions
+// (`commands::search`/`commands::takeoff`/`commands::document`/
+// `commands::compare`/`commands::docops`) - not reimplemented here.
+// Argument-validation tests below cover serde shape only; the wrapped
+// behaviour itself is covered by each underlying command's own existing
+// tests plus this PR's live-drive transcript (see PR description).
+// ---------------------------------------------------------------------------
+
+// --- search (commands::text, commands::search) ---
+
+#[derive(Debug, Deserialize)]
+pub struct SearchDocumentParams {
+    pub doc_id: String,
+    pub query: String,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub whole_word: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OpenFolderIndexParams {
+    pub root: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchFolderParams {
+    pub root: String,
+    pub query: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FolderIndexStatusParams {
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+/// Wraps `search::IndexStatus` with a `matches_requested_root` flag - redline holds
+/// exactly one active folder index at a time (`AppState.folder_index: Mutex<Option<
+/// FolderIndex>>`), so a caller polling a DIFFERENT root than whatever is currently
+/// indexed gets back the REAL (mismatched) status plus this flag, rather than a
+/// silently-narrowed or fabricated "not found" result.
+#[derive(Debug, Serialize)]
+pub struct FolderIndexStatusResult {
+    #[serde(flatten)]
+    pub status: crate::search::IndexStatus,
+    pub matches_requested_root: bool,
+}
+
+// --- takeoff (commands::takeoff) ---
+
+#[derive(Debug, Deserialize)]
+pub struct ListScalesParams {
+    pub doc_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddScaleParams {
+    pub doc_id: String,
+    #[serde(default)]
+    pub applies_to_page: Option<u32>,
+    pub ratio: f64,
+    pub unit: String,
+    pub label: String,
+    pub precision: u8,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteScaleParams {
+    pub doc_id: String,
+    pub scale_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WritePageMeasureParams {
+    pub doc_id: String,
+    pub page_idx: u32,
+    pub scale_id: String,
+}
+
+/// `export_markup_list` requires the caller to supply the destination `path`,
+/// matching the underlying Tauri command 1:1 (it's driven by a GUI save dialog on
+/// the frontend). This is the named difference from `export_markup_schedule`
+/// (wave 1, `export_markup_schedule` above), which generates its own path next to
+/// the source document - both ultimately call the exact same writer
+/// (`commands::takeoff::export_markup_list_to`) and produce byte-identical output
+/// for the same input; the two tools differ only in path-selection semantics, not
+/// in export logic.
+#[derive(Debug, Deserialize)]
+pub struct ExportMarkupListParams {
+    pub doc_id: String,
+    pub path: String,
+    pub format: crate::commands::takeoff::ExportFormat,
+}
+
+// --- page ops (commands::document) ---
+//
+// None of these are gated behind save_document - apply_page_edit (their shared
+// implementation) writes the file atomically (temp + rename) and reloads the
+// render engine IMMEDIATELY, unlike markup create/update/delete which stay in
+// MarkupStore until save_document is called. There is also no document-level
+// lock concept anywhere in this codebase to check - only the markup-level
+// Locked/LockedContents PDF annotation flags (`markup::check_not_locked`), which
+// apply to individual annotations, not page structure. Both facts are stated in
+// each tool's MCP description in `redline_mcp.rs` rather than assumed.
+
+#[derive(Debug, Deserialize)]
+pub struct RotatePageParams {
+    pub doc_id: String,
+    pub page_idx: u32,
+    pub degrees: i32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeletePageParams {
+    pub doc_id: String,
+    pub page_idx: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReorderPagesParams {
+    pub doc_id: String,
+    pub new_order: Vec<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InsertBlankPageParams {
+    pub doc_id: String,
+    pub at: u32,
+    pub width: f32,
+    pub height: f32,
+}
+
+// --- compare (commands::compare) ---
+
+/// Named deviation from every other tool: `compare_pages` takes `path_a`/`path_b`
+/// directly, not `doc_id` - matching the underlying Tauri command exactly ("wrap,
+/// don't reimplement"). The command itself never touches `AppState`/`MarkupStore`;
+/// it runs a standalone two-tier diff over two raw file paths and does NOT require
+/// either document to be open in redline.
+#[derive(Debug, Deserialize)]
+pub struct ComparePagesParams {
+    pub path_a: String,
+    pub path_b: String,
+    pub page_a: u32,
+    pub page_b: u32,
+    #[serde(default)]
+    pub dpi: Option<f32>,
+    #[serde(default)]
+    pub pixel_tolerance: Option<u8>,
+}
+
+/// Diff summary WITHOUT the base64 PNG overlay (`compare::PageDiffResult::
+/// diff_png_b64`) - an MCP tool response is JSON-in-text, and embedding a
+/// per-page raster image (tens to hundreds of KB) in every compare call serves
+/// no purpose for a calling agent, which wants the numeric verdict, not to
+/// render an image. Wraps the EXACT SAME `compare::run_two_tier_diff` result the
+/// Tauri command returns - no new diff logic, one field dropped. The M6 diff
+/// engine's public output is aggregate tier-1/tier-2 stats only (no per-region
+/// breakdown), so this mirrors that shape rather than inventing a "regions" field
+/// the crate doesn't produce.
+#[derive(Debug, Clone, Serialize)]
+pub struct ComparePagesSummary {
+    pub text_char_match: bool,
+    pub text_delta_count: usize,
+    pub text_rms_delta_pts: f32,
+    pub pixel_passed: bool,
+    pub changed_pct: f32,
+    pub max_pixel_delta: u8,
+    pub render_dpi: f32,
+}
+
+impl From<crate::compare::PageDiffResult> for ComparePagesSummary {
+    fn from(r: crate::compare::PageDiffResult) -> Self {
+        Self {
+            text_char_match: r.text_char_match,
+            text_delta_count: r.text_delta_count,
+            text_rms_delta_pts: r.text_rms_delta_pts,
+            pixel_passed: r.pixel_passed,
+            changed_pct: r.changed_pct,
+            max_pixel_delta: r.max_pixel_delta,
+            render_dpi: r.render_dpi,
+        }
+    }
+}
+
+// --- docops (commands::docops) ---
+
+#[derive(Debug, Deserialize)]
+pub struct RedactDocumentParams {
+    pub doc_id: String,
+    #[serde(default)]
+    pub regions: Vec<crate::docops::RedactRegion>,
+    #[serde(default)]
+    pub apply_annots: bool,
+}
+
+// --- save-as (commands::document) ---
+
+#[derive(Debug, Deserialize)]
+pub struct SaveDocumentAsParams {
+    pub doc_id: String,
+    pub path: String,
+}
+
+#[cfg(test)]
+mod phase2b_param_tests {
+    use super::*;
+
+    #[test]
+    fn search_document_defaults_case_sensitive_and_whole_word_to_false() {
+        let p: SearchDocumentParams =
+            serde_json::from_value(serde_json::json!({"doc_id": "d1", "query": "fire"})).unwrap();
+        assert!(!p.case_sensitive);
+        assert!(!p.whole_word);
+    }
+
+    #[test]
+    fn search_document_missing_doc_id_is_a_bad_params_error() {
+        let err =
+            serde_json::from_value::<SearchDocumentParams>(serde_json::json!({"query": "fire"}))
+                .unwrap_err();
+        assert!(err.to_string().contains("doc_id"));
+    }
+
+    #[test]
+    fn open_folder_index_requires_root() {
+        let err =
+            serde_json::from_value::<OpenFolderIndexParams>(serde_json::json!({})).unwrap_err();
+        assert!(err.to_string().contains("root"));
+    }
+
+    #[test]
+    fn search_folder_limit_defaults_to_none() {
+        let p: SearchFolderParams =
+            serde_json::from_value(serde_json::json!({"root": "/plans", "query": "door"})).unwrap();
+        assert_eq!(p.limit, None);
+    }
+
+    #[test]
+    fn folder_index_status_root_is_optional() {
+        let p: FolderIndexStatusParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(p.root, None);
+    }
+
+    #[test]
+    fn folder_index_status_result_flattens_status_fields_alongside_the_flag() {
+        let result = FolderIndexStatusResult {
+            status: crate::search::IndexStatus {
+                folder_path: "/plans".into(),
+                indexed_files: 3,
+                indexed_pages: 40,
+                state: crate::search::IndexState::Idle,
+            },
+            matches_requested_root: true,
+        };
+        let v = serde_json::to_value(&result).unwrap();
+        assert_eq!(v["folder_path"], "/plans");
+        assert_eq!(v["matches_requested_root"], true);
+    }
+
+    #[test]
+    fn add_scale_requires_ratio_unit_label_precision() {
+        let err = serde_json::from_value::<AddScaleParams>(
+            serde_json::json!({"doc_id": "d1", "unit": "m", "label": "1:100", "precision": 2}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ratio"));
+    }
+
+    #[test]
+    fn add_scale_applies_to_page_defaults_to_none_meaning_document_default() {
+        let p: AddScaleParams = serde_json::from_value(serde_json::json!({
+            "doc_id": "d1", "ratio": 0.001, "unit": "m", "label": "1:1000", "precision": 2
+        }))
+        .unwrap();
+        assert_eq!(p.applies_to_page, None);
+    }
+
+    #[test]
+    fn export_markup_list_requires_explicit_path_unlike_export_markup_schedule() {
+        let err = serde_json::from_value::<ExportMarkupListParams>(
+            serde_json::json!({"doc_id": "d1", "format": "Csv"}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("path"));
+    }
+
+    #[test]
+    fn rotate_page_requires_degrees() {
+        let err = serde_json::from_value::<RotatePageParams>(
+            serde_json::json!({"doc_id": "d1", "page_idx": 0}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("degrees"));
+    }
+
+    #[test]
+    fn reorder_pages_new_order_is_a_plain_index_vec() {
+        let p: ReorderPagesParams = serde_json::from_value(serde_json::json!({
+            "doc_id": "d1", "new_order": [2, 0, 1]
+        }))
+        .unwrap();
+        assert_eq!(p.new_order, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn compare_pages_uses_path_a_path_b_not_doc_id() {
+        let p: ComparePagesParams = serde_json::from_value(serde_json::json!({
+            "path_a": "/a.pdf", "path_b": "/b.pdf", "page_a": 0, "page_b": 0
+        }))
+        .unwrap();
+        assert_eq!(p.path_a, "/a.pdf");
+        assert_eq!(p.dpi, None);
+        assert_eq!(p.pixel_tolerance, None);
+    }
+
+    #[test]
+    fn compare_pages_summary_omits_the_png_field() {
+        let r = crate::compare::PageDiffResult {
+            text_char_match: true,
+            text_delta_count: 0,
+            text_rms_delta_pts: 0.0,
+            pixel_passed: true,
+            changed_pct: 0.0,
+            max_pixel_delta: 0,
+            diff_png_b64: "not-actually-tiny-in-real-life".repeat(1000),
+            render_dpi: 150.0,
+        };
+        let v = serde_json::to_value(ComparePagesSummary::from(r)).unwrap();
+        assert!(
+            v.get("diff_png_b64").is_none(),
+            "MCP compare_pages summary must not carry the base64 PNG overlay"
+        );
+        assert_eq!(v["changed_pct"], 0.0);
+    }
+
+    #[test]
+    fn redact_document_regions_and_apply_annots_default_to_empty_and_false() {
+        let p: RedactDocumentParams =
+            serde_json::from_value(serde_json::json!({"doc_id": "d1"})).unwrap();
+        assert!(p.regions.is_empty());
+        assert!(!p.apply_annots);
+    }
+
+    #[test]
+    fn save_document_as_requires_path() {
+        let err =
+            serde_json::from_value::<SaveDocumentAsParams>(serde_json::json!({"doc_id": "d1"}))
+                .unwrap_err();
+        assert!(err.to_string().contains("path"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

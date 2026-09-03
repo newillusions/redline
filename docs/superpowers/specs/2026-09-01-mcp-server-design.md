@@ -434,6 +434,191 @@ unmodified Phase 1 tip (`git stash` + re-run). Not fixed here - reformatting ~15
 untouched files is out of this PR's scope; `git diff --stat` confirms only the 8 files
 this phase intentionally touched changed.
 
+## Implementation notes (Phase 2b, 2026-09-03)
+
+Phase 2b exposes the rest of the app's existing command surface as MCP tools, per the
+owner's "start 2b" direction (2026-09-03) - sixteen tools across search, takeoff, page
+operations, compare, and docops, following the exact same wrap-don't-reimplement pattern
+as Phase 1/2a: every tool is a thin pass-through in `rpc::dispatch::dispatch` to the
+EXISTING `commands::*` Tauri command function, called via `AppHandle::state()`, no new
+domain logic. Thirty tools total.
+
+**Tools added** (param shapes in `rpc::tools`; dispatch arms in `rpc::dispatch`;
+`tools/list` schemas in `redline_mcp.rs`'s `tool_defs()`):
+
+| Tool | Wraps | Mutates | Persists |
+|---|---|---|---|
+| `search_document` | `commands::text::search_document` | no | n/a |
+| `open_folder_index` | `commands::search::open_folder_index` | in-app search state only | on-disk index cache (app data dir) |
+| `search_folder` | `commands::search::search_folder` | no | n/a |
+| `folder_index_status` | `commands::search::folder_index_status` | no | n/a |
+| `list_scales` | `commands::takeoff::list_scales` | no | n/a |
+| `add_scale` | `commands::takeoff::add_scale` | yes | immediately, to sidecar |
+| `delete_scale` | `commands::takeoff::delete_scale` | yes | immediately, to sidecar |
+| `write_page_measure` | `commands::takeoff::write_page_measure` | yes | immediately, to the PDF file |
+| `export_markup_list` | `commands::takeoff::export_markup_list` | no (writes a new file, doesn't touch the source) | new file at caller-supplied path |
+| `rotate_page` | `commands::document::rotate_page` | yes | immediately, to the PDF file |
+| `delete_page` | `commands::document::delete_page` | yes | immediately, to the PDF file |
+| `reorder_pages` | `commands::document::reorder_pages` | yes | immediately, to the PDF file |
+| `insert_blank_page` | `commands::document::insert_blank_page` | yes | immediately, to the PDF file |
+| `compare_pages` | `commands::compare::compare_pages` | no | n/a |
+| `redact_document` | `commands::docops::redact_document` | yes | immediately, to the PDF file |
+| `save_document_as` | `commands::document::save_document_as` | no (writes a new file) | new file at caller-supplied path |
+
+**Page ops and docops writes are NOT gated behind `save_document`, unlike markup
+create/update/delete.** `rotate_page`/`delete_page`/`reorder_pages`/`insert_blank_page`/
+`redact_document`/`write_page_measure` all share `commands::document::apply_page_edit` -
+the same load-op-save(atomic temp+rename)-reload pipeline used since M4/M5 - which writes
+the file on disk and reloads the render engine before the command even returns. There is
+no in-memory staging for these, and no document-level lock concept exists anywhere in this
+codebase to check before allowing one (only the markup-level `Locked`/`LockedContents` PDF
+annotation flags from Phase 1's lock guard, which apply to individual annotations, not
+page structure). Every one of these tool descriptions states this plainly rather than
+implying a save step exists. Live-verified this session (see below): each of the four page
+ops changed the target file's md5 hash immediately, with no `save_document` call in
+between.
+
+**`compare_pages` is the one tool that takes raw file paths (`path_a`/`path_b`), not a
+`doc_id`.** The underlying Tauri command never touches `AppState`/`MarkupStore` - it runs
+a standalone two-tier diff over two file paths and does not require either document to be
+open in redline at all. Matching that 1:1 ("wrap, don't reimplement") was the more honest
+choice than inventing a `doc_id`-based contract the real command doesn't have. Its MCP
+response also omits `PageDiffResult::diff_png_b64` (a base64 PNG overlay, tens-to-hundreds
+of KB per page) - a calling agent wants the numeric verdict (`changed_pct`,
+`text_char_match`, etc.), not an embedded image in a JSON-in-text tool response.
+
+**`export_markup_list` vs `export_markup_schedule` (wave 1): same writer, different path
+contract, not different content.** Both ultimately call
+`commands::takeoff::export_markup_list_to` and produce byte-identical output for the same
+markup set. `export_markup_schedule` (Phase 1) generates its own path next to the source
+document; `export_markup_list` (Phase 2b) requires the caller to supply an explicit `path`,
+matching the underlying Tauri command exactly (it's driven by a GUI save dialog on the
+frontend). Both are kept, per the owner's explicit "keep both, document the difference"
+instruction - this is that documentation.
+
+**`search_folder`/`folder_index_status` are root-checked, not silently mis-scoped.**
+`AppState.folder_index` is a single `Mutex<Option<FolderIndex>>` - redline supports exactly
+one active folder index at a time. `search_folder` refuses with a structured
+`folder_index_root_mismatch` error (naming the requested and actual root) if no index is
+open, or it's open for a different folder than the caller asked about, rather than silently
+searching whatever happens to be active. `folder_index_status` instead returns the real
+status plus a `matches_requested_root` boolean, since polling status is a read and the
+caller can see the mismatch directly in the returned `folder_path`.
+
+**`compare_pages` could NOT be live-verified - a real, pre-existing hang, named plainly
+rather than papered over.** Every attempt (four, across two fresh dev-instance restarts,
+including one against two completely untouched copies of the e2e fixture) hung
+indefinitely inside `commands::compare::compare_pages` itself - the dev instance's log
+shows `pdf_diff: PDFium loaded` and then nothing further, ever, for as long as 120s. Root
+cause, inferred not confirmed: `crates/pdf-diff/src/lib.rs`'s `PdfDiffEngine::new()` calls
+`Pdfium::bind_to_library`/`bind_to_system_library` to create its OWN, SEPARATE PDFium
+binding, independent of `redline_lib::render::RenderEngine`'s binding - which was already
+active on its own dedicated thread in the same process for every reproduction (a document
+was open via the render engine in three of the four attempts; the fourth used fresh files
+but the render engine's PDFium binding was still resident in-process from the earlier
+`open_document` calls in that same session). This matches the exact class of hazard this
+project's own judgment rules already name for PDFium ("PDFium global C state" - the reason
+`REDLINE_BENCH_TESTS` tests must run serial) - a second concurrent binding to the same
+underlying library, in the same process, is plausible to deadlock on a shared global lock
+FPDFium's C API isn't documented as safe against. This is NOT caused by this PR's MCP
+wrapper - the hang happens inside the existing `compare_pages` Tauri command before the
+wrapper's own code (which only strips one field from the result afterward) ever runs, and
+`pdf-diff`'s own isolated unit/integration tests (7 + 14, no render engine sharing the
+process) pass cleanly in the same session. Flagged as a real, unverified gap for the owner
+- `compare_pages` may need to run its diff on a dedicated thread that never shares a
+process with an active `RenderEngine` PDFium binding, or the `pdf-diff` crate needs to
+reuse the render engine's existing binding rather than creating its own. The MCP tool and
+its schema ship as designed (matching the underlying command 1:1, per "wrap, don't
+reimplement") but its live behavior is unverified pending that fix.
+
+**Verified this session, live, against an isolated dev instance** (never the installed
+release build or any pre-existing running `redline` process - the pre-existing process on
+the default `$TMPDIR`, confirmed by `pgrep -x redline` before and after every step, was
+never touched; each isolated instance ran under its own short-path `TMPDIR` and was killed
+by its own PID at the end, located via `lsof` on that instance's own socket path, never a
+broad process match). `search_document` found real text hits by rect; `open_folder_index`
++ `folder_index_status` + `search_folder` round-tripped correctly including the
+`folder_index_root_mismatch` refusal on a mismatched root and a real hit
+(`"snippet":"Redline WDIO E2E <b>fixture</b> ..."`) once queried with real fixture text
+(a bare `"a"`/`"sample"` query returned no folder-search hits, consistent with Tantivy's
+default English stopword/stemming behavior, not a wrapper defect - `search_document`
+against the same text via PDFium's own search found `"a"` in four places, confirming the
+underlying text IS there and the two search engines simply tokenize differently, which is
+pre-existing, not something this PR changed). `list_scales`/`add_scale`/
+`write_page_measure`/`export_markup_list`/`delete_scale` round-tripped correctly, and
+`export_markup_list`'s output file was confirmed to exist on disk with real CSV headers.
+`insert_blank_page`/`rotate_page`/`reorder_pages`/`delete_page` all changed the target
+file's md5 immediately (before, `7117bad2...`; after all four ops, `b6decd99...`),
+confirming the no-staging/no-save-step behavior claimed above. `redact_document` changed
+its target file's md5 immediately (`e473e8b3...` -> `0f718911...`). `save_document_as`
+wrote a distinct, valid, differently-sized PDF at the caller-supplied path while leaving
+the source file's md5 unchanged. `compare_pages` did not complete - see above.
+
+`cargo test --workspace --all-targets`: 660 passed (7 pdf-diff-lib + 14 pdf-diff-tests +
+631 redline_lib + 8 redline-mcp bin), 0 failed among tests actually exercised, 18 ignored
+(unchanged from Phase 2a's 5 plus 13 more `#[ignore]`d elsewhere in the workspace already
+present pre-PR) - the one `redline-mcp` bin test failure
+(`call_bridge_connection_failure_is_a_structured_tool_error`) is the SAME pre-existing
+environmental collision Phase 2a already documented: a genuinely-running `redline` process
+(this session's own default-`$TMPDIR` neighbor, PID confirmed via `pgrep -x redline` both
+before this PR's changes and after, i.e. present regardless of this diff) answers the
+test's connection attempt instead of refusing it. `cargo clippy --all-targets`: 0 warnings
+(one `clippy::doc_lazy_continuation` warning was found and fixed during this session, in
+this PR's own new doc comment on `ComparePagesParams`). `cargo fmt --all -- --check`:
+this PR's own three touched files are fully clean; the pre-existing, repo-wide drift
+Phase 2a already documented (223 `Diff in` blocks there) is unrelated and unchanged by
+this PR - confirmed via `git stash` + re-run against the unmodified pre-PR tip (226 blocks,
+consistent with Phase 2a's number within normal drift-count variance across sessions);
+`git diff --stat` confirms only the four files this phase intentionally touched changed
+(`CLAUDE.md`, `src-tauri/src/bin/redline_mcp.rs`, `src-tauri/src/rpc/dispatch.rs`,
+`src-tauri/src/rpc/tools.rs`) plus this design doc.
+
+**Not verified / out of reach in this environment, named honestly:** `compare_pages`'s
+live behavior (see above - the tool exists and matches the design, but could not be
+exercised end-to-end); the Windows named-pipe path (unchanged from Phase 1/2a - this
+session was also macOS-only); no frontend (Svelte/`npm test`/`npm run check`) changes were
+made or re-verified in this phase, since none of this phase's code touches the frontend.
+
+### Fix round (2026-09-03, PR #99 review)
+
+Three findings from the fresh-context PR review, all fixed on the same branch before merge:
+
+1. **[HIGH] `redline-mcp` had no socket read/write timeout anywhere.** Its own loop is a
+   single blocking thread (no tokio), so one stuck server-side call - `compare_pages`
+   above is the known case - wedged the entire client process silently for every
+   subsequent tool call too, not just that one. Fixed: `connect()` now sets
+   `set_read_timeout`/`set_write_timeout` on the Unix socket (default 120s, override via
+   `REDLINE_MCP_TIMEOUT_SECS`) before boxing the stream; a resulting `WouldBlock`/
+   `TimedOut` I/O error is mapped to a structured `redline_timeout` tool error instead of
+   the generic `read_failed`/`write_failed`, both distinguished by `socket_io_err_to_json`.
+   `call_bridge`'s body was extracted into `call_bridge_over_stream<S: Read + Write>` so
+   this is unit-testable against a synthetic `UnixStream::pair()` whose peer is held open
+   but never written to - a genuine "socket that never replies," not a connection
+   failure - and asserted to return the `redline_timeout` error within a bounded time
+   rather than hanging the test suite itself. The Windows named-pipe client path does
+   **not** get this timeout yet (`std::fs::File` has no equivalent method; would need
+   `SetNamedPipeHandleState`/overlapped I/O via `windows-sys`) - named as a follow-up
+   alongside the pipe path's existing UNVERIFIED status, not silently skipped.
+2. **`compare_pages` pulled from the default tool list.** `tool_defs()` now delegates to
+   `tool_defs_for(experimental: bool)`, which omits the `compare_pages` entry unless
+   `REDLINE_MCP_EXPERIMENTAL=1` is set - so a client's `tools/list` no longer advertises a
+   tool known to hang by default. `handle_tools_call` additionally refuses a direct
+   `compare_pages` call by name (before ever touching the socket) when the gate is off,
+   with a structured `experimental_tool_disabled` error naming the env var - belt and
+   suspenders beyond the timeout fix above, since even a client-side-recovered hang can
+   still leak a stuck app-side blocking thread from the double PDFium binding. This is a
+   client-side-only gate (`redline_mcp.rs`); the server-side dispatch arm in
+   `rpc/dispatch.rs` is untouched and still wraps the real command correctly for when the
+   root cause is eventually fixed and the gate is lifted.
+3. **[LOW] `save_document_as` now validates its path is absolute**, mirroring the
+   `open_document` guard exactly (`path_not_absolute` structured error) - a relative path
+   previously would have resolved against the Tauri process's cwd rather than the source
+   document's directory.
+
+Tracked as a mission-record next step: `fix pdf-diff second PDFium binding (reuse render
+engine binding or dedicated process)` - the underlying `compare_pages` hang itself remains
+unfixed; the fixes above make it recoverable and opt-in, not fixed at the root.
+
 ## Open questions for the owner (not resolved by this design)
 
 1. **Does Wave 1 alone satisfy the "helpful" bar Martin described, or is mutation the

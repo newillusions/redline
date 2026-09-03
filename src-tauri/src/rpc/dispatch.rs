@@ -226,6 +226,202 @@ pub async fn dispatch(app: &AppHandle, req: RpcRequest) -> Result<Value, Value> 
             .await;
             to_value(result)
         }
+        // -----------------------------------------------------------------
+        // Phase 2b (2026-09-03): app-surface tools. Each is a thin
+        // pass-through to the EXISTING Tauri command function via
+        // `app.state::<AppState>()` - same pattern as save_document/
+        // flatten_document/reduce_file_size above, routed through `to_value`
+        // throughout so a genuine success is never collapsible to a bare
+        // JSON `null` (the same class of bug fixed for delete_markup/
+        // reduce_file_size above - see `to_value`'s doc comment).
+        // -----------------------------------------------------------------
+        "search_document" => {
+            let p: tools::SearchDocumentParams = parse(req.params)?;
+            let state = app.state::<AppState>();
+            let result = crate::commands::text::search_document(
+                state,
+                p.doc_id,
+                p.query,
+                p.case_sensitive,
+                p.whole_word,
+            )
+            .await;
+            to_value(result)
+        }
+        "open_folder_index" => {
+            let p: tools::OpenFolderIndexParams = parse(req.params)?;
+            let state = app.state::<AppState>();
+            let result =
+                crate::commands::search::open_folder_index(app.clone(), state, p.root).await;
+            to_value(result)
+        }
+        "search_folder" => {
+            let p: tools::SearchFolderParams = parse(req.params)?;
+            let state = app.state::<AppState>();
+            // redline holds exactly one active folder index at a time - refuse rather
+            // than silently searching whatever happens to be open for a different
+            // root than the caller asked about (design's "never a silent fallback").
+            let active_root: Option<String> = {
+                let guard = state.folder_index.lock().unwrap();
+                guard.as_ref().map(|idx| idx.status().folder_path)
+            };
+            if active_root.as_deref() != Some(p.root.as_str()) {
+                return Err(serde_json::json!({
+                    "error": "folder_index_root_mismatch",
+                    "requested_root": p.root,
+                    "active_root": active_root,
+                    "detail": "no folder index is open for this root - call open_folder_index first"
+                }));
+            }
+            let result = crate::commands::search::search_folder(state, p.query, p.limit).await;
+            to_value(result)
+        }
+        "folder_index_status" => {
+            let p: tools::FolderIndexStatusParams = parse(req.params)?;
+            let state = app.state::<AppState>();
+            let result = crate::commands::search::folder_index_status(state)
+                .await
+                .map(|status| {
+                    let matches = p.root.as_deref() == Some(status.folder_path.as_str());
+                    tools::FolderIndexStatusResult {
+                        status,
+                        matches_requested_root: matches,
+                    }
+                });
+            to_value(result)
+        }
+        "list_scales" => {
+            let p: tools::ListScalesParams = parse(req.params)?;
+            let state = app.state::<AppState>();
+            let result = crate::commands::takeoff::list_scales(state, p.doc_id).await;
+            to_value(result)
+        }
+        "add_scale" => {
+            let p: tools::AddScaleParams = parse(req.params)?;
+            let state = app.state::<AppState>();
+            let result = crate::commands::takeoff::add_scale(
+                state,
+                p.doc_id,
+                p.applies_to_page,
+                p.ratio,
+                p.unit,
+                p.label,
+                p.precision,
+            )
+            .await;
+            to_value(result)
+        }
+        "delete_scale" => {
+            let p: tools::DeleteScaleParams = parse(req.params)?;
+            let state = app.state::<AppState>();
+            let result = crate::commands::takeoff::delete_scale(state, p.doc_id, p.scale_id)
+                .await
+                .map(|removed| serde_json::json!({ "removed": removed }));
+            to_value(result)
+        }
+        "write_page_measure" => {
+            let p: tools::WritePageMeasureParams = parse(req.params)?;
+            let state = app.state::<AppState>();
+            let result = crate::commands::takeoff::write_page_measure(
+                state, p.doc_id, p.page_idx, p.scale_id,
+            )
+            .await
+            .map(|()| serde_json::json!({ "written": true }));
+            to_value(result)
+        }
+        "export_markup_list" => {
+            let p: tools::ExportMarkupListParams = parse(req.params)?;
+            let out_path = p.path.clone();
+            let state = app.state::<AppState>();
+            let result =
+                crate::commands::takeoff::export_markup_list(state, p.doc_id, p.path, p.format)
+                    .await
+                    .map(|()| serde_json::json!({ "out_path": out_path }));
+            to_value(result)
+        }
+        "rotate_page" => {
+            let p: tools::RotatePageParams = parse(req.params)?;
+            let state = app.state::<AppState>();
+            let result =
+                crate::commands::document::rotate_page(state, p.doc_id, p.page_idx, p.degrees)
+                    .await
+                    .map(|()| serde_json::json!({ "rotated": true }));
+            to_value(result)
+        }
+        "delete_page" => {
+            let p: tools::DeletePageParams = parse(req.params)?;
+            let state = app.state::<AppState>();
+            let result = crate::commands::document::delete_page(state, p.doc_id, p.page_idx)
+                .await
+                .map(|()| serde_json::json!({ "deleted": true }));
+            to_value(result)
+        }
+        "reorder_pages" => {
+            let p: tools::ReorderPagesParams = parse(req.params)?;
+            let state = app.state::<AppState>();
+            let result = crate::commands::document::reorder_pages(state, p.doc_id, p.new_order)
+                .await
+                .map(|()| serde_json::json!({ "reordered": true }));
+            to_value(result)
+        }
+        "insert_blank_page" => {
+            let p: tools::InsertBlankPageParams = parse(req.params)?;
+            let state = app.state::<AppState>();
+            let result = crate::commands::document::insert_blank_page(
+                state, p.doc_id, p.at, p.width, p.height,
+            )
+            .await
+            .map(|()| serde_json::json!({ "inserted": true }));
+            to_value(result)
+        }
+        "compare_pages" => {
+            let p: tools::ComparePagesParams = parse(req.params)?;
+            let result = crate::commands::compare::compare_pages(
+                p.path_a,
+                p.path_b,
+                p.page_a,
+                p.page_b,
+                p.dpi,
+                p.pixel_tolerance,
+            )
+            .await
+            .map(tools::ComparePagesSummary::from);
+            to_value(result)
+        }
+        "redact_document" => {
+            let p: tools::RedactDocumentParams = parse(req.params)?;
+            let state = app.state::<AppState>();
+            let result = crate::commands::docops::redact_document(
+                state,
+                p.doc_id,
+                p.regions,
+                p.apply_annots,
+            )
+            .await
+            .map(|()| serde_json::json!({ "redacted": true }));
+            to_value(result)
+        }
+        "save_document_as" => {
+            let p: tools::SaveDocumentAsParams = parse(req.params)?;
+            // Same guard as open_document (reviewer finding #2 on PR #99) - a relative
+            // path here would resolve against the Tauri process's cwd rather than the
+            // source document's directory, which is unlikely to be what the caller
+            // meant. Checked before touching the filesystem.
+            let path_check = std::path::PathBuf::from(&p.path);
+            if !path_check.is_absolute() {
+                return Err(serde_json::json!({
+                    "error": "path_not_absolute",
+                    "detail": "save_document_as requires an absolute path",
+                    "path": p.path
+                }));
+            }
+            let out_path = p.path.clone();
+            let state = app.state::<AppState>();
+            let result = crate::commands::document::save_document_as(state, p.doc_id, p.path)
+                .await
+                .map(|()| serde_json::json!({ "saved": true, "path": out_path }));
+            to_value(result)
+        }
         other => Err(serde_json::json!({ "error": "unknown_op", "op": other })),
     }
 }
