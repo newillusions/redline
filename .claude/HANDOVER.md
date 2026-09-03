@@ -1,6 +1,43 @@
 # Redline - Handover Notes
 
-## Current Status (as of 2026-09-02, dispatched session - MCP server Phase 1 LIVE round trip)
+## Current Status (as of 2026-09-03, dispatched session - MCP server Phase 2a document tools)
+
+**Dispatched by team-lead to build MCP Phase 2a: four document-lifecycle tools
+(`list_open_documents`, `open_document`, `close_document`, `get_active_document`)
+closing the doc_id-discovery gap left by Phase 1 (below). PR #98 open against `main`
+(branch `feat/mcp-phase2a-document-tools`, worktree-isolated, head sha `fe933b3a`), CI
+green (run #272), NOT merged - orchestrator owns merge. 14 tools total now.**
+
+**Key points for the next session:**
+- `MarkupStore` (`document/store.rs`) now tracks `dirty` per doc (set by
+  add/update/delete, cleared by save/apply_page_edit) and gained `find_by_path`/
+  `list_open`. `AppState` gained `active_doc: Mutex<Option<String>>`, pushed from a
+  single `$effect` in `App.svelte` watching `tabStore.activeDocId`.
+- **Named limitation, not yet solved**: closing a doc via the MCP `close_document` tool
+  has no channel to tell the GUI's own tab list to refresh - a stale tab can still show
+  after an MCP-driven close. Would need either a Tauri event pushed from Rust to the
+  frontend, or the frontend polling `list_open_documents` itself.
+- **Testing this live**: never point a dev build at the default `$TMPDIR` - it collides
+  with whatever `redline` process (installed app, or another session) is already
+  running, since the socket path is fixed and shared. Use an isolated, SHORT `TMPDIR`
+  (macOS caps Unix socket paths at ~104 bytes, `SUN_LEN` - a scratchpad-nested path is
+  too long and fails to bind). See `CLAUDE.md`'s new MCP Server section for the exact
+  recipe.
+- `cargo fmt --all -- --check` reports 223 pre-existing diff blocks repo-wide, confirmed
+  present identically on the unmodified pre-Phase-2a tip via `git stash` - not something
+  this session caused, and out of scope to fix (would touch ~150 untouched files). A
+  future session should investigate whether this is a rustfmt version/edition mismatch
+  and, if so, either pin a `rust-toolchain.toml` rustfmt version or do one deliberate
+  repo-wide reformat commit.
+- Next MCP wave (per the design doc's roadmap, not yet scoped): folder search,
+  takeoff/measurement tools, compare tools.
+- The mission record (`project:q8gm8dv3k7smld12rm25`) currently carries 84 `next_steps`
+  entries - the `kb_status_update` write this session returned lint warnings that
+  several (including this session's own entry) read like code-level churn (PR/version
+  references) rather than milestone-altitude text. Worth a pruning pass per
+  `live-project-ledger.md`'s guidance - not done here, out of this session's scope.
+
+## Prior session: MCP server Phase 1 LIVE round trip (2026-09-02)
 
 **Dispatched by team-lead to prove MCP server Phase 1 (PR #92, merged to main
 2026-09-01T11:58+04:00 as `1805b1a`) works LIVE end to end on macOS, not just in unit

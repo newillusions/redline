@@ -20,6 +20,30 @@ pub struct DocEntry {
     pub markups: Vec<Markup>,
     pub loaded: bool,
     pub saving: bool,
+    /// True once `add`/`update`/`delete` has been called since the doc was
+    /// registered or since [`MarkupStore::clear_dirty`] last ran (MCP server design,
+    /// Phase 2a `list_open_documents`/`close_document` - the same "unsaved changes
+    /// since open/last save" concept the frontend's own `MarkupStore.dirty`
+    /// ($state, `markup-store.svelte.ts`) tracks, mirrored here so the RPC bridge
+    /// (which has no visibility into Svelte state) can answer without a new
+    /// frontend->backend push for every edit. `seed_loaded` deliberately does NOT
+    /// touch this flag - merging a document's pre-existing on-disk annotations at
+    /// open time is not an edit. Cleared by `clear_dirty`, called from both
+    /// `commands::document::save_inner` (save_document/save_document_as) and
+    /// `commands::document::apply_page_edit` (rotate/delete/reorder/insert pages,
+    /// and - via `commands::docops` - flatten/optimize/redact), since all of those
+    /// flush the current markup state to disk exactly like a save does.
+    pub dirty: bool,
+}
+
+/// One open document as reported by [`MarkupStore::list_open`] - the data
+/// `rpc::tools::list_open_documents` needs that doesn't require a doc_id to look up
+/// (MCP server design, Phase 2a).
+#[derive(Debug, Clone)]
+pub struct OpenDocEntry {
+    pub doc_id: String,
+    pub path: PathBuf,
+    pub dirty: bool,
 }
 
 /// Keyed by path: returns the parsed annotation set for a file that hasn't changed since the
@@ -74,6 +98,7 @@ impl MarkupStore {
                 markups: Vec::new(),
                 loaded: false,
                 saving: false,
+                dirty: false,
             },
         );
     }
@@ -89,6 +114,58 @@ impl MarkupStore {
             .unwrap()
             .get(doc_id)
             .map(|e| e.path.clone())
+    }
+
+    /// The doc_id of the currently-open document registered at exactly `path`, if any
+    /// (`open_document` MCP tool's already-open dedup, Phase 2a - the design's "returns
+    /// the existing doc_id if that path is already open" requirement; without this, an
+    /// MCP-driven open of an already-open path would register a second, independent
+    /// PDFium handle under a fresh doc_id rather than reusing the one the GUI or an
+    /// earlier MCP call already has open).
+    pub fn find_by_path(&self, path: &std::path::Path) -> Option<String> {
+        self.docs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, e)| e.path == path)
+            .map(|(doc_id, _)| doc_id.clone())
+    }
+
+    /// Every currently-open document's doc_id/path/dirty state (`list_open_documents`
+    /// MCP tool, Phase 2a). Order is unspecified (backed by a `HashMap`).
+    pub fn list_open(&self) -> Vec<OpenDocEntry> {
+        self.docs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(doc_id, e)| OpenDocEntry {
+                doc_id: doc_id.clone(),
+                path: e.path.clone(),
+                dirty: e.dirty,
+            })
+            .collect()
+    }
+
+    /// True if markups have changed since this doc was opened or since the last
+    /// [`Self::clear_dirty`] - see the field doc comment on [`DocEntry::dirty`].
+    /// `false` for an unknown doc_id, matching [`Self::is_loaded`]'s convention.
+    pub fn is_dirty(&self, doc_id: &str) -> bool {
+        self.docs
+            .lock()
+            .unwrap()
+            .get(doc_id)
+            .map(|e| e.dirty)
+            .unwrap_or(false)
+    }
+
+    /// Mark a doc clean (call after a successful save or any other flush of the
+    /// current markup state to disk - see [`DocEntry::dirty`]'s doc comment for the
+    /// full list of call sites). No-op for an unknown doc_id (the entry may have
+    /// already been removed), matching [`Self::end_save`]'s convention.
+    pub fn clear_dirty(&self, doc_id: &str) {
+        if let Some(e) = self.docs.lock().unwrap().get_mut(doc_id) {
+            e.dirty = false;
+        }
     }
 
     /// Password this doc was opened with, if it required one. `None` for both
@@ -131,6 +208,7 @@ impl MarkupStore {
             return Err(format!("duplicate markup id {}", m.id()));
         }
         e.markups.push(m);
+        e.dirty = true;
         Ok(())
     }
 
@@ -154,6 +232,7 @@ impl MarkupStore {
             .ok_or_else(|| format!("unknown markup id {}", m.id()))?;
         crate::markup::check_not_locked(slot).map_err(|e| e.to_string())?;
         *slot = m;
+        e.dirty = true;
         Ok(())
     }
 
@@ -172,6 +251,7 @@ impl MarkupStore {
             .ok_or_else(|| format!("unknown markup id {id}"))?;
         crate::markup::check_not_locked(existing).map_err(|e| e.to_string())?;
         e.markups.retain(|x| x.id() != id);
+        e.dirty = true;
         Ok(())
     }
 
@@ -641,5 +721,127 @@ mod tests {
             "changed mtime must invalidate the cache"
         );
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // dirty tracking + list_open + find_by_path (MCP server design, Phase 2a)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fresh_doc_is_not_dirty() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        assert!(!s.is_dirty("d1"));
+    }
+
+    #[test]
+    fn unknown_doc_is_not_dirty() {
+        let s = MarkupStore::default();
+        assert!(!s.is_dirty("nope"));
+    }
+
+    #[test]
+    fn add_marks_dirty() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        s.add("d1", markup()).unwrap();
+        assert!(s.is_dirty("d1"));
+    }
+
+    #[test]
+    fn update_marks_dirty() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let m = markup();
+        s.add("d1", m.clone()).unwrap();
+        s.clear_dirty("d1");
+        assert!(!s.is_dirty("d1"), "precondition: clean after clear_dirty");
+        s.update("d1", m).unwrap();
+        assert!(s.is_dirty("d1"), "update must mark the doc dirty again");
+    }
+
+    #[test]
+    fn delete_marks_dirty() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let m = markup();
+        let id = m.id();
+        s.add("d1", m).unwrap();
+        s.clear_dirty("d1");
+        s.delete("d1", id).unwrap();
+        assert!(s.is_dirty("d1"), "delete must mark the doc dirty again");
+    }
+
+    #[test]
+    fn seed_loaded_does_not_mark_dirty() {
+        // Merging a document's own pre-existing on-disk annotations at open time is
+        // not an edit - see DocEntry::dirty's doc comment.
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        s.seed_loaded("d1", vec![markup()]).unwrap();
+        assert!(!s.is_dirty("d1"));
+    }
+
+    #[test]
+    fn clear_dirty_resets_flag_and_is_a_noop_for_unknown_doc() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        s.add("d1", markup()).unwrap();
+        assert!(s.is_dirty("d1"));
+        s.clear_dirty("d1");
+        assert!(!s.is_dirty("d1"));
+        // Unknown doc: must not panic.
+        s.clear_dirty("nope");
+    }
+
+    #[test]
+    fn find_by_path_matches_a_registered_doc() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        s.register("d2", PathBuf::from("/tmp/b.pdf"), None);
+        assert_eq!(
+            s.find_by_path(&PathBuf::from("/tmp/b.pdf")),
+            Some("d2".to_string())
+        );
+    }
+
+    #[test]
+    fn find_by_path_none_for_unopened_path() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        assert_eq!(s.find_by_path(&PathBuf::from("/tmp/nope.pdf")), None);
+    }
+
+    #[test]
+    fn list_open_reports_every_registered_doc_with_its_dirty_state() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        s.register("d2", PathBuf::from("/tmp/b.pdf"), None);
+        s.add("d2", markup()).unwrap();
+
+        let mut open = s.list_open();
+        open.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
+
+        assert_eq!(open.len(), 2);
+        assert_eq!(open[0].doc_id, "d1");
+        assert_eq!(open[0].path, PathBuf::from("/tmp/a.pdf"));
+        assert!(!open[0].dirty);
+        assert_eq!(open[1].doc_id, "d2");
+        assert!(open[1].dirty);
+    }
+
+    #[test]
+    fn list_open_empty_when_nothing_registered() {
+        let s = MarkupStore::default();
+        assert!(s.list_open().is_empty());
+    }
+
+    #[test]
+    fn remove_drops_the_doc_from_list_open() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        assert_eq!(s.list_open().len(), 1);
+        s.remove("d1");
+        assert!(s.list_open().is_empty());
     }
 }

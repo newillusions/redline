@@ -11,9 +11,11 @@
 //! `dispatch::dispatch`, which calls the exact existing `commands::document`/
 //! `commands::docops` Tauri command functions instead, via `AppHandle::state()`.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::document::store::MarkupStore;
+use crate::document::store::{MarkupStore, OpenDocEntry};
 use crate::markup::{Appearance, Markup, MarkupGeometry, MarkupStatus, MarkupType, UserRef};
 
 /// Compact summary returned by `list_markups`/`search_markups` (MCP server design §3:
@@ -232,6 +234,79 @@ pub fn export_markup_schedule(
 }
 
 // ---------------------------------------------------------------------------
+// list_open_documents / open_document / close_document / get_active_document
+// (MCP server design, Phase 2a, 2026-09-03 - document lifecycle tools)
+//
+// Every tool in this section needs more than `&MarkupStore` alone (page counts come
+// from the render engine, "active" from `AppState::active_doc`, and open_document/
+// close_document must call the exact existing `commands::document::open_document`/
+// `close_document` Tauri commands per the design's single-writer-correctness argument
+// - see the module doc comment at the top of this file). Only the parts that ARE pure
+// transforms over already-fetched data live here, unit-tested directly; the async
+// AppHandle-dependent orchestration lives in `dispatch::dispatch`, matching how
+// `save_document`/`flatten_document`/`reduce_file_size` are handled.
+// ---------------------------------------------------------------------------
+
+/// One open document as reported by `list_open_documents`. `title` is the file name
+/// component of `path` (the only "title" concept redline has - there is no separate
+/// display-name field anywhere in the document model).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OpenDocumentSummary {
+    pub doc_id: String,
+    pub path: String,
+    pub title: String,
+    pub page_count: u32,
+    pub is_active: bool,
+    pub dirty: bool,
+}
+
+/// Build the `list_open_documents` response from data the caller (`dispatch::dispatch`)
+/// has already fetched: `entries` from `MarkupStore::list_open`, `page_counts` keyed by
+/// doc_id from the render engine (missing entries default to `0` - a doc registered in
+/// `MarkupStore` but not yet resolvable in the render engine is a real, if narrow, race
+/// between `register` and the render thread's own open completing; `0` is a visibly
+/// wrong-looking sentinel an agent should not mistake for a real empty document, but a
+/// missing page count must never make the whole tool call fail for every other open
+/// doc), and `active_doc_id` from `AppState::active_doc`. Order matches `entries`'
+/// (unspecified - `MarkupStore` is `HashMap`-backed).
+pub fn list_open_documents(
+    entries: Vec<OpenDocEntry>,
+    active_doc_id: Option<&str>,
+    page_counts: &HashMap<String, u32>,
+) -> Vec<OpenDocumentSummary> {
+    entries
+        .into_iter()
+        .map(|e| {
+            let title = e
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| e.path.to_string_lossy().into_owned());
+            OpenDocumentSummary {
+                is_active: active_doc_id == Some(e.doc_id.as_str()),
+                dirty: e.dirty,
+                page_count: page_counts.get(&e.doc_id).copied().unwrap_or(0),
+                path: e.path.to_string_lossy().into_owned(),
+                doc_id: e.doc_id,
+                title,
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OpenDocumentParams {
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CloseDocumentParams {
+    pub doc_id: String,
+    #[serde(default)]
+    pub discard_changes: bool,
+}
+
+// ---------------------------------------------------------------------------
 // create_markup
 // ---------------------------------------------------------------------------
 
@@ -365,6 +440,78 @@ mod tests {
     use super::*;
     use crate::geometry::PdfPoint;
     use std::path::PathBuf;
+
+    // -------------------------------------------------------------------
+    // list_open_documents (Phase 2a)
+    // -------------------------------------------------------------------
+
+    fn open_entry(doc_id: &str, path: &str, dirty: bool) -> OpenDocEntry {
+        OpenDocEntry {
+            doc_id: doc_id.to_string(),
+            path: PathBuf::from(path),
+            dirty,
+        }
+    }
+
+    #[test]
+    fn list_open_documents_marks_the_active_doc_and_carries_dirty_through() {
+        let entries = vec![
+            open_entry("d1", "/plans/floor-1.pdf", false),
+            open_entry("d2", "/plans/floor-2.pdf", true),
+        ];
+        let mut page_counts = HashMap::new();
+        page_counts.insert("d1".to_string(), 12u32);
+        page_counts.insert("d2".to_string(), 3u32);
+
+        let mut out = list_open_documents(entries, Some("d2"), &page_counts);
+        out.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].doc_id, "d1");
+        assert_eq!(out[0].title, "floor-1.pdf");
+        assert_eq!(out[0].page_count, 12);
+        assert!(!out[0].is_active);
+        assert!(!out[0].dirty);
+
+        assert_eq!(out[1].doc_id, "d2");
+        assert_eq!(out[1].title, "floor-2.pdf");
+        assert_eq!(out[1].page_count, 3);
+        assert!(out[1].is_active, "d2 must be marked active");
+        assert!(out[1].dirty);
+    }
+
+    #[test]
+    fn list_open_documents_no_active_doc_marks_none_active() {
+        let entries = vec![open_entry("d1", "/plans/a.pdf", false)];
+        let out = list_open_documents(entries, None, &HashMap::new());
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].is_active);
+    }
+
+    #[test]
+    fn list_open_documents_missing_page_count_defaults_to_zero_not_a_failure() {
+        // A doc registered in MarkupStore but not yet resolvable in the render engine
+        // must not fail the whole call - see the doc comment on list_open_documents.
+        let entries = vec![open_entry("d1", "/plans/a.pdf", false)];
+        let out = list_open_documents(entries, None, &HashMap::new());
+        assert_eq!(out[0].page_count, 0);
+    }
+
+    #[test]
+    fn list_open_documents_empty_when_nothing_open() {
+        let out = list_open_documents(vec![], None, &HashMap::new());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn list_open_documents_title_falls_back_to_full_path_when_no_file_name() {
+        // A path with no final component (e.g. "/") has no file_name() - must not
+        // panic, must fall back to the full (stringified) path rather than an empty
+        // title.
+        let entries = vec![open_entry("d1", "/", false)];
+        let out = list_open_documents(entries, None, &HashMap::new());
+        assert_eq!(out[0].title, "/");
+    }
 
     fn store_with_one_markup(annot_flags: i32) -> (MarkupStore, uuid::Uuid) {
         let store = MarkupStore::default();

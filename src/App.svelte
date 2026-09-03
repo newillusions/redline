@@ -33,7 +33,7 @@
   import SavePromptDialog from "./components/SavePromptDialog.svelte";
   import PasswordPromptDialog from "./components/PasswordPromptDialog.svelte";
   import ConfirmDialog from "./components/ConfirmDialog.svelte";
-  import { openDocument, closeDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity } from "$lib/ipc";
+  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity } from "$lib/ipc";
   import type { IndexStatus } from "$lib/ipc";
   import SearchPanel from "./components/SearchPanel.svelte";
   import { SearchStore, computeViewportSearchOverlay, type UnifiedSearchHit, type SearchGroup, type DocSearchInput } from "$lib/search-store.svelte";
@@ -86,6 +86,20 @@
 
   /** Convenience alias for the currently active tab (null when no docs open). */
   const activeTab = $derived(tabStore.activeTab);
+
+  /**
+   * Mirror the active tab into the Rust backend for the MCP `get_active_document`/
+   * `list_open_documents` tools (MCP server design, Phase 2a) - there is otherwise no
+   * backend concept of "the active document" at all, since tab state is Svelte-only.
+   * A single effect watching `tabStore.activeDocId` covers every path that changes it
+   * (open, switch tab, close tab, keyboard next/prev-tab) without a call at each of
+   * those individual call sites - see `set_active_document`'s Rust doc comment.
+   */
+  $effect(() => {
+    setActiveDocument(tabStore.activeDocId).catch((e) => {
+      console.error("setActiveDocument failed (non-fatal - MCP active-doc tracking only):", e);
+    });
+  });
 
   // Tool Chest (spec "Tools & Tool Sets") - workspace-level, not per-document; one
   // instance lives for the app's lifetime and is shared across every open tab.

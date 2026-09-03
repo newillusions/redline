@@ -25,6 +25,17 @@ No `ocr` module - deferred (see "Deferred: OCR" under Key Decisions); `pub mod o
 
 **Precision-critical invariant:** display (raster tiles) and geometry (vector snap targets) are two independent layers. Snapping/measurement NEVER read the raster - all math runs in PDF user space at f64. See spec §5.
 
+## MCP Server
+
+Full design: `docs/superpowers/specs/2026-09-01-mcp-server-design.md` - read it before touching `src-tauri/src/rpc/` or `src-tauri/src/bin/redline_mcp.rs`. Summary:
+
+- **Architecture:** an embedded companion process, not a standalone file-mutating binary. The `redline` GUI app runs a loopback-only local RPC bridge (`src-tauri/src/rpc/`, a Unix domain socket on macOS/Linux at `$TMPDIR/redline-mcp/mcp.sock`, `0700`/`0600`-permissioned; a named pipe on Windows, unverified). `redline-mcp` (`src-tauri/src/bin/redline_mcp.rs`, a separate `[[bin]]` target) is the actual MCP stdio server Claude Code launches - a pure protocol translator with no PDF/Tauri logic of its own. Every tool call resolves to the exact same `commands::*`/`MarkupStore` functions the Svelte frontend already calls via `invoke` - single-writer correctness, no parallel mutation path.
+- **14 tools** (`redline_mcp.rs::tool_defs`): document lifecycle (`list_open_documents`, `open_document`, `close_document`, `get_active_document` - Phase 2a, 2026-09-03), read-only markup (`list_markups`, `read_markup`, `search_markups`, `export_markup_schedule`), mutating markup behind the lock guard (`create_markup`, `update_markup`, `delete_markup`, `save_document`), and docops (`flatten_document`, `reduce_file_size`).
+- **Every tool but the three document-discovery ones requires `doc_id`** - obtain one via `list_open_documents` or `get_active_document` first, or via `open_document`'s own return value.
+- **Lock guard:** `Markup::is_locked`/`is_contents_locked` (ISO 32000-1 `/F` bits 8/10) are enforced once, inside `document::store::MarkupStore::update`/`delete` - the single choke point both the GUI's own `commands::document::update_markup`/`delete_markup` and the MCP bridge's `update_markup`/`delete_markup` tools call through.
+- **Active-tab/dirty tracking has no other source of truth than this MCP work.** `AppState.active_doc` is pushed from a single `$effect` in `App.svelte` watching `tabStore.activeDocId` - if you touch tab-switching logic, verify that effect still fires (see its comment). `dirty` is derived server-side from `MarkupStore::add`/`update`/`delete` and cleared by `save_inner`/`apply_page_edit` - no frontend plumbing needed for it, don't add any.
+- **Testing an MCP change live:** never point a dev build at the default `$TMPDIR` while the installed app (or another dev session) might be running - it shares the same fixed socket path (single-instance assumption, named in the design doc). Run with an isolated, SHORT `TMPDIR` instead (macOS Unix-socket paths are capped at ~104 bytes - `SUN_LEN` - so a deeply-nested scratch path will fail to bind with a cryptic error), e.g. `TMPDIR=/tmp/rlmcp-scratch/ REDLINE_OPEN_PDF=/path/to/scratch.pdf npm run tauri:dev -- --no-watch`, then run `TMPDIR=/tmp/rlmcp-scratch/ target/debug/redline-mcp` with JSON-RPC lines on stdin.
+
 ## Commands
 ```bash
 # Dev

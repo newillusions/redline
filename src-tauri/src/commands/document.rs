@@ -72,11 +72,13 @@ pub async fn open_document(
         .register(&doc_id, path.clone(), effective_password);
 
     // Info-level so an MCP caller (or a human tailing the log) can discover the
-    // doc_id for an already-open document - the RPC bridge (rpc/mod.rs) has no
-    // `list_open_documents` tool in v1, and doc_id is otherwise only ever returned
-    // to whichever frontend IPC call opened the file. Found live 2026-09-02 while
-    // exercising the MCP round trip: there was no way to learn the doc_id a
-    // REDLINE_OPEN_PDF auto-open produced other than reading this log.
+    // doc_id for a document opened some other way (e.g. a GUI-driven open, or the
+    // REDLINE_OPEN_PDF auto-open). Originally added 2026-09-02 because there was no
+    // other way to learn a doc_id an MCP client didn't itself open - Phase 2a's
+    // `list_open_documents` MCP tool (`rpc::tools::list_open_documents`) is now the
+    // structured way to enumerate every open doc_id/path, but this log line stays as a
+    // lower-friction check when just tailing the log (e.g. while `redline` is running
+    // without an MCP client attached at all).
     log::info!("document opened: doc_id={doc_id} path={}", path.display());
 
     Ok(DocumentInfo {
@@ -183,6 +185,28 @@ pub async fn close_document(state: State<'_, AppState>, doc_id: String) -> Resul
         .await
         .map_err(|e| format!("{:#}", e))?;
     state.markups.remove(&doc_id);
+    // Drop a stale `active_doc` pointing at a doc that no longer exists (MCP server
+    // design, Phase 2a) - relevant when this close was driven by the MCP
+    // `close_document` tool rather than a GUI tab close, since the frontend's own
+    // `$effect` sync (see `set_active_document`'s doc comment) has no channel to learn
+    // about a backend-driven close and pick a new active tab itself.
+    let mut active = state.active_doc.lock().unwrap();
+    if active.as_deref() == Some(doc_id.as_str()) {
+        *active = None;
+    }
+    Ok(())
+}
+
+/// Record the frontend's currently-focused document tab (MCP server design, Phase 2a -
+/// `get_active_document`/`list_open_documents`). There is no backend concept of "the
+/// active tab" otherwise - `DocTabStore.activeDocId` (`src/lib/doc-tabs.svelte.ts`) is
+/// Svelte-only reactive state. `App.svelte` mirrors it here with a single `$effect`
+/// watching `tabStore.activeDocId`, so every path that changes it (open, switch tab,
+/// close tab) stays in sync without a call at each of those call sites individually.
+/// `doc_id: None` means no document is open/focused (last tab closed).
+#[tauri::command]
+pub fn set_active_document(state: State<'_, AppState>, doc_id: Option<String>) -> Result<(), String> {
+    *state.active_doc.lock().unwrap() = doc_id;
     Ok(())
 }
 
@@ -371,6 +395,9 @@ async fn save_inner(
     if new_path.is_some() {
         state.markups.set_path(doc_id, dest)?;
     }
+    // The current markup state is now on disk - clear dirty (MCP server design, Phase
+    // 2a `close_document`/`list_open_documents`; see `DocEntry::dirty`'s doc comment).
+    state.markups.clear_dirty(doc_id);
     Ok(())
 }
 
@@ -498,6 +525,12 @@ pub(crate) async fn apply_page_edit(
         .and_then(|outcome| outcome.into_page_count())
         .map_err(|e| format!("reopen after page op: {e:#}"))?;
     state.markups.invalidate_cache(&src);
+    // Every caller of apply_page_edit (rotate/delete/reorder/insert, and - via
+    // commands::docops - flatten/optimize/redact) writes the current markup state to
+    // disk exactly like a save does (apply_edit_and_save calls write_markups before
+    // `op` runs) - clear dirty here too, not just in save_inner (MCP server design,
+    // Phase 2a; see DocEntry::dirty's doc comment).
+    state.markups.clear_dirty(doc_id);
     Ok(())
 }
 

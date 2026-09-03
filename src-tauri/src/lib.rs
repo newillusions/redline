@@ -71,6 +71,20 @@ pub struct AppState {
     /// In-memory dynamic-stamp sequence counters (M2). See `toolchest::sequence` doc
     /// comment for the named sidecar-persistence deferral.
     pub sequence_counters: SequenceCounters,
+    /// The frontend's currently-focused tab (MCP server design, Phase 2a -
+    /// `get_active_document`/`list_open_documents`). Tab/active-tab state otherwise
+    /// lives entirely in Svelte (`DocTabStore.activeDocId`, `src/lib/doc-tabs.svelte.ts`),
+    /// so there is no other backend concept of "the active document" for a multi-tab
+    /// session. The frontend pushes every change here via the `set_active_document`
+    /// command (see `commands::document::set_active_document`'s doc comment for the
+    /// `$effect` that keeps this synced from `App.svelte`). `None` when no document is
+    /// open, or (a named limitation) when a document was closed via the MCP
+    /// `close_document` tool rather than the GUI, since the frontend has no channel to
+    /// learn about a backend-driven close and refresh its own tab list - this can only
+    /// be cleared from the closing side instead (`commands::document::close_document`
+    /// and the MCP bridge's `close_document` dispatch arm both clear it when it matches
+    /// the closed doc_id).
+    pub active_doc: Mutex<Option<String>>,
 }
 
 /// Resolve the bundled PDFium library path and export it via `PDFIUM_DYNAMIC_LIB_PATH`
@@ -179,6 +193,7 @@ pub fn run() {
                 folder_index: Mutex::new(None),
                 toolchest,
                 sequence_counters: SequenceCounters::new(),
+                active_doc: Mutex::new(None),
             });
             // MCP companion bridge (design §2/§5) - started once, after AppState is
             // managed (the bridge dispatches into it), lives for the app's lifetime
@@ -197,6 +212,7 @@ pub fn run() {
             // Document commands (M1 shell + M2 markup store + S1 save pipeline)
             commands::document::open_document,
             commands::document::close_document,
+            commands::document::set_active_document,
             commands::document::add_markup,
             commands::document::list_markups,
             commands::document::load_markups,

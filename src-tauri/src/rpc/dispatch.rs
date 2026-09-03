@@ -10,6 +10,8 @@
 //! process that ever mutates `MarkupStore` or calls `document::save`, regardless of
 //! whether the caller is the frontend or this bridge.
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
 
@@ -19,6 +21,125 @@ use crate::AppState;
 
 pub async fn dispatch(app: &AppHandle, req: RpcRequest) -> Result<Value, Value> {
     match req.op.as_str() {
+        "list_open_documents" => {
+            // No params (an empty/absent object is fine - nothing to parse).
+            let state = app.state::<AppState>();
+            let open = state.markups.list_open();
+            let active = state.active_doc.lock().unwrap().clone();
+
+            // Resolve page counts one doc at a time - each is its own render-thread
+            // round trip (RenderHandle has no batch API), and a missing/errored count
+            // must not fail the whole call (see list_open_documents' doc comment on
+            // the zero-default) so a single doc's render-engine hiccup can't hide every
+            // other open document from the caller.
+            let mut page_counts: HashMap<String, u32> = HashMap::new();
+            for entry in &open {
+                if let Ok(Some(pc)) = state.render.page_count(entry.doc_id.clone()).await {
+                    page_counts.insert(entry.doc_id.clone(), pc);
+                }
+            }
+
+            to_value(Ok::<_, String>(tools::list_open_documents(
+                open,
+                active.as_deref(),
+                &page_counts,
+            )))
+        }
+        "open_document" => {
+            let p: tools::OpenDocumentParams = parse(req.params)?;
+            let path = std::path::PathBuf::from(&p.path);
+            if !path.is_absolute() {
+                return Err(serde_json::json!({
+                    "error": "path_not_absolute",
+                    "detail": "open_document requires an absolute path",
+                    "path": p.path
+                }));
+            }
+
+            let state = app.state::<AppState>();
+            // Already-open dedup (design: "returns the existing doc_id if that path is
+            // already open") - reuse the existing doc_id/PDFium handle rather than
+            // opening a second independent instance of the same file under a fresh
+            // doc_id.
+            if let Some(existing_id) = state.markups.find_by_path(&path) {
+                let page_count = app
+                    .state::<AppState>()
+                    .render
+                    .page_count(existing_id.clone())
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                return Ok(serde_json::json!({
+                    "doc_id": existing_id,
+                    "page_count": page_count,
+                    "already_open": true
+                }));
+            }
+
+            // Reuses the exact existing `open_document` Tauri command - the same path
+            // the Svelte frontend's file-open dialog and REDLINE_OPEN_PDF auto-open both
+            // invoke (design §2's single-writer-correctness argument: no forked open
+            // logic). `password: None` - the MCP tool surface has no password-prompt
+            // round trip in v1; an encrypted PDF with no remembered password refuses
+            // with the same ERR_PASSWORD_REQUIRED sentinel the GUI would otherwise
+            // catch and re-prompt on.
+            let info =
+                crate::commands::document::open_document(state, app.clone(), p.path.clone(), None)
+                    .await
+                    .map_err(to_err)?;
+            Ok(serde_json::json!({
+                "doc_id": info.doc_id,
+                "page_count": info.page_count,
+                "already_open": false
+            }))
+        }
+        "close_document" => {
+            let p: tools::CloseDocumentParams = parse(req.params)?;
+            let state = app.state::<AppState>();
+            if state.markups.is_dirty(&p.doc_id) && !p.discard_changes {
+                return Err(serde_json::json!({
+                    "error": "document_dirty",
+                    "doc_id": p.doc_id,
+                    "detail": "document has unsaved changes - call save_document first, \
+                               or pass discard_changes: true to close without saving"
+                }));
+            }
+            let doc_id = p.doc_id.clone();
+            crate::commands::document::close_document(state, doc_id.clone())
+                .await
+                .map(|()| serde_json::json!({ "closed": true, "doc_id": doc_id }))
+                .map_err(to_err)
+        }
+        "get_active_document" => {
+            let state = app.state::<AppState>();
+            let active = state.active_doc.lock().unwrap().clone();
+            let Some(doc_id) = active else {
+                return Err(serde_json::json!({
+                    "error": "no_active_document",
+                    "detail": "no document is currently focused in the redline GUI"
+                }));
+            };
+            let Some(path) = state.markups.path(&doc_id) else {
+                return Err(serde_json::json!({
+                    "error": "no_active_document",
+                    "detail": "the previously active document is no longer open"
+                }));
+            };
+            let page_count = state
+                .render
+                .page_count(doc_id.clone())
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            Ok(serde_json::json!({
+                "doc_id": doc_id,
+                "path": path.to_string_lossy(),
+                "page_count": page_count,
+                "dirty": state.markups.is_dirty(&doc_id)
+            }))
+        }
         "list_markups" => {
             let p: tools::ListMarkupsParams = parse(req.params)?;
             let state = app.state::<AppState>();

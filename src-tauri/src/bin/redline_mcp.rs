@@ -8,12 +8,16 @@
 //! failure surfaces as the tool's error - never a silent fallback to direct file access
 //! (design §2, the cost accepted deliberately for single-writer correctness).
 //!
-//! Ten tools, matching the owner's full-surface scope decision (2026-09-01, "We need
-//! mutation as well... And the ability to flatten and reduce file size through the
+//! Fourteen tools. Ten from the owner's full-surface scope decision (2026-09-01, "We
+//! need mutation as well... And the ability to flatten and reduce file size through the
 //! mcp."): wave 1 read-only (list_markups, read_markup, search_markups,
 //! export_markup_schedule), wave 2 mutating (create_markup, update_markup,
 //! delete_markup, save_document) behind the lock guard, plus the two docops tools
-//! (flatten_document, reduce_file_size).
+//! (flatten_document, reduce_file_size). Plus four Phase 2a document-lifecycle tools
+//! (2026-09-03, owner-approved "add open tools"): list_open_documents, open_document,
+//! close_document, get_active_document - added because every one of the original ten
+//! requires a doc_id, and prior to this a client had no way to obtain one without
+//! reading it out of the app's own log file (observation:dtko8oxo8fooqt7qrt44).
 //!
 //! Deliberately synchronous, no tokio: this binary's own loop is a blocking read of
 //! stdin lines, and the socket round-trip per tool call is a single blocking
@@ -232,6 +236,45 @@ impl<T: Read + Write> ReadWrite for T {}
 fn tool_defs() -> Value {
     json!([
         {
+            "name": "list_open_documents",
+            "description": "List every document currently open in redline: doc_id, path, title, page_count, whether it's the focused tab (is_active), and whether it has unsaved changes (dirty). Use this (or get_active_document) to obtain a doc_id before calling any other tool.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "open_document",
+            "description": "Open a PDF file in redline, or return the existing doc_id if that path is already open. Path must be absolute. Does not prompt for a password - an encrypted PDF with no remembered password is refused.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to the PDF file."}
+                },
+                "required": ["path"]
+            }
+        },
+        {
+            "name": "close_document",
+            "description": "Close an open document. Refused with a document_dirty error if it has unsaved changes, unless discard_changes is true.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "string"},
+                    "discard_changes": {"type": "boolean", "description": "Close even if there are unsaved changes, discarding them. Defaults to false."}
+                },
+                "required": ["doc_id"]
+            }
+        },
+        {
+            "name": "get_active_document",
+            "description": "Get the doc_id, path, page_count, and dirty state of the document currently focused in the redline GUI's tab bar. Refused with a no_active_document error if no document is open/focused.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
             "name": "list_markups",
             "description": "List markups in an open redline document, optionally filtered by page/type/status. Each result reports locked/locked_contents so a doomed mutation can be avoided up front.",
             "inputSchema": {
@@ -366,8 +409,16 @@ fn tool_defs() -> Value {
 mod tests {
     use super::*;
 
+    /// Tools that legitimately have no required `doc_id` - see each tool's own
+    /// description for why: `list_open_documents`/`get_active_document` are how a
+    /// client discovers a doc_id in the first place (no doc_id to require yet), and
+    /// `open_document` takes a `path`, not a `doc_id` (the tool call itself produces
+    /// one).
+    const TOOLS_WITHOUT_A_REQUIRED_DOC_ID: &[&str] =
+        &["list_open_documents", "open_document", "get_active_document"];
+
     #[test]
-    fn tool_defs_names_all_ten_tools_from_the_scope_decision() {
+    fn tool_defs_names_all_fourteen_tools_from_the_scope_decision() {
         let defs = tool_defs();
         let names: Vec<&str> = defs
             .as_array()
@@ -376,6 +427,10 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
         for expected in [
+            "list_open_documents",
+            "open_document",
+            "close_document",
+            "get_active_document",
             "list_markups",
             "read_markup",
             "search_markups",
@@ -389,20 +444,41 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 14);
     }
 
     #[test]
-    fn every_tool_def_has_a_required_doc_id() {
+    fn every_tool_def_not_named_in_the_doc_id_free_list_requires_doc_id() {
         let defs = tool_defs();
         for tool in defs.as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            if TOOLS_WITHOUT_A_REQUIRED_DOC_ID.contains(&name) {
+                continue;
+            }
             let required = tool["inputSchema"]["required"]
                 .as_array()
-                .unwrap_or_else(|| panic!("{} has no required array", tool["name"]));
+                .unwrap_or_else(|| panic!("{name} has no required array"));
+            assert!(required.iter().any(|r| r == "doc_id"), "{name} must require doc_id");
+        }
+    }
+
+    #[test]
+    fn doc_id_free_tools_really_do_not_require_it() {
+        let defs = tool_defs();
+        for &name in TOOLS_WITHOUT_A_REQUIRED_DOC_ID {
+            let tool = defs
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("tool {name} not found in tool_defs"));
+            let required = tool["inputSchema"]["required"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             assert!(
-                required.iter().any(|r| r == "doc_id"),
-                "{} must require doc_id",
-                tool["name"]
+                !required.iter().any(|r| r == "doc_id"),
+                "{name} is listed as doc_id-free but its schema requires doc_id"
             );
         }
     }

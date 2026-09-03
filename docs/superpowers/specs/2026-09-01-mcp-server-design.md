@@ -327,6 +327,113 @@ all three binaries (`redline`, `bench`, `redline-mcp`) link successfully.
 - Multi-document / multi-instance behaviour beyond what's noted above (open questions 2
   and 3 below remain genuinely open).
 
+## Implementation notes (Phase 2a, 2026-09-03)
+
+Phase 1 shipped ten tools that all require a `doc_id`, but left no way for a client to
+obtain one - the orchestrator hit this live 2026-09-02, having to read a `doc_id` out of
+the app's own log file (`observation:dtko8oxo8fooqt7qrt44`). Phase 2a adds four
+document-lifecycle tools, owner-approved 2026-09-03 ("add open tools"), closing that
+gap: `list_open_documents`, `open_document`, `close_document`, `get_active_document`.
+Fourteen tools total.
+
+**`list_open_documents`/`get_active_document` resolve open question 3 above** (whether
+`list_markups` without a `doc_id` should mean "the active tab" or "every open tab"): the
+answer taken is neither - `doc_id` stays required on every Wave 1/Wave 2 tool (no change
+to their schemas), and these two new tools are how a client discovers a `doc_id` in the
+first place. `list_open_documents` enumerates every open tab (doc_id/path/title/
+page_count/is_active/dirty); `get_active_document` resolves to the one currently
+focused. Both are needed - a client that already knows the file it wants uses
+`list_open_documents` to find its doc_id (or dedups via `open_document`); a client
+co-driving alongside a human uses `get_active_document` to follow whichever tab the
+human is looking at.
+
+**"Active tab" and "dirty" are two different plumbing problems, solved differently.**
+Neither concept existed anywhere in the Rust backend before this phase - both are
+Svelte-only in the existing multi-doc-tab feature (`DocTabStore.activeDocId`,
+`MarkupStore.dirty` in `src/lib/doc-tabs.svelte.ts`/`markup-store.svelte.ts`).
+- **`dirty` is derived entirely server-side**, with no new frontend plumbing: a
+  `dirty: bool` field was added to `document::store::DocEntry`, set `true` by
+  `MarkupStore::add`/`update`/`delete` (the same choke point both the GUI's own
+  `add_markup`/`update_markup`/`delete_markup` commands and the MCP `create_markup`/
+  `update_markup`/`delete_markup` tools already call through - so an MCP-driven edit and
+  a GUI-driven edit both mark the doc dirty correctly, for free), and cleared by a new
+  `MarkupStore::clear_dirty`, called from both `commands::document::save_inner` (covers
+  `save_document`/`save_document_as`) and the end of `commands::document::apply_page_edit`
+  (covers rotate/delete/reorder/insert page ops and, via `commands::docops`, flatten/
+  optimize/redact - all of which flush the current markup state to disk exactly like a
+  save does, via the same `write_markups`-then-atomic-rename pipeline).
+  `MarkupStore::seed_loaded` (merging a document's own pre-existing on-disk annotations
+  at open time) deliberately does NOT touch `dirty` - that is not an edit.
+- **`is_active` genuinely requires a frontend push** - there is no way for the backend
+  to infer which Svelte tab is focused from anything it already tracks. A new
+  `AppState.active_doc: Mutex<Option<String>>` plus a `set_active_document` Tauri
+  command is written by exactly one place in the frontend: a single `$effect` in
+  `App.svelte` watching `tabStore.activeDocId`, added once rather than at each of the
+  several call sites that change it (`addTab`/`switchTab`/`closeTab`, keyboard
+  next/prev-tab) - see `set_active_document`'s Rust doc comment and the `$effect`'s own
+  comment in `App.svelte` for why a single watcher was chosen over per-call-site pushes.
+  **Named limitation**: closing a document via the MCP `close_document` tool has no
+  channel to tell the frontend to refresh its own tab list or `activeDocId` - the
+  frontend's tabs are unaware of an MCP-driven close. `close_document`'s Rust
+  implementation and its RPC dispatch arm both clear `active_doc` when it matches the
+  closed doc, so `get_active_document` never reports a doc that no longer exists, but a
+  GUI tab for it can still be showing until the human interacts with it. This mirrors
+  the design's own stated architecture cost (§2: "an MCP call against a closed app
+  returns a clear error, never a silent fallback") extended to a subtler case the
+  original design didn't anticipate (a *third* actor - the MCP client - changing tab
+  state the GUI doesn't poll for).
+
+**`open_document`'s already-open dedup** (design requirement, §3's illustrative sketch
+predates this tool but the phrasing carries over: "returns the existing doc_id if that
+path is already open") is implemented via a new `MarkupStore::find_by_path`, checked
+before falling through to the real `commands::document::open_document` Tauri command -
+the same function the Svelte frontend's file-open dialog and the `REDLINE_OPEN_PDF`
+auto-open both call (no forked open logic, per §2). An MCP `path` must be absolute
+(checked before touching the filesystem) - a relative path is refused with a
+`path_not_absolute` structured error rather than being resolved against whatever
+directory the GUI process happens to be running in.
+
+**`close_document`'s dirty refusal** reads the same server-side `dirty` flag: refused
+with a structured `document_dirty` error unless `discard_changes: true` is passed - "the
+document was never silently dropped" (design §4's refusal-shape precedent for locked
+markups, reused here for a different guard).
+
+**Verified this session, live, against an isolated dev instance** (never the installed
+release build or any pre-existing running `redline` process - see the constraint in the
+dispatch prompt and the isolation method below): a full JSON-RPC round trip over the
+real `redline-mcp` stdio protocol and the real Unix-socket bridge, against a scratch PDF
+under a session-isolated `$TMPDIR` (the fixed `$TMPDIR/redline-mcp/mcp.sock` path is a
+single-instance assumption per §2's own note - a second, deliberately isolated `TMPDIR`
+was used for this dev instance rather than colliding with whatever `redline` process was
+already running on the default one). Observed and quoted in the implementer's RETURN:
+`tools/list` advertises all 14 tools with the schemas above; `list_open_documents`
+correctly reported `is_active: true` for only the most-recently-focused tab across four
+accumulated open docs (proving the `$effect` sync works end-to-end through a live
+webview, not just in isolation); `open_document` on an already-open path returned
+`already_open: true` with the existing doc_id; `create_markup` flipped `dirty: true` in
+a following `list_open_documents` call; `close_document` correctly refused with
+`document_dirty` while dirty, then succeeded once `save_document` had cleared it (and
+the saved file was re-verified as a valid, larger PDF via `qpdf --check`); closing the
+active doc correctly made `get_active_document` report `no_active_document`.
+`cargo test --workspace --all-targets`: 645 passed (7 pdf-diff-lib + 14 pdf-diff-tests +
+616 redline_lib + 8 redline-mcp bin), 0 failed among tests actually exercised, 5 ignored
+(unchanged) - one pre-existing `redline-mcp` bin test
+(`call_bridge_connection_failure_is_a_structured_tool_error`) failed in this same run
+purely because a genuinely-running `redline` process (not this session's isolated
+instance, which had already been torn down) occupied the real socket path; this is an
+environmental collision with the test's unstated "nothing else is running" assumption,
+reproduced identically by stashing every change in this phase and re-running against the
+unmodified Phase 1 tip, not a regression from this work. `cargo clippy --all-targets`: 0
+warnings. `cargo build --bins`: all binaries link. `npm run check` (svelte-check): 0
+errors (23 pre-existing warnings, none in the two files this phase touched). `npm test`:
+49 files / 820 tests passed.
+
+**`cargo fmt --all -- --check` reports pre-existing, repo-wide drift unrelated to this
+phase** - 223 `Diff in` blocks across the codebase, confirmed present identically on the
+unmodified Phase 1 tip (`git stash` + re-run). Not fixed here - reformatting ~150
+untouched files is out of this PR's scope; `git diff --stat` confirms only the 8 files
+this phase intentionally touched changed.
+
 ## Open questions for the owner (not resolved by this design)
 
 1. **Does Wave 1 alone satisfy the "helpful" bar Martin described, or is mutation the
@@ -337,7 +444,10 @@ all three binaries (`redline`, `bench`, `redline-mcp`) link successfully.
    `redline` itself (a second executable in the app bundle), or a separate lightweight
    package a Claude Code session installs independently? Affects packaging, not the
    architecture above.
-3. **Multi-document sessions.** The local RPC surface is sketched per-document
+3. **Multi-document sessions.** ~~The local RPC surface is sketched per-document
    (`doc_id`-scoped); redline supports tabbed multi-file sessions. Whether `list_markups`
    without a `doc_id` should mean "the active tab" or "every open tab" needs a decision
-   before Wave 1's schema is frozen.
+   before Wave 1's schema is frozen.~~ **Resolved by Phase 2a** (2026-09-03): neither -
+   `doc_id` stays required everywhere it already was, and `list_open_documents`/
+   `get_active_document` are the new tools that resolve one. See the Phase 2a
+   implementation notes above.

@@ -82,6 +82,18 @@ export async function closeDocument(doc_id: string): Promise<void> {
 }
 
 /**
+ * Tell the backend which document tab is currently focused (or `null` when none is
+ * open) - the redline MCP server's `get_active_document`/`list_open_documents` tools
+ * have no other way to learn this, since tab/active-tab state otherwise lives entirely
+ * in Svelte (`DocTabStore.activeDocId`). Called from a single `$effect` in App.svelte
+ * that watches `tabStore.activeDocId`, not from every individual call site that changes
+ * it - see that effect's comment for why.
+ */
+export async function setActiveDocument(doc_id: string | null): Promise<void> {
+  return invoke<void>("set_active_document", { docId: doc_id });
+}
+
+/**
  * Save an unprotected (no open password) copy of an encrypted document to
  * `dest_path`. Errors if the document was not opened with a password.
  */
