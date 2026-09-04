@@ -103,8 +103,28 @@ function Register-Leg {
     }
 }
 
+# NOT registered with -LaunchViaCommandLine, deliberately. AcrobatLeg.ps1 throws
+# "-LaunchViaCommandLine handles exactly one file; got N" for anything but a single PDF
+# (see that script's own param block), and this task's -InputDir is the full multi-file
+# corpus. Until AcrobatLeg.ps1 gains a per-file command-line-launch loop (a real feature,
+# not a config tweak - open one, capture, close, repeat), this task stays on the IAC
+# (AVDoc.Open) path: reliable annotation scan across every file, but no render whenever
+# Acrobat lands on its Home-screen shell instead of a document window (see the new
+# no-document-window preflight in AcrobatLeg.ps1). Use $TaskPrefix-acrobat-one below for a
+# real single-file render via command-line launch.
 Register-Leg -Name "$TaskPrefix-acrobat" -ScriptName 'AcrobatLeg.ps1' `
     -ExtraArgs "-InputDir `"$StagingRoot\in`" -OutputDir `"$StagingRoot\out\acrobat`"" -LogName 'acrobat.log'
+
+# One-file render gate via command-line launch (docs/TESTING.md "RESOLVED - Acrobat
+# renders", 2026-08-30) - formalises what had only existed as an ad-hoc, hand-registered
+# task on mr-desktop (not tracked anywhere in this repo) into the tracked registration.
+# -LaunchViaCommandLine requires exactly one PDF, hence the dedicated -InputDir\in-one
+# rather than the shared corpus dir. No -Method flag: AcrobatLeg.ps1 has no -Method
+# parameter at all - Method Auto is hardcoded at its own Save-WindowCapture call sites
+# (see Capture.ps1's -Method Auto usage inside AcrobatLeg.ps1), so passing "-Method Auto"
+# here would fail with a parameter-binding error, not select a mode.
+Register-Leg -Name "$TaskPrefix-acrobat-one" -ScriptName 'AcrobatLeg.ps1' `
+    -ExtraArgs "-InputDir `"$StagingRoot\in-one`" -OutputDir `"$StagingRoot\out\acrobat-one`" -TargetDevice \\.\DISPLAY1 -LaunchViaCommandLine" -LogName 'acrobat-one.log'
 
 Register-Leg -Name "$TaskPrefix-bluebeam" -ScriptName 'BluebeamLeg.ps1' `
     -ExtraArgs "-InputDir `"$StagingRoot\in`" -OutputDir `"$StagingRoot\out\bluebeam`"" -LogName 'bluebeam.log'

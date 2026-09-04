@@ -105,19 +105,36 @@ async function stage() {
 async function runLeg(leg, timeoutMs) {
   const task = `${TASK_PREFIX}-${leg}`;
   console.log(`== 3. running ${task} in Session 1`);
-  await ps(`Start-ScheduledTask -TaskName '${task}'`);
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    await new Promise((r) => setTimeout(r, 10_000));
-    const out = await ps(`Write-Output "STATE=$((Get-ScheduledTask -TaskName '${task}').State)"`);
-    const state = (out.match(/STATE=(\w+)/) || [])[1];
-    process.stdout.write(`   ${leg}: ${state}\n`);
-    if (state === "Ready") return true;
-    if (Date.now() > deadline) {
-      console.error(`   ${leg}: TIMED OUT after ${timeoutMs}ms - stopping task`);
-      await ps(`Stop-ScheduledTask -TaskName '${task}' -EA SilentlyContinue`);
-      return false;
+  // Register-CrossviewerTask.ps1 registers every task DISABLED by default (fixed
+  // 2026-09-04, PR #101) so a leftover task can never re-arm itself on the owner's
+  // machine between runs. Start-ScheduledTask silently NO-OPS on a disabled task
+  // (LastTaskResult 267011 = SCHED_S_TASK_DISABLED) - there is no error, no thrown
+  // exception, nothing in this function's own output that would say so; the poll loop
+  // below would just watch State stay "Disabled" until it timed out, 45+ minutes later
+  // for the acrobat leg. Found live 2026-09-04 running this exact leg by hand. Enable
+  // immediately before starting, and disable again as soon as this leg's own run ends
+  // (success, failure, or timeout) - mirrors disableAllTasks()'s end-of-batch sweep but
+  // narrows the exposure window to just this one task's own run instead of the whole
+  // multi-leg batch.
+  await ps(`Enable-ScheduledTask -TaskName '${task}' | Out-Null`);
+  try {
+    await ps(`Start-ScheduledTask -TaskName '${task}'`);
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 10_000));
+      const out = await ps(`Write-Output "STATE=$((Get-ScheduledTask -TaskName '${task}').State)"`);
+      const state = (out.match(/STATE=(\w+)/) || [])[1];
+      process.stdout.write(`   ${leg}: ${state}\n`);
+      if (state === "Ready") return true;
+      if (Date.now() > deadline) {
+        console.error(`   ${leg}: TIMED OUT after ${timeoutMs}ms - stopping task`);
+        await ps(`Stop-ScheduledTask -TaskName '${task}' -EA SilentlyContinue`);
+        return false;
+      }
     }
+  } finally {
+    await ps(`Disable-ScheduledTask -TaskName '${task}' | Out-Null`)
+      .catch((e) => console.warn(`   (could not disable ${task}: ${e.message})`));
   }
 }
 

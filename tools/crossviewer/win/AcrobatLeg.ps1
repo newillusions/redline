@@ -117,6 +117,12 @@ function Write-Log {
 # AVPageView.ZoomTo zoom types (AVZoomType, unchanged since Acrobat 5).
 $AVZoomFitPage = 1
 
+# Shared with Get-AcrobatWindow's own document-vs-shell filter below, and with the
+# no-document-window preflight this title pattern was added for (2026-09-04) - a
+# window titled exactly this is Acrobat's empty application shell (Home/Start
+# screen), never a document.
+$script:BareAcrobatShellTitleRegex = '^\s*Adobe Acrobat( \(\d+-bit\))?\s*$'
+
 # AVDoc.SetViewMode: hide the navigation panel so the page gets the whole window.
 $PDUseNone = 1
 
@@ -157,7 +163,7 @@ function Get-AcrobatWindow {
     $candidates = @(Get-AcrobatWindowCandidates | Where-Object { $_.class -eq 'AcrobatSDIWindow' })
     if ($candidates.Count -eq 0) { return $null }
     # 'Adobe Acrobat (64-bit)' / 'Adobe Acrobat' with no document part is the empty shell.
-    $documents = @($candidates | Where-Object { $_.title -notmatch '^\s*Adobe Acrobat( \(\d+-bit\))?\s*$' })
+    $documents = @($candidates | Where-Object { $_.title -notmatch $script:BareAcrobatShellTitleRegex })
     if ($documents.Count -gt 0) { return $documents[0] }
     return $candidates[0]
 }
@@ -462,6 +468,24 @@ try {
                     throw 'Acrobat has no document frame (class AcrobatSDIWindow) to capture'
                 }
                 Write-Log "document frame hwnd=$($win.handle) pid=$($win.pid) $($win.width)x$($win.height) title='$($win.title)'"
+
+                # PREFLIGHT (added 2026-09-04, live-reproduced the same day): the window
+                # Get-AcrobatWindow returns can still be the empty application shell, not
+                # a document - it falls back to the largest AcrobatSDIWindow candidate when
+                # every candidate carries the bare application title (see that function's
+                # own header). That is a KNOWN, distinct failure mode (root-caused
+                # 2026-08-30: IAC's AVDoc.Open does not always produce a document window;
+                # command-line launch does) and deserves its own name, not a 45s page-paint
+                # wait followed by a "no page visible (bright fraction 0)" REJECTED frame
+                # that reads exactly like a generic render/capture failure. Checked by
+                # PROCESS/CLASS+TITLE-PATTERN MATCH only - the boolean result is logged and
+                # reported, never the live title text itself (matches this project's
+                # never-log-window-titles-in-diagnostics discipline for anything beyond our
+                # own opened-by-us document).
+                if ($win.title -match $script:BareAcrobatShellTitleRegex) {
+                    Write-Log 'window is the empty application shell, not a document (bare-title match) - refusing the 45s paint wait'
+                    throw 'no document window: Acrobat is showing its Home/Start screen shell instead of the document - this is the known AVDoc.Open-vs-command-line-launch class (see -LaunchViaCommandLine), not a rendering/capture-method failure'
+                }
 
                 # Select this document's TAB. Acrobat opens into a shared frame that can
                 # still be sitting on the Home screen; without this the pane photographs
