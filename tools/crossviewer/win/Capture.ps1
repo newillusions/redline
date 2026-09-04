@@ -7,16 +7,27 @@
     Enable-DpiAwareness      - make coordinates physical pixels, not scaled ones
     Get-ProcessWindows       - every visible top-level window of a process, with class + title
     Get-ProcessDialogs       - just the ones that look like dialogs (#32770)
-    Save-WindowCapture       - screenshot a window's screen rectangle to PNG
+    Save-WindowCapture       - screenshot a window; -Method picks CopyFromScreen (default),
+                                PrintWindow, Wgc, or Auto (PrintWindow with a CopyFromScreen
+                                fallback) - see that function's own header
     Get-CaptureHash          - hash a capture so "has it finished rendering?" is answerable
     Close-WindowPolitely     - WM_CLOSE, then wait; never terminates a process
 
 .NOTES
-  WHY CopyFromScreen AND NOT PrintWindow: Revu composites through the GPU, and PrintWindow
-  against a hardware-accelerated document view returns a blank or partially-blank bitmap.
-  Capturing the screen rectangle the window occupies gets what is actually on the panel,
-  which is the whole point of a visual check. The cost is that the window must be foreground
-  and unobstructed - the leg maximises and foregrounds it before every capture.
+  CopyFromScreen IS NOT ONE-METHOD-FITS-ALL. It is a BitBlt of the desktop at the window's
+  screen rectangle, and that only shows real content for a GDI-composited surface.
+  Bluebeam Revu is GDI-composited (measured): PrintWindow against it returns a blank or
+  partially-blank bitmap, so Revu's leg (BluebeamGuiLeg.ps1) uses CopyFromScreen and always
+  will. Acrobat is DIFFERENT: its renderer is CEF-based (AcroCEF process, DirectComposition
+  surface), and since 2026-08-31 CopyFromScreen against it returns solid black on every
+  capture ("bright fraction 0" - README.md has the full regression history). That is the
+  textbook failure mode for a hardware-overlay/DirectComposition-composited window under a
+  BitBlt-based capture, and PW_RENDERFULLCONTENT is the documented remedy - see
+  Save-WindowCapturePrintWindow. So: CopyFromScreen for Revu, PrintWindow-first Auto for
+  Acrobat - never assume one method is right for every viewer this harness drives.
+  Whichever method a caller uses, the window must be foreground and unobstructed for the
+  Foreground/-VerifyOnTop safety gate to pass - the leg maximises and foregrounds it before
+  every capture.
 
   WHY DPI AWARENESS MATTERS: an unaware process is lied to by Windows - Screen.AllScreens
   reports scaled logical pixels while CopyFromScreen addresses physical ones, so on a scaled
@@ -61,12 +72,21 @@ namespace Crossviewer {
         [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
         [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        // Asks the target window to paint itself into a caller-supplied DC, bypassing the
+        // desktop's own composited surface. PW_RENDERFULLCONTENT (added Windows 8.1) tells
+        // the window to render its FULL content even when normal PrintWindow support would
+        // only draw non-client chrome - this is the documented fix for DirectComposition /
+        // hardware-overlay-composited windows (Chromium/CEF apps in particular) returning a
+        // black frame from PrintWindow's default flags. See Save-WindowCapturePrintWindow.
+        [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdcBlt, uint flags);
 
         // Z-order pseudo-handles and SetWindowPos flags.
         public static readonly IntPtr HWND_TOPMOST   = new IntPtr(-1);
         public static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
         public const uint SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_NOACTIVATE = 0x0010, SWP_SHOWWINDOW = 0x0040;
         public const uint GA_ROOT = 2;
+        public const uint PW_CLIENTONLY = 0x00000001;
+        public const uint PW_RENDERFULLCONTENT = 0x00000002;
 
         // Which top-level window owns a screen point. GetAncestor(GA_ROOT) lifts the result
         // from whatever child control is under the cursor to the frame window we can compare
@@ -260,26 +280,111 @@ function Test-WindowUnobstructed {
     }
 }
 
-function Save-WindowCapture {
+function Test-BitmapNonBlank {
     <#
-      Screenshots the screen rectangle a window occupies. Returns the path, or $null if the
-      window has gone away. Clamps to the virtual desktop so a window hanging off the edge
-      of a monitor does not throw.
+      Cheap, method-agnostic "did anything actually get drawn" gate. Deliberately looser
+      than AcrobatLeg's own Test-PageVisible (which assumes a white PDF page and a 10%
+      bright-pixel threshold): this only has to tell a genuinely empty/black frame - the
+      shape a capture method returns when it cannot see a window's real surface - from a
+      frame with SOME content, whatever colour it is. Callers apply whatever stricter,
+      content-aware check they need afterwards.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [double]$MinNonBlankFraction = 0.02
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $bmp = $null
+    try {
+        $bmp = New-Object System.Drawing.Bitmap $Path
+        $stepX = [Math]::Max(1, [int]($bmp.Width  / 40))
+        $stepY = [Math]::Max(1, [int]($bmp.Height / 40))
+        $nonBlank = 0; $total = 0
+        for ($y = 0; $y -lt $bmp.Height; $y += $stepY) {
+            for ($x = 0; $x -lt $bmp.Width; $x += $stepX) {
+                $c = $bmp.GetPixel($x, $y)
+                $total++
+                if ($c.R -gt 8 -or $c.G -gt 8 -or $c.B -gt 8) { $nonBlank++ }
+            }
+        }
+        if ($total -eq 0) { return $false }
+        return (([double]$nonBlank / $total) -ge $MinNonBlankFraction)
+    } catch {
+        return $false
+    } finally {
+        if ($null -ne $bmp) { $bmp.Dispose() }
+    }
+}
+
+function Save-WindowCapturePrintWindow {
+    <#
+      Pixel grab via PrintWindow(PW_RENDERFULLCONTENT): asks the window to paint its own
+      content into our DC, instead of photographing whatever the desktop compositor last
+      drew at that screen rectangle. This is the documented remedy for a
+      DirectComposition / hardware-overlay-composited surface returning black from a
+      BitBlt-based capture (CopyFromScreen is a BitBlt under the hood) - the exact shape
+      Chromium/CEF-based applications are known to hit. Acrobat's renderer IS CEF-based
+      (see AcrobatLeg.ps1's own AcroCEF process references and its CEF GPU-flag findings) -
+      the strongest available evidence for why this method, not CopyFromScreen, is the
+      Acrobat leg's new primary attempt (see Save-WindowCapture's -Method Auto).
+
+      PW_RENDERFULLCONTENT was added in Windows 8.1 specifically so a window that renders
+      through DirectComposition (rather than classic GDI) still produces real content from
+      PrintWindow - without it, PrintWindow against such a window can return a call that
+      SUCCEEDS (returns TRUE) but paints nothing, which is why this function's success only
+      means "the OS call was accepted", not "the pixels are any good" - Test-BitmapNonBlank
+      (or a caller's own stricter check) still has to look at the result.
+
+      Returns $null on ANY failure (window gone, zero-area, PrintWindow itself refused) so
+      the caller can fall back cleanly.
     #>
     param(
         [Parameter(Mandatory = $true)][IntPtr]$WindowHandle,
-        [Parameter(Mandatory = $true)][string]$Path,
-        [switch]$Foreground,
-        # Refuse to write anything unless the window provably owns its own rectangle.
-        # Callers photographing a shared desktop should ALWAYS pass this.
-        [switch]$VerifyOnTop
+        [Parameter(Mandatory = $true)][string]$Path
     )
     if (-not [Crossviewer.Win]::IsWindow($WindowHandle)) { return $null }
-    if ($Foreground) { Set-WindowForeground -WindowHandle $WindowHandle }
-    if ($VerifyOnTop) {
-        $check = Test-WindowUnobstructed -WindowHandle $WindowHandle
-        if (-not $check.unobstructed) { return $null }
-    }
+    $r = New-Object Crossviewer.WinRect
+    if (-not [Crossviewer.Win]::GetWindowRect($WindowHandle, [ref]$r)) { return $null }
+    $w = $r.Right - $r.Left; $h = $r.Bottom - $r.Top
+    if ($w -le 0 -or $h -le 0) { return $null }
+
+    $bmp = New-Object System.Drawing.Bitmap($w, $h)
+    $ok = $false
+    try {
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $hdc = [IntPtr]::Zero
+        try {
+            $hdc = $g.GetHdc()
+            $ok = [Crossviewer.Win]::PrintWindow($WindowHandle, $hdc, [Crossviewer.Win]::PW_RENDERFULLCONTENT)
+        } finally {
+            if ($hdc -ne [IntPtr]::Zero) { $g.ReleaseHdc($hdc) }
+            $g.Dispose()
+        }
+        if (-not $ok) { return $null }
+        $dir = Split-Path -Parent $Path
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+    } finally { $bmp.Dispose() }
+    return $Path
+}
+
+function Save-WindowCaptureCopyFromScreen {
+    <#
+      The harness's original capture primitive, unchanged in behaviour: BitBlt the screen
+      rectangle the window occupies. Correct for GDI-composited surfaces (proven for
+      Bluebeam Revu - see this file's header) and the safety net for anything a caller has
+      not proven a composited-surface method for. Photographs the DESKTOP, not the window -
+      whatever is topmost at that rectangle is what gets captured regardless of the handle
+      passed in - so a caller MUST still gate this with -VerifyOnTop / a fresh
+      Test-WindowUnobstructed. Save-WindowCapture does that gating before dispatch; this
+      function does not repeat it. Split out of Save-WindowCapture unchanged so the method
+      dispatch there stays a thin, obviously-correct switch rather than a second copy of
+      this logic.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$WindowHandle,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
     $r = New-Object Crossviewer.WinRect
     if (-not [Crossviewer.Win]::GetWindowRect($WindowHandle, [ref]$r)) { return $null }
 
@@ -302,6 +407,82 @@ function Save-WindowCapture {
         $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
     } finally { $bmp.Dispose() }
     return $Path
+}
+
+function Save-WindowCapture {
+    <#
+      Screenshots a window. Returns $null if the window has gone away, is obscured (with
+      -VerifyOnTop), or the chosen method fails; otherwise an object { path; method }.
+      Existing callers that only ever checked truthiness ("if ($written) {...}") stay
+      correct unchanged: an object is truthy, $null is falsy, and .path equals the -Path the
+      caller already knows.
+
+      -Method picks the pixel-grab primitive. The Foreground/VerifyOnTop safety gate below
+      always runs first, unchanged, regardless of method:
+        CopyFromScreen (default) - Save-WindowCaptureCopyFromScreen. Original, proven
+          behaviour, unchanged. KNOWN GOOD for Bluebeam Revu (this file's header), KNOWN BAD
+          for Acrobat since the 2026-08-31 regression (bright fraction 0 on every capture -
+          see AcrobatLeg.ps1 / README.md).
+        PrintWindow - Save-WindowCapturePrintWindow only, no fallback.
+        Wgc - Save-WindowCaptureWgc only, no fallback. EXPERIMENTAL - see that function's
+          own header (lazily dot-sourced from WgcCapture.ps1, so legs that never request it
+          pay no WinRT/Direct3D load cost). Not used by any leg's default path; exercised by
+          CaptureSelfTest.ps1 until a live run proves it captures real composited content.
+        Auto - what AcrobatLeg.ps1 uses. Try PrintWindow; if it fails OR produces a
+          blank/near-black frame (Test-BitmapNonBlank), fall back to CopyFromScreen.
+          Acrobat's renderer is CEF-based and the regression's shape matches the documented
+          PrintWindow-vs-composited-surface failure exactly, but CopyFromScreen stays the
+          safety net so a method that stops working again does not silently produce
+          nothing, the way the bare "bright fraction 0" failure did. Wgc is deliberately
+          NOT part of Auto yet - promote it once a live self-test run proves it out.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$WindowHandle,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$Foreground,
+        # Refuse to write anything unless the window provably owns its own rectangle.
+        # Callers photographing a shared desktop should ALWAYS pass this.
+        [switch]$VerifyOnTop,
+        [ValidateSet('CopyFromScreen', 'PrintWindow', 'Wgc', 'Auto')]
+        [string]$Method = 'CopyFromScreen'
+    )
+    if (-not [Crossviewer.Win]::IsWindow($WindowHandle)) { return $null }
+    if ($Foreground) { Set-WindowForeground -WindowHandle $WindowHandle }
+    if ($VerifyOnTop) {
+        $check = Test-WindowUnobstructed -WindowHandle $WindowHandle
+        if (-not $check.unobstructed) { return $null }
+    }
+
+    $written = $null
+    $used = $null
+    switch ($Method) {
+        'PrintWindow' {
+            $written = Save-WindowCapturePrintWindow -WindowHandle $WindowHandle -Path $Path
+            if ($written) { $used = 'PrintWindow' }
+        }
+        'Wgc' {
+            if (-not (Get-Command Save-WindowCaptureWgc -ErrorAction SilentlyContinue)) {
+                . (Join-Path $PSScriptRoot 'WgcCapture.ps1')
+            }
+            $written = Save-WindowCaptureWgc -WindowHandle $WindowHandle -Path $Path
+            if ($written) { $used = 'Wgc' }
+        }
+        'Auto' {
+            $written = Save-WindowCapturePrintWindow -WindowHandle $WindowHandle -Path $Path
+            if ($written -and (Test-BitmapNonBlank -Path $written)) {
+                $used = 'PrintWindow'
+            } else {
+                $written = Save-WindowCaptureCopyFromScreen -WindowHandle $WindowHandle -Path $Path
+                if ($written) { $used = 'CopyFromScreen (Auto fallback)' }
+            }
+        }
+        default {
+            $written = Save-WindowCaptureCopyFromScreen -WindowHandle $WindowHandle -Path $Path
+            if ($written) { $used = 'CopyFromScreen' }
+        }
+    }
+    if (-not $used) { return $null }
+    return [pscustomobject]@{ path = $written; method = $used }
 }
 
 function Get-CaptureHash {

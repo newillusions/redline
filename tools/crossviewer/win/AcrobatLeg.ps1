@@ -251,28 +251,33 @@ function Save-SettledCapture {
     # blocked (typically by one of Acrobat's own dialogs) the earlier verified frame is
     # still the best evidence available, so keep it rather than returning nothing.
     $lastGood = $null
+    $lastMethod = $null
 
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 600
         $attempts++
         # -VerifyOnTop: a frame is only written when the window provably owns its own
-        # rectangle. Without it CopyFromScreen happily photographs whatever is in front -
-        # on 2026-08-29 that was the owner's Teams window, and the PNG looked perfect.
-        $written = Save-WindowCapture -WindowHandle $WindowHandle -Path $Path -Foreground -VerifyOnTop
-        if (-not $written) {
+        # rectangle. Load-bearing for the CopyFromScreen fallback inside -Method Auto - on
+        # 2026-08-29 that was the owner's Teams window, and the PNG looked perfect. Kept for
+        # every method (PrintWindow does not strictly need it - it draws from the HWND, not
+        # the desktop - but bringing the window forward first is still what makes a settled
+        # capture possible, and there is no cost to the extra safety check).
+        $cap = Save-WindowCapture -WindowHandle $WindowHandle -Path $Path -Foreground -VerifyOnTop -Method Auto
+        if (-not $cap) {
             $why = Test-WindowUnobstructed -WindowHandle $WindowHandle
             $reason = if ($why.unobstructed) { 'window vanished during capture' }
                       else { "window obscured ($($why.hits)/$($why.total) sample points ours; blocker $($why.blocker))" }
-            return [pscustomobject]@{ path = $lastGood; settled = $false; attempts = $attempts; error = $reason }
+            return [pscustomobject]@{ path = $lastGood; method = $lastMethod; settled = $false; attempts = $attempts; error = $reason }
         }
-        $lastGood = $Path
+        $lastGood = $cap.path
+        $lastMethod = $cap.method
         $hash = Get-CaptureHash -Path $Path
         if ($null -ne $prevHash -and $hash -eq $prevHash) {
-            return [pscustomobject]@{ path = $Path; settled = $true; attempts = $attempts; error = $null }
+            return [pscustomobject]@{ path = $Path; method = $cap.method; settled = $true; attempts = $attempts; error = $null }
         }
         $prevHash = $hash
     }
-    return [pscustomobject]@{ path = $lastGood; settled = $false; attempts = $attempts; error = "did not stabilise within ${TimeoutSec}s" }
+    return [pscustomobject]@{ path = $lastGood; method = $lastMethod; settled = $false; attempts = $attempts; error = "did not stabilise within ${TimeoutSec}s" }
 }
 
 if (-not (Test-Path -LiteralPath $InputDir)) { throw "InputDir not found: $InputDir" }
@@ -540,7 +545,7 @@ try {
                 $painted = $false
                 $lastFrac = -1.0
                 while ((Get-Date) -lt $pageDeadline) {
-                    $ok = Save-WindowCapture -WindowHandle $win.handle -Path $probe -VerifyOnTop
+                    $ok = Save-WindowCapture -WindowHandle $win.handle -Path $probe -VerifyOnTop -Method Auto
                     if ($ok) {
                         $v = Test-PageVisible -Path $probe
                         if ($v.bright_fraction -ne $lastFrac) {
@@ -575,7 +580,7 @@ try {
                         $vis = Test-PageVisible -Path $cap.path
                         if ($vis.visible) {
                             $renderPaths += $cap.path
-                            Write-Log "captured page $($p + 1)/$($entry.pages) -> $pngName ($size bytes, settled=$($cap.settled), frames=$($cap.attempts), bright=$($vis.bright_fraction))"
+                            Write-Log "captured page $($p + 1)/$($entry.pages) -> $pngName ($size bytes, settled=$($cap.settled), frames=$($cap.attempts), bright=$($vis.bright_fraction), method=$($cap.method))"
                         } else {
                             # A capture with no page in it is worse than none: it looks like
                             # a successful render to every downstream consumer.
@@ -584,18 +589,19 @@ try {
                             # name guarantees no downstream consumer mistakes it for a render.
                             $rejPath = Join-Path $OutputDir ("REJECTED-" + $pngName)
                             try { Move-Item -LiteralPath $cap.path -Destination $rejPath -Force } catch { }
-                            Write-Log "capture REJECTED for page $($p + 1): no page visible (bright fraction $($vis.bright_fraction) < threshold) - kept as REJECTED-$pngName for diagnosis"
-                            $cap = [pscustomobject]@{ path = $null; settled = $cap.settled; attempts = $cap.attempts; error = "no page visible (bright fraction $($vis.bright_fraction))" }
+                            Write-Log "capture REJECTED for page $($p + 1): no page visible (bright fraction $($vis.bright_fraction) < threshold, method=$($cap.method)) - kept as REJECTED-$pngName for diagnosis"
+                            $cap = [pscustomobject]@{ path = $null; method = $cap.method; settled = $cap.settled; attempts = $cap.attempts; error = "no page visible (bright fraction $($vis.bright_fraction))" }
                         }
                     } else {
                         Write-Log "capture FAILED for page $($p + 1): $($cap.error)"
                     }
                     $detail += [ordered]@{
-                        page     = $p
-                        path     = $cap.path
-                        settled  = $cap.settled
-                        attempts = $cap.attempts
-                        error    = $cap.error
+                        page           = $p
+                        path           = $cap.path
+                        capture_method = $cap.method
+                        settled        = $cap.settled
+                        attempts       = $cap.attempts
+                        error          = $cap.error
                     }
                 }
                 $entry.renders = $renderPaths
@@ -649,7 +655,10 @@ try {
 
 $payload = [ordered]@{
     engine     = 'acrobat'
-    render_via = 'window-capture'
+    # The actual per-frame method (PrintWindow or the CopyFromScreen fallback) is recorded
+    # per page in each result's render_detail[].capture_method - this field just names the
+    # dispatch policy, since Auto can pick either method frame by frame.
+    render_via = 'window-capture (Method=Auto: PrintWindow first, CopyFromScreen fallback)'
     version    = (Get-Item 'C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe' -ErrorAction SilentlyContinue).VersionInfo.ProductVersion
     machine    = $env:COMPUTERNAME
     started_at = (Get-Date).ToString('o')

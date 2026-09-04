@@ -19,14 +19,32 @@
   task - which needs a real executable - cannot use it. The leg scripts are written to be
   5.1-compatible for this reason.
 
+  TASKS ARE REGISTERED DISABLED BY DEFAULT. Fixed 2026-09-04 - Register-ScheduledTask has
+  no "create disabled" switch of its own, so every prior version of this script left every
+  task it (re)registered in Windows' default Ready/enabled state, silently undoing whatever
+  a session had deliberately disabled moments earlier. This bit real runs: PR #85's own
+  RETURN and the 2026-09-04 retest RETURN both record having to manually re-disable the
+  standard 5 tasks after registration rebuilt PsGuiHost.exe, because registering it had
+  quietly re-enabled them. Every call below now disables the task immediately after
+  registering it, unless -Enable is passed - so re-running this script to pick up new leg
+  code (the common case: a leg script changed, PsGuiHost.exe needs rebuilding, or a new task
+  like the self-test below is being added) can never re-arm a task on its own. Passing
+  -Enable is for the one case that legitimately wants tasks left runnable straight after
+  registration - do that deliberately, not as this script's silent default.
+
 .EXAMPLE
-  # Run once at the console or over SSH, then drive with Start-ScheduledTask.
+  # Run once at the console or over SSH. Registers every task DISABLED - drive one with
+  # Start-ScheduledTask, then Disable-ScheduledTask again when done (or -Enable at
+  # registration time if every task should be left runnable).
   powershell -NoProfile -File Register-CrossviewerTask.ps1 -StagingRoot 'H:\redline-crossviewer'
 #>
 [CmdletBinding()]
 param(
     [string]$StagingRoot = 'H:\redline-crossviewer',
-    [string]$TaskPrefix  = 'redline-crossviewer'
+    [string]$TaskPrefix  = 'redline-crossviewer',
+    # Leave every (re)registered task enabled instead of the safe default. Opt in
+    # deliberately - see .NOTES above for why the default flipped.
+    [switch]$Enable
 )
 
 $ErrorActionPreference = 'Stop'
@@ -74,7 +92,15 @@ function Register-Leg {
     $action = New-ScheduledTaskAction -Execute $hostExe -Argument $arg -WorkingDirectory $StagingRoot
     Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction SilentlyContinue
     Register-ScheduledTask -TaskName $Name -Action $action -Principal $principal -Settings $settings | Out-Null
-    Write-Output "registered $Name"
+    # Register-ScheduledTask has no "create disabled" option - it always lands Ready. Undo
+    # that immediately unless the caller explicitly asked to leave tasks runnable (-Enable).
+    # See this file's header for why this default changed.
+    if (-not $Enable) {
+        Disable-ScheduledTask -TaskName $Name | Out-Null
+        Write-Output "registered $Name (disabled)"
+    } else {
+        Write-Output "registered $Name (enabled)"
+    }
 }
 
 Register-Leg -Name "$TaskPrefix-acrobat" -ScriptName 'AcrobatLeg.ps1' `
@@ -99,5 +125,13 @@ Register-Leg -Name "$TaskPrefix-cleanup" -ScriptName 'CloseAcrobat.ps1' `
 Register-Leg -Name "$TaskPrefix-displays" -ScriptName 'ProbeDisplays.ps1' `
     -ExtraArgs "-OutputDir `"$StagingRoot\out`"" -LogName 'displays.log'
 
+# Proves a capture method (PrintWindow, Wgc) actually captures real content on a known
+# throwaway window BEFORE it is trusted for a real Acrobat diagnostic run - see
+# CaptureSelfTest.ps1's own header. Run this first on any machine/session where the Acrobat
+# leg's capture method is in question.
+Register-Leg -Name "$TaskPrefix-selftest" -ScriptName 'CaptureSelfTest.ps1' `
+    -ExtraArgs "-OutputDir `"$StagingRoot\out\selftest`"" -LogName 'selftest.log'
+
 Write-Output "identity: $identity"
 Write-Output "staging:  $StagingRoot"
+Write-Output "tasks left $(if ($Enable) { 'ENABLED' } else { 'DISABLED' }) (pass -Enable to change)"

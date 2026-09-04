@@ -31,6 +31,9 @@ harness targets those two specifically.
 | `win/AcrobatLeg.ps1` | mr-desktop | Drives Acrobat over COM/IAC: open, page count, annotation scan, PNG export |
 | `win/BluebeamLeg.ps1` | mr-desktop | Bluebeam leg - currently a licence probe, see below |
 | `win/CloseAcrobat.ps1` | mr-desktop | Recovery: close leftover documents and exit Acrobat, API-only |
+| `win/Capture.ps1` | mr-desktop | Shared window-capture + z-order helpers; `Save-WindowCapture -Method` (CopyFromScreen / PrintWindow / Wgc / Auto) |
+| `win/WgcCapture.ps1` | mr-desktop | Windows.Graphics.Capture method - EXPERIMENTAL, lazily loaded, not in the default chain (see Status below) |
+| `win/CaptureSelfTest.ps1` | mr-desktop | Proves a capture method against a known composited window before it is trusted on Acrobat |
 
 The corpus is **not** stored here. It is regenerated from the repo's own `#[ignore]`d
 emitters so it can never drift from what the code actually writes:
@@ -72,6 +75,83 @@ Two settings are load-bearing:
 The tasks run **Windows PowerShell 5.1**, not `pwsh`: on mr-desktop `pwsh` is an MSIX
 app-execution alias with no invocable file path (`obs:ryzah0kwi09tjeg9ppf8`), and a scheduled
 task needs a real executable. The leg scripts are 5.1-compatible for that reason.
+
+## Status as of 2026-09-04: capture-method fix for the Acrobat black-pane regression
+
+**Context.** Since 2026-08-31 the Acrobat leg has captured a solid BLACK frame on every run
+(`bright fraction 0`), regardless of file. Four dispatched sessions chased this as a
+Windows/Acrobat configuration problem - CEF GPU registry flags, discrete-vs-integrated GPU
+pinning, a reboot - and every one of those bounded remedies failed (full history: RETURN
+`redline-crossviewer-wave2.md`, KB `observation:wv98ysz7nph51hpece7v`). Nobody had yet
+tested the CAPTURE METHOD itself as the culprit, which is what this session did.
+
+**The hypothesis, and the evidence for it.** `win/Capture.ps1`'s own original header already
+documented that Acrobat's pane and Bluebeam Revu's pane are captured by the SAME
+`CopyFromScreen` (BitBlt) primitive, chosen specifically because it worked for Revu -
+`PrintWindow` had already been tried against Revu and found to return a blank/partial
+bitmap there. BitBlt-based capture is well known to return black against a window whose
+content is drawn through DirectComposition or a hardware overlay/independent-flip swap
+chain, bypassing the desktop's own composited surface entirely - and Acrobat's renderer IS
+CEF-based (its own `AcroCEF` process, and the CEF GPU registry key the 2026-09-04 retest
+already probed). That is the textbook shape of this regression, not a driver/GPU-pinning
+problem, which is presumably why the four earlier config-level remedies all failed
+identically.
+
+**What changed.** `win/Capture.ps1`'s `Save-WindowCapture` now takes a `-Method` parameter:
+`CopyFromScreen` (default, UNCHANGED - still what `win/BluebeamGuiLeg.ps1` uses, so Revu's
+proven-working capture is untouched), `PrintWindow` (new: `PrintWindow(PW_RENDERFULLCONTENT)`
+- the documented remedy for exactly this class of composited-surface failure), `Wgc` (new,
+EXPERIMENTAL - see below), and `Auto` (new: try `PrintWindow` first, fall back to
+`CopyFromScreen` if it fails or produces a near-black frame). `win/AcrobatLeg.ps1`'s capture
+call sites now pass `-Method Auto` - Bluebeam's leg passes nothing and is therefore
+unaffected. Which method actually produced each frame is recorded per page in
+`acrobat-results.json`'s `render_detail[].capture_method`, so a future run's report says
+which method worked rather than leaving that to be inferred.
+
+**Wgc (Windows.Graphics.Capture), and why it is NOT in the Auto chain yet.** `win/WgcCapture.ps1`
+implements the "ask DWM directly for the window's real composited surface" path some
+composited windows need even PrintWindow to fail against - the same mechanism the Snipping
+Tool / Xbox Game Bar use. It is real, working code by every check this dispatch could run
+without touching Acrobat/Revu: the embedded C# compiles cleanly on mr-desktop itself
+(`Add-Type` succeeded, all four custom COM types plus both PowerShell functions loaded), and
+all seven WinRT capture types resolve there too. But `[GraphicsCaptureSession]::IsSupported()`
+threw `"The specified service does not exist as an installed service"` when probed - from an
+SSH (Session 0) shell, which every other COM/GUI call in this harness is already documented
+to fail from for the same window-station reason. That failure is UNVERIFIED as a real
+platform gap rather than a Session-0 artifact; it has not been tested from Session 1. Given
+that, and given a genuinely wrong low-level D3D11 vtable interop can corrupt memory in a way
+C#/PowerShell `try/catch` cannot catch, this implementation deliberately avoids ANY
+hand-declared interface with more than one real method call (see `WgcCapture.ps1`'s own
+header for the full design reasoning) and is kept OUT of `-Method Auto`'s default chain
+until a live self-test proves it out - available only via explicit `-Method Wgc` and
+`win/CaptureSelfTest.ps1`.
+
+**New: `win/CaptureSelfTest.ps1`.** Launches a throwaway, isolated Microsoft Edge window
+(own `-UserDataDir`, so it can never attach to or close an owner's real Edge session)
+painted a known solid colour - a GPU-composited target that reproduces the same surface
+class Acrobat uses, unlike a plain WinForms window (which already captures fine via
+`CopyFromScreen`, so would not distinguish a working fix from a broken one). Captures it with
+every requested method and asserts BOTH non-black content AND that the sampled colour
+actually matches what the page was given - proving a method captures the RIGHT content, not
+merely SOME content. Run this first, on an idle machine, before trusting any Acrobat capture
+method this session added. Registered as the 6th scheduled task,
+`redline-crossviewer-selftest`.
+
+**Harness hygiene fix, in the same PR because it kept re-surfacing.** Both the 2026-08-31 and
+2026-09-04 sessions found `win/Register-CrossviewerTask.ps1` had silently RE-ENABLED the
+standard tasks on a re-registration (`Register-ScheduledTask` has no "create disabled"
+option, so every prior version left every task Ready). Fixed: registration now disables
+every task immediately after registering it, unless the new `-Enable` switch is passed
+explicitly - see that script's own header for the full incident trail.
+
+**Not done, and next.** All of the above is CODE ONLY - this dispatch was explicitly scoped
+to not run a live capture against Acrobat or Revu. What it DID verify, on the real machine,
+via parse-only checks and a harmless Add-Type compile (no window touched, no process
+launched): every changed/new `.ps1` file parses; `WgcCapture.ps1`'s C# compiles and its
+WinRT types resolve. What remains, for the next session with an owner-idle window: run
+`CaptureSelfTest.ps1` first (proves or disproves PrintWindow/Wgc against a known target,
+and answers whether the `IsSupported()` failure above was a Session-0 artifact); only then
+re-run the Acrobat leg against a real PDF and confirm `bright fraction` is non-zero again.
 
 ## Status as of 2026-08-31: Fit Page + symmetric crop
 
