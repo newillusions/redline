@@ -3,8 +3,9 @@
 Per the workspace-wide Tauri UI testing research (`/Users/martin/dev-reports/2026-08-22-tauri-ui-testing.md`)
 and the `satchel-gui` precedent that first adopted it (forge.mms.name/emittiv/satchel PR #25).
 None of these replaces a real interactive click-through on the target hardware for
-installer/SmartScreen/native-dialog chrome, or the still-owed §20 floor-machine run and G9
-human Acrobat/Bluebeam visual check (see CLAUDE.md "Current phase").
+installer/SmartScreen/native-dialog chrome, or the still-owed §20 floor-machine run (see
+CLAUDE.md "Current phase"). The G9 human Bluebeam visual check passed 2026-07-12; the
+Acrobat leg of G9 remains optional/open (as of 2026-09-04).
 
 ## Tier 0/1 — Rust unit/integration tests + Svelte component tests
 
@@ -35,8 +36,14 @@ the Session 0 context SSH lands in, then screened through a local vision model a
 
 Proven on real hardware 2026-08-29: Session-1 invocation, Acrobat DC 26.1 over COM/IAC
 (`AllTypes.pdf` -> `pages=1 annots=20`, matching all 20 fixtures), and the vision-review leg
-end to end (`qwen3.8:27b`, ~51s/page, structured per-item verdicts). The vision review has
-NOT yet been run against an Acrobat capture - see the open blocker below.
+end to end (`qwen3.8:27b`, ~51s/page, structured per-item verdicts).
+
+**Update (as of 2026-09-04):** the Acrobat command-line-launch capture path (PR #102, merged
+`main@2ebb9fa5`) now produces a genuine document render (bright fraction 0.547, real page
+content incl. all markup types, Comments panel matching the 19-thread fixture set) - the
+blocker below describing black/blank Acrobat panes is resolved. The vision-review leg has
+not yet been re-run specifically against this fixed Acrobat capture; that is the remaining
+gap, not "no Acrobat capture exists".
 
 **2026-08-31: Fit Page + symmetric crop, closing the "Revu missing the lower-left cluster"
 question from 2026-08-30.** Root cause was a viewport artifact, not a Bluebeam render
