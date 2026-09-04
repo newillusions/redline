@@ -58,6 +58,10 @@ use image::ImageFormat;
 
 use crate::render::PageRaster;
 
+/// Invisible searchable text-layer writer (Phase 2c-i) — see its own module
+/// doc comment for the in-place-vs-sidecar decision and design.
+pub mod writer;
+
 /// A single OCR-recognized text line, in PDF user-space coordinates.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct OcrLine {

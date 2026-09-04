@@ -1,16 +1,19 @@
 # Auto-OCR
 
-Status: Phase 2b (2026-09-03) — macOS/Windows release-bundle wiring + a
-bundling smoke test, implemented and verified locally (macOS: compiles,
-`cargo test`/`--features ocr` both green, the `ocr-selftest` binary PASSes
-against the fetched bundled tessdata). The GitHub Actions proof leg
-(`build-ocr-check`, see below) that exercises the actual macOS/Windows
-GitHub-hosted runners has not landed a result as of this writing — see the
-PR for the run outcome. Still no `-ocr.pdf` writer, no UI, no auto-trigger.
-Feature stays OFF by default (`src-tauri/Cargo.toml`'s `ocr` feature); the
-tag-triggered release path is unaffected by this phase — see "Phase 2b:
-bundling into the shipped app" below for exactly what changed and what's
-still owed.
+Status: Phase 2c-i (2026-09-04) — the invisible searchable text-layer writer
+(`ocr::writer::write_ocr_pdf`), proven end-to-end against a real fixture:
+real Tesseract OCR output written by the real writer, then found by both
+PDFium in-document search AND the Tantivy folder-indexer's `lopdf`
+extraction path (see "Phase 2c: text-layer writer" below and
+`tests/ocr_writer_e2e.rs`). Phase 2a (engine) and Phase 2b (macOS/Windows
+bundling — the GitHub Actions proof leg landed GREEN on both platforms
+before its PR merged, correcting this doc's earlier "has not landed a
+result" note) are both merged to `main`. Still no UI, no "Run OCR" command
+wiring, no auto-trigger-on-open — explicitly Phase 2c-ii, split off by owner
+decision 2026-09-04 so 2c-i (writer + search pickup) could ship on its own.
+Feature stays OFF by default (`src-tauri/Cargo.toml`'s `ocr` feature); no
+code path in this phase runs OCR automatically or changes anything about a
+normal document-open/save flow.
 
 ## Engine
 
@@ -261,6 +264,29 @@ See `src-tauri/src/ocr/mod.rs`'s module doc comment and unit tests
 `parse_tsv_words`/`group_words_into_lines`) for the exact geometry and
 parsing logic, all covered by pure-Rust tests needing no Tesseract binary.
 
+### Why no `osd.traineddata`
+
+Tesseract ships a separate orientation/script-detection model
+(`osd.traineddata`) specifically for the case this module's rotate-4x
+strategy already solves a different way. Only `eng.traineddata` is fetched
+(`scripts/fetch-ocr-tessdata.sh`) and bundled (Phase 2b) — `osd.traineddata`
+is deliberately NOT included. Rationale: Tesseract's OSD would tell us "this
+page looks rotated 90°" for a whole page or region, then Tesseract would
+still need a *second* recognition pass at the corrected orientation — which
+is exactly what rotate-4x already does for every page unconditionally (all
+4 orientations, always), except rotate-4x also handles the CAD-specific case
+OSD is not designed for: a SINGLE page with text at MULTIPLE simultaneous
+orientations (e.g. `b-rotated-dimension.pdf`'s horizontal label plus
+90°-rotated dimension string on the same sheet) — OSD picks one dominant
+orientation per page/region, not a per-line mix. Adding OSD would mean
+running it, branching on its verdict, and STILL needing the rotate-4x
+fallback for mixed-orientation sheets — extra tessdata (~10MB), extra
+runtime cost, and extra code path for no coverage rotate-4x doesn't already
+provide. Revisit only if a future profiling pass shows rotate-4x's
+always-run-all-4-passes cost (`docs/ocr.md`'s "Measured numbers" below —
+19.1s on the dense A0 fixture) is a real problem OSD-first branching would
+measurably fix.
+
 ## Measured numbers
 
 Full corpus benchmark (`src-tauri/tests/ocr_benchmark.rs`,
@@ -287,8 +313,8 @@ routinely produce extra low-confidence noise fragments alongside the correct
 reading (see the bake-off report's raw-dump section for concrete examples
 like `"fo)"`, `"(=)"` from reading vertical text sideways). This does not
 affect recall (the matching logic only checks whether each EXPECTED line
-was found among the recognized ones) and is expected, not a defect — a
-future `-ocr.pdf` writer (Phase 2c) should filter low-confidence/degenerate
+was found among the recognized ones) and is expected, not a defect — the
+Phase 2c text-layer writer (below) filters low-confidence/degenerate
 recognized text before embedding it as invisible searchable text, rather
 than embedding every raw candidate.
 
@@ -297,18 +323,103 @@ run unconditionally); the dense A0 fixture at 19.1s reflects that cost on a
 40-label sheet at 150 DPI on this Mac. No latency ceiling is asserted by the
 benchmark.
 
+## Phase 2c: text-layer writer
+
+`src-tauri/src/ocr/writer.rs` (`write_ocr_pdf`) embeds recognized `OcrLine`s
+as an invisible, searchable text layer.
+
+**In-place, not a sidecar file.** The scoping doc's working name (`-ocr.pdf`)
+implied a separate output file; the shipped design writes the text layer
+into the SAME PDF bytes instead. Every consumer that needs to "see" OCR
+text already reads a document's own content stream directly — Bluebeam and
+Acrobat search the file a user opens, `search::indexer::extract_pdf_text`
+(the Tantivy folder-index source) walks whatever file it finds in a folder
+via `lopdf::Document::extract_text`, and `render::RenderEngine::search_page`
+(in-app search) opens the `doc_id` the app already loaded. None of them
+know a sidecar convention; a sidecar would need matching logic added in at
+least three independent places for no real benefit, since embedding an
+invisible layer never touches existing visible content anyway (see
+`writer.rs`'s module doc comment for the full reasoning).
+
+**Mechanism** (PDF spec, not vendor-specific): each kept line becomes one
+`BT...ET` text object appended to the page's content stream (reusing
+`docops::append_to_page_contents`/`docops::add_named_objects_to_page_resources`
+— generalized this phase from the redact-region helpers `docops::mod.rs`
+already had, rather than duplicating that finicky `lopdf` resource-merging
+logic), drawn in **text-rendering mode 3** (`3 Tr` — "neither fill nor
+stroke", PDF 32000-1:2008 §9.3.3) using a standard, non-embedded Helvetica
+font (`/Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding` — built into
+every PDF-1.x viewer, no font file to bundle). Font size matches the
+recognized line's box height; horizontal scaling (`Tz`) is chosen so the
+string's nominal Helvetica width matches the line's measured baseline
+length, using a single flat average-glyph-width constant rather than a
+full per-glyph AFM metrics table (documented at `HELVETICA_AVG_WIDTH_EM`'s
+definition — the layer is invisible, so width accuracy only affects the
+approximate size of a search-hit/selection box, never text-extraction
+correctness or PDF validity; `Tz` is clamped to a safe range regardless).
+Rotation follows the line's own baseline vector (`corners_pdf`'s
+top-left→top-right edge, which rotate-4x already maps into the ORIGINAL
+page's coordinate space — see the rotate-4x section above), so a
+90°-rotated CAD dimension string gets an invisible text run rotated to
+match, not a wide horizontal box stamped over a tall narrow region.
+
+**Confidence filtering** (named as owed above): `write_ocr_pdf` takes a
+`min_confidence` parameter (`DEFAULT_MIN_CONFIDENCE = 0.5`) and drops, before
+embedding, any line below that threshold, with `None` confidence, empty/
+whitespace-only text, or a degenerate (near-zero-area) box. Filtering
+happens BEFORE embedding, never after — an already-embedded noise fragment
+is exactly as searchable as a correct line, so there is no cheaper place to
+filter than the moment the invisible text is chosen. 0.5 is chosen from the
+measured per-fixture mean confidences above (correct lines: 63-82%; the
+"wrong orientation" noise the precision numbers are attributed to reads as
+qualitatively low-confidence) rather than a corpus sweep tuned to an exact
+number this session — a future UI setting (Phase 2c-ii) can expose a
+different threshold without changing the writer's contract.
+
+**Proof, not just compilation.** `ocr::writer`'s own unit tests (pure
+`lopdf`, no Tesseract/PDFium needed — same reason the ocr feature gate
+already requires `libtesseract-dev` at compile time regardless) assert the
+`3 Tr` operator, the `Tj` string, font-resource registration, and every
+filter case (low confidence, `None` confidence, empty text, degenerate box,
+out-of-range page index) using synthetic `OcrLine`s. `tests/ocr_writer_e2e.rs`
+(`#[ignore]`d, real PDFium + real Tesseract, matching `ocr_benchmark.rs`'s
+own convention) proves the FULL real pipeline on `a-plain-horizontal.pdf`
+(the same image-only fixture the benchmark scores): confirms the source
+fixture has ZERO extractable text, runs real OCR, writes the real layer,
+then confirms BOTH `render::RenderEngine::search_page` (PDFium — the
+in-app/Bluebeam-equivalent search path) AND `lopdf::Document::extract_text`
+(the exact call the Tantivy folder indexer makes) find the recognized word
+— and that the text layer survives an unrelated `docops::optimize` pass.
+This is the "does a scanned fixture become searchable" proof, exercised
+against real engines rather than mocked. **Caveat:** like `ocr_benchmark.rs`,
+this test is `#[ignore]`d and needs a real PDFium dylib + Tesseract install
+neither Forgejo CI's `test-rust` job nor its `ocr` job's `RUN_OCR_TESTS`
+build-arg leg provisions for the WRITER path specifically (the `ocr` job's
+`RUN_OCR_TESTS` block does run `ocr_benchmark.rs`, but `ocr_writer_e2e.rs`
+was added after that Dockerfile step was written and is not yet wired into
+it) — the "proven end-to-end" claim above rests on a real local run (quoted
+in the shipping PR's test plan), not on CI evidence. Wiring it into the
+Linux CI `ocr` job (same Tesseract/PDFium setup that leg already has) is a
+cheap, real follow-up, not yet done.
+
+**Not done this phase, explicitly Phase 2c-ii** (owner-approved split,
+2026-09-04): no Tauri command/MCP tool wiring a "Run OCR" action to
+`write_ocr_pdf`, no UI (toolbar action, progress, per-page status), no
+auto-trigger heuristic on document open, no human visual/search
+confirmation in real Bluebeam/Acrobat (same "owed, not silently assumed"
+posture `.claude/rules/judgment.md` already applies to G9).
+
 ## What's NOT built yet
 
-- `-ocr.pdf` invisible-text-layer writer (Phase 2c).
-- Auto-trigger on document open / manual "Run OCR" UI action (Phase 2c).
-- **The GitHub Actions proof leg's actual result.** Phase 2b's macOS/Windows
-  bundling design (above) is implemented and locally verified on macOS
-  (compiles, tests green, `ocr-selftest` PASSes against fetched tessdata) —
-  but has not yet been confirmed green on real GitHub-hosted macOS/Windows
-  runners. Windows in particular carries real unverified risk: whether the
-  vcpkg `tesseract` port actually builds cleanly under the
-  `x64-windows-static-md` triplet has never been exercised in this repo.
-  See the PR this phase shipped in for the actual run outcome.
+- **UI, command/MCP wiring, and auto-trigger (Phase 2c-ii).** See "Phase 2c:
+  text-layer writer" above for exactly what IS built (the writer + its
+  real-pipeline search-pickup proof) and what this split deliberately left
+  out: an OCR action in the app (toolbar/menu), progress + per-page status,
+  a setting-gated offer-or-run heuristic when a document opens with no
+  extractable text on N sampled pages (default: offer, not silently run —
+  matching this repo's general posture of never taking a write action a
+  user didn't ask for), and a human visual/search confirmation in real
+  Bluebeam/Acrobat.
 - **Windows NSIS-installed-layout verification.** The Windows smoke test
   (see "Bundling smoke test" above) proves the vcpkg-linked Tesseract binary
   itself works and that `resolve_tessdata_dir`'s portable-layout candidate

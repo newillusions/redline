@@ -402,7 +402,11 @@ fn flatten_page(doc: &mut Document, page_id: ObjectId) -> Result<usize> {
 
 /// Append `new_id` to the page's `/Contents` array.
 /// If `/Contents` was a single indirect reference, it is promoted to an array.
-fn append_to_page_contents(doc: &mut Document, page_id: ObjectId, new_id: ObjectId) -> Result<()> {
+pub(crate) fn append_to_page_contents(
+    doc: &mut Document,
+    page_id: ObjectId,
+    new_id: ObjectId,
+) -> Result<()> {
     // Read existing /Contents (owned).
     let existing: Option<Object> = {
         let page = doc
@@ -438,60 +442,123 @@ fn add_xobjects_to_page_resources(
     page_id: ObjectId,
     xobj_entries: &[(String, ObjectId)],
 ) -> Result<()> {
+    add_named_objects_to_page_resources(doc, page_id, b"XObject", xobj_entries)
+}
+
+/// Resolve `key` on `page_id`'s own dictionary, or the first ancestor
+/// reachable via `/Parent` that carries it — implements the PDF 32000-1:2008
+/// §7.7.3.4 inheritable-attribute rule (used here for `/Resources`, which
+/// along with `/MediaBox`/`/CropBox`/`/Rotate` a leaf `Page` may omit and
+/// inherit from an ancestor `/Pages` node). Returns `None` if neither the
+/// page nor any ancestor (up to a defensive hop cap, guarding against a
+/// malformed/cyclic `/Parent` chain in an untrusted PDF) carries `key`.
+fn resolve_inherited_attribute(
+    doc: &Document,
+    page_id: ObjectId,
+    key: &[u8],
+) -> Result<Option<Object>> {
+    const MAX_ANCESTOR_HOPS: u32 = 64;
+    let mut current = page_id;
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        let dict = doc.get_dictionary(current)?;
+        if let Ok(obj) = dict.get(key) {
+            return Ok(Some(obj.clone()));
+        }
+        match dict.get(b"Parent") {
+            Ok(Object::Reference(parent_id)) => current = *parent_id,
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// Merge `entries` into the named sub-dictionary of a page's `/Resources`
+/// (e.g. `b"XObject"`, `b"Font"`), creating the sub-dict and/or `/Resources`
+/// itself if absent. Handles the three shapes PDF allows for both
+/// `/Resources` and its sub-dicts (direct dict on the page, indirect
+/// reference, or absent) — see the original `add_xobjects_to_page_resources`
+/// this was generalized from (still the only caller-facing name for the
+/// XObject case; `ocr::writer` calls this directly with `b"Font"` to avoid
+/// duplicating this logic for the invisible-text-layer's font resource).
+/// Correctly preserves an INHERITED `/Resources` (see
+/// `resolve_inherited_attribute` above) rather than shadowing it with an
+/// empty dict — fixed by code review on PR #103; see that function's own
+/// tests for the regression coverage.
+///
+/// **Shared/indirect sub-dict caveat**: when the target sub-dict (e.g.
+/// `/Font`) is itself an indirect reference shared by multiple pages, Step D
+/// mutates it in place, which injects the new entry into every page sharing
+/// that sub-dictionary, not just the one this call targets. Harmless in
+/// practice (no other page references the newly-added name), but worth
+/// knowing if a future caller ever needs true per-page resource isolation.
+pub(crate) fn add_named_objects_to_page_resources(
+    doc: &mut Document,
+    page_id: ObjectId,
+    resource_key: &[u8],
+    entries: &[(String, ObjectId)],
+) -> Result<()> {
     // --- Step A: resolve /Resources to an owned Dictionary ---
     //
-    // Three cases: direct dict on page, indirect ref, or absent.
-    let (res_is_indirect, res_ref_id): (bool, ObjectId) = {
-        let page = doc.get_dictionary(page_id)?;
-        match page.get(b"Resources") {
-            Ok(Object::Reference(r)) => (true, *r),
-            _ => (false, (0, 0)),
-        }
+    // /Resources is an INHERITABLE page attribute (PDF 32000-1:2008
+    // §7.7.3.4, alongside /MediaBox/CropBox/Rotate): a leaf Page may omit
+    // it entirely and inherit from an ancestor /Pages node via /Parent.
+    // `resolve_inherited_attribute` checks the leaf page first, then walks
+    // /Parent, so a page relying on inheritance still gets its REAL
+    // effective resources as the merge base — not an empty dict that would
+    // shadow the inheritance once Step D writes the merged result directly
+    // onto the leaf page (see this function's earlier gap, found by code
+    // review on PR #103: a page with no /Resources of its own lost every
+    // inherited resource - fonts, image XObjects, etc. - the moment this
+    // function ran).
+    let resources_obj = resolve_inherited_attribute(doc, page_id, b"Resources")?;
+
+    let (res_is_indirect, res_ref_id): (bool, ObjectId) = match &resources_obj {
+        Some(Object::Reference(r)) => (true, *r),
+        _ => (false, (0, 0)),
     };
 
     let mut res_dict: Dictionary = if res_is_indirect {
         doc.get_dictionary(res_ref_id)?.clone()
     } else {
-        let page = doc.get_dictionary(page_id)?;
-        match page.get(b"Resources") {
-            Ok(Object::Dictionary(d)) => d.clone(),
+        match &resources_obj {
+            Some(Object::Dictionary(d)) => d.clone(),
             _ => Dictionary::new(),
         }
     };
 
-    // --- Step B: resolve /XObject sub-dict to an owned Dictionary ---
+    // --- Step B: resolve the sub-dict (e.g. /XObject or /Font) to an owned Dictionary ---
     //
-    // /XObject inside /Resources can itself be an indirect ref or direct dict.
-    let (xobj_is_indirect, xobj_ref_id): (bool, ObjectId) = match res_dict.get(b"XObject") {
+    // A /Resources sub-dict can itself be an indirect ref or direct dict.
+    let (sub_is_indirect, sub_ref_id): (bool, ObjectId) = match res_dict.get(resource_key) {
         Ok(Object::Reference(r)) => (true, *r),
         _ => (false, (0, 0)),
     };
 
-    let mut xobj_dict: Dictionary = if xobj_is_indirect {
-        doc.get_dictionary(xobj_ref_id)?.clone()
+    let mut sub_dict: Dictionary = if sub_is_indirect {
+        doc.get_dictionary(sub_ref_id)?.clone()
     } else {
-        match res_dict.get(b"XObject") {
+        match res_dict.get(resource_key) {
             Ok(Object::Dictionary(d)) => d.clone(),
             _ => Dictionary::new(),
         }
     };
 
     // --- Step C: add new entries ---
-    for (name, obj_id) in xobj_entries {
-        xobj_dict.set(name.as_bytes().to_vec(), Object::Reference(*obj_id));
+    for (name, obj_id) in entries {
+        sub_dict.set(name.as_bytes().to_vec(), Object::Reference(*obj_id));
     }
 
     // --- Step D: write back ---
     //
-    // If /XObject was indirect, update it in place; otherwise embed as direct dict.
-    if xobj_is_indirect {
-        let xd = doc.get_dictionary_mut(xobj_ref_id)?;
-        for (name, obj_id) in xobj_entries {
-            xd.set(name.as_bytes().to_vec(), Object::Reference(*obj_id));
+    // If the sub-dict was indirect, update it in place; otherwise embed as direct dict.
+    if sub_is_indirect {
+        let sd = doc.get_dictionary_mut(sub_ref_id)?;
+        for (name, obj_id) in entries {
+            sd.set(name.as_bytes().to_vec(), Object::Reference(*obj_id));
         }
-        // res_dict and the page already reference the same indirect /XObject — done.
+        // res_dict and the page already reference the same indirect sub-dict — done.
     } else {
-        res_dict.set("XObject", Object::Dictionary(xobj_dict));
+        res_dict.set(resource_key, Object::Dictionary(sub_dict));
     }
 
     // Write /Resources back to page (as a direct dict).  If it was indirect, this
@@ -770,7 +837,7 @@ fn solid_black_image_xobject() -> Stream {
 /// PDF content streams accept integer and decimal literals.  Prefer integers when
 /// the value has no fractional part; otherwise use up to 4 decimal places, stripping
 /// trailing zeros.
-fn pdf_num(v: f64) -> String {
+pub(crate) fn pdf_num(v: f64) -> String {
     if v.fract().abs() < 1e-9 && v.abs() < 1e9 {
         format!("{}", v as i64)
     } else {
@@ -1518,6 +1585,100 @@ mod tests {
             text.contains("cm"),
             "overlay must contain 'cm'; got: {text:?}"
         );
+    }
+
+    /// A page that deliberately carries NO `/Resources` key of its own,
+    /// whose `/Pages` parent carries the real (inherited) `/Resources`
+    /// containing one pre-existing `/XObject` entry — the exact PDF
+    /// 32000-1:2008 §7.7.3.4 inheritance shape `bare_page_doc()` (which
+    /// always gives the leaf page its own empty dict) never exercises.
+    fn page_doc_with_inherited_xobject_resources() -> (Document, ObjectId, ObjectId) {
+        let mut doc = Document::with_version("1.7");
+        let existing_xobj_id = doc.add_object(Stream::new(
+            dictionary! { "Type" => "XObject", "Subtype" => "Image" },
+            vec![],
+        ));
+        let pages_id = doc.new_object_id();
+        let content_id = doc.add_object(Stream::new(dictionary! {}, b"BT ET".to_vec()));
+        let page_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![Object::Integer(0), Object::Integer(0),
+                               Object::Integer(612), Object::Integer(792)],
+            "Contents" => content_id,
+            // Deliberately NO "Resources" key here — relies on inheritance.
+        }));
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1_i64,
+                "Resources" => Object::Dictionary(dictionary! {
+                    "XObject" => Object::Dictionary(dictionary! {
+                        "Im0" => Object::Reference(existing_xobj_id),
+                    }),
+                }),
+            }),
+        );
+        let catalog_id = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        }));
+        doc.trailer.set("Root", catalog_id);
+        (doc, page_id, existing_xobj_id)
+    }
+
+    #[test]
+    fn add_named_objects_to_page_resources_preserves_inherited_resources() {
+        // Regression test for a code-review-caught bug (PR #103 fix round):
+        // a page relying on inherited /Resources (no /Resources key of its
+        // own) had that inheritance silently SHADOWED by an empty dict the
+        // moment this function ran, dropping every pre-existing resource
+        // (fonts, image XObjects, ...) the page's content stream needed.
+        let (mut doc, page_id, existing_xobj_id) = page_doc_with_inherited_xobject_resources();
+
+        let new_font_id = doc.add_object(dictionary! { "Type" => "Font" });
+        add_named_objects_to_page_resources(
+            &mut doc,
+            page_id,
+            b"Font",
+            &[("RLOCRFont".to_string(), new_font_id)],
+        )
+        .unwrap();
+
+        let page = doc.get_dictionary(page_id).unwrap();
+        let res = match page.get(b"Resources").unwrap() {
+            Object::Reference(r) => doc.get_dictionary(*r).unwrap(),
+            Object::Dictionary(d) => d,
+            other => panic!("unexpected Resources shape: {other:?}"),
+        };
+
+        // The INHERITED XObject must still be resolvable — this is the bug.
+        let xobj_dict = match res
+            .get(b"XObject")
+            .expect("/XObject must survive from the inherited Resources")
+        {
+            Object::Reference(r) => doc.get_dictionary(*r).unwrap(),
+            Object::Dictionary(d) => d,
+            other => panic!("unexpected XObject shape: {other:?}"),
+        };
+        let im0 = xobj_dict
+            .get(b"Im0")
+            .expect("inherited /XObject /Im0 must still be present after the merge");
+        assert_eq!(
+            im0.as_reference().unwrap(),
+            existing_xobj_id,
+            "Im0 must still point at the ORIGINAL inherited XObject, not be lost/replaced"
+        );
+
+        // AND the newly-added Font entry must also be present.
+        let font_dict = match res.get(b"Font").unwrap() {
+            Object::Reference(r) => doc.get_dictionary(*r).unwrap(),
+            Object::Dictionary(d) => d,
+            other => panic!("unexpected Font shape: {other:?}"),
+        };
+        assert!(font_dict.has(b"RLOCRFont"));
     }
 
     #[test]
