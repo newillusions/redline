@@ -16,6 +16,20 @@
 //! - In async (tokio) code: wrap with `tokio::task::spawn_blocking`.
 //! - For Tauri commands: create one engine per compare call inside `spawn_blocking`.
 //!
+//! # Do not create a second PDFium binding in a process that already has one
+//! [`PdfDiffEngine::new`] loads its OWN PDFium binding (`Pdfium::bind_to_library`/
+//! `bind_to_system_library`), independent of any other `Pdfium` instance already
+//! resident in the same process. That is safe for a standalone binary (this crate's
+//! own tests/examples, `cad-export-api`) where nothing else touches PDFium. It is
+//! NOT safe inside a host process — like redline's GUI — that already keeps a
+//! `Pdfium` instance alive on a dedicated thread: PDFium's C library is only safe to
+//! use from the thread that first initialised it, so a second `Pdfium::new()` call
+//! from a DIFFERENT thread while the first is still resident hangs indefinitely
+//! rather than erroring (found 2026-09-03, redline PR #99 review — see
+//! `PdfDiffEngine::with_pdfium`'s doc comment for the fix). Any embedding host with
+//! its own resident PDFium binding MUST use [`PdfDiffEngine::with_pdfium`] and run
+//! it on that same thread — never [`PdfDiffEngine::new`].
+//!
 //! # Two-tier diff algorithm
 //! Run text diff FIRST (tier 1) — it catches font-substitution, text reflow, and
 //! field-value changes directly from the PDF text layer (Unicode-independent of
@@ -146,27 +160,61 @@ struct OpenDoc {
 // PdfDiffEngine
 // ---------------------------------------------------------------------------
 
+/// Owns or borrows the engine's PDFium binding.
+///
+/// `Owned` loads and unloads its own dylib (standalone use — [`PdfDiffEngine::new`]).
+/// `Borrowed` reuses a binding that already lives elsewhere for the engine's whole
+/// lifetime and does nothing on drop — the owner unloads it ([`PdfDiffEngine::with_pdfium`],
+/// the fix for the double-binding hang described in the module doc comment).
+enum PdfiumHandle<'p> {
+    Owned(Pdfium),
+    Borrowed(&'p Pdfium),
+}
+
+impl std::ops::Deref for PdfiumHandle<'_> {
+    type Target = Pdfium;
+    fn deref(&self) -> &Pdfium {
+        match self {
+            PdfiumHandle::Owned(p) => p,
+            PdfiumHandle::Borrowed(p) => p,
+        }
+    }
+}
+
 /// Headless PDF diff engine. `!Send + !Sync` — PDFium uses process-global C state.
+///
+/// The `'p` lifetime is `'static` for an owned binding ([`PdfDiffEngine::new`]) or
+/// tied to a borrowed one ([`PdfDiffEngine::with_pdfium`]) — see the module doc
+/// comment's "Do not create a second PDFium binding" section for when to use which.
 ///
 /// # Drop order (SAFETY-critical)
 /// `docs` MUST drop before `pdfium` — PdfDocument/PdfPage call back into the
 /// PDFium library on drop, so the library must still be loaded at that point.
 /// Fields drop in declaration order: `docs` is declared first. Do NOT reorder.
-pub struct PdfDiffEngine {
+/// This holds for both `PdfiumHandle` variants: an `Owned` binding unloads its
+/// dylib on drop (must happen after `docs`); a `Borrowed` one drops as a no-op, so
+/// ordering relative to `docs` doesn't matter for it but is kept identical for
+/// consistency and because the field can't change variant after construction.
+pub struct PdfDiffEngine<'p> {
     /// Open documents keyed by opaque ID. MUST drop before `pdfium`.
     docs: HashMap<String, OpenDoc>,
-    /// PDFium bindings — owns the shared library. MUST be the LAST field.
-    pdfium: Pdfium,
+    /// PDFium bindings. MUST be the LAST field.
+    pdfium: PdfiumHandle<'p>,
 }
 
-impl PdfDiffEngine {
-    /// Create a new engine.
+impl PdfDiffEngine<'static> {
+    /// Create a new engine with its OWN, independent PDFium binding.
     ///
     /// PDFium is loaded from:
     ///   1. `PDFIUM_DYNAMIC_LIB_PATH` environment variable (recommended).
     ///   2. System library search path as a fallback.
     ///
     /// Returns `Err` if PDFium cannot be loaded — this is a hard failure.
+    ///
+    /// Only safe when nothing else in the process already has a `Pdfium` instance
+    /// resident (standalone binaries, this crate's own tests/examples, cad-export-api).
+    /// An embedding host with its own resident binding (redline's GUI) must use
+    /// [`PdfDiffEngine::with_pdfium`] instead — see the module doc comment.
     pub fn new() -> Result<Self> {
         let bindings = if let Ok(p) = std::env::var("PDFIUM_DYNAMIC_LIB_PATH") {
             Pdfium::bind_to_library(p)
@@ -177,9 +225,29 @@ impl PdfDiffEngine {
         };
         info!("pdf-diff: PDFium loaded");
         Ok(Self {
-            pdfium: Pdfium::new(bindings),
+            pdfium: PdfiumHandle::Owned(Pdfium::new(bindings)),
             docs: HashMap::new(),
         })
+    }
+}
+
+impl<'p> PdfDiffEngine<'p> {
+    /// Create an engine that REUSES an already-loaded PDFium binding instead of
+    /// loading a second, independent one.
+    ///
+    /// This is the fix for the hang described in the module doc comment: PDFium is
+    /// only safe from the thread that initialised it, so an embedding host that
+    /// already keeps a `Pdfium` instance alive (e.g. on a dedicated render thread)
+    /// MUST pass that same instance here and call every method on THIS engine from
+    /// that same thread — never call [`PdfDiffEngine::new`] from a different thread
+    /// while a host binding is resident.
+    ///
+    /// Infallible: no library loading happens here, `pdfium` is already initialised.
+    pub fn with_pdfium(pdfium: &'p Pdfium) -> Self {
+        Self {
+            docs: HashMap::new(),
+            pdfium: PdfiumHandle::Borrowed(pdfium),
+        }
     }
 
     /// Open a PDF file and return an opaque [`DocId`] handle.

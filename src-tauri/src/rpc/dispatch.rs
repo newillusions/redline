@@ -376,7 +376,9 @@ pub async fn dispatch(app: &AppHandle, req: RpcRequest) -> Result<Value, Value> 
         }
         "compare_pages" => {
             let p: tools::ComparePagesParams = parse(req.params)?;
+            let state = app.state::<AppState>();
             let result = crate::commands::compare::compare_pages(
+                state,
                 p.path_a,
                 p.path_b,
                 p.page_a,

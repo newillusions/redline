@@ -619,6 +619,55 @@ Tracked as a mission-record next step: `fix pdf-diff second PDFium binding (reus
 engine binding or dedicated process)` - the underlying `compare_pages` hang itself remains
 unfixed; the fixes above make it recoverable and opt-in, not fixed at the root.
 
+### Fix: double-PDFium-binding hang resolved at the root (2026-09-04)
+
+Closes the mission-record next step named above. `pdf-diff`'s `PdfDiffEngine::new()`
+loading its own, independent PDFium binding was correctly inferred as root cause in the
+2026-09-03 review, but never confirmed by exercising the fix - this round confirms it and
+ships the fix, chosen over "dedicated process" (the other option named above) because
+redline's render engine already runs PDFium on a dedicated actor thread
+(`render::RenderHandle`/`RenderCmd`) - reusing that thread and its binding needed no new
+process, IPC, or lifecycle to manage.
+
+**Fix, three layers:**
+1. `crates/pdf-diff/src/lib.rs`: `PdfDiffEngine` gained a `'p` lifetime and a
+   `PdfiumHandle<'p>` enum (`Owned(Pdfium)` / `Borrowed(&'p Pdfium)`) behind a `Deref`.
+   `PdfDiffEngine::new()` (now on `impl PdfDiffEngine<'static>`) is unchanged for standalone
+   callers (this crate's own tests/examples, `cad-export-api`). New
+   `PdfDiffEngine::with_pdfium(&'p Pdfium) -> Self` reuses an existing binding instead of
+   loading a second one - infallible, since no library loading happens.
+2. `src-tauri/src/compare/mod.rs`: `run_two_tier_diff` now takes `&Pdfium` and builds its
+   engine with `with_pdfium` instead of `new()`.
+3. `src-tauri/src/render/mod.rs`: a new `RenderCmd::ComparePages` variant runs
+   `compare::run_two_tier_diff` ON THE RENDER THREAD, passing `engine.pdfium()` (a new
+   `pub(crate)` accessor - deliberately not `pub`, so nothing off the render thread can
+   reach it directly) - so the diff engine borrows the SAME binding the render engine
+   already initialised on that thread, instead of a second `Pdfium::new()` call from a
+   different thread. `RenderHandle::compare_pages` is the async channel wrapper, mirroring
+   every other `RenderCmd`. `commands::compare::compare_pages` (the Tauri command) now takes
+   `State<'_, AppState>` and calls `state.render.compare_pages(...)` instead of
+   `tokio::task::spawn_blocking(|| PdfDiffEngine::new()...)` - `rpc/dispatch.rs`'s
+   `"compare_pages"` arm updated to pass `state` through.
+
+**Verified, not merely inferred fixed:**
+- `cargo test --workspace --all-targets`: all pdf-diff-lib/pdf-diff-tests/redline_lib/
+  redline-mcp-bin tests pass, including the crate's own standalone
+  `engine_new_fails_gracefully_without_pdfium` (proves `PdfDiffEngine::new()` still works
+  unmodified for `cad-export-api`/this crate's own examples).
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Live drive against an isolated dev instance (own `TMPDIR`, never the owner's running
+  `redline` process - confirmed untouched via `pgrep -x redline` before/after): the render
+  engine initialised (a document opened via the GUI first, so its PDFium binding was
+  resident exactly as in every 2026-09-03 hang reproduction), then `redline-mcp compare_pages`
+  on two fixture PDFs completed within the socket timeout and returned real tier-1/tier-2
+  diff stats - the exact scenario that hung indefinitely before this fix.
+
+**Gate removed:** `REDLINE_MCP_EXPERIMENTAL` and the `experimental_tool_disabled` refusal
+(2026-09-03 fix-round item 2, above) are deleted - `compare_pages` is listed in `tools/list`
+and callable like every other tool again, since the hang it guarded against no longer
+exists. The socket-timeout mechanism (fix-round item 1) is kept as a general safety net for
+any future stuck call, independent of this specific fix.
+
 ## Open questions for the owner (not resolved by this design)
 
 1. **Does Wave 1 alone satisfy the "helpful" bar Martin described, or is mutation the

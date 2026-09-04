@@ -8,19 +8,20 @@
 //! failure surfaces as the tool's error - never a silent fallback to direct file access
 //! (design §2, the cost accepted deliberately for single-writer correctness).
 //!
-//! Thirty tools. Ten from the owner's full-surface scope decision (2026-09-01, "We
-//! need mutation as well... And the ability to flatten and reduce file size through the
-//! mcp."): wave 1 read-only (list_markups, read_markup, search_markups,
-//! export_markup_schedule), wave 2 mutating (create_markup, update_markup,
-//! delete_markup, save_document) behind the lock guard, plus the two docops tools
-//! (flatten_document, reduce_file_size). Plus four Phase 2a document-lifecycle tools
-//! (2026-09-03, owner-approved "add open tools"): list_open_documents, open_document,
-//! close_document, get_active_document - added because every one of the original ten
-//! requires a doc_id, and prior to this a client had no way to obtain one without
-//! reading it out of the app's own log file (observation:dtko8oxo8fooqt7qrt44). Plus
-//! sixteen Phase 2b app-surface tools (2026-09-03, owner-approved "start 2b"): search
-//! (search_document, open_folder_index, search_folder, folder_index_status), takeoff
-//! (list_scales, add_scale, delete_scale, write_page_measure, export_markup_list), page
+//! Thirty tools, all listed by default. Ten from the owner's full-surface scope
+//! decision (2026-09-01, "We need mutation as well... And the ability to flatten
+//! and reduce file size through the mcp."): wave 1 read-only (list_markups,
+//! read_markup, search_markups, export_markup_schedule), wave 2 mutating
+//! (create_markup, update_markup, delete_markup, save_document) behind the lock
+//! guard, plus the two docops tools (flatten_document, reduce_file_size). Plus four
+//! Phase 2a document-lifecycle tools (2026-09-03, owner-approved "add open tools"):
+//! list_open_documents, open_document, close_document, get_active_document - added
+//! because every one of the original ten requires a doc_id, and prior to this a
+//! client had no way to obtain one without reading it out of the app's own log file
+//! (observation:dtko8oxo8fooqt7qrt44). Plus sixteen Phase 2b app-surface tools
+//! (2026-09-03, owner-approved "start 2b"): search (search_document,
+//! open_folder_index, search_folder, folder_index_status), takeoff (list_scales,
+//! add_scale, delete_scale, write_page_measure, export_markup_list), page
 //! operations (rotate_page, delete_page, reorder_pages, insert_blank_page), compare
 //! (compare_pages), docops (redact_document), and save_document_as - see the design
 //! doc's "Implementation notes (Phase 2b...)" section for the mutates/persists/
@@ -30,18 +31,25 @@
 //! stdin lines, and the socket round-trip per tool call is a single blocking
 //! request/response - no concurrency needed on this side.
 //!
-//! **`compare_pages` is opt-in, not one of the 29 tools listed by default** (PR #99
-//! review finding #2, 2026-09-03): it hangs indefinitely today due to a pre-existing
-//! double-PDFium-binding conflict inside the wrapped `commands::compare::compare_pages`
-//! command (see the design doc's "Implementation notes (Phase 2b...)" section and
-//! `experimental_enabled()` below). Set `REDLINE_MCP_EXPERIMENTAL=1` to enable it.
+//! **`compare_pages` was opt-in-only from 2026-09-03 to 2026-09-04** (PR #99 review
+//! finding #2): it hung indefinitely due to a double-PDFium-binding conflict inside
+//! the wrapped `commands::compare::compare_pages` command - the render engine's own
+//! PDFium binding and `pdf-diff`'s independently-loaded one were both resident at
+//! once, and PDFium's C library is only safe from the thread that initialised it.
+//! Fixed at the root 2026-09-04 (`compare::run_two_tier_diff` now reuses the render
+//! engine's binding via `render::RenderCmd::ComparePages`, running on the render
+//! thread instead of a `spawn_blocking` thread - see that module's doc comment) and
+//! proven live against an isolated dev instance. The gate and
+//! `REDLINE_MCP_EXPERIMENTAL` env var are removed; `compare_pages` is a normal
+//! always-listed tool again like every other one here.
 //!
-//! **The socket round trip has a read/write timeout** (default 120s, override via
-//! `REDLINE_MCP_TIMEOUT_SECS`) - PR #99 review finding #1: this binary's loop is a
-//! single blocking thread with no concurrency, so an unbounded socket read on a
-//! server-side hang (`compare_pages` today) used to wedge the ENTIRE process silently
-//! for every later call, not just that one. A timeout now surfaces as a structured
-//! `redline_timeout` tool error instead.
+//! **The socket round trip still has a read/write timeout** (default 120s, override
+//! via `REDLINE_MCP_TIMEOUT_SECS`) - PR #99 review finding #1: this binary's loop is
+//! a single blocking thread with no concurrency, so an unbounded socket read on any
+//! server-side hang used to wedge the ENTIRE process silently for every later call,
+//! not just that one. Kept as a general safety net even though the specific hang
+//! that motivated it (`compare_pages`) is fixed - a timeout surfaces as a structured
+//! `redline_timeout` tool error instead of hanging forever.
 
 use std::io::{self, BufRead, Read, Write};
 use std::time::Duration;
@@ -88,12 +96,7 @@ fn main() {
                 }),
             ),
             "tools/list" => ok(id, json!({ "tools": tool_defs() })),
-            "tools/call" => handle_tools_call(
-                id,
-                msg.get("params"),
-                &mut next_call_id,
-                experimental_enabled(),
-            ),
+            "tools/call" => handle_tools_call(id, msg.get("params"), &mut next_call_id),
             other => rpc_error(id, -32601, &format!("method not found: {other}")),
         };
 
@@ -112,51 +115,12 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-/// `experimental` gates the known-hanging `compare_pages` tool (PR #99 review finding
-/// #2) - passed in explicitly rather than read from the environment here so this
-/// function's gating behaviour is unit-testable without mutating process-global env
-/// state (which is unsound under `cargo test`'s default parallel execution). The real
-/// binary's `main()` loop passes `experimental_enabled()`.
-fn handle_tools_call(
-    id: Value,
-    params: Option<&Value>,
-    next_call_id: &mut u64,
-    experimental: bool,
-) -> Value {
+fn handle_tools_call(id: Value, params: Option<&Value>, next_call_id: &mut u64) -> Value {
     let Some(params) = params else {
         return rpc_error(id, -32602, "missing params");
     };
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
-
-    // compare_pages is opt-in (see the module doc comment and experimental_enabled())
-    // - refused HERE, before ever touching the socket, so a client that calls it by
-    // name without having seen it in tools/list still gets a clear, cheap refusal
-    // rather than the (now-timeout-bounded, but still costly and app-side-thread-
-    // leaking) real hang.
-    if name == "compare_pages" && !experimental {
-        return ok(
-            id,
-            json!({
-                "content": [{
-                    "type": "text",
-                    "text": to_text(&json!({
-                        "error": "experimental_tool_disabled",
-                        "detail": "compare_pages is disabled by default - it can hang \
-                                   indefinitely due to a known pre-existing PDFium \
-                                   double-binding conflict inside \
-                                   commands::compare::compare_pages (see the design \
-                                   doc's 'Implementation notes (Phase 2b...)' section). \
-                                   Set REDLINE_MCP_EXPERIMENTAL=1 to enable it at your \
-                                   own risk - a hang now recovers client-side via the \
-                                   socket timeout, but may still leak a stuck thread \
-                                   app-side."
-                    }))
-                }],
-                "isError": true
-            }),
-        );
-    }
 
     // MCP tool-level errors (design §4 item 4: "a structured error naming the markup
     // and the blocking flag") are reported via isError:true, not a JSON-RPC protocol
@@ -185,9 +149,11 @@ fn to_text(v: &Value) -> String {
 
 /// Read/write timeout on the socket round trip to the running app, in seconds
 /// (PR #99 review finding #1). `redline-mcp`'s own loop is a single blocking thread -
-/// with no timeout, one server-side call that never responds (`compare_pages` today,
-/// see the module doc comment) wedges this ENTIRE process for every subsequent tool
-/// call too, silently, until the client is killed and restarted. Default 120s is long
+/// with no timeout, one server-side call that never responds (`compare_pages` used to
+/// be the known case - see the module doc comment; fixed 2026-09-04) wedges this
+/// ENTIRE process for every subsequent tool call too, silently, until the client is
+/// killed and restarted. Kept as a general safety net for any future stuck call.
+/// Default 120s is long
 /// enough for a legitimate slow operation (a large save/optimize) but short enough that
 /// a genuinely stuck call degrades to a clear error. Override for local debugging of a
 /// known-slow operation via `REDLINE_MCP_TIMEOUT_SECS`; a non-positive or unparseable
@@ -200,16 +166,6 @@ fn socket_timeout() -> Duration {
         .filter(|&s| s > 0)
         .unwrap_or(120);
     Duration::from_secs(secs)
-}
-
-/// Whether experimental/known-unstable tools are enabled for this process
-/// (PR #99 review finding #2). Currently gates only `compare_pages` - see the module
-/// doc comment and `handle_tools_call`/`tool_defs_for`.
-fn experimental_enabled() -> bool {
-    matches!(
-        std::env::var("REDLINE_MCP_EXPERIMENTAL").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
-    )
 }
 
 /// Maps a socket I/O error to a tool-level JSON error, distinguishing a genuine
@@ -226,8 +182,7 @@ fn socket_io_err_to_json(e: &io::Error, timeout: Duration, fallback_tag: &str) -
             "error": "redline_timeout",
             "detail": format!(
                 "redline did not respond within {}s - the connection was dropped. A tool \
-                 call may be stuck server-side (known case: compare_pages, see the design \
-                 doc's Phase 2b section) rather than merely slow.",
+                 call may be stuck server-side rather than merely slow.",
                 timeout.as_secs()
             )
         })
@@ -377,18 +332,13 @@ fn connect() -> io::Result<Box<dyn ReadWrite>> {
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
-/// The MCP tool-surface definitions (JSON Schema `inputSchema` per tool) actually
-/// advertised by this running process - `tools/list`'s call site. Delegates to
-/// [`tool_defs_for`] with the real, environment-read gate.
+/// The MCP tool-surface definitions (JSON Schema `inputSchema` per tool) - all
+/// thirty, always advertised. `tools/list`'s call site. `compare_pages` was
+/// opt-in-only from 2026-09-03 to 2026-09-04 behind `REDLINE_MCP_EXPERIMENTAL` (PR
+/// #99 review finding #2) - see the module doc comment for the fix that removed
+/// the gate.
 fn tool_defs() -> Value {
-    tool_defs_for(experimental_enabled())
-}
-
-/// All defined tools, with `compare_pages` present only when `experimental` is true
-/// (PR #99 review finding #2 - see the module doc comment). Split from [`tool_defs`]
-/// so the gating behaviour is unit-testable without mutating process-global env state.
-fn tool_defs_for(experimental: bool) -> Value {
-    let mut tools = json!([
+    json!([
         {
             "name": "list_open_documents",
             "description": "List every document currently open in redline: doc_id, path, title, page_count, whether it's the focused tab (is_active), and whether it has unsaved changes (dirty). Use this (or get_active_document) to obtain a doc_id before calling any other tool.",
@@ -755,13 +705,7 @@ fn tool_defs_for(experimental: bool) -> Value {
                 "required": ["doc_id", "path"]
             }
         }
-    ]);
-    if !experimental {
-        if let Value::Array(arr) = &mut tools {
-            arr.retain(|t| t["name"] != "compare_pages");
-        }
-    }
-    tools
+    ])
 }
 
 #[cfg(test)]
@@ -788,10 +732,10 @@ mod tests {
 
     #[test]
     fn tool_defs_names_all_thirty_tools_across_phase_1_2a_and_2b() {
-        // Uses `tool_defs_for(true)` - the full schema shape, independent of the
-        // `compare_pages` opt-in gate (PR #99 review finding #2) - see
-        // `tool_defs_default_excludes_compare_pages` for the gate itself.
-        let defs = tool_defs_for(true);
+        // All thirty tools are always listed - `compare_pages`'s opt-in gate (PR #99
+        // review finding #2) was removed 2026-09-04 once the underlying hang was
+        // fixed at the root (see the module doc comment).
+        let defs = tool_defs();
         let names: Vec<&str> = defs
             .as_array()
             .unwrap()
@@ -842,11 +786,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_defs_default_excludes_compare_pages_and_lists_twenty_nine_tools() {
-        // PR #99 review finding #2: compare_pages hangs indefinitely today (a
-        // pre-existing double-PDFium-binding conflict) and must not be advertised to a
-        // client by default.
-        let defs = tool_defs_for(false);
+    fn tool_defs_includes_compare_pages_by_default() {
+        // PR #99 review finding #2's opt-in gate hid compare_pages behind
+        // REDLINE_MCP_EXPERIMENTAL because it hung indefinitely (a double-PDFium-
+        // binding conflict). Fixed at the root 2026-09-04 (render::RenderCmd::ComparePages
+        // now reuses the render engine's own binding) and proven live - the gate is
+        // gone, compare_pages is a normal always-listed tool like every other one.
+        let defs = tool_defs();
         let names: Vec<&str> = defs
             .as_array()
             .unwrap()
@@ -854,28 +800,15 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
         assert!(
-            !names.contains(&"compare_pages"),
-            "compare_pages must be opt-in (REDLINE_MCP_EXPERIMENTAL=1), not listed by default"
+            names.contains(&"compare_pages"),
+            "compare_pages must be listed by default now that the double-binding hang is fixed"
         );
-        assert_eq!(names.len(), 29);
-    }
-
-    #[test]
-    fn tool_defs_experimental_enabled_includes_compare_pages() {
-        let defs = tool_defs_for(true);
-        let names: Vec<&str> = defs
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
-        assert!(names.contains(&"compare_pages"));
         assert_eq!(names.len(), 30);
     }
 
     #[test]
     fn every_tool_def_not_named_in_the_doc_id_free_list_requires_doc_id() {
-        let defs = tool_defs_for(true);
+        let defs = tool_defs();
         for tool in defs.as_array().unwrap() {
             let name = tool["name"].as_str().unwrap();
             if TOOLS_WITHOUT_A_REQUIRED_DOC_ID.contains(&name) {
@@ -893,7 +826,7 @@ mod tests {
 
     #[test]
     fn doc_id_free_tools_really_do_not_require_it() {
-        let defs = tool_defs_for(true);
+        let defs = tool_defs();
         for &name in TOOLS_WITHOUT_A_REQUIRED_DOC_ID {
             let tool = defs
                 .as_array()
@@ -914,38 +847,25 @@ mod tests {
 
     #[test]
     fn handle_tools_call_missing_params_is_a_protocol_error_not_a_tool_error() {
-        let resp = handle_tools_call(json!(1), None, &mut 1, false);
+        let resp = handle_tools_call(json!(1), None, &mut 1);
         assert_eq!(resp["error"]["code"], -32602);
     }
 
     #[test]
-    fn handle_tools_call_refuses_compare_pages_when_experimental_disabled() {
+    fn handle_tools_call_compare_pages_reaches_call_bridge_no_gate() {
+        // The REDLINE_MCP_EXPERIMENTAL gate (PR #99 review finding #2) is gone - a
+        // compare_pages call now goes straight to call_bridge like any other tool,
+        // no experimental_tool_disabled refusal. No real app is running in this test
+        // process, so it falls through to call_bridge's own connection-failure path
+        // (already covered by call_bridge_connection_failure_is_a_structured_tool_error).
         let params = json!({
             "name": "compare_pages",
             "arguments": {"path_a": "/a.pdf", "path_b": "/b.pdf", "page_a": 0, "page_b": 0}
         });
-        let resp = handle_tools_call(json!(1), Some(&params), &mut 1, false);
-        // A tool-level refusal (isError:true), NOT a JSON-RPC protocol error - the call
-        // itself is well-formed, the tool is simply disabled. Confirms this refusal
-        // never reaches `call_bridge` (no socket touched, no real app needed).
-        assert_eq!(resp["result"]["isError"], true);
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("experimental_tool_disabled"), "got: {text}");
-    }
-
-    #[test]
-    fn handle_tools_call_allows_compare_pages_when_experimental_enabled() {
-        // Enabled but no real app running -> falls through to call_bridge's own
-        // connection-failure path (already covered by
-        // call_bridge_connection_failure_is_a_structured_tool_error), NOT the
-        // experimental_tool_disabled refusal - proves the gate actually gates.
-        let params = json!({
-            "name": "compare_pages",
-            "arguments": {"path_a": "/a.pdf", "path_b": "/b.pdf", "page_a": 0, "page_b": 0}
-        });
-        let resp = handle_tools_call(json!(1), Some(&params), &mut 1, true);
+        let resp = handle_tools_call(json!(1), Some(&params), &mut 1);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(!text.contains("experimental_tool_disabled"), "got: {text}");
+        assert!(text.contains("redline_not_running"), "got: {text}");
     }
 
     #[test]
@@ -966,11 +886,13 @@ mod tests {
         fn call_bridge_over_stream_times_out_on_a_socket_that_never_replies() {
             // PR #99 review finding #1: before this fix, `redline-mcp` had no
             // read/write timeout at all, so a server-side call that never responds
-            // (compare_pages today - see the module doc comment) hung this call - and
-            // every later one, since this binary's loop is single-threaded and
-            // synchronous - forever, silently. `_server` is a connected pair endpoint
-            // that is held open but never written to: not a connection failure
-            // (`redline_not_running`), a genuinely-stuck peer.
+            // (compare_pages used to be the known case - see the module doc comment;
+            // fixed 2026-09-04) hung this call - and every later one, since this
+            // binary's loop is single-threaded and synchronous - forever, silently.
+            // `_server` is a connected pair endpoint that is held open but never
+            // written to: not a connection failure (`redline_not_running`), a
+            // genuinely-stuck peer. Kept as regression coverage for the timeout
+            // mechanism itself, independent of which tool triggered it originally.
             let (client, _server) = UnixStream::pair().expect("unix socket pair");
             let timeout = Duration::from_millis(300);
             client

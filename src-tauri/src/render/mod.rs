@@ -460,6 +460,19 @@ impl RenderEngine {
         self.tile_cache.len()
     }
 
+    /// Expose the render thread's already-loaded PDFium binding so other
+    /// subsystems that run ON THIS SAME THREAD can reuse it instead of loading a
+    /// second, independent one — the fix for the `compare_pages` hang (PR #99
+    /// review finding, 2026-09-03): PDFium's C library is only safe from the
+    /// thread that initialised it, so a second `Pdfium::new()` from a different
+    /// thread while this one is resident hangs indefinitely rather than erroring.
+    /// `pub(crate)`, not `pub` — callers off the render thread MUST go through
+    /// `RenderHandle` (the channel), never touch this directly. See
+    /// `compare::run_two_tier_diff`'s doc comment and `RenderCmd::ComparePages`.
+    pub(crate) fn pdfium(&self) -> &Pdfium {
+        &self.pdfium
+    }
+
     /// Open a PDF file and register it under a new doc_id.
     ///
     /// Three-stage strategy for robustness across the §20 corpus:
@@ -1386,6 +1399,22 @@ pub enum RenderCmd {
         max_dim_px: u32,
         reply: oneshot::Sender<Result<Vec<u8>>>,
     },
+    /// Two-tier PDF diff (text-layer + pixel) between one page of `path_a` and one
+    /// page of `path_b`. Runs on THIS thread specifically so it can reuse the
+    /// render engine's already-loaded PDFium binding via `crate::compare::run_two_tier_diff`
+    /// — see that function's doc comment for why a second, independently-loaded
+    /// binding hung the process indefinitely (PR #99 review finding, 2026-09-03).
+    /// Does not touch `documents`/`AppState` — `path_a`/`path_b` need not be open
+    /// documents.
+    ComparePages {
+        path_a: PathBuf,
+        path_b: PathBuf,
+        page_a: u32,
+        page_b: u32,
+        dpi: f32,
+        pixel_tolerance: u8,
+        reply: oneshot::Sender<Result<crate::compare::PageDiffResult>>,
+    },
 }
 
 /// A `Send + Sync` handle to the render thread.
@@ -1505,6 +1534,26 @@ impl RenderHandle {
                             reply,
                         } => {
                             let _ = reply.send(engine.rasterize_pdf_bytes(bytes, max_dim_px));
+                        }
+                        RenderCmd::ComparePages {
+                            path_a,
+                            path_b,
+                            page_a,
+                            page_b,
+                            dpi,
+                            pixel_tolerance,
+                            reply,
+                        } => {
+                            let result = crate::compare::run_two_tier_diff(
+                                engine.pdfium(),
+                                &path_a,
+                                &path_b,
+                                page_a,
+                                page_b,
+                                dpi,
+                                pixel_tolerance,
+                            );
+                            let _ = reply.send(result);
                         }
                     }
                 }
@@ -1711,6 +1760,36 @@ impl RenderHandle {
             .await
             .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
     }
+
+    /// Run the two-tier PDF diff (text-layer + pixel) on the render thread, reusing
+    /// its already-loaded PDFium binding instead of creating a second, independent
+    /// one. See [`crate::compare::run_two_tier_diff`]'s doc comment for why a second
+    /// binding hung the process indefinitely (PR #99 review finding, 2026-09-03).
+    pub async fn compare_pages(
+        &self,
+        path_a: PathBuf,
+        path_b: PathBuf,
+        page_a: u32,
+        page_b: u32,
+        dpi: f32,
+        pixel_tolerance: u8,
+    ) -> Result<crate::compare::PageDiffResult> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(RenderCmd::ComparePages {
+                path_a,
+                path_b,
+                page_a,
+                page_b,
+                dpi,
+                pixel_tolerance,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("render thread gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
+    }
 }
 
 /// Send an init-error reply to any command that arrived before PDFium loaded.
@@ -1745,6 +1824,9 @@ fn send_init_error(cmd: RenderCmd, err: &anyhow::Error) {
             let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
         }
         RenderCmd::RasterizePdfBytes { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+        }
+        RenderCmd::ComparePages { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
         }
     }
@@ -1917,6 +1999,77 @@ pub(crate) mod tests {
             .open_document(path, "pw-test".into(), Some("unused-password"))
             .expect("open should succeed regardless of the unused password arg");
         assert_eq!(outcome, OpenOutcome::Opened(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // compare_pages double-PDFium-binding hang regression (PR #99 review finding,
+    // 2026-09-03; fixed 2026-09-04 - see `crate::compare::run_two_tier_diff`'s doc
+    // comment and this module's `RenderCmd::ComparePages`).
+    // -----------------------------------------------------------------------
+
+    /// Drives `compare_pages` through the EXACT path the GUI and the MCP bridge
+    /// use — `RenderHandle::compare_pages` → `RenderCmd::ComparePages` → the render
+    /// thread's own `RenderEngine::pdfium()` — with a document already open via
+    /// that SAME render engine first, reproducing the precondition present in
+    /// every 2026-09-03 hang repro (the render engine's PDFium binding already
+    /// resident in-process when `compare_pages` ran). Wrapped in a bounded
+    /// `tokio::time::timeout` so a regression FAILS this test instead of hanging
+    /// the suite — before the fix, this exact sequence hung indefinitely.
+    #[tokio::test]
+    async fn compare_pages_completes_via_render_handle_with_render_engine_initialised() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+
+        let handle = RenderHandle::spawn().expect("spawn render thread");
+
+        // Open a document via the render engine FIRST — this is what made every
+        // 2026-09-03 hang reproduction hang: the render engine's PDFium binding
+        // already resident on this thread before compare_pages tried to load a
+        // second, independent one.
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("compare-a.pdf");
+        crate::document::annots::tests::one_page_doc()
+            .0
+            .save(&path_a)
+            .expect("save fixture a");
+        let outcome = handle
+            .open_document(path_a.clone(), "compare-hang-regression".into(), None)
+            .await
+            .expect("open_document");
+        assert_eq!(outcome, OpenOutcome::Opened(1));
+
+        // Second fixture for the diff itself — deliberately built the same way as
+        // path_a (empty `BT ET` content stream), so the expected diff result is
+        // "identical": both text sequences are empty (match) and both pages
+        // render as blank white pages of the same size (pixel-identical).
+        let path_b = dir.path().join("compare-b.pdf");
+        crate::document::annots::tests::one_page_doc()
+            .0
+            .save(&path_b)
+            .expect("save fixture b");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            handle.compare_pages(path_a, path_b, 0, 0, 72.0, 5),
+        )
+        .await
+        .expect(
+            "compare_pages must complete within 30s, not hang — this is the PR #99 \
+             double-PDFium-binding regression test",
+        )
+        .expect("compare_pages should succeed on two valid one-page PDFs");
+
+        assert!(
+            result.text_char_match,
+            "two blank fixtures have identical (empty) text sequences"
+        );
+        assert!(
+            result.pixel_passed,
+            "two blank fixtures of the same page size render pixel-identical"
+        );
+        assert_eq!(result.changed_pct, 0.0);
     }
 
     // -----------------------------------------------------------------------

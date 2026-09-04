@@ -2,9 +2,25 @@
 //!
 //! M6 / Phase 1.1: two-tier diff (text-layer + pixel) via the headless `pdf-diff`
 //! workspace crate. The `pdf-diff` crate is Tauri-free and shared with `cad-export-api`
-//! (Linux/axum). This module provides the Tauri-aware wrapper: it runs `PdfDiffEngine`
-//! on a `spawn_blocking` thread (PDFium is `!Send + !Sync`) and returns serialisable
-//! results to the webview via the `compare_pages` command in `commands/compare.rs`.
+//! (Linux/axum). This module provides the Tauri-aware wrapper, invoked from the
+//! `compare_pages` command in `commands/compare.rs` via `RenderHandle::compare_pages`
+//! → `render::RenderCmd::ComparePages`.
+//!
+//! # Reuses the render engine's PDFium binding — do not construct a second one
+//! [`run_two_tier_diff`] takes `&Pdfium` and builds its diff engine with
+//! [`pdf_diff::PdfDiffEngine::with_pdfium`] rather than `PdfDiffEngine::new()`.
+//! Before 2026-09-03 this called `PdfDiffEngine::new()` on a `tokio::task::spawn_blocking`
+//! thread, which loaded a SECOND, independent PDFium binding while the render
+//! engine's own binding was already resident on its dedicated thread
+//! (`render::RenderHandle`) — PDFium's C library is only safe from the thread that
+//! initialised it, so the second `Pdfium::new()` call hung indefinitely rather than
+//! erroring (found via the MCP `compare_pages` tool, PR #99 review finding #2,
+//! observation:x6xsf3hlpepo9ohc7wij). The fix moves this function's caller onto the
+//! render thread itself (`render::RenderCmd::ComparePages`'s handler) and passes
+//! that thread's own `Pdfium` in — so **this function MUST be called from the
+//! render thread**, never from a `spawn_blocking`/arbitrary thread. See
+//! `pdf_diff`'s module doc comment ("Do not create a second PDFium binding") for
+//! the general rule this is an instance of.
 //!
 //! Full M6 UX (color-channel overlay, viewport comparison panels, change-heatmap)
 //! is deferred — tracked as follow-up. The shared crate is the M6 must-have; the
@@ -12,6 +28,7 @@
 
 use anyhow::Result;
 use pdf_diff::{PdfDiffEngine, pixel_diff};
+use pdfium_render::prelude::Pdfium;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -43,11 +60,18 @@ pub struct PageDiffResult {
     pub render_dpi: f32,
 }
 
-/// Run a two-tier diff between `page_a` of `path_a` and `page_b` of `path_b`.
+/// Run a two-tier diff between `page_a` of `path_a` and `page_b` of `path_b`,
+/// reusing an already-loaded PDFium binding (`pdfium`) instead of creating a new
+/// one — see the module doc comment for why this is required.
 ///
-/// MUST be called from a `tokio::task::spawn_blocking` closure because `PdfDiffEngine`
-/// is `!Send + !Sync`. All PDFium operations complete before this function returns.
+/// MUST be called from the SAME thread that owns `pdfium` — for redline that is
+/// the dedicated render thread (`render::RenderCmd::ComparePages`'s handler is the
+/// only call site; `pdfium` there is `RenderEngine`'s own binding, via
+/// `RenderEngine::pdfium()`). `PdfDiffEngine` is `!Send + !Sync`, so this function
+/// itself is not `Send` either — all PDFium operations complete synchronously
+/// before it returns.
 pub fn run_two_tier_diff(
+    pdfium: &Pdfium,
     path_a: &Path,
     path_b: &Path,
     page_a: u32,
@@ -55,7 +79,7 @@ pub fn run_two_tier_diff(
     dpi: f32,
     pixel_tolerance: u8,
 ) -> Result<PageDiffResult> {
-    let mut engine = PdfDiffEngine::new()?;
+    let mut engine = PdfDiffEngine::with_pdfium(pdfium);
     let doc_a = engine.open(path_a)?;
     let doc_b = engine.open(path_b)?;
 
