@@ -229,6 +229,29 @@ closing a separate gap where a same-job smoke-test failure could otherwise
 still let a stale/empty-signature manifest ship to the auto-updater, since a
 job's declared `outputs:` survive a later step's failure.
 
+**The updater archive is now rebuilt from the final signed .app, after
+bundling (fixed 2026-09-07).** Auditing v0.3.19's shipped assets found a
+second, separate gap in the same job: `npm run tauri:build` produces the
+updater artifact (`*.app.tar.gz` + `.sig`) from the `.app` as it exists
+immediately after that build step - before "Bundle Tesseract + Leptonica
+dylibs into the .app" adds `Contents/Frameworks` and before "Fix code
+signature" does the final codesign. That stale archive therefore had zero
+`Contents/Frameworks` entries, and every binary inside it linked
+Tesseract/Leptonica/libarchive by absolute Homebrew path - a Mac auto-updating
+to that release without Homebrew installed could not launch the app. The DMG
+never had this problem because "Recreate DMG with fixed signature" already
+rebuilds it from the final `.app`; the updater archive just never got the
+same treatment. Fixed by a new "Regenerate updater archive (post-bundle,
+post-sign)" step that re-tars the archive from the final bundled+signed
+`.app` and re-signs it with `tauri signer sign`, mirroring the Windows leg's
+"Regenerate updater signature (post-Authenticode)" pattern - same filename
+and path, so the existing "Find artifacts"/upload steps pick it up
+unchanged. A following "Verify updater archive integrity (hard gate)" step
+extracts the regenerated archive and fails the job if an OCR build is
+missing `Contents/Frameworks/libtesseract*`, or if `otool -L` on the main
+executable shows any `/opt/homebrew` path, so this class cannot ship
+silently again.
+
 Manually triggering the `workflow_dispatch` rehearsal (`build_ocr=true`)
 remains the way to prove the OCR build/bundle/smoke-test steps on a branch
 without cutting a release - unchanged from before this fix, still the only
