@@ -771,6 +771,64 @@ export async function redactDocument(
 }
 
 // ---------------------------------------------------------------------------
+// OCR commands (Phase 2c-ii — "OCR this document" action + auto-OCR-on-open)
+// ---------------------------------------------------------------------------
+
+/**
+ * `true` if none of the open document's first few pages have meaningful extractable
+ * text — the no-text-layer test the auto-OCR-on-open setting uses to decide whether to
+ * trigger OCR right after a document opens. Needs no `ocr` build feature (it only reads
+ * text that's already there).
+ *
+ * Returns a rejected promise on backend error (unknown doc_id, or the file can't be
+ * parsed).
+ */
+export async function documentNeedsOcr(docId: string): Promise<boolean> {
+  return invoke<boolean>("document_needs_ocr", { docId });
+}
+
+/** What `runOcrDocument` actually did — mirrors Rust `OcrRunReport`, keep in sync. */
+export interface OcrRunReport {
+  pages_total: number;
+  pages_ocred: number;
+  pages_skipped_existing_text: number;
+  pages_with_text_embedded: number;
+  lines_embedded: number;
+}
+
+/**
+ * Payload of the `"ocr-progress"` Tauri event `runOcrDocument` emits once per page while
+ * it runs — mirrors Rust `OcrProgressEvent`, keep in sync. Listen for it via
+ * `@tauri-apps/api/event`'s `listen<OcrProgressEvent>("ocr-progress", ...)`.
+ */
+export interface OcrProgressEvent {
+  doc_id: string;
+  page_index: number;
+  pages_done: number;
+  pages_total: number;
+  lines_found: number;
+}
+
+/**
+ * Run OCR over every page of the open document `docId` that doesn't already have
+ * extractable text, and embed the recognized lines as an invisible searchable text layer
+ * (Phase 2c-i). Emits `"ocr-progress"` events (`OcrProgressEvent`) as each page finishes.
+ *
+ * The Tauri backend atomically rewrites the file and reloads the render engine, so
+ * in-document search finds the new text immediately — no reopen needed.
+ *
+ * Returns a rejected promise on backend error (unknown doc_id, OCR not compiled into this
+ * build, Tesseract engine failure, recognition failure, or atomic-save failure). Nothing
+ * is written on error — an all-or-nothing action, matching flatten/optimize/redact.
+ */
+export async function runOcrDocument(
+  docId: string,
+  minConfidence?: number,
+): Promise<OcrRunReport> {
+  return invoke<OcrRunReport>("run_ocr_document", { docId, minConfidence });
+}
+
+// ---------------------------------------------------------------------------
 // Compare commands (M6 Phase 1.1 — two-tier diff, spec §10)
 // ---------------------------------------------------------------------------
 

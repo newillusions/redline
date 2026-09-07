@@ -33,6 +33,10 @@ export interface AppSettings {
   author_name: string;
   last_window: LastWindowState | null;
   recent_colors: string[];
+  /** Auto-OCR Phase 2c-ii: run OCR automatically on open when the document has no
+   *  extractable text on its sampled leading pages (see `documentNeedsOcr`). Defaults
+   *  to `false` — a background CPU operation should not fire silently by default. */
+  auto_ocr_on_open: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -49,6 +53,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   author_name: "",
   last_window: null,
   recent_colors: [],
+  auto_ocr_on_open: false,
 };
 
 // ---------------------------------------------------------------------------

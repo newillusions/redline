@@ -316,6 +316,11 @@ pub fn run() {
             commands::docops::flatten_document,
             commands::docops::optimize_document,
             commands::docops::redact_document,
+            // OCR commands (Phase 2c-ii — "OCR this document" action + auto-OCR-on-open
+            // detection; run_ocr_document's real work is #[cfg(feature = "ocr")]-gated
+            // inside the command itself, see commands::ocr's module doc comment)
+            commands::ocr::document_needs_ocr,
+            commands::ocr::run_ocr_document,
             // Compare commands (M6 Phase 1.1)
             commands::compare::compare_pages,
             // Recent docs (MRU list, Document History panel)

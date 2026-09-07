@@ -153,6 +153,7 @@
   let defaultTool = $state("");
   let measurementUnit = $state<MeasurementUnit>("m");
   let authorName = $state("");
+  let autoOcrOnOpen = $state(false);
 
   onMount(async () => {
     try {
@@ -161,6 +162,7 @@
       defaultTool = settings.default_tool ?? "";
       measurementUnit = settings.measurement_unit;
       authorName = settings.author_name;
+      autoOcrOnOpen = settings.auto_ocr_on_open;
     } catch (e) {
       error = `Failed to load settings: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
@@ -183,6 +185,7 @@
         author_name: authorName,
         last_window: null,
         recent_colors: [],
+        auto_ocr_on_open: autoOcrOnOpen,
       };
       // Preserve fields this dialog does not edit (last_window, recent_colors)
       // by merging over whatever is currently persisted.
@@ -253,6 +256,11 @@
         placeholder="Shown on new markups and comments"
         bind:value={authorName}
       />
+
+      <label class="field-checkbox-label" for="settings-auto-ocr">
+        <input id="settings-auto-ocr" type="checkbox" bind:checked={autoOcrOnOpen} />
+        Auto-OCR on open when the document has no text layer
+      </label>
     {/if}
 
     <hr class="section-divider" />
@@ -361,6 +369,11 @@
     font-size: var(--font-size-sm);
   }
   .field-label { font-size: var(--font-size-sm); color: var(--color-text); margin-top: var(--space-2); }
+  .field-checkbox-label {
+    display: flex; align-items: center; gap: var(--space-2);
+    font-size: var(--font-size-sm); color: var(--color-text);
+    margin-top: var(--space-3); cursor: pointer;
+  }
   .field-select, .field-input {
     padding: var(--space-2) var(--space-3);
     border: 1px solid var(--color-border); border-radius: var(--radius-sm);

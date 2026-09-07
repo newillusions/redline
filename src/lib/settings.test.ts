@@ -25,6 +25,12 @@ describe("withDefaults", () => {
     expect(result.author_name).toBe("Martin");
     expect(result.measurement_unit).toBe(DEFAULT_SETTINGS.measurement_unit);
     expect(result.recent_colors).toEqual([]);
+    expect(result.auto_ocr_on_open).toBe(false);
+  });
+
+  it("a pre-2c-ii partial missing auto_ocr_on_open defaults it to false, not silently on", () => {
+    const result = withDefaults({ theme: "dark" });
+    expect(result.auto_ocr_on_open).toBe(false);
   });
 
   it("does not mutate DEFAULT_SETTINGS", () => {

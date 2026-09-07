@@ -166,7 +166,28 @@ pub fn write_ocr_pdf(
     min_confidence: f32,
 ) -> Result<Vec<u8>> {
     let mut doc = Document::load_from(Cursor::new(pdf_bytes)).context("load PDF from bytes")?;
+    write_pages_text_layers(&mut doc, pages_lines, min_confidence)?;
 
+    let mut out: Vec<u8> = Vec::new();
+    doc.save_to(&mut out).context("save OCR'd PDF to bytes")?;
+    Ok(out)
+}
+
+/// Embed `lines` as an invisible searchable text layer on `pages_lines`' named pages of
+/// an ALREADY-LOADED `doc`, without (re)loading or saving it — the shared core `write_ocr_pdf`
+/// wraps with its own load/save-to-bytes pair.
+///
+/// `pub(crate)` (not `pub`) so `commands::ocr::run_ocr_document` (Phase 2c-ii) can call it
+/// directly inside `commands::document::apply_page_edit`'s `&mut lopdf::Document` closure —
+/// reusing the exact same page-lookup/font-sharing/per-page-write logic `write_ocr_pdf`
+/// uses, rather than that command hand-rolling a second load/save-to-bytes round trip that
+/// would either duplicate `apply_page_edit`'s own atomic-save/markup-preservation/render-
+/// reload contract or bypass it outright (see that command's doc comment).
+pub(crate) fn write_pages_text_layers(
+    doc: &mut Document,
+    pages_lines: &[(u32, Vec<OcrLine>)],
+    min_confidence: f32,
+) -> Result<()> {
     // lopdf's get_pages() is 1-based (BTreeMap<u32, ObjectId>) — matches the
     // same convention `docops::redact_regions` already relies on.
     let page_map = doc.get_pages();
@@ -190,12 +211,10 @@ pub fn write_ocr_pdf(
         };
 
         let fid = *font_id.get_or_insert_with(|| doc.add_object(helvetica_font_dict()));
-        write_page_text_layer(&mut doc, page_id, fid, lines, min_confidence)?;
+        write_page_text_layer(doc, page_id, fid, lines, min_confidence)?;
     }
 
-    let mut out: Vec<u8> = Vec::new();
-    doc.save_to(&mut out).context("save OCR'd PDF to bytes")?;
-    Ok(out)
+    Ok(())
 }
 
 /// Embed one page's worth of `lines` as invisible text, appending a new
@@ -505,6 +524,43 @@ mod tests {
         assert!(
             text.contains("HELLO WORLD"),
             "expected embedded text in extracted content, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn write_pages_text_layers_embeds_extractable_text_in_an_already_loaded_document() {
+        // Exercises the in-memory-Document entry point `run_ocr_document` (Phase 2c-ii)
+        // calls directly inside `apply_page_edit`'s closure, as opposed to `write_ocr_pdf`'s
+        // own load-bytes -> write -> save-bytes wrapper around the same function.
+        let mut doc = one_page_pdf();
+        let lines = vec![horizontal_line("HELLO WORLD", Some(0.9))];
+
+        write_pages_text_layers(&mut doc, &[(0, lines)], DEFAULT_MIN_CONFIDENCE).unwrap();
+
+        let mut out = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        let reopened = Document::load_from(Cursor::new(&out)).unwrap();
+        let text = reopened.extract_text(&[1]).unwrap();
+        assert!(
+            text.contains("HELLO WORLD"),
+            "expected embedded text in extracted content, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn write_pages_text_layers_leaves_document_untouched_when_all_pages_have_no_lines() {
+        // The empty-lines-list skip (`if lines.is_empty() { continue; }`) must hold on the
+        // in-memory entry point too — a page named with zero recognized lines (e.g. every
+        // page was already skipped by `run_ocr_document`'s existing-text guard) must not
+        // gain a font resource or content-stream object it never needed.
+        let mut doc = one_page_pdf();
+        let before_max_id = doc.max_id;
+
+        write_pages_text_layers(&mut doc, &[(0, vec![])], DEFAULT_MIN_CONFIDENCE).unwrap();
+
+        assert_eq!(
+            doc.max_id, before_max_id,
+            "no objects should have been added for an empty lines list"
         );
     }
 

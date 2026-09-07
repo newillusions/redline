@@ -62,6 +62,14 @@ pub struct AppSettings {
     /// Most-recently-used markup colors, newest first, capped at `MAX_RECENT_COLORS`.
     #[serde(default)]
     pub recent_colors: Vec<String>,
+    /// Auto-OCR Phase 2c-ii: when `true`, opening a document with no extractable text on
+    /// its sampled leading pages (see `commands::ocr::document_needs_ocr`) automatically
+    /// runs OCR on it in the background. Defaults to `false` (bool's own zero value, so
+    /// `#[serde(default)]` needs no explicit default fn) — a silent, potentially
+    /// multi-minute background CPU operation firing on every scan a user opens is not a
+    /// safe default; the user opts in from Settings.
+    #[serde(default)]
+    pub auto_ocr_on_open: bool,
 }
 
 impl Default for AppSettings {
@@ -73,6 +81,7 @@ impl Default for AppSettings {
             author_name: String::new(),
             last_window: None,
             recent_colors: Vec::new(),
+            auto_ocr_on_open: false,
         }
     }
 }
@@ -157,6 +166,7 @@ mod tests {
         assert!(s.default_tool.is_none());
         assert!(s.last_window.is_none());
         assert!(s.recent_colors.is_empty());
+        assert!(!s.auto_ocr_on_open);
     }
 
     #[test]
@@ -180,6 +190,7 @@ mod tests {
                 maximized: true,
             }),
             recent_colors: vec!["#ff0000".to_string(), "#00ff00".to_string()],
+            auto_ocr_on_open: true,
         };
 
         save_settings(dir.path(), &settings).unwrap();
@@ -217,6 +228,10 @@ mod tests {
         assert!(loaded.default_tool.is_none());
         assert!(loaded.last_window.is_none());
         assert!(loaded.recent_colors.is_empty());
+        assert!(
+            !loaded.auto_ocr_on_open,
+            "a pre-2c-ii settings file must not silently turn on a background CPU op"
+        );
     }
 
     #[test]

@@ -304,6 +304,28 @@ describe("docops ipc invoke argument keys (Tauri v2 camelCase)", () => {
       applyAnnots: true,
     });
   });
+
+  it("documentNeedsOcr → docId", async () => {
+    mockInvokeDocops.mockResolvedValue(true as never);
+    await ipc.documentNeedsOcr("d1");
+    expect(mockInvokeDocops).toHaveBeenCalledWith("document_needs_ocr", { docId: "d1" });
+  });
+
+  it("runOcrDocument with no explicit minConfidence → docId / minConfidence:undefined", async () => {
+    await ipc.runOcrDocument("d1");
+    expect(mockInvokeDocops).toHaveBeenCalledWith("run_ocr_document", {
+      docId: "d1",
+      minConfidence: undefined,
+    });
+  });
+
+  it("runOcrDocument with an explicit minConfidence → docId / minConfidence (camelCase multi-word key)", async () => {
+    await ipc.runOcrDocument("d1", 0.6);
+    expect(mockInvokeDocops).toHaveBeenCalledWith("run_ocr_document", {
+      docId: "d1",
+      minConfidence: 0.6,
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

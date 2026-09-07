@@ -9,6 +9,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, fireEvent, waitFor } from "@testing-library/svelte";
 import { tick } from "svelte";
 import SettingsDialog from "./SettingsDialog.svelte";
+import { saveSettings } from "$lib/settings";
 import type { AppSettings } from "$lib/settings";
 import type { LicenseInfo } from "$lib/license";
 
@@ -19,6 +20,7 @@ const FAKE_SETTINGS: AppSettings = {
   author_name: "",
   last_window: null,
   recent_colors: [],
+  auto_ocr_on_open: false,
 };
 
 vi.mock("$lib/settings", () => ({
@@ -153,5 +155,33 @@ describe("SettingsDialog - License section", () => {
     // Even if the post-deactivate refresh fails, the section must fall back
     // to reflecting the known-good local result rather than erroring out.
     expect(await findByText(/not activated/i)).toBeTruthy();
+  });
+});
+
+describe("SettingsDialog - Auto-OCR toggle (Phase 2c-ii)", () => {
+  beforeEach(() => {
+    vi.mocked(saveSettings).mockReset().mockResolvedValue(undefined);
+    mockGetLicenseInfo.mockReset().mockResolvedValue(validInfo());
+  });
+
+  it("reflects the loaded setting's checked state", async () => {
+    mockGetLicenseInfo.mockResolvedValue(validInfo());
+    const { findByLabelText } = render(SettingsDialog, { props: { onClose: vi.fn() } });
+    const checkbox = (await findByLabelText(
+      /auto-ocr on open/i,
+    )) as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
+  });
+
+  it("toggling on and saving persists auto_ocr_on_open:true alongside the other fields", async () => {
+    const { findByLabelText, getByRole } = render(SettingsDialog, { props: { onClose: vi.fn() } });
+    const checkbox = await findByLabelText(/auto-ocr on open/i);
+    await fireEvent.click(checkbox);
+    await fireEvent.click(getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenCalledWith(
+        expect.objectContaining({ auto_ocr_on_open: true, theme: "dark" }),
+      ),
+    );
   });
 });

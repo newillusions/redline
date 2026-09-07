@@ -33,8 +33,10 @@
   import SavePromptDialog from "./components/SavePromptDialog.svelte";
   import PasswordPromptDialog from "./components/PasswordPromptDialog.svelte";
   import ConfirmDialog from "./components/ConfirmDialog.svelte";
-  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity } from "$lib/ipc";
-  import type { IndexStatus } from "$lib/ipc";
+  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity } from "$lib/ipc";
+  import type { IndexStatus, OcrProgressEvent } from "$lib/ipc";
+  import { listen } from "@tauri-apps/api/event";
+  import { loadSettings } from "$lib/settings";
   import SearchPanel from "./components/SearchPanel.svelte";
   import { SearchStore, computeViewportSearchOverlay, type UnifiedSearchHit, type SearchGroup, type DocSearchInput } from "$lib/search-store.svelte";
   import { createPasswordCache, getCachedPassword, setCachedPassword } from "$lib/password-cache";
@@ -295,6 +297,12 @@
   let isFlattening = $state(false);
   let isOptimizing = $state(false);
   let isRedacting = $state(false);
+  /** OCR (Phase 2c-ii) - single global run gate, matching isFlattening/isOptimizing/
+   *  isRedacting's own convention (one DocOps action at a time, app-wide). Tracks WHICH
+   *  doc is running so a background auto-OCR run on an inactive tab doesn't overwrite
+   *  the status banner the user is actually looking at. */
+  let isOcrRunning = $state(false);
+  let ocrRunningDocId = $state<string | null>(null);
   /** Compression/quality control for the Optimize action (spec §8 image downsampling) -
    *  Bluebeam-style preset: High (minimal loss) / Balanced (default) / Small (aggressive). */
   let imageQualityPreset = $state<ImageQualityPreset>("balanced");
@@ -334,6 +342,8 @@
 
   // Cleanup handle for the Tauri drag-drop listener.
   let _dropUnlisten: (() => void) | undefined;
+  // Cleanup handle for the OCR per-page progress event listener (Phase 2c-ii).
+  let _ocrProgressUnlisten: (() => void) | undefined;
 
   // ---------------------------------------------------------------------------
   // Recent-docs MRU list (Document History panel)
@@ -374,6 +384,15 @@
   async function initializeAppContent() {
     // Load the MRU list from the backend (non-blocking; failure is non-fatal).
     loadRecentDocs().then((docs) => { recentDocs = docs; }).catch(() => {});
+
+    // OCR per-page progress (Phase 2c-ii) - only updates the visible banner when the
+    // event's doc_id matches the run this session is currently tracking (see
+    // ocrRunningDocId's doc comment).
+    _ocrProgressUnlisten = await listen<OcrProgressEvent>("ocr-progress", (event) => {
+      const p = event.payload;
+      if (p.doc_id !== ocrRunningDocId) return;
+      docOpsStatus = `OCR running - page ${p.page_index + 1}: ${p.pages_done} of ${p.pages_total} page${p.pages_total === 1 ? "" : "s"} scanned (${p.lines_found} line${p.lines_found === 1 ? "" : "s"} found on this page)...`;
+    });
 
     await autoOpenIfRequested();
     // File drop: open each dropped PDF into a new tab (same dedup logic as File>Open).
@@ -431,6 +450,7 @@
 
   onDestroy(() => {
     _dropUnlisten?.();
+    _ocrProgressUnlisten?.();
     if (folderIndexPollTimer) clearInterval(folderIndexPollTimer);
   });
 
@@ -506,6 +526,16 @@
       listScales(doc.doc_id)
         .then((scales) => { ts.seedScales(scales); })
         .catch(() => {}); // scales are non-critical
+
+      // Auto-OCR-on-open (Phase 2c-ii, opt-in via Settings - default off). Best-effort,
+      // non-blocking: a failed settings load or detection must never slow or break
+      // opening the document, so any error here is swallowed rather than surfaced.
+      loadSettings()
+        .then((settings) => (settings.auto_ocr_on_open ? documentNeedsOcr(doc.doc_id) : false))
+        .then((needsOcr) => {
+          if (needsOcr) void runOcrForDoc(doc.doc_id, store);
+        })
+        .catch(() => {});
     } catch (e) {
       const message = String(e);
       if (message === ERR_PASSWORD_REQUIRED) {
@@ -829,6 +859,48 @@
     }
   }
 
+  /**
+   * OCR (Phase 2c-ii) - shared by the toolbar action and the auto-OCR-on-open trigger,
+   * same flush -> op -> reseed pattern the other DocOps handlers use (docops-handlers.ts).
+   * `docId`/`store` are passed explicitly rather than always reading `activeTab` because
+   * auto-OCR-on-open must be able to run against a just-opened document that isn't
+   * necessarily the currently focused tab (e.g. several PDFs opened at once via drag-drop).
+   */
+  async function runOcrForDoc(docId: string, store: MarkupStore) {
+    if (isOcrRunning) return;
+    openError = null;
+    docOpsStatus = null;
+    isOcrRunning = true;
+    ocrRunningDocId = docId;
+    try {
+      const report = await runDocOpAndReseed(
+        docId,
+        store,
+        { loadMarkups },
+        () => runOcrDocument(docId),
+      );
+      const skippedNote =
+        report.pages_skipped_existing_text > 0
+          ? ` (${report.pages_skipped_existing_text} page${report.pages_skipped_existing_text === 1 ? "" : "s"} already had text, skipped)`
+          : "";
+      docOpsStatus =
+        report.pages_ocred === 0
+          ? `OCR: no pages needed scanning${skippedNote || " - document is empty"}.`
+          : `OCR complete - ${report.pages_ocred} page${report.pages_ocred === 1 ? "" : "s"} scanned, ${report.lines_embedded} line${report.lines_embedded === 1 ? "" : "s"} embedded${skippedNote}.`;
+    } catch (e) {
+      openError = `OCR failed: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      isOcrRunning = false;
+      ocrRunningDocId = null;
+    }
+  }
+
+  /** Toolbar/menu action: OCR the active tab's document. */
+  async function handleRunOcr() {
+    if (!activeTab || isOcrRunning) return;
+    await runOcrForDoc(activeTab.docId, activeTab.store);
+  }
+
   // ---------------------------------------------------------------------------
   // Compare handlers (M6 Phase 1.1)
   // ---------------------------------------------------------------------------
@@ -997,6 +1069,14 @@
         title="Apply Redactions — permanently cover all Redact-marked regions with solid-black overlays (irreversible)"
       >
         {isRedacting ? "Redacting…" : "Apply Redactions"}
+      </button>
+      <button
+        class="btn-toolbar btn-docops"
+        onclick={handleRunOcr}
+        disabled={!activeTab || isOcrRunning || isSaving}
+        title="OCR this document — recognize scanned text and embed it as an invisible, searchable layer"
+      >
+        {isOcrRunning && ocrRunningDocId === activeTab?.docId ? "OCR running…" : "OCR this document"}
       </button>
       <button
         class="btn-toolbar btn-compare-toggle"

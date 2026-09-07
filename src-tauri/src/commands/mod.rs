@@ -9,6 +9,7 @@ pub mod docops;
 pub mod document;
 pub mod geometry;
 pub mod license;
+pub mod ocr;
 pub mod recent_docs;
 pub mod render;
 pub mod search;

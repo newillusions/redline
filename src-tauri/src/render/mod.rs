@@ -1354,6 +1354,16 @@ pub enum RenderCmd {
         page_index: u32,
         reply: oneshot::Sender<Result<PageSize>>,
     },
+    /// Rasterize a FULL page (not a tile) at `dpi`, for the `ocr` module (Phase 2c-ii's
+    /// `commands::ocr::run_ocr_document`). See `RenderEngine::render_page_full`'s doc
+    /// comment — this variant just dispatches to it on the render thread, matching every
+    /// other PDFium-touching command in this enum.
+    RenderPageFull {
+        doc_id: String,
+        page_index: u32,
+        dpi: f32,
+        reply: oneshot::Sender<Result<PageRaster>>,
+    },
     RenderTile {
         req: TileRequest,
         reply: oneshot::Sender<Result<RenderedTile>>,
@@ -1486,6 +1496,14 @@ impl RenderHandle {
                             reply,
                         } => {
                             let _ = reply.send(engine.page_size(&doc_id, page_index));
+                        }
+                        RenderCmd::RenderPageFull {
+                            doc_id,
+                            page_index,
+                            dpi,
+                            reply,
+                        } => {
+                            let _ = reply.send(engine.render_page_full(&doc_id, page_index, dpi));
                         }
                         RenderCmd::RenderTile { req, reply } => {
                             let _ = reply.send(engine.render_tile(&req));
@@ -1624,6 +1642,28 @@ impl RenderHandle {
             .send(RenderCmd::PageSize {
                 doc_id,
                 page_index,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("render thread gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
+    }
+
+    /// Rasterize a full page at `dpi` for the `ocr` module's Tesseract pipeline. See
+    /// `RenderEngine::render_page_full`'s doc comment.
+    pub async fn render_page_full(
+        &self,
+        doc_id: String,
+        page_index: u32,
+        dpi: f32,
+    ) -> Result<PageRaster> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(RenderCmd::RenderPageFull {
+                doc_id,
+                page_index,
+                dpi,
                 reply: reply_tx,
             })
             .map_err(|_| anyhow::anyhow!("render thread gone"))?;
@@ -1806,6 +1846,9 @@ fn send_init_error(cmd: RenderCmd, err: &anyhow::Error) {
             let _ = reply.send(None);
         }
         RenderCmd::PageSize { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+        }
+        RenderCmd::RenderPageFull { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
         }
         RenderCmd::RenderTile { reply, .. } => {
