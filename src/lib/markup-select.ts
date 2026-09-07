@@ -92,6 +92,43 @@ export function boundsOf(m: Markup): Bounds {
   return { minX: g.Point.x, minY: g.Point.y, maxX: g.Point.x, maxY: g.Point.y };
 }
 
+/** Numeric tolerance (PDF points) for "this Highlight markup was authored for THIS
+ *  exact rect" - a search-hit-driven Highlight's Quads box always exactly equals the
+ *  hit's own rect, so this only needs to absorb floating-point noise, not do a fuzzy
+ *  real-world overlap test. Exported so App.svelte's derived "already highlighted"
+ *  label check and this function agree on what "the same hit" means. */
+export const SEARCH_HIGHLIGHT_MATCH_TOL_PTS = 0.5;
+
+/**
+ * Ids of every existing Highlight markup on `page` whose bounds match `rect` within
+ * [`SEARCH_HIGHLIGHT_MATCH_TOL_PTS`] - i.e. one a prior click of "Highlight Checked"
+ * produced for this exact search hit. Used both to TOGGLE the action (owner defect
+ * 2026-09-07: clicking Highlight repeatedly "keeps adding a new highlight over the
+ * existing ones... no way to turn it off" - stacked translucent fills compound toward
+ * opaque) and to drive the button's "already highlighted" label. A pure function (no
+ * Svelte/App.svelte dependency) so it's unit-testable without mounting the app,
+ * mirroring `computeViewportSearchOverlay`'s own reason for living outside App.svelte.
+ */
+export function existingSearchHighlightIds(
+  markups: readonly Markup[],
+  page: number,
+  rect: [number, number, number, number]
+): string[] {
+  const [left, bottom, right, top] = rect;
+  return markups
+    .filter((m) => m.markup_type === "Highlight" && m.page === page)
+    .filter((m) => {
+      const b = boundsOf(m);
+      return (
+        Math.abs(b.minX - left) < SEARCH_HIGHLIGHT_MATCH_TOL_PTS &&
+        Math.abs(b.minY - bottom) < SEARCH_HIGHLIGHT_MATCH_TOL_PTS &&
+        Math.abs(b.maxX - right) < SEARCH_HIGHLIGHT_MATCH_TOL_PTS &&
+        Math.abs(b.maxY - top) < SEARCH_HIGHLIGHT_MATCH_TOL_PTS
+      );
+    })
+    .map((m) => m.id);
+}
+
 function _boundsOfPoints(pts: PdfPoint[]): Bounds {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const p of pts) {

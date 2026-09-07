@@ -47,6 +47,7 @@ function mountPanel(store: SearchStore, extra: Partial<Parameters<typeof render>
       onPickFolder,
       onJump,
       onHighlightChecked,
+      highlightCheckedAlreadyApplied: false,
       ...extra,
     },
   });
@@ -122,6 +123,29 @@ describe("SearchPanel — debounced search", () => {
     const input = getByTestId("search-input") as HTMLInputElement;
     await fireEvent.keyDown(input, { key: "Enter" });
     expect(onSearch).toHaveBeenCalledTimes(1);
+  });
+
+  it("never disables the input during a search — a disabled element blurs in every real browser, permanently kicking keyboard focus out of the search box (owner defect 2026-09-07, confirmed with a real-Chromium GUI harness — jsdom does not model disabled-blurs-focus, so this asserts the root-cause condition directly rather than relying on that browser behavior). Uses store.run() directly + tick(), not waitFor, per this suite's own fake-timers note below.", async () => {
+    let resolveSearch!: (hits: SearchHit[]) => void;
+    const store = new SearchStore(
+      fakeDeps({
+        searchDocument: vi.fn(() => new Promise<SearchHit[]>((resolve) => { resolveSearch = resolve; })),
+      })
+    );
+    store.query = "concrete";
+    const { getByTestId } = mountPanel(store);
+    const input = getByTestId("search-input") as HTMLInputElement;
+
+    const runPromise = store.run({ scope: "document", doc: { docId: "d1", label: "a.pdf", path: "/a.pdf", markups: [] } });
+    await tick();
+    expect(store.searching).toBe(true);
+    expect(input.disabled).toBe(false);
+
+    resolveSearch([hit(0)]);
+    await runPromise;
+    await tick();
+    expect(store.searching).toBe(false);
+    expect(input.disabled).toBe(false);
   });
 
   it("clearing the query to blank cancels the pending debounce and clears results", async () => {

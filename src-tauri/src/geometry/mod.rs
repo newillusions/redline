@@ -57,6 +57,84 @@ pub struct PdfPoint {
     pub y: f64,
 }
 
+// ---------------------------------------------------------------------------
+// Rotation- and MediaBox-origin-aware coordinate conversion.
+//
+// Canonical home for the true<->display transform (moved here 2026-09-07 from
+// `document::annots`, its original site - the 2026-08-06 markup interop fix - so a
+// second consumer, `render::search_page`'s rotation fix, doesn't have to duplicate it a
+// third time). See `document::annots`'s module doc comment (still there, unmodified) for
+// the full derivation and empirical verification against real PDFium rendering; the
+// short version: PDF content-stream/annotation coordinates ("true" space) are always in
+// the page's absolute default user space, unaffected by `/Rotate` or a non-origin
+// `/MediaBox` (ISO 32000-1 §14.4/§8.4.1) - but PDFium's OWN page-space APIs
+// (`get_page_size`, `render_tile`'s custom matrix, and per the 2026-09-07 rotation-space
+// probe in `render::tests::search_rotation_space`, also the raw `/MediaBox` origin but
+// NOT `FPDFText_*` search results) report a "display" space that bakes `/Rotate` in
+// (width/height swap on 90/270) and treats the MediaBox's own lower-left corner as
+// local (0,0). `w0`/`h0` are the page's TRUE (unrotated) MediaBox width/height; `ox`/`oy`
+// are its lower-left corner's absolute coordinates (0,0 for the common case).
+// ---------------------------------------------------------------------------
+
+/// Rotation-only step (MediaBox assumed to start at its own local (0,0)) - PDF true
+/// default user space -> PDFium "display" (rotated) page space.
+pub fn rotate_local_true_to_display(p: PdfPoint, rotation: i32, w0: f64, h0: f64) -> PdfPoint {
+    match rotation.rem_euclid(360) {
+        90 => PdfPoint {
+            x: p.y,
+            y: w0 - p.x,
+        },
+        180 => PdfPoint {
+            x: w0 - p.x,
+            y: h0 - p.y,
+        },
+        270 => PdfPoint {
+            x: h0 - p.y,
+            y: p.x,
+        },
+        _ => p, // 0 (or a non-multiple-of-90 value some other tool wrote) - identity.
+    }
+}
+
+/// Exact inverse of [`rotate_local_true_to_display`].
+pub fn rotate_local_display_to_true(p: PdfPoint, rotation: i32, w0: f64, h0: f64) -> PdfPoint {
+    match rotation.rem_euclid(360) {
+        90 => PdfPoint {
+            x: w0 - p.y,
+            y: p.x,
+        },
+        180 => PdfPoint {
+            x: w0 - p.x,
+            y: h0 - p.y,
+        },
+        270 => PdfPoint {
+            x: p.y,
+            y: h0 - p.x,
+        },
+        _ => p,
+    }
+}
+
+/// PDF true (absolute) default user space -> PDFium "display" page space: shift into the
+/// MediaBox's own local frame, then rotate.
+pub fn true_to_display(p: PdfPoint, rotation: i32, w0: f64, h0: f64, ox: f64, oy: f64) -> PdfPoint {
+    let local = PdfPoint {
+        x: p.x - ox,
+        y: p.y - oy,
+    };
+    rotate_local_true_to_display(local, rotation, w0, h0)
+}
+
+/// PDFium "display" page space -> PDF true (absolute) default user space: un-rotate, then
+/// shift out of the MediaBox's local frame. Exact inverse of [`true_to_display`].
+pub fn display_to_true(p: PdfPoint, rotation: i32, w0: f64, h0: f64, ox: f64, oy: f64) -> PdfPoint {
+    let local = rotate_local_display_to_true(p, rotation, w0, h0);
+    PdfPoint {
+        x: local.x + ox,
+        y: local.y + oy,
+    }
+}
+
 /// Category of snap target — mirrors Bluebeam's snap modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapKind {

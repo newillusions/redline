@@ -37,8 +37,16 @@
     onPickFolder: () => void;
     /** A result was clicked or keyboard-activated. */
     onJump: (hit: UnifiedSearchHit, group: SearchGroup) => void;
-    /** Apply a Highlight markup to every checked TEXT result ("Check Options" -> Highlight Checked). */
+    /** Toggle a Highlight markup on every checked TEXT result ("Check Options" ->
+     *  Highlight Checked / Clear Highlights - see App.svelte's applyHighlightToChecked
+     *  doc comment: this is a toggle per-hit, not an always-add action). */
     onHighlightChecked: () => void;
+    /** True when every currently-checked result already has its own Highlight markup -
+     *  computed in App.svelte (needs MarkupStore/tab access this component deliberately
+     *  doesn't have). Relabels the button "Clear Highlights" so the toggle behaviour
+     *  (owner defect 2026-09-07: highlighting stacked with "no way to turn it off") is
+     *  visibly a pair, not a one-way action. */
+    highlightCheckedAlreadyApplied: boolean;
   }
 
   const {
@@ -49,6 +57,7 @@
     onPickFolder,
     onJump,
     onHighlightChecked,
+    highlightCheckedAlreadyApplied,
   }: Props = $props();
 
   const SCOPES: Array<{ value: SearchScope; label: string }> = [
@@ -185,6 +194,24 @@
   {/if}
 
   <div class="search-input-row">
+    <!-- Owner-reported defect (2026-09-07, v0.3.18): "the highlight and jump to
+         result functions aren't working" after a search that DOES return hits.
+         Root cause (confirmed with a real-browser GUI harness — jsdom does not
+         reproduce this, see tools/repro-search-input-focus.mjs): this input used
+         to carry `disabled={store.searching}`. Disabling a focused element blurs
+         it in every real browser engine (Chromium/WebKit/WebView2), and nothing
+         re-focuses it once `store.searching` flips back to false a moment later
+         — so the very first search (via Enter, the Find button, or debounce)
+         permanently kicks focus out of the input for the rest of that panel
+         session. SearchPanel's own Enter/Shift+Enter handler (handleKeydown,
+         below) is bound to THIS element's onkeydown, so once focus is gone,
+         pressing Enter again to step to the next/prev result silently does
+         nothing — mouse clicks on a result row and the global F3/Shift+F3
+         shortcut (App.svelte, window-level) are unaffected, which is why the
+         defect reads as intermittent rather than total. Disabling was never
+         load-bearing for correctness — SearchStore.run()'s runToken already
+         discards a stale in-flight response if a newer search supersedes it —
+         so it's dropped rather than patched with an explicit refocus. -->
     <input
       class="search-input"
       type="search"
@@ -193,7 +220,7 @@
       oninput={handleQueryInput}
       onkeydown={handleKeydown}
       aria-label="Search query"
-      disabled={store.searching}
+      aria-busy={store.searching}
       data-testid="search-input"
     />
     <button
@@ -264,9 +291,14 @@
         class="check-opt-btn check-opt-btn--primary"
         onclick={onHighlightChecked}
         disabled={store.checkedHits.length === 0}
-        title="Apply a Highlight markup to every checked text result"
+        title={highlightCheckedAlreadyApplied
+          ? "Remove the Highlight markup from every checked text result"
+          : "Apply a Highlight markup to every checked text result"}
+        data-testid="highlight-checked-btn"
       >
-        ⚡ Highlight Checked ({store.checkedHits.length})
+        {highlightCheckedAlreadyApplied
+          ? `✕ Clear Highlights (${store.checkedHits.length})`
+          : `⚡ Highlight Checked (${store.checkedHits.length})`}
       </button>
     </div>
 

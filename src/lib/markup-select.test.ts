@@ -17,6 +17,7 @@ import {
   insertVertex,
   deleteVertex,
   calloutBoxBounds,
+  existingSearchHighlightIds,
   HANDLE_IDS,
 } from "./markup-select";
 import { DEFAULT_TEXT_BOX } from "./markup-tools";
@@ -643,5 +644,69 @@ describe("deleteVertex", () => {
     const before = JSON.stringify(g);
     deleteVertex(g, 1, 2);
     expect(JSON.stringify(g)).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// existingSearchHighlightIds (owner defect 2026-09-07: "Highlight Checked" kept
+// adding a new highlight over the existing ones, with no way to turn it off)
+// ---------------------------------------------------------------------------
+describe("existingSearchHighlightIds", () => {
+  /** A search-hit-driven Highlight markup, matching exactly what
+   *  App.svelte's applyHighlightToChecked authors: one Quads box equal to
+   *  [left,bottom,right,top]. */
+  function mkSearchHighlight(id: string, page: number, rect: [number, number, number, number]): Markup {
+    const [left, bottom, right, top] = rect;
+    return {
+      id, markup_type: "Highlight", page,
+      geometry: {
+        Quads: [[{ x: left, y: top }, { x: right, y: top }, { x: left, y: bottom }, { x: right, y: bottom }]],
+      },
+      appearance: AP, subject: null, layer: null, contents: null, group_id: null,
+      audit: AUDIT, workflow: WORKFLOW, measurement: null,
+    };
+  }
+
+  const rect: [number, number, number, number] = [50, 700, 150, 720];
+
+  it("finds no match when no Highlight exists yet", () => {
+    expect(existingSearchHighlightIds([], 0, rect)).toEqual([]);
+  });
+
+  it("finds the markup a prior click created for the EXACT same hit", () => {
+    const h = mkSearchHighlight("h1", 0, rect);
+    expect(existingSearchHighlightIds([h], 0, rect)).toEqual(["h1"]);
+  });
+
+  it("ignores a Highlight on a DIFFERENT page", () => {
+    const h = mkSearchHighlight("h1", 3, rect);
+    expect(existingSearchHighlightIds([h], 0, rect)).toEqual([]);
+  });
+
+  it("ignores a Highlight at a DIFFERENT rect on the same page", () => {
+    const h = mkSearchHighlight("h1", 0, [0, 0, 10, 10]);
+    expect(existingSearchHighlightIds([h], 0, rect)).toEqual([]);
+  });
+
+  it("ignores non-Highlight markup types even at the exact same rect", () => {
+    const h = mkMarkup("r1", { Rect: { min: { x: rect[0], y: rect[1] }, max: { x: rect[2], y: rect[3] } } });
+    expect(existingSearchHighlightIds([{ ...h, page: 0 }], 0, rect)).toEqual([]);
+  });
+
+  it("returns EVERY match, self-healing a pre-fix stack of duplicate highlights", () => {
+    const stack = [
+      mkSearchHighlight("h1", 0, rect),
+      mkSearchHighlight("h2", 0, rect),
+      mkSearchHighlight("h3", 0, rect),
+    ];
+    expect(existingSearchHighlightIds(stack, 0, rect).sort()).toEqual(["h1", "h2", "h3"]);
+  });
+
+  it("tolerates sub-tolerance floating-point noise but not a real offset", () => {
+    const nearlyExact = mkSearchHighlight("h1", 0, [50.1, 699.9, 150.05, 720.02]);
+    expect(existingSearchHighlightIds([nearlyExact], 0, rect)).toEqual(["h1"]);
+
+    const offsetBy2pt = mkSearchHighlight("h2", 0, [52, 700, 150, 720]);
+    expect(existingSearchHighlightIds([offsetBy2pt], 0, rect)).toEqual([]);
   });
 });

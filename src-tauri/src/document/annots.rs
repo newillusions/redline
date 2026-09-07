@@ -8,7 +8,7 @@
 use anyhow::{bail, Context, Result};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId};
 
-use crate::geometry::PdfPoint;
+use crate::geometry::{display_to_true, true_to_display, PdfPoint};
 use crate::markup::{appearance, Markup, MarkupGeometry};
 
 // ---------------------------------------------------------------------------
@@ -66,65 +66,15 @@ use crate::markup::{appearance, Markup, MarkupGeometry};
 // origin were (0,0)) and the origin shift is applied outside that step - order matters:
 // subtract-then-rotate going true->display, rotate-then-add going display->true.
 
-/// Rotation-only step (MediaBox assumed to start at its own local (0,0)) - PDF true
-/// default user space -> PDFium "display" (rotated) page space.
-fn rotate_local_true_to_display(p: PdfPoint, rotation: i32, w0: f64, h0: f64) -> PdfPoint {
-    match rotation.rem_euclid(360) {
-        90 => PdfPoint {
-            x: p.y,
-            y: w0 - p.x,
-        },
-        180 => PdfPoint {
-            x: w0 - p.x,
-            y: h0 - p.y,
-        },
-        270 => PdfPoint {
-            x: h0 - p.y,
-            y: p.x,
-        },
-        _ => p, // 0 (or a non-multiple-of-90 value some other tool wrote) - identity.
-    }
-}
-
-/// Exact inverse of [`rotate_local_true_to_display`] (verified by round-trip in
-/// `rotation_interop` tests).
-fn rotate_local_display_to_true(p: PdfPoint, rotation: i32, w0: f64, h0: f64) -> PdfPoint {
-    match rotation.rem_euclid(360) {
-        90 => PdfPoint {
-            x: w0 - p.y,
-            y: p.x,
-        },
-        180 => PdfPoint {
-            x: w0 - p.x,
-            y: h0 - p.y,
-        },
-        270 => PdfPoint {
-            x: p.y,
-            y: h0 - p.x,
-        },
-        _ => p,
-    }
-}
-
-/// PDF true (absolute) default user space -> PDFium "display" page space: shift into the
-/// MediaBox's own local frame, then rotate.
-fn true_to_display(p: PdfPoint, rotation: i32, w0: f64, h0: f64, ox: f64, oy: f64) -> PdfPoint {
-    let local = PdfPoint {
-        x: p.x - ox,
-        y: p.y - oy,
-    };
-    rotate_local_true_to_display(local, rotation, w0, h0)
-}
-
-/// PDFium "display" page space -> PDF true (absolute) default user space: un-rotate, then
-/// shift out of the MediaBox's local frame. Exact inverse of [`true_to_display`].
-fn display_to_true(p: PdfPoint, rotation: i32, w0: f64, h0: f64, ox: f64, oy: f64) -> PdfPoint {
-    let local = rotate_local_display_to_true(p, rotation, w0, h0);
-    PdfPoint {
-        x: local.x + ox,
-        y: local.y + oy,
-    }
-}
+// The four closed-form transform functions (`rotate_local_true_to_display`,
+// `rotate_local_display_to_true`, `true_to_display`, `display_to_true`) that used to
+// live here moved to `crate::geometry` on 2026-09-07 (imported above) - a second
+// consumer (`render::search_page`'s rotation-space fix for search-hit highlight/jump
+// geometry, owner defect 2026-09-07) needed the exact same math, and duplicating a
+// closed-form derivation this easy to get subtly wrong is worse than one shared,
+// already-round-trip-tested home for it. Behavior here is unchanged - this module's own
+// `rotation_interop` tests below still exercise the same functions, just imported
+// rather than defined locally.
 
 /// Apply a point-wise transform to every coordinate in a `MarkupGeometry`. `Rect`'s two
 /// corners are re-normalised (component-wise min/max) after mapping rather than kept as

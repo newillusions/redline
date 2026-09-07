@@ -46,6 +46,7 @@
   import type { DocumentInfo, ImageQualityPreset } from "$lib/ipc";
   import { MarkupStore } from "$lib/markup-store.svelte";
   import { buildMarkup } from "$lib/markup-tools";
+  import { existingSearchHighlightIds } from "$lib/markup-select";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
   import { DocTabStore } from "$lib/doc-tabs.svelte";
   import type { ViewportSnapshot } from "$lib/viewport";
@@ -147,6 +148,25 @@
     )
   );
 
+  /** True when every currently-checked search hit already has its own Highlight markup
+   *  (see `existingSearchHighlightIds` / the Highlight-Checked toggle below) - drives
+   *  the "Highlight Checked" button's label so the results panel visibly reads as a
+   *  toggle ("Clear Highlights" once everything checked is already highlighted) rather
+   *  than an always-add action with no visible way back (owner defect 2026-09-07).
+   *  Computed here, not in SearchPanel, because it needs MarkupStore/tab access
+   *  SearchPanel deliberately doesn't have (see its own header comment). */
+  const checkedAlreadyHighlighted = $derived.by(() => {
+    const checked = searchStore.checkedHits;
+    if (checked.length === 0) return false;
+    return checked.every((ref) => {
+      const hit = ref.hit;
+      if (hit.kind !== "text" || !hit.rect || !hit.docId) return false;
+      const tab = tabStore.tabs.find((t) => t.docId === hit.docId);
+      if (!tab) return false;
+      return existingSearchHighlightIds(tab.store.markups, hit.page, hit.rect).length > 0;
+    });
+  });
+
   /** Run a search for searchStore.query against searchStore's current scope. */
   async function runSearch() {
     if (searchStore.scope === "document") {
@@ -222,11 +242,27 @@
     if (ref) void handleSearchJump(ref.hit, searchStore.groups[ref.groupIndex]);
   }
 
+
   /**
    * "Check Options" -> Highlight Checked (Bluebeam parity, confirmed via the
    * official "How to Search PDFs" / "How To Use Visual Search" tutorials:
    * check results, apply Highlight/Underline/Hyperlink/etc to all of them at
    * once — this build ships Highlight, the rest are named follow-ups).
+   *
+   * TOGGLE, not always-add (owner defect 2026-09-07: searching "proposed" in a title
+   * block and clicking Highlight repeatedly "keeps adding a new highlight over the
+   * existing ones... and there's no way to turn it off" - each click created ANOTHER
+   * Highlight markup stacked on the same spot, and stacked translucent fills compound
+   * toward opaque, eventually hiding the text underneath). For each checked hit: if a
+   * Highlight markup already exists at that EXACT rect (this action's own prior output -
+   * `existingSearchHighlightIds`), DELETE it instead of creating another; only create
+   * when none exists. This also self-heals any stack already created by the pre-fix
+   * behavior - the first click on an N-times-stacked result clears every one of them
+   * (`store.delete` per id, not just one), the next click re-adds a single highlight.
+   * Each created markup uses `tab.store.draftAppearance` unchanged - the G9 Bluebeam
+   * interop fix already established Highlight's default appearance as a translucent
+   * (CA 0.35, multiply-blend) fill, not opaque; nothing here overrides that, so a SINGLE
+   * highlight was never the problem - only the uncapped stacking was.
    *
    * Scoped to kind==="text" hits belonging to an ALREADY-OPEN tab (`docId`
    * set) — a folder/recents-scope hit for a file that isn't open has no
@@ -247,6 +283,7 @@
     }
 
     let applied = 0;
+    let removed = 0;
     let skipped = 0;
     const now = new Date().toISOString();
 
@@ -261,6 +298,14 @@
         skipped += 1;
         continue;
       }
+
+      const existingIds = existingSearchHighlightIds(tab.store.markups, hit.page, hit.rect);
+      if (existingIds.length > 0) {
+        for (const id of existingIds) tab.store.delete(id);
+        removed += 1;
+        continue;
+      }
+
       const [left, bottom, right, top] = hit.rect;
       const m = buildMarkup({
         markupType: "Highlight",
@@ -285,10 +330,11 @@
     }
 
     searchStore.uncheckAll();
-    docOpsStatus =
-      skipped > 0
-        ? `Highlighted ${applied} result${applied !== 1 ? "s" : ""}; skipped ${skipped} not currently open.`
-        : `Highlighted ${applied} result${applied !== 1 ? "s" : ""}.`;
+    const parts: string[] = [];
+    if (applied > 0) parts.push(`highlighted ${applied} result${applied !== 1 ? "s" : ""}`);
+    if (removed > 0) parts.push(`cleared ${removed} existing highlight${removed !== 1 ? "s" : ""}`);
+    if (skipped > 0) parts.push(`skipped ${skipped} not currently open`);
+    docOpsStatus = parts.length > 0 ? `${parts.join("; ")}.` : "Nothing to do.";
   }
 
   // Per-operation busy flags (apply to the active tab's document).
@@ -1198,6 +1244,7 @@
                 onPickFolder={pickSearchFolder}
                 onJump={handleSearchJump}
                 onHighlightChecked={applyHighlightToChecked}
+                highlightCheckedAlreadyApplied={checkedAlreadyHighlighted}
               />
             </div>
           </div>

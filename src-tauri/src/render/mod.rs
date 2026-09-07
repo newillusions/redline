@@ -31,7 +31,7 @@ use pdfium_render::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use crate::geometry::rects_to_quads;
+use crate::geometry::{rects_to_quads, true_to_display, PdfPoint};
 use crate::text::{SearchHit, SearchOptions, TextRangeSelection};
 
 /// Files at or above this size use the memory-mapped `FPDF_LoadMemDocument64`
@@ -683,8 +683,20 @@ impl RenderEngine {
     /// Search for all occurrences of `query` on a single page.
     ///
     /// Uses PDFium's FPDFText search API via `PdfPageText::search()`.
-    /// Each hit's bounding rect is in PDF user-space (y-up, origin bottom-left),
-    /// matching the same coordinate system as markups (spec §5).
+    ///
+    /// Each hit's bounding rect is returned in PDFium "display" page space - the SAME
+    /// convention `get_page_size`/`render_tile` use (rotation baked in, MediaBox's own
+    /// lower-left corner as local origin) and that `document::annots` established
+    /// markups are kept in throughout the frontend (spec §5's "same coordinate system
+    /// as markups" - see `crate::geometry`'s true<->display module doc comment for the
+    /// full derivation). `FPDFText_*` (unlike `get_page_size`/rendering) reports RAW
+    /// segment bounds in the page's TRUE (unrotated, spec-absolute) space regardless of
+    /// `/Rotate` - empirically confirmed via `render::tests::search_rotation_space`
+    /// (owner defect 2026-09-07: "redline is highlighting and zooming to the spot but
+    /// it's missed the actual target word" - reproduced on a CAD title block on a
+    /// rotated sheet, not on plain unrotated text). `true_to_display` below converts
+    /// each hit into the space every other consumer of `SearchHit.rect` already expects,
+    /// so callers never need to know PDFium's text API is the odd one out.
     ///
     /// Returns an empty Vec for blank/image-only pages (no text layer) or when the
     /// query has no matches. Returns Err only if the doc_id is unknown.
@@ -703,6 +715,43 @@ impl RenderEngine {
         // Load page (cached; the LRU page-handle cache keeps it hot if recently rendered).
         let page = doc.page(page_index)?;
 
+        // TRUE (unrotated) MediaBox width/height + lower-left origin, read straight from
+        // the page's own boundary box - unaffected by `/Rotate` (a literal dictionary
+        // array, same as `document::annots::true_media_box`'s lopdf read, just sourced
+        // via PDFium here since this is the render thread's own already-open page
+        // handle). `rotation` likewise comes straight from PDFium rather than being
+        // re-derived from `page_size()`'s swapped width/height, to avoid a second,
+        // easy-to-get-backwards inference.
+        let mut rotation: i32 = match page.rotation() {
+            Ok(PdfPageRenderRotation::Degrees90) => 90,
+            Ok(PdfPageRenderRotation::Degrees180) => 180,
+            Ok(PdfPageRenderRotation::Degrees270) => 270,
+            Ok(PdfPageRenderRotation::None) | Err(_) => 0,
+        };
+        let (w0, h0, ox, oy) = match page.boundaries().media() {
+            Ok(b) => {
+                let (l, r) = (b.bounds.left().value as f64, b.bounds.right().value as f64);
+                let (bo, t) = (b.bounds.bottom().value as f64, b.bounds.top().value as f64);
+                ((r - l).abs(), (t - bo).abs(), l.min(r), bo.min(t))
+            }
+            // No /MediaBox is a malformed PDF PDFium wouldn't normally have opened at
+            // all. `true_to_display` is only an identity transform when rotation==0,
+            // so a rotated page hitting this arm must have its rotation forced to 0
+            // too - otherwise the (0,0,0,0) fallback box gets rotated against, which
+            // silently mis-maps the hit rect with no error. Forcing both together
+            // makes the fallback a TRUE identity: the raw PDFium rect passes through
+            // unchanged. Logged, not hard-failed - search must not hard-fail on a
+            // malformed MediaBox rather than the caller's real query.
+            Err(e) => {
+                warn!(
+                    "search_page: doc={doc_id} page={page_index} MediaBox read failed \
+                     ({e}); treating page as rotation 0 for identity hit-rect mapping"
+                );
+                rotation = 0;
+                (0.0, 0.0, 0.0, 0.0)
+            }
+        };
+
         let page_text = page.text().with_context(|| {
             format!("Failed to load text page for doc={doc_id} page={page_index}")
         })?;
@@ -719,7 +768,8 @@ impl RenderEngine {
 
         while let Some(segments) = search.find_next() {
             // Each result is a PdfPageTextSegments (may span multiple rects due to
-            // line-wrapping). Collect all segment bounds and merge into one hit rect.
+            // line-wrapping). Collect all segment bounds and merge into one hit rect,
+            // in PDFium's TRUE (unrotated) text-space - see this function's doc comment.
             let mut merged_left = f64::MAX;
             let mut merged_bottom = f64::MAX;
             let mut merged_right = f64::MIN;
@@ -728,7 +778,7 @@ impl RenderEngine {
 
             for seg in segments.iter() {
                 let b = seg.bounds();
-                // PdfRect: left/bottom/right/top in PDF user-space points.
+                // PdfRect: left/bottom/right/top in PDFium's TRUE text-space points.
                 let left = b.left().value as f64;
                 let bottom = b.bottom().value as f64;
                 let right = b.right().value as f64;
@@ -747,9 +797,27 @@ impl RenderEngine {
             // Guard: skip degenerate rects (empty or inverted — can occur on
             // image-only pages where the text layer has zero-area entries).
             if merged_left < merged_right && merged_bottom < merged_top {
+                // Convert TRUE -> DISPLAY space (identity when rotation==0 and the
+                // MediaBox already starts at (0,0) - the overwhelming common case, zero
+                // behaviour change there). A 90/270 rotation can flip which mapped
+                // corner ends up the smaller one on a given axis, same caveat
+                // `document::annots::map_geometry` documents for markup geometry - so
+                // the two mapped corners are re-normalised by component-wise min/max
+                // rather than kept positionally.
+                let a = true_to_display(
+                    PdfPoint { x: merged_left, y: merged_bottom },
+                    rotation, w0, h0, ox, oy,
+                );
+                let b = true_to_display(
+                    PdfPoint { x: merged_right, y: merged_top },
+                    rotation, w0, h0, ox, oy,
+                );
+                let (left, right) = (a.x.min(b.x), a.x.max(b.x));
+                let (bottom, top) = (a.y.min(b.y), a.y.max(b.y));
+
                 hits.push(SearchHit {
                     page: page_index,
-                    rect: [merged_left, merged_bottom, merged_right, merged_top],
+                    rect: [left, bottom, right, top],
                     snippet,
                 });
             }
@@ -2468,6 +2536,157 @@ pub(crate) mod tests {
             expected.2,
             expected.3
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // search_page rotation-space empirical test (owner defect 2026-09-07: "redline is
+    // highlighting and zooming to the spot, but it's missed the actual target word" -
+    // specifically reproduced on a CAD title block on a rotated sheet, not on plain
+    // horizontal text). This answers, EMPIRICALLY (not by reading pdfium-render's docs),
+    // the question the frontend fix depends on: does `search_page`'s returned `rect`
+    // already account for the page's `/Rotate`, the same way `get_page_size`/`render_tile`
+    // do (per the rotation-interop finding in `document::annots` - "PDFium applies
+    // /Rotate internally to every page-space API uniformly")? Text extraction
+    // (`FPDFText_*`) is a DIFFERENT PDFium API family from page-size/rendering, and per
+    // ISO 32000-1 the content-stream coordinate system a text-showing operator's position
+    // is defined in is the page's TRUE (unrotated) default user space - /Rotate is a
+    // purely VIEWING-time transform layered on top, not a change to that coordinate
+    // system - so there's no a-priori reason the two API families would share a
+    // convention. Method: place the SAME text at the SAME true-space position on two
+    // otherwise-identical one-page docs, one with rotation=0 (identity - true==display)
+    // and one with rotation=90 (via `page_ops::rotate_page`, the exact production code
+    // path a user's "rotate this page" action and a page authored with /Rotate already
+    // set both go through), then compare `search_page`'s two returned rects.
+    // -----------------------------------------------------------------------
+
+    mod search_rotation_space {
+        use super::*;
+        use crate::text::SearchOptions;
+
+        /// One-page 612x792 doc with real vector Helvetica text (searchable, not an
+        /// image) at a KNOWN true-space baseline - mirrors `bin/gen_ocr_fixtures.rs`'s
+        /// `build_source_pdf` (real vector text, WinAnsiEncoding) rather than duplicating
+        /// a third text-fixture builder in the codebase.
+        fn one_page_with_text(text: &str, x: f64, y: f64, font_size: f64) -> lopdf::Document {
+            use lopdf::{dictionary, Dictionary, Document, Object, Stream};
+
+            let mut doc = Document::with_version("1.7");
+            let pages_id = doc.new_object_id();
+            let font_id = doc.add_object(dictionary! {
+                "Type" => "Font", "Subtype" => "Type1",
+                "BaseFont" => "Helvetica", "Encoding" => "WinAnsiEncoding",
+            });
+            let resources = dictionary! {
+                "Font" => Object::Dictionary(dictionary! { "F1" => Object::Reference(font_id) }),
+            };
+            let content = format!("BT\n/F1 {font_size:.2} Tf\n{x:.2} {y:.2} Td\n({text}) Tj\nET\n");
+            let content_id = doc.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page", "Parent" => pages_id,
+                "MediaBox" => vec![0.0.into(), 0.0.into(), 612.0.into(), 792.0.into()],
+                "Resources" => Object::Dictionary(resources),
+                "Contents" => Object::Reference(content_id),
+            });
+            doc.objects.insert(
+                pages_id,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1_i64,
+                }),
+            );
+            let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+            doc.trailer.set("Root", catalog_id);
+            doc
+        }
+
+        /// Search a saved-to-disk doc via the SAME `RenderEngine::search_page` the
+        /// `search_document` Tauri command calls, returning the first hit's rect.
+        fn search_first_hit(path: &std::path::Path, doc_id: &str, query: &str) -> [f64; 4] {
+            let mut e = RenderEngine::new().expect("pdfium (PDFIUM_DYNAMIC_LIB_PATH)");
+            e.open_document(path.to_path_buf(), doc_id.into(), None)
+                .expect("open_document");
+            let hits = e
+                .search_page(doc_id, 0, query, &SearchOptions::default())
+                .expect("search_page");
+            assert_eq!(hits.len(), 1, "expected exactly one hit for {query:?}: {hits:?}");
+            hits[0].rect
+        }
+
+        /// Regression test for the fix. History: an earlier version of this test was an
+        /// exploratory probe (no fix yet) that logged whichever of "true space" /
+        /// "display space" `search_page` matched, without asserting either was
+        /// required — it CONFIRMED (see the 2026-09-07 commit this comment references)
+        /// that `search_page` was returning TRUE (unrotated) space while every other
+        /// `SearchHit.rect` consumer (`pdfUserSpaceToScreen`, `Viewport.pageSearchHits`)
+        /// expects DISPLAY space, exactly matching the owner's report of a search
+        /// highlight/jump landing off the real glyphs on a rotated CAD title block. Now
+        /// that `search_page` converts true->display internally, this asserts the
+        /// DISPLAY-space match specifically - it fails again if that conversion ever
+        /// regresses.
+        #[test]
+        fn search_page_rect_is_in_display_space_matching_get_page_size_under_rotation() {
+            if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+                eprintln!("skip: no PDFIUM_DYNAMIC_LIB_PATH");
+                return;
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+
+            // Identity case: rotation 0, true space == display space, so this is
+            // unambiguous ground truth for "the true-space rect of this text".
+            let mut doc0 = one_page_with_text("TESTWORD", 100.0, 100.0, 24.0);
+            let path0 = dir.path().join("rot0.pdf");
+            doc0.save(&path0).unwrap();
+            let rect0 = search_first_hit(&path0, "rot0", "TESTWORD");
+
+            // Same text, same TRUE-space baseline, but the PAGE carries /Rotate 90 -
+            // via the exact production code path (`page_ops::rotate_page`) a user's
+            // "rotate this page" action or an already-rotated CAD-exported sheet both
+            // exercise.
+            let mut doc90 = one_page_with_text("TESTWORD", 100.0, 100.0, 24.0);
+            crate::document::page_ops::rotate_page(&mut doc90, 0, 90).expect("rotate_page");
+            let path90 = dir.path().join("rot90.pdf");
+            doc90.save(&path90).unwrap();
+            let rect90 = search_first_hit(&path90, "rot90", "TESTWORD");
+
+            // Hand-computed prediction of the DISPLAY-space rect (rotation 90 on a
+            // 612x792 MediaBox maps a true-space point (x,y) -> local (y, 612-x) -
+            // `rotate_local_true_to_display`'s own documented formula, hand-copied here
+            // rather than imported, so this test doesn't just prove the fix agrees with
+            // itself).
+            let predicted_display = {
+                let (l, b, rt, t) = (rect0[0], rect0[1], rect0[2], rect0[3]);
+                let map = |x: f64, y: f64| (y, 612.0 - x);
+                let corners = [map(l, b), map(l, t), map(rt, b), map(rt, t)];
+                let xs: Vec<f64> = corners.iter().map(|c| c.0).collect();
+                let ys: Vec<f64> = corners.iter().map(|c| c.1).collect();
+                [
+                    xs.iter().cloned().fold(f64::MAX, f64::min),
+                    ys.iter().cloned().fold(f64::MAX, f64::min),
+                    xs.iter().cloned().fold(f64::MIN, f64::max),
+                    ys.iter().cloned().fold(f64::MIN, f64::max),
+                ]
+            };
+
+            let tol = 1.0;
+            let close = (0..4).all(|i| (rect90[i] - predicted_display[i]).abs() < tol);
+            assert!(
+                close,
+                "rect90 ({rect90:?}) does not match the predicted DISPLAY-space rect \
+                 ({predicted_display:?}, derived from the unrotated rect0={rect0:?}) - \
+                 search_page is not correctly converting true->display space for a \
+                 rotated page, which reproduces the owner's 2026-09-07 report of a \
+                 search highlight/jump landing off the real text on a rotated sheet"
+            );
+            // And the true-space identity value must NOT match (proves the fixture
+            // actually exercises a real rotation difference, not a no-op).
+            let unconverted = (0..4).all(|i| (rect90[i] - rect0[i]).abs() < tol);
+            assert!(
+                !unconverted,
+                "rect90 equals the raw unrotated rect0 - search_page appears to have \
+                 stopped converting to display space entirely (regressed back to TRUE \
+                 space)"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
