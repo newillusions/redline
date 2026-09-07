@@ -51,7 +51,11 @@
   --radius-lg: 10px;
 
   /* --- Panel sizing (Bluebeam-like 3-column layout) --- */
-  --panel-left-width:   260px;
+  --panel-left-width:        260px;
+  /* Search takes over the whole left column while open (owner defect fix,
+     2026-09-07 — see App.svelte's panel-left--search comment) and needs more
+     room than the shared-sidebar default for the query row + result list. */
+  --panel-left-width-search: 340px;
   --panel-right-width:  260px;
   --toolbar-height:     40px;
   --bottom-panel-height: 200px;
@@ -75,11 +79,24 @@ body {
   -webkit-user-select: none;
 }
 
-/* --- Scrollbars (thin, themed) --- */
-::-webkit-scrollbar        { width: 6px; height: 6px; }
-::-webkit-scrollbar-track  { background: var(--color-bg-panel); }
-::-webkit-scrollbar-thumb  { background: var(--color-border); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: var(--color-text-muted); }
+/* --- Scrollbars (thin, themed) ---
+   Owner-reported defect (2026-09-07): "the toolchest panels probably need to have
+   vertical scroll bars where needed." Verified via tools/gui-harness.mjs with a
+   12-set/96-tool fixture: overflow WAS already scrollable (wheel + programmatic
+   scrollTop both worked, content was reachable) but the scrollbar itself was
+   invisible — track (--color-bg-panel, #242426) and thumb (--color-border,
+   #3a3a3c) sit only ~22 RGB units apart, both close to the panel's own dark
+   background, so a 6px thumb read as nothing. Content silently clipped off
+   with zero visual cue that Tool Set 1 alone had 6 more tools below the fold
+   and 11 more tool sets after it. Fix: raise thumb/track contrast against the
+   panel background using existing tokens (no new colours) — every scrollable
+   panel that shares this global rule (ToolChestPanel, MeasurementPanel via the
+   right/bottom panels, PropertiesPanel, SearchPanel's result list) gets a
+   visible affordance from this one change. */
+::-webkit-scrollbar        { width: 8px; height: 8px; }
+::-webkit-scrollbar-track  { background: var(--color-bg-panel-alt); }
+::-webkit-scrollbar-thumb  { background: var(--color-text-muted); border-radius: 4px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-text-secondary); background-clip: padding-box; }
 
 /* --- Utility classes --- */
 .visually-hidden {
@@ -88,4 +105,25 @@ body {
   overflow: hidden;
   clip: rect(0 0 0 0);
   white-space: nowrap;
+}
+
+/* --- Panel body layout (global, not component-scoped) ---
+   Used via Accordion.svelte's `bodyClass` prop (App.svelte's Recent
+   Documents/Tool Chest/Navigator/Properties/bottom-panel accordions), which
+   applies the class string to an element ACCORDION itself creates - a
+   component-scoped rule in App.svelte's own <style> would not match there
+   (Svelte's scoped-CSS hash only reaches elements the OWNING component's
+   template renders directly), confirmed by svelte-check's "unused CSS
+   selector" warning when these lived in App.svelte. Kept here, global, for
+   the same reason .visually-hidden above is global - genuinely
+   cross-component layout primitives, not one component's private look. */
+.panel-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-3);
+}
+.panel-body-flush {
+  padding: 0;
+  overflow-y: auto;
+  flex: 1;
 }

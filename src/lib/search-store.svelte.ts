@@ -300,12 +300,25 @@ export class SearchStore {
   }
 
   private async buildGroups(ctx: SearchContext, q: string): Promise<SearchGroup[]> {
+    // document/page scope: filter out a zero-hit group exactly like "open" scope
+    // does below, rather than always returning one group object regardless of hit
+    // count. Owner-reported defect (2026-09-07, image-only PDF): "I did a search,
+    // and just got zero response" — root cause (confirmed via the vitest suite,
+    // not just reading the code): SearchPanel's empty state only renders when
+    // `store.groups.length === 0`, but this method used to return a single
+    // {hits: []} group unconditionally for document/page scope, so `groups.length`
+    // was always >= 1 and none of SearchPanel's four status branches (error /
+    // searching / "No results" / summary) ever matched — total silence on a
+    // genuine zero-match search (e.g. a scanned PDF with no text layer, where
+    // search_document legitimately returns Ok(vec![]), not an error).
     if (ctx.scope === "document") {
-      return [await this.searchOneDoc(ctx.doc, q)];
+      const group = await this.searchOneDoc(ctx.doc, q);
+      return group.hits.length > 0 ? [group] : [];
     }
     if (ctx.scope === "page") {
       const group = await this.searchOneDoc(ctx.doc, q);
-      return [{ ...group, hits: group.hits.filter((h) => h.page === ctx.page) }];
+      const hits = group.hits.filter((h) => h.page === ctx.page);
+      return hits.length > 0 ? [{ ...group, hits }] : [];
     }
     if (ctx.scope === "open") {
       const groups = await Promise.all(ctx.docs.map((d) => this.searchOneDoc(d, q)));

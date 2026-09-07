@@ -24,6 +24,7 @@
    */
   import type { SearchStore, SearchScope, UnifiedSearchHit, SearchGroup } from "$lib/search-store.svelte";
   import type { IndexStatus } from "$lib/ipc";
+  import Accordion from "./Accordion.svelte";
 
   interface Props {
     store: SearchStore;
@@ -231,9 +232,16 @@
   {#if store.error}
     <div class="search-error" role="alert">{store.error}</div>
   {:else if store.searching}
-    <div class="search-status">Searching…</div>
+    <div class="search-status" role="status" aria-live="polite" data-testid="search-status-searching">
+      Searching for "{store.query.trim()}"…
+    </div>
   {:else if store.query.trim() && store.groups.length === 0}
-    <div class="search-status">No results</div>
+    <div class="search-status" role="status" aria-live="polite" data-testid="search-status-no-results">
+      No results for "{store.query.trim()}".
+      {#if store.scope === "document" || store.scope === "page"}
+        <span class="search-status-hint">If this is a scanned or image-only PDF, it may have no searchable text layer — Auto-OCR can add one.</span>
+      {/if}
+    </div>
   {:else if store.totalHitCount > 0}
     <div class="search-summary">
       {store.totalHitCount} result{store.totalHitCount !== 1 ? "s" : ""}
@@ -266,17 +274,54 @@
       {#each store.groups as group, groupIndex (group.key)}
         <div class="search-group">
           {#if showGroupHeaders}
-            <button
-              class="group-header"
-              onclick={() => store.toggleGroupCollapsed(group.key)}
-              aria-expanded={!store.isGroupCollapsed(group.key)}
+            <!-- Owner defect (2026-09-07): accordion behaviour for "search
+                 results groups", on the shared Accordion component. Stays
+                 CONTROLLED by SearchStore.collapsedKeys (not Accordion's own
+                 storageKey persistence) so the existing Collapse All/Expand
+                 All toolbar above keeps working, and because a group's key is
+                 only meaningful for THIS result set - persisting it across
+                 different searches would be noise, not a useful memory. -->
+            <Accordion
+              title={group.label}
+              collapsed={store.isGroupCollapsed(group.key)}
+              ontoggle={() => store.toggleGroupCollapsed(group.key)}
+              variant="nested"
+              testId={`search-group-${group.key}`}
             >
-              <span class="group-caret">{store.isGroupCollapsed(group.key) ? "▸" : "▾"}</span>
-              <span class="group-label">{group.label}</span>
-              <span class="group-count">{group.hits.length}</span>
-            </button>
-          {/if}
-          {#if !showGroupHeaders || !store.isGroupCollapsed(group.key)}
+              {#snippet titleExtra()}<span class="group-count">{group.hits.length}</span>{/snippet}
+              <ol class="search-results">
+                {#each group.hits as hit, hitIndex (hitIndex)}
+                  <li
+                    class="search-result"
+                    class:active={flatIndexOf(groupIndex, hitIndex) === store.activeFlatIndex}
+                    role="option"
+                    aria-selected={flatIndexOf(groupIndex, hitIndex) === store.activeFlatIndex}
+                    onclick={() => clickResult(groupIndex, hitIndex)}
+                    onkeydown={(e) => e.key === "Enter" && clickResult(groupIndex, hitIndex)}
+                    tabindex="0"
+                  >
+                    <input
+                      type="checkbox"
+                      class="search-result-check"
+                      checked={hit.checked}
+                      onclick={(e) => toggleChecked(e, groupIndex, hitIndex)}
+                      aria-label="Select this result"
+                    />
+                    <span class="search-result-page">p.{hit.page + 1}</span>
+                    {#if hit.kind === "markup"}
+                      <span class="search-result-kind" title="Markup comment/note">markup</span>
+                    {/if}
+                    {#if hit.snippetHtml}
+                      <!-- Tantivy snippet HTML: only <b> tags, safe to render. -->
+                      <span class="search-result-snippet">{@html hit.snippet}</span>
+                    {:else}
+                      <span class="search-result-snippet">{hit.snippet}</span>
+                    {/if}
+                  </li>
+                {/each}
+              </ol>
+            </Accordion>
+          {:else}
             <ol class="search-results">
               {#each group.hits as hit, hitIndex (hitIndex)}
                 <li
@@ -483,6 +528,12 @@
     padding: var(--space-1, 2px) 0;
   }
 
+  .search-status-hint {
+    display: block;
+    margin-top: var(--space-1, 2px);
+    color: var(--color-text-secondary, #a6adc8);
+  }
+
   .search-error {
     color: var(--color-error, #f38ba8);
     font-size: var(--text-xs, 11px);
@@ -543,34 +594,6 @@
     border: 1px solid var(--color-border, #45475a);
     border-radius: var(--radius-sm, 3px);
     overflow: hidden;
-  }
-
-  .group-header {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2, 4px);
-    width: 100%;
-    background: var(--color-surface-raised, #313244);
-    border: none;
-    color: var(--color-text, #cdd6f4);
-    cursor: pointer;
-    font-size: inherit;
-    font-weight: 600;
-    padding: var(--space-1, 2px) var(--space-2, 4px);
-    text-align: left;
-  }
-
-  .group-caret {
-    color: var(--color-text-muted, #6c7086);
-    width: 1em;
-    flex-shrink: 0;
-  }
-
-  .group-label {
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
   .group-count {

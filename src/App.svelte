@@ -57,6 +57,7 @@
   import UpdateNotification from "./components/UpdateNotification.svelte";
   import ErrorBanner from "./components/ErrorBanner.svelte";
   import ToolChestPanel from "./components/ToolChestPanel.svelte";
+  import Accordion from "./components/Accordion.svelte";
   import { ToolChestStore } from "$lib/toolchest-store.svelte";
   import ActivationGate from "./components/ActivationGate.svelte";
   import LicenseGraceWarning from "./components/LicenseGraceWarning.svelte";
@@ -1166,9 +1167,22 @@
   <div class="body-row">
     <!-- Left panel -->
     {#if !leftCollapsed}
-      <aside class="panel panel-left">
+      <aside class="panel panel-left" class:panel-left--search={searchPanelVisible} data-testid="panel-left">
         <!-- Search (search-parity: current doc / open docs / folder+subfolders). Placed
-             first — the toolbar Find button / Cmd-Ctrl-F is the primary way in. -->
+             first — the toolbar Find button / Cmd-Ctrl-F is the primary way in.
+
+             Owner-reported defect (2026-09-07, v0.3.17 live use): "the search window
+             was collapsed when it opened... that needs to be fully open and visible."
+             Root cause (confirmed via tools/gui-harness.mjs, not just reading the code):
+             leftCollapsed/searchPanelVisible were both already correct (no stale
+             persisted collapse state, none exists in this file), but Search shared the
+             fixed 260px sidebar with three other always-visible sections and only got
+             a 2/5 flex-basis share of the height — plenty of DOM presence, but visually
+             reads as "collapsed" next to what Bluebeam's dedicated Search panel looks
+             like. Fix: while search is open, it takes over the whole left column (the
+             other sections resume when it's closed — nothing they show is needed while
+             actively searching), and the column itself widens via
+             --panel-left-width-search so the input/results aren't cramped. -->
         {#if searchPanelVisible}
           <div class="panel-section panel-section--search">
             <div class="panel-header">
@@ -1187,38 +1201,56 @@
               />
             </div>
           </div>
+        {:else}
+          <!-- Document History section (MRU list). Owner defect (2026-09-07):
+               "the recent documents panel needs to be able to accordion -
+               actually, all subpanels in the side panels" - every left/right
+               panel section below is now collapsible via the shared Accordion
+               component (src/components/Accordion.svelte), remembering its
+               state for this app session via sessionStorage (storageKey). -->
+          <div class="panel-section">
+            <Accordion
+              title="Recent Documents"
+              storageKey="left-recent-docs"
+              bodyClass="panel-body panel-body-flush"
+              testId="accordion-recent-docs"
+            >
+              <DocumentHistoryPanel
+                recentDocs={recentDocs}
+                onOpen={openFilePath}
+              />
+            </Accordion>
+          </div>
+          <!-- Tool Chest (spec "Tools & Tool Sets") - Tool Sets + Recent Tools; click a
+               tool to make it active. Discoverable here regardless of which doc tab is
+               active (Tool Sets are a workspace resource, not per-document). -->
+          <div class="panel-section panel-section--secondary">
+            <Accordion
+              title="Tool Chest"
+              storageKey="left-toolchest"
+              bodyClass="panel-body panel-body-flush"
+              testId="accordion-tool-chest"
+            >
+              <ToolChestPanel toolChest={toolChestStore} markupStore={activeTab?.store ?? null} />
+            </Accordion>
+          </div>
+          <!-- Navigator placeholder (M4 - thumbnails/bookmarks/layers) -->
+          <div class="panel-section panel-section--secondary">
+            <Accordion
+              title="Navigator"
+              storageKey="left-navigator"
+              bodyClass="panel-body"
+              testId="accordion-navigator"
+            >
+              {#if activeTab}
+                <p class="panel-hint">Thumbnails · Bookmarks · Layers</p>
+                <p class="panel-hint muted">(M4)</p>
+              {:else}
+                <p class="panel-hint muted">Open a PDF to begin.</p>
+              {/if}
+            </Accordion>
+          </div>
         {/if}
-        <!-- Document History section (MRU list) -->
-        <div class="panel-section">
-          <div class="panel-header">Recent Documents</div>
-          <div class="panel-body panel-body-flush">
-            <DocumentHistoryPanel
-              recentDocs={recentDocs}
-              onOpen={openFilePath}
-            />
-          </div>
-        </div>
-        <!-- Tool Chest (spec "Tools & Tool Sets") - Tool Sets + Recent Tools; click a
-             tool to make it active. Discoverable here regardless of which doc tab is
-             active (Tool Sets are a workspace resource, not per-document). -->
-        <div class="panel-section panel-section--secondary">
-          <div class="panel-header">Tool Chest</div>
-          <div class="panel-body panel-body-flush">
-            <ToolChestPanel toolChest={toolChestStore} markupStore={activeTab?.store ?? null} />
-          </div>
-        </div>
-        <!-- Navigator placeholder (M4 - thumbnails/bookmarks/layers) -->
-        <div class="panel-section panel-section--secondary">
-          <div class="panel-header">Navigator</div>
-          <div class="panel-body">
-            {#if activeTab}
-              <p class="panel-hint">Thumbnails · Bookmarks · Layers</p>
-              <p class="panel-hint muted">(M4)</p>
-            {:else}
-              <p class="panel-hint muted">Open a PDF to begin.</p>
-            {/if}
-          </div>
-        </div>
       </aside>
     {/if}
 
@@ -1252,14 +1284,18 @@
     <!-- Right panel -->
     {#if !rightCollapsed}
       <aside class="panel panel-right">
-        <div class="panel-header">Properties</div>
-        <div class="panel-body panel-body-flush">
+        <Accordion
+          title="Properties"
+          storageKey="right-properties"
+          bodyClass="panel-body panel-body-flush"
+          testId="accordion-properties"
+        >
           {#if activeTab}
             <PropertiesPanel store={activeTab.store} />
           {:else}
             <p class="panel-hint muted">Select a markup to edit its properties.</p>
           {/if}
-        </div>
+        </Accordion>
       </aside>
     {/if}
   </div>
@@ -1267,14 +1303,12 @@
   <!-- Bottom panel — Markups / Measurement quantities (spec §17) -->
   {#if !bottomCollapsed}
     <div class="bottom-panel">
-      <div class="panel-header">
-        {#if activeTab}
-          Takeoff — Quantities
-        {:else}
-          Markups / Comments
-        {/if}
-      </div>
-      <div class="panel-body panel-body-flush">
+      <Accordion
+        title={activeTab ? "Takeoff — Quantities" : "Markups / Comments"}
+        storageKey="bottom-panel"
+        bodyClass="panel-body panel-body-flush"
+        testId="accordion-bottom-panel"
+      >
         {#if activeTab}
           <MeasurementPanel
             store={activeTab.store}
@@ -1284,7 +1318,7 @@
         {:else}
           <p class="panel-hint muted">Open a PDF to see measurements.</p>
         {/if}
-      </div>
+      </Accordion>
     </div>
   {/if}
 
@@ -1516,6 +1550,10 @@
     overflow: hidden;
   }
   .panel-left  { width: var(--panel-left-width); }
+  /* While Search is open it owns the whole left column (see the panel-left--search
+     class in the template) — wider than the shared-sidebar default so the query
+     row, scope tabs and result snippets aren't cramped. */
+  .panel-left.panel-left--search { width: var(--panel-left-width-search); }
   .panel-right { width: var(--panel-right-width); border-right: none; border-left: 1px solid var(--color-border); }
 
   .panel-header {
@@ -1528,11 +1566,11 @@
     border-bottom: 1px solid var(--color-border);
     flex-shrink: 0;
   }
-  .panel-body {
-    flex: 1;
-    overflow-y: auto;
-    padding: var(--space-3);
-  }
+  /* .panel-body / .panel-body-flush moved to src/lib/styles.css (global) -
+     Accordion.svelte applies them via its `bodyClass` prop to an element IT
+     creates, so a component-scoped rule here would not match (Svelte's
+     scoped-CSS hash only reaches elements the OWNING component's own
+     template renders directly). See Accordion.svelte's header comment. */
   .panel-hint {
     font-size: var(--font-size-sm);
     color: var(--color-text-secondary);
@@ -1557,11 +1595,13 @@
     flex: 1;
     overflow: hidden;
   }
-  /* Search is the primary feature while open — give it more room than the
-     default first-child 55% cap, and don't let other sections shrink it. */
+  /* Search is the ONLY section rendered in .panel-left while open (the
+     template hides Recent Documents/Tool Chest/Navigator behind an
+     {:else} — see the panel-left--search comment) so it gets the full
+     column height, not a shared fraction of it. */
   .panel-section.panel-section--search {
-    flex: 2;
-    max-height: 75%;
+    flex: 1;
+    max-height: 100%;
     overflow: hidden;
   }
   .panel-section--search .panel-header {
@@ -1580,11 +1620,6 @@
   }
   .btn-icon-close:hover {
     color: var(--color-text);
-  }
-  .panel-body-flush {
-    padding: 0;
-    overflow-y: auto;
-    flex: 1;
   }
 
   /* --- Viewport container --- */

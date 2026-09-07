@@ -91,3 +91,52 @@ describe("ToolChestPanel drag-to-reorder", () => {
     });
   });
 });
+
+describe("ToolChestPanel — overflow (owner defect, 2026-09-07)", () => {
+  /**
+   * Owner report (v0.3.17 live use): "the toolchest panels probably need to have
+   * vertical scroll bars where needed." Confirmed via tools/gui-harness.mjs with a
+   * 12-set/96-tool fixture: content was NOT actually being dropped or clipped out
+   * of the DOM — wheel/programmatic scroll both reached the last row — but the
+   * scrollbar affordance was invisible (thumb ~22 RGB units from the track, both
+   * near-black) so a user had zero visual signal that 94 more tools existed below
+   * the fold. Fixed in src/lib/styles.css's global ::-webkit-scrollbar rule
+   * (raised contrast + width; not testable here since jsdom doesn't run a real
+   * paint/scrollbar engine — verified visually via the harness, see the PR
+   * description for before/after screenshots).
+   *
+   * What IS testable at the component level, and the actual invariant the CSS
+   * fix depends on: ToolChestPanel must never silently drop content instead of
+   * making it scrollable. This guards against a future regression (e.g. someone
+   * adding a max-items slice, or a `{#if i < N}` cap) reintroducing a real data
+   * loss where the CSS fix alone couldn't help.
+   */
+  it("renders every tool set and every tool in the DOM, however many there are", async () => {
+    const store = new ToolChestStore();
+    store.sets = Array.from({ length: 12 }, (_, si) => ({
+      id: `set-${si}`,
+      name: `Tool Set ${si + 1}`,
+      tools: Array.from({ length: 8 }, (_, ti) => tool(`set-${si}-tool-${ti}`, `Tool ${si + 1}.${ti + 1}`)),
+    }));
+
+    const { container } = render(ToolChestPanel, { props: { toolChest: store, markupStore: null } });
+    await tick();
+
+    expect(container.querySelectorAll(".tc-set").length).toBe(12);
+    expect(container.querySelectorAll(".tc-tool-row").length).toBe(96);
+    // Spot-check the very last row (the one that was invisible under the old
+    // low-contrast scrollbar) is actually present, not truncated.
+    expect(container.textContent).toContain("Tool 12.8");
+  });
+
+  it("the panel root is a bounded, scrollable container (overflow-y: auto)", async () => {
+    const store = new ToolChestStore();
+    store.sets = [setWithTools()];
+    const { container } = render(ToolChestPanel, { props: { toolChest: store, markupStore: null } });
+    await tick();
+
+    const root = container.querySelector(".toolchest-panel") as HTMLElement;
+    expect(root).toBeTruthy();
+    expect(getComputedStyle(root).overflowY).toBe("auto");
+  });
+});

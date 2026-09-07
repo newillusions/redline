@@ -174,7 +174,12 @@ describe("SearchPanel — grouped result rendering", () => {
     ];
     const { container } = mountPanel(store, { folderPath: null });
     await tick();
-    const headers = container.querySelectorAll(".group-header");
+    // Group headers are now the shared Accordion component's toggle buttons
+    // (data-testid="search-group-<key>", see SearchPanel.svelte) - the old
+    // ".group-header" class lives only on Accordion's own scoped CSS now
+    // (variant="nested"), so it can no longer be relied on as a cross-component
+    // selector (Svelte's scoped-CSS hash doesn't reach here - see Accordion.svelte).
+    const headers = container.querySelectorAll('[data-testid^="search-group-"]');
     expect(headers).toHaveLength(2);
     expect(headers[0].textContent).toContain("a.pdf");
     expect(headers[0].textContent).toContain("2");
@@ -191,11 +196,11 @@ describe("SearchPanel — grouped result rendering", () => {
     await tick();
     expect(container.querySelectorAll(".search-result")).toHaveLength(1);
 
-    await fireEvent.click(container.querySelector(".group-header")!);
+    await fireEvent.click(container.querySelector('[data-testid="search-group-d1"]')!);
     await tick();
     expect(container.querySelectorAll(".search-result")).toHaveLength(0);
 
-    await fireEvent.click(container.querySelector(".group-header")!);
+    await fireEvent.click(container.querySelector('[data-testid="search-group-d1"]')!);
     await tick();
     expect(container.querySelectorAll(".search-result")).toHaveLength(1);
   });
@@ -238,6 +243,111 @@ describe("SearchPanel — grouped result rendering", () => {
     await tick();
     const snippetEl = container.querySelector(".search-result-snippet")!;
     expect(snippetEl.querySelector("b")).not.toBeNull();
+  });
+});
+
+describe("SearchPanel — searching/no-results feedback (owner defect fix, 2026-09-07)", () => {
+  /**
+   * Owner report (v0.3.17 live use, image-only/scanned PDF): "i did a search, and
+   * just got zero response... we need to see when the search is happening, and a
+   * no results found response if that's the end result."
+   *
+   * Root cause (search-store.svelte.ts's old buildGroups): document/page scope
+   * always returned one group object regardless of hit count, so
+   * `store.groups.length` was never 0 even on a genuine zero-match search — none
+   * of SearchPanel's four status branches (error/searching/no-results/summary)
+   * ever matched. Fixed by filtering the zero-hit group out, matching how "open"
+   * scope already behaved. These tests exercise the REAL SearchStore.run() path
+   * (not a hand-set store.groups) so they'd have caught the original bug.
+   */
+  function doc(overrides: Partial<import("$lib/search-store.svelte").DocSearchInput> = {}) {
+    return { docId: "d1", label: "scanned.pdf", path: "/mock/scanned.pdf", markups: [], ...overrides };
+  }
+
+  // These call store.run() directly (rather than clicking Find + waiting on the
+  // debounce/onSearch wiring) so they aren't entangled with this file's
+  // `beforeEach(vi.useFakeTimers())` — @testing-library's `waitFor` polls with
+  // real timers and would hang under fake ones. mountPanel/SearchPanel still
+  // render the REAL store reactively, so the assertions exercise the actual
+  // fixed render path, not a hand-set store.groups shortcut.
+
+  it("a zero-hit document-scope search shows a visible 'No results' message, not silence", async () => {
+    // Mirrors the real Rust command's documented behaviour on an image-only PDF
+    // (src-tauri/src/commands/text.rs::search_document): Ok(vec![]), not an error.
+    const store = new SearchStore(fakeDeps({ searchDocument: vi.fn(async () => []) }));
+    store.query = "elevation";
+    const { container, getByTestId } = mountPanel(store);
+
+    await store.run({ scope: "document", doc: doc() });
+    await tick();
+
+    expect(container.querySelector(".search-status, .search-error, .search-summary")).not.toBeNull();
+    const status = getByTestId("search-status-no-results");
+    expect(status.textContent).toContain('No results for "elevation"');
+    // Document/page scope gets the scanned-PDF hint; folder/open scope (tested
+    // below) deliberately does not, since "this document" phrasing wouldn't fit
+    // a multi-file result set.
+    expect(status.textContent).toContain("searchable text layer");
+    expect(store.groups).toHaveLength(0);
+  });
+
+  it("a zero-hit page-scope search also shows 'No results' (same phantom-group class)", async () => {
+    const store = new SearchStore(fakeDeps({ searchDocument: vi.fn(async () => []) }));
+    store.query = "elevation";
+    const { container, getByTestId } = mountPanel(store);
+
+    await store.run({ scope: "page", doc: doc(), page: 0 });
+    await tick();
+
+    expect(getByTestId("search-status-no-results")).toBeTruthy();
+    expect(store.groups).toHaveLength(0);
+  });
+
+  it("a zero-hit folder-scope search shows 'No results' without the single-document OCR hint", async () => {
+    const store = new SearchStore(fakeDeps({ searchFolder: vi.fn(async () => []) }));
+    store.setScope("folder");
+    store.query = "elevation";
+    const { container, getByTestId } = mountPanel(store);
+
+    await store.run({ scope: "folder" });
+    await tick();
+
+    const status = getByTestId("search-status-no-results");
+    expect(status.textContent).toContain('No results for "elevation"');
+    expect(status.textContent).not.toContain("text layer");
+  });
+
+  it("shows an in-progress 'Searching…' status while a search is in flight", async () => {
+    let resolveSearch: (v: never[]) => void = () => {};
+    const pending = new Promise<never[]>((resolve) => { resolveSearch = resolve; });
+    const store = new SearchStore(fakeDeps({ searchDocument: vi.fn(() => pending) }));
+    store.query = "elevation";
+    const { container, getByTestId } = mountPanel(store);
+
+    const run = store.run({ scope: "document", doc: doc() });
+    await tick();
+    expect(store.searching).toBe(true);
+    const status = getByTestId("search-status-searching");
+    expect(status.textContent).toContain('Searching for "elevation"');
+
+    resolveSearch([]);
+    await run;
+    await tick();
+    expect(store.searching).toBe(false);
+  });
+
+  it("a search that finds hits shows the result summary, not the no-results message", async () => {
+    const store = new SearchStore(
+      fakeDeps({ searchDocument: vi.fn(async () => [{ page: 0, rect: [0, 0, 1, 1] as [number, number, number, number], snippet: "hit" }]) })
+    );
+    store.query = "elevation";
+    const { container } = mountPanel(store);
+
+    await store.run({ scope: "document", doc: doc() });
+    await tick();
+
+    expect(container.querySelector('[data-testid="search-status-no-results"]')).toBeNull();
+    expect(container.querySelector(".search-summary")?.textContent).toContain("1 result");
   });
 });
 

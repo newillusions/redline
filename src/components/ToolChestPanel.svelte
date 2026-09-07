@@ -16,6 +16,7 @@
   import { reorderAfterDrag } from "$lib/toolchest-reorder";
   import type { MarkupStore } from "$lib/markup-store.svelte";
   import type { Tool, ToolSet, PlacementMode, MarkupType } from "$lib/ipc";
+  import Accordion from "./Accordion.svelte";
 
   const {
     toolChest,
@@ -54,16 +55,14 @@
     void toolChest.recordRecent(tool);
   }
 
-  // ---------------------------------------------------------------------------
-  // Set collapse state (local UI only - not persisted)
-  // ---------------------------------------------------------------------------
-  let collapsedSets = $state<Set<string>>(new Set());
-  function toggleSet(setId: string) {
-    const next = new Set(collapsedSets);
-    if (next.has(setId)) next.delete(setId);
-    else next.add(setId);
-    collapsedSets = next;
-  }
+  // Set collapse/expand is now owned by the shared Accordion component
+  // (src/components/Accordion.svelte, uncontrolled mode, storageKey per set) -
+  // it remembers each set's collapsed state for the rest of this app session
+  // via sessionStorage, which the old local-only $state did not (owner defect,
+  // 2026-09-07: "accordion... collapsed state remembered per sub-panel for
+  // the session" - this also matters because closing/reopening Search now
+  // unmounts and remounts ToolChestPanel, see App.svelte's panel-left--search
+  // comment, which would have reset the old in-memory Set every time).
 
   // ---------------------------------------------------------------------------
   // New set
@@ -214,16 +213,17 @@
     {/if}
 
     {#each toolChest.sets as set (set.id)}
-      {@const collapsed = collapsedSets.has(set.id)}
       <div class="tc-set">
-        <div class="tc-set-header">
-          <button class="tc-set-toggle" onclick={() => toggleSet(set.id)} aria-expanded={!collapsed}>
-            {collapsed ? "▸" : "▾"} {set.name}
-            <span class="tc-set-count">({set.tools.length})</span>
-          </button>
-          <button class="tc-icon-btn" title="Delete set" onclick={() => handleDeleteSet(set)}>✕</button>
-        </div>
-        {#if !collapsed}
+        <Accordion
+          title={set.name}
+          storageKey={`toolchest-set-${set.id}`}
+          variant="nested"
+          testId={`accordion-toolset-${set.id}`}
+        >
+          {#snippet titleExtra()}<span class="tc-set-count">({set.tools.length})</span>{/snippet}
+          {#snippet headerExtra()}
+            <button class="tc-icon-btn" title="Delete set" onclick={() => handleDeleteSet(set)}>✕</button>
+          {/snippet}
           {#if set.tools.length === 0}
             <p class="tc-hint muted tc-indent">Empty set.</p>
           {:else}
@@ -253,7 +253,7 @@
               {/each}
             </ul>
           {/if}
-        {/if}
+        </Accordion>
       </div>
     {/each}
 
@@ -385,24 +385,6 @@
   /* Tool Sets */
   .tc-set {
     margin-bottom: var(--space-2);
-  }
-
-  .tc-set-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-
-  .tc-set-toggle {
-    background: none;
-    border: none;
-    color: var(--color-text);
-    font-size: var(--font-size-sm);
-    font-weight: 600;
-    cursor: pointer;
-    padding: var(--space-1) 0;
-    flex: 1;
-    text-align: left;
   }
 
   .tc-set-count {
