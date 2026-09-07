@@ -15,6 +15,12 @@ Feature stays OFF by default (`src-tauri/Cargo.toml`'s `ocr` feature); no
 code path in this phase runs OCR automatically or changes anything about a
 normal document-open/save flow.
 
+**Release pipeline (fixed 2026-09-07):** tagged desktop releases now build
+with `--features ocr` and bundle it, closing a gap where v0.3.17/v0.3.18
+shipped without OCR compiled in despite the `workflow_dispatch` proof leg
+passing green - see "Shipping OCR in every tagged release" under Phase 2b
+below.
+
 ## Engine
 
 Tesseract 5 via the [`leptess`](https://docs.rs/leptess/0.14.0/leptess/)
@@ -188,20 +194,46 @@ than installing the real NSIS package. **Proving the actual NSIS-installed
 layout end-to-end is a residual gap**, not silently assumed to work — see
 "What's NOT built yet" below.
 
-#### Proving both legs without cutting a release
+#### Shipping OCR in every tagged release (fixed 2026-09-07)
 
-`.github/workflows/build-releases.yml` gained a `workflow_dispatch` boolean
-input `build_ocr`, which sets a per-job `Determine OCR proof mode` step's
-`enabled` output: adds `--features ocr` (macOS also adds `--bundles app`,
-skipping the DMG — nothing in this leg needs one) to the `Build Tauri app`
-step, runs the Tesseract-install/tessdata-fetch/dylib-bundle/smoke-test
-steps above, and gates OFF every publish-oriented step (code signing, DMG
-recreation, Authenticode signing, Gitea/GitHub asset upload, the
-`update-manifest` job) via `if: steps.ocr_mode.outputs.enabled != 'true'` —
-no signing, no upload, no release cut. The tag-triggered release path's
-steps are functionally unchanged: `ocr_mode.enabled` evaluates `false`
-there, so every existing step's condition is unaffected and the feature
-stays off, exactly as before this phase.
+**Tagged releases now build and bundle OCR.** Through v0.3.17/v0.3.18 the
+tag-triggered release path never set `--features ocr` at all - the
+`workflow_dispatch` proof leg (below) built and smoke-tested OCR
+successfully, but that never touched a real `v*`-tag release, so shipped
+installers had no OCR compiled in despite the proof leg passing green. The
+owner hit "OCR is not compiled into this build" on the shipped app and that
+gap is what this fix closes.
+
+`.github/workflows/build-releases.yml`'s per-job `Determine OCR proof mode`
+step now sets two separate flags instead of one:
+
+- **`enabled`** - whether THIS build compiles with `--features ocr` and runs
+  the Tesseract-install/tessdata-fetch/dylib-bundle(macOS)/vcpkg-static-link
+  (Windows)/smoke-test steps. `true` for a real `v*` tag push AND for the
+  `workflow_dispatch` proof leg (`build_ocr=true`) - OCR now ships in every
+  tagged release, not just the rehearsal.
+- **`proof_leg`** - `true` only for the `workflow_dispatch` rehearsal.
+  Publish-oriented steps (code signing, DMG recreation, Authenticode
+  signing, Gitea/GitHub asset upload, the `update-manifest` job) are gated
+  `if: steps.ocr_mode.outputs.proof_leg != 'true'`, so a real tag release
+  still signs and ships; only the rehearsal skips signing/upload/manifest.
+
+**The OCR bundling smoke test is a hard release gate**, not just a proof-leg
+check: it runs (gated on `enabled`) before the code-signing step in the same
+job, with no `continue-on-error`, so a failure fails the job and every
+downstream signing/upload step (gated on `proof_leg`) is skipped by GitHub
+Actions' default stop-on-failure behavior. The `update-manifest` job's own
+condition additionally requires both platform jobs' `result` to be
+`success` (not merely "not cancelled") before publishing `update.json` -
+closing a separate gap where a same-job smoke-test failure could otherwise
+still let a stale/empty-signature manifest ship to the auto-updater, since a
+job's declared `outputs:` survive a later step's failure.
+
+Manually triggering the `workflow_dispatch` rehearsal (`build_ocr=true`)
+remains the way to prove the OCR build/bundle/smoke-test steps on a branch
+without cutting a release - unchanged from before this fix, still the only
+way to exercise this on a non-tag ref since GitHub Actions workflow changes
+can't be run on Forgejo's self-hosted runner.
 
 An earlier version of this leg used a `push: branches: [feat/**]` trigger
 instead — removed on review feedback the same day it landed, because it
@@ -428,19 +460,18 @@ posture `.claude/rules/judgment.md` already applies to G9).
   should either silently-install the NSIS output on the CI runner and repeat
   the smoke test against that layout, or accept the current portable-layout
   proof as sufficient and say so explicitly (owner call).
-- **Codesigning + dylib bundling are mutually exclusive today, on macOS.**
-  The OCR-proof leg's `Bundle Tesseract + Leptonica dylibs into the .app`
-  step is gated OFF for real releases along with every other publish-step
-  (see "Proving both legs" above) — it has never run in the SAME build as
-  the existing `Fix code signature`/notarization steps. Turning `ocr` on
-  for a real signed release therefore needs the dylib-bundling step wired
-  into the actual release path (not just the proof leg), placed BEFORE code
-  signing (dylibbundler rewrites load commands, invalidating any prior
-  signature — matching the existing re-sign-after-build pattern this repo
-  already uses for the CSResourcesFileMapped fix), and the combined result
-  re-verified end-to-end (signed + bundled + smoke-tested) — none of which
-  has been done. An OCR-enabled release cannot be shipped signed until this
-  lands.
+- ~~Codesigning + dylib bundling are mutually exclusive on macOS~~ **FIXED
+  2026-09-07** (see "Shipping OCR in every tagged release" above): the
+  dylib-bundling and smoke-test steps now run on the real tag-release path
+  too, gated on `enabled` rather than the old proof-leg-only flag, and still
+  placed BEFORE the `Fix code signature` step so the codesign happens after
+  dylibbundler rewrites load commands, matching the pre-existing
+  re-sign-after-build pattern. **Still owed:** the combined result
+  (OCR-enabled + dylib-bundled + code-signed + smoke-tested, in one real
+  build) has not yet been verified end-to-end against an actual signed
+  release - that verification is the `workflow_dispatch` proof run this fix
+  shipped with, and finally the first real tagged release built on top of
+  it (v0.3.19).
 - **Installer size deltas are unmeasured.** The macOS proof leg bundles 15
   dylibs into `Contents/Frameworks` (measured locally 2026-09-03: libarchive,
   libb2, libgif, libjpeg, libleptonica, liblz4, liblzma, libopenjp2, libpng16,
