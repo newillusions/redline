@@ -8,16 +8,27 @@ on:
   push:
     tags:
       - 'v*'
-  # Auto-OCR Phase 2b bundling proof leg (2026-09-03): a manual
-  # workflow_dispatch run with build_ocr=true builds with `--features ocr`
-  # on both desktop legs and runs the ocr-selftest bundling smoke test,
-  # WITHOUT cutting a release - no signing, no Gitea/GitHub asset upload, no
-  # update.json commit. See the "Determine OCR proof mode" step in
-  # build-macos/build-windows and the `if: steps.ocr_mode.outputs.enabled
-  # != 'true'` guards added to every publish-oriented step below. The
-  # default (tag-triggered) release path is functionally unchanged:
-  # ocr_mode.enabled evaluates false there, so every existing step's
-  # condition is unaffected.
+  # Auto-OCR (2026-09-03 Phase 2b bundling proof leg; gating fixed 2026-09-07
+  # so tagged releases actually ship it - see below): every tag-triggered
+  # release build now ALSO builds with `--features ocr` and runs the OCR
+  # bring-up steps (Tesseract install, tessdata fetch, dylib bundling on
+  # macOS / vcpkg static link on Windows, and the ocr-selftest bundling
+  # smoke test) on BOTH desktop legs, before signing/upload. A failed smoke
+  # test fails the job before any artefact is signed or uploaded (see
+  # update-manifest's hard release gate below for why that also blocks the
+  # manifest publish, not just the same-job signing steps).
+  #
+  # A separate manual workflow_dispatch run with build_ocr=true is the
+  # no-release REHEARSAL of the exact same OCR build/bundle/smoke-test
+  # steps, with signing/upload/manifest-publish skipped (no release cut).
+  # See the "Determine OCR proof mode" step in build-macos/build-windows:
+  # it sets two flags - `enabled` (build with --features ocr; true for BOTH
+  # a tag push and the proof leg) and `proof_leg` (skip signing/upload/
+  # manifest; true ONLY for the workflow_dispatch rehearsal). Prior to
+  # 2026-09-07 these were a single flag, so a tag push never set it and
+  # v0.3.17/v0.3.18 shipped without OCR despite the proof leg passing green
+  # (obs: redline "OCR is not compiled into this build" owner report,
+  # 2026-09-07) - fixed by this split, not by removing the rehearsal leg.
   #
   # Deliberately NOT a `push: branches: [feat/**]` trigger (that was tried
   # first, 2026-09-03, and removed on review feedback): it fired a full
@@ -32,7 +43,7 @@ on:
         required: true
         default: '0.2.0'
       build_ocr:
-        description: 'OCR proof leg: build with --features ocr, run the bundling smoke test, skip signing/upload (no release cut)'
+        description: 'OCR rehearsal: build with --features ocr, run the bundling smoke test, skip signing/upload (no release cut). Tag-triggered releases build OCR unconditionally regardless of this input.'
         type: boolean
         required: false
         default: false
@@ -55,31 +66,55 @@ jobs:
             pdfium_target: mac-arm64
     outputs:
       sig-aarch64: ${{ steps.get_sig.outputs.sig_aarch64 }}
-      ocr-proof: ${{ steps.ocr_mode.outputs.enabled }}
+      ocr-proof: ${{ steps.ocr_mode.outputs.proof_leg }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Auto-OCR Phase 2b: see the `on:` block comment above. Every step from
-      # here down that publishes/signs/uploads a release artifact is gated
-      # `if: steps.ocr_mode.outputs.enabled != 'true'` so the tag-triggered
-      # release path is unaffected; every new OCR-only step is gated the
-      # opposite way.
+      # Auto-OCR: see the `on:` block comment above. Every step from here
+      # down that publishes/signs/uploads a release artifact is gated
+      # `if: steps.ocr_mode.outputs.proof_leg != 'true'` so a real tag
+      # release still signs and ships (only the workflow_dispatch rehearsal
+      # skips publish); every OCR bring-up step is gated on `enabled`
+      # instead, which is true for both a tag push and the rehearsal.
       - name: Determine OCR proof mode
         id: ocr_mode
         shell: bash
         run: |
+          # Two independent flags, deliberately split (2026-09-07, closes the
+          # "tagged releases never build with --features ocr" gap - v0.3.17/
+          # v0.3.18 shipped without OCR despite the proof leg passing green):
+          #   - `proof_leg`: workflow_dispatch with build_ocr=true - the
+          #     no-release rehearsal. Skips signing/upload/manifest (see the
+          #     publish-step guards below and in update-manifest).
+          #   - `enabled`: whether THIS build compiles with --features ocr
+          #     and runs the OCR bring-up steps (Tesseract install, tessdata
+          #     fetch, dylib bundling, smoke test). True for the proof leg
+          #     AND for every real tag-triggered release - OCR now ships in
+          #     every tagged build, not just the rehearsal.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.build_ocr }}" = "true" ]; then
+            PROOF_LEG=true
+          else
+            PROOF_LEG=false
+          fi
+          if [ "$PROOF_LEG" = "true" ] || [ "${{ github.event_name }}" = "push" ]; then
             ENABLED=true
           else
             ENABLED=false
           fi
+          echo "proof_leg=$PROOF_LEG" >> "$GITHUB_OUTPUT"
           echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
-          if [ "$ENABLED" = "true" ]; then
+          if [ "$PROOF_LEG" = "true" ]; then
             # --bundles app (not the config's default app+dmg+nsis targets):
             # the proof leg only needs the .app to bundle dylibs into and run
-            # the smoke test against - a DMG buys nothing here.
+            # the smoke test against - a DMG buys nothing here, and this leg
+            # never signs/uploads/releases anything.
             echo "build_args=--features ocr --bundles app" >> "$GITHUB_OUTPUT"
+          elif [ "$ENABLED" = "true" ]; then
+            # Real tag release with OCR: use the config's default bundle
+            # targets (DMG included - this IS the shipped artifact) plus the
+            # ocr feature.
+            echo "build_args=--features ocr" >> "$GITHUB_OUTPUT"
           else
             echo "build_args=" >> "$GITHUB_OUTPUT"
           fi
@@ -100,11 +135,11 @@ jobs:
       - name: Fetch PDFium (${{ matrix.pdfium_target }})
         run: scripts/fetch-pdfium.sh ${{ matrix.pdfium_target }}
 
-      - name: Install Tesseract (Homebrew, OCR proof leg only)
+      - name: Install Tesseract (Homebrew, OCR build)
         if: steps.ocr_mode.outputs.enabled == 'true'
         run: brew install tesseract
 
-      - name: Fetch OCR tessdata (OCR proof leg only)
+      - name: Fetch OCR tessdata (OCR build)
         if: steps.ocr_mode.outputs.enabled == 'true'
         run: scripts/fetch-ocr-tessdata.sh
 
@@ -127,7 +162,7 @@ jobs:
           REDLINE_LICENSE_API_URL_DEFAULT: https://staff.emittiv.studio
         run: npm run tauri:build -- --target ${{ matrix.target }} ${{ steps.ocr_mode.outputs.build_args }}
 
-      - name: Bundle Tesseract + Leptonica dylibs into the .app (OCR proof leg only)
+      - name: Bundle Tesseract + Leptonica dylibs into the .app (OCR build)
         if: steps.ocr_mode.outputs.enabled == 'true'
         run: |
           # `leptess`/tesseract-plumbing links Tesseract + Leptonica as DYNAMIC
@@ -190,7 +225,7 @@ jobs:
           echo "Its dependent libraries after bundling:"
           otool -L "$APP_PATH/Contents/MacOS/$MAIN_EXE_NAME"
 
-      - name: OCR bundling smoke test (OCR proof leg only)
+      - name: OCR bundling smoke test (OCR build)
         if: steps.ocr_mode.outputs.enabled == 'true'
         run: |
           # Runs the ACTUAL bundled+dylib-rewritten copy of ocr-selftest
@@ -214,7 +249,7 @@ jobs:
           "$APP_PATH/Contents/MacOS/ocr-selftest" --tessdata-dir "$TESSDATA_DIR"
 
       - name: Fix code signature
-        if: steps.ocr_mode.outputs.enabled != 'true'
+        if: steps.ocr_mode.outputs.proof_leg != 'true'
         run: |
           # Find the .app bundle (workspace root target/, not src-tauri/target/)
           APP_PATH=$(find target/${{ matrix.target }}/release/bundle/macos -name "*.app" -type d | head -1)
@@ -225,7 +260,7 @@ jobs:
           fi
 
       - name: Recreate DMG with fixed signature
-        if: steps.ocr_mode.outputs.enabled != 'true'
+        if: steps.ocr_mode.outputs.proof_leg != 'true'
         run: |
           DMG_PATH=$(find target/${{ matrix.target }}/release/bundle/dmg -name "*.dmg" | head -1)
           APP_PATH=$(find target/${{ matrix.target }}/release/bundle/macos -name "*.app" -type d | head -1)
@@ -240,7 +275,7 @@ jobs:
           fi
 
       - name: Create archive name
-        if: steps.ocr_mode.outputs.enabled != 'true'
+        if: steps.ocr_mode.outputs.proof_leg != 'true'
         id: archive
         run: |
           if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
@@ -252,7 +287,7 @@ jobs:
           fi
 
       - name: Find artifacts
-        if: steps.ocr_mode.outputs.enabled != 'true'
+        if: steps.ocr_mode.outputs.proof_leg != 'true'
         id: find_artifacts
         run: |
           DMG_PATH=$(find target/${{ matrix.target }}/release/bundle/dmg -name "*.dmg" | head -1)
@@ -263,7 +298,7 @@ jobs:
           echo "SIG_PATH=$SIG_PATH" >> $GITHUB_OUTPUT
 
       - name: Get signature
-        if: steps.ocr_mode.outputs.enabled != 'true'
+        if: steps.ocr_mode.outputs.proof_leg != 'true'
         id: get_sig
         run: |
           if [ -f "${{ steps.find_artifacts.outputs.SIG_PATH }}" ]; then
@@ -276,13 +311,13 @@ jobs:
           fi
 
       - name: Create checksum
-        if: steps.ocr_mode.outputs.enabled != 'true'
+        if: steps.ocr_mode.outputs.proof_leg != 'true'
         run: |
           cd $(dirname "${{ steps.find_artifacts.outputs.DMG_PATH }}")
           shasum -a 256 $(basename "${{ steps.find_artifacts.outputs.DMG_PATH }}") > ${{ steps.archive.outputs.NAME }}.dmg.sha256
 
       - name: Upload to Gitea Release
-        if: steps.ocr_mode.outputs.enabled != 'true'
+        if: steps.ocr_mode.outputs.proof_leg != 'true'
         run: |
           MAX_RETRIES=5
           RETRY_DELAY=5
@@ -345,7 +380,7 @@ jobs:
 
       - name: Upload artifacts (GitHub)
         uses: actions/upload-artifact@v4
-        if: always() && steps.ocr_mode.outputs.enabled != 'true'
+        if: always() && steps.ocr_mode.outputs.proof_leg != 'true'
         with:
           name: macos-${{ steps.archive.outputs.ARCH }}
           path: |
@@ -358,7 +393,7 @@ jobs:
     runs-on: windows-latest
     outputs:
       sig-windows: ${{ steps.get_sig.outputs.sig_windows }}
-      ocr-proof: ${{ steps.ocr_mode.outputs.enabled }}
+      ocr-proof: ${{ steps.ocr_mode.outputs.proof_leg }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -369,11 +404,21 @@ jobs:
         id: ocr_mode
         shell: bash
         run: |
+          # Mirrors build-macos's split (see its "Determine OCR proof mode"
+          # comment for the full rationale): `proof_leg` gates skip-publish
+          # only; `enabled` gates the OCR feature build/bring-up steps and is
+          # true for the proof leg AND every real tag-triggered release.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.build_ocr }}" = "true" ]; then
+            PROOF_LEG=true
+          else
+            PROOF_LEG=false
+          fi
+          if [ "$PROOF_LEG" = "true" ] || [ "${{ github.event_name }}" = "push" ]; then
             ENABLED=true
           else
             ENABLED=false
           fi
+          echo "proof_leg=$PROOF_LEG" >> "$GITHUB_OUTPUT"
           echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
           if [ "$ENABLED" = "true" ]; then
             echo "build_args=--features ocr" >> "$GITHUB_OUTPUT"
@@ -419,7 +464,7 @@ jobs:
       # real vcpkg build of the tesseract PORT until this workflow actually
       # runs - some vcpkg ports don't support every triplet cleanly - which is
       # exactly what this OCR-proof leg exists to prove or disprove.
-      - name: Install Tesseract (vcpkg, OCR proof leg only)
+      - name: Install Tesseract (vcpkg, OCR build)
         if: steps.ocr_mode.outputs.enabled == 'true'
         shell: pwsh
         run: |
@@ -428,7 +473,7 @@ jobs:
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install tesseract:x64-windows-static-md
           if ($LASTEXITCODE -ne 0) { Write-Error "vcpkg install tesseract failed"; exit 1 }
 
-      - name: Fetch OCR tessdata (OCR proof leg only)
+      - name: Fetch OCR tessdata (OCR build)
         if: steps.ocr_mode.outputs.enabled == 'true'
         shell: bash
         run: scripts/fetch-ocr-tessdata.sh
@@ -454,7 +499,7 @@ jobs:
           REDLINE_LICENSE_API_URL_DEFAULT: https://staff.emittiv.studio
         run: npm run tauri:build -- ${{ steps.ocr_mode.outputs.build_args }}
 
-      - name: OCR bundling smoke test (OCR proof leg only)
+      - name: OCR bundling smoke test (OCR build)
         if: steps.ocr_mode.outputs.enabled == 'true'
         shell: bash
         run: |
@@ -517,7 +562,7 @@ jobs:
       # File"). This also drops the `choco install osslsigncode` step entirely - nothing left
       # to install.
       - name: Sign Windows installer (Authenticode)
-        if: steps.sign_check.outputs.available == 'true' && steps.ocr_mode.outputs.enabled != 'true'
+        if: steps.sign_check.outputs.available == 'true' && steps.ocr_mode.outputs.proof_leg != 'true'
         id: sign
         # shell: pwsh - NOT bash. Git-Bash/MSYS rewrites any argument starting with
         # "/" into a Windows path, so signtool's /fd /tr /td flags never reached it
@@ -561,7 +606,7 @@ jobs:
           Write-Host "Signed $($nsis.FullName)"
 
       - name: Regenerate updater signature (post-Authenticode)
-        if: steps.sign_check.outputs.available == 'true' && steps.sign.outputs.signed == 'true' && steps.ocr_mode.outputs.enabled != 'true'
+        if: steps.sign_check.outputs.available == 'true' && steps.sign.outputs.signed == 'true' && steps.ocr_mode.outputs.proof_leg != 'true'
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -573,7 +618,7 @@ jobs:
           npm run tauri -- signer sign -k "$TAURI_SIGNING_PRIVATE_KEY" -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$NSIS_PATH"
 
       - name: Find installers
-        if: steps.ocr_mode.outputs.enabled != 'true'
+        if: steps.ocr_mode.outputs.proof_leg != 'true'
         id: find_installers
         shell: bash
         run: |
@@ -583,7 +628,7 @@ jobs:
           echo "NSIS_SIG=$NSIS_SIG" >> $GITHUB_OUTPUT
 
       - name: Get signature
-        if: steps.ocr_mode.outputs.enabled != 'true'
+        if: steps.ocr_mode.outputs.proof_leg != 'true'
         id: get_sig
         shell: bash
         run: |
@@ -593,7 +638,7 @@ jobs:
           fi
 
       - name: Upload to Gitea Release
-        if: steps.ocr_mode.outputs.enabled != 'true'
+        if: steps.ocr_mode.outputs.proof_leg != 'true'
         shell: bash
         run: |
           MAX_RETRIES=5
@@ -642,7 +687,7 @@ jobs:
 
       - name: Upload artifacts (GitHub)
         uses: actions/upload-artifact@v4
-        if: always() && steps.ocr_mode.outputs.enabled != 'true'
+        if: always() && steps.ocr_mode.outputs.proof_leg != 'true'
         with:
           name: windows
           path: |
@@ -659,7 +704,20 @@ jobs:
     # no manifest to publish) - `needs.build-macos.outputs.ocr-proof` is this
     # job's only signal for that, since it has no event context of its own
     # beyond what its `needs:` jobs computed.
-    if: always() && needs.build-macos.result != 'cancelled' && needs.build-windows.result != 'cancelled' && needs.build-macos.outputs.ocr-proof != 'true'
+    #
+    # HARD RELEASE GATE (2026-09-07): requires both platform jobs to have
+    # actually SUCCEEDED - not merely "not cancelled". Now that tag releases
+    # build with --features ocr and run the OCR bundling smoke test inside
+    # build-macos/build-windows, a smoke-test failure fails that job's
+    # `result`. The previous `always() && result != 'cancelled'` condition
+    # would still have run this job on a `result: failure` (job outputs
+    # survive a later step's failure, since they're set by an early step),
+    # publishing an update.json with an empty/missing signature for a
+    # version whose real installer was never signed or uploaded - exactly
+    # the "smoke test failure could still ship a broken auto-update" gap a
+    # hard release gate must close, not just gate signing/upload within the
+    # same job.
+    if: needs.build-macos.result == 'success' && needs.build-windows.result == 'success' && needs.build-macos.outputs.ocr-proof != 'true'
     steps:
       - name: Get version
         id: version
