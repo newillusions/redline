@@ -259,6 +259,92 @@ jobs:
             codesign --verify --verbose=4 "$APP_PATH"
           fi
 
+      - name: Regenerate updater archive (post-bundle, post-sign)
+        if: steps.ocr_mode.outputs.proof_leg != 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          # BUG THIS CLOSES (found 2026-09-07 auditing v0.3.19's shipped assets):
+          # `npm run tauri:build` above produces the updater archive
+          # (*.app.tar.gz + .sig) from the .app as it existed IMMEDIATELY
+          # after that build - before "Bundle Tesseract + Leptonica dylibs"
+          # added Contents/Frameworks and before "Fix code signature" did the
+          # final codesign. That stale archive therefore has ZERO
+          # Contents/Frameworks entries and every binary inside it
+          # (redline, redline-mcp, ocr-selftest, bench, gen-ocr-fixtures)
+          # links Tesseract/Leptonica/libarchive by ABSOLUTE Homebrew path
+          # (verified via `otool -L` on the extracted v0.3.19 archive) - a
+          # Mac that auto-updates to that release without Homebrew installed
+          # cannot launch the app. The DMG was already correct because
+          # "Recreate DMG with fixed signature" rebuilds it from the final
+          # .app; the updater archive never got the same treatment. Fix:
+          # rebuild the archive from the FINAL bundled+signed .app instead,
+          # mirroring Tauri's own layout (gzip tar whose root entry is
+          # "<Name>.app/") and the Windows leg's "Regenerate updater
+          # signature (post-Authenticode)" step above - sign the artifact
+          # last, then regenerate the minisign signature over the exact
+          # bytes that will actually ship.
+          APP_PATH=$(find target/${{ matrix.target }}/release/bundle/macos -name "*.app" -type d | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: no .app bundle found to archive"
+            exit 1
+          fi
+          APP_DIR=$(dirname "$APP_PATH")
+          APP_NAME=$(basename "$APP_PATH")
+          TARGZ_PATH="$APP_PATH.tar.gz"
+
+          echo "Rebuilding $TARGZ_PATH from $APP_PATH (post-bundle, post-sign)"
+          rm -f "$TARGZ_PATH" "$TARGZ_PATH.sig"
+          tar -czf "$TARGZ_PATH" -C "$APP_DIR" "$APP_NAME"
+
+          echo "Re-signing the updater archive with the Tauri updater key..."
+          npm run tauri -- signer sign -k "$TAURI_SIGNING_PRIVATE_KEY" -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$TARGZ_PATH"
+
+          if [ ! -f "$TARGZ_PATH.sig" ]; then
+            echo "ERROR: signer did not produce $TARGZ_PATH.sig"
+            exit 1
+          fi
+
+      - name: Verify updater archive integrity (hard gate)
+        if: steps.ocr_mode.outputs.proof_leg != 'true'
+        run: |
+          # Structural gate so this class of defect cannot ship silently
+          # again: fails the job (not a warning) if the regenerated updater
+          # archive is missing the bundled OCR dylibs (when this is an OCR
+          # build) or if its main executable still links anything under
+          # /opt/homebrew. Mirrors the OCR smoke test's own hard-fail
+          # posture earlier in this job.
+          APP_PATH=$(find target/${{ matrix.target }}/release/bundle/macos -name "*.app" -type d | head -1)
+          TARGZ_PATH="$APP_PATH.tar.gz"
+          MAIN_EXE_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Contents/Info.plist")
+
+          VERIFY_DIR=$(mktemp -d)
+          tar -xzf "$TARGZ_PATH" -C "$VERIFY_DIR"
+          EXTRACTED_APP=$(find "$VERIFY_DIR" -maxdepth 1 -name "*.app" -type d | head -1)
+          if [ -z "$EXTRACTED_APP" ]; then
+            echo "ERROR: updater archive does not extract to a .app bundle"
+            exit 1
+          fi
+
+          if [ "${{ steps.ocr_mode.outputs.enabled }}" = "true" ]; then
+            if [ ! -d "$EXTRACTED_APP/Contents/Frameworks" ] || ! ls "$EXTRACTED_APP/Contents/Frameworks" | grep -qi libtesseract; then
+              echo "ERROR: updater archive is an OCR build but Contents/Frameworks/libtesseract* is missing"
+              find "$EXTRACTED_APP/Contents" -maxdepth 2
+              exit 1
+            fi
+          fi
+
+          BAD_LINKS=$(otool -L "$EXTRACTED_APP/Contents/MacOS/$MAIN_EXE_NAME" | grep -c '/opt/homebrew' || true)
+          if [ "$BAD_LINKS" -gt 0 ]; then
+            echo "ERROR: updater archive's main executable links $BAD_LINKS absolute Homebrew path(s):"
+            otool -L "$EXTRACTED_APP/Contents/MacOS/$MAIN_EXE_NAME" | grep '/opt/homebrew'
+            exit 1
+          fi
+
+          echo "OK: updater archive has no absolute Homebrew links on its main executable."
+          rm -rf "$VERIFY_DIR"
+
       - name: Recreate DMG with fixed signature
         if: steps.ocr_mode.outputs.proof_leg != 'true'
         run: |
