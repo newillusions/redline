@@ -296,6 +296,19 @@ jobs:
 
           echo "Rebuilding $TARGZ_PATH from $APP_PATH (post-bundle, post-sign)"
           rm -f "$TARGZ_PATH" "$TARGZ_PATH.sig"
+          # COPYFILE_DISABLE / COPY_EXTENDED_ATTRIBUTES_DISABLE: without these,
+          # macOS bsdtar writes AppleDouble "._*" sibling entries into the
+          # archive for any source file carrying extended attributes -
+          # exactly what codesign/install_name_tool leave behind on files
+          # they've just touched (the "Fix code signature" step above and
+          # dylibbundler's rewrites). Those "._*" files sit inside Contents/
+          # but were never part of the CodeResources seal, so a Gatekeeper
+          # `codesign --verify --deep --strict` on the extracted .app fails
+          # at launch - reproducing this PR's own target symptom (broken
+          # post-update launch) through a different mechanism. Caught in
+          # review of the first version of this fix (PR #109).
+          export COPYFILE_DISABLE=1
+          export COPY_EXTENDED_ATTRIBUTES_DISABLE=1
           tar -czf "$TARGZ_PATH" -C "$APP_DIR" "$APP_NAME"
 
           echo "Re-signing the updater archive with the Tauri updater key..."
@@ -342,7 +355,29 @@ jobs:
             exit 1
           fi
 
-          echo "OK: updater archive has no absolute Homebrew links on its main executable."
+          # Belt-and-braces: the re-tar step exports COPYFILE_DISABLE=1 to stop
+          # bsdtar writing AppleDouble "._*" sibling files into the archive in
+          # the first place (they'd sit outside the CodeResources seal and
+          # fail Gatekeeper at launch - see that step's comment). Check here
+          # too, so a runner/tar behavior change that reintroduces them fails
+          # the build instead of shipping a broken signature silently.
+          if find "$EXTRACTED_APP" -name '._*' | grep -q .; then
+            echo "ERROR: updater archive contains AppleDouble ._* files - these break the code signature seal:"
+            find "$EXTRACTED_APP" -name '._*'
+            exit 1
+          fi
+
+          # The actual Gatekeeper-equivalent check: does the extracted .app's
+          # signature still verify? This is the property the ._* check above
+          # is only a proxy for, and the property "Fix code signature" was
+          # supposed to guarantee before this archive-regeneration step
+          # existed - confirm the re-tar didn't undo it.
+          if ! codesign --verify --verbose=4 --deep --strict "$EXTRACTED_APP"; then
+            echo "ERROR: codesign --verify failed on the updater archive's extracted .app - the re-tar corrupted the signature."
+            exit 1
+          fi
+
+          echo "OK: updater archive has no absolute Homebrew links, no AppleDouble files, and passes codesign --verify --deep --strict."
           rm -rf "$VERIFY_DIR"
 
       - name: Recreate DMG with fixed signature
