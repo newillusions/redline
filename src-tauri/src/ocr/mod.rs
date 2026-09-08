@@ -138,7 +138,24 @@ impl OcrEngineHandle {
                     .with_context(|| format!("recognize_pass failed at {rotation:?}"))?,
             );
         }
-        Ok(merge_rotate4x_candidates(candidates))
+        let mut lines = merge_rotate4x_candidates(candidates);
+        // `merge_rotate4x_candidates` returns its survivors in the
+        // confidence-descending order its own NMS pass needs internally —
+        // that is an implementation detail of the merge, not a meaningful
+        // order for a page's text. Re-order into reading order here so
+        // EVERY consumer (the invisible-text-layer writer, and therefore
+        // anything that later extracts this page's text — lopdf's
+        // `extract_text` for the Tantivy folder index, PDFium's own text
+        // search) sees lines top-to-bottom/left-to-right, the same way a
+        // human reads the page. Without this, a real word and an unrelated
+        // noise fragment from a completely different part of the page can
+        // land right next to each other in extracted text purely because
+        // they happened to score similarly — see `sort_by_reading_order`'s
+        // own doc comment and
+        // `reading_order_recovers_spatial_order_from_confidence_ordered_merge_output`
+        // below for the concrete owner-reported symptom this fixes.
+        sort_by_reading_order(&mut lines);
+        Ok(lines)
     }
 
     /// Run OCR over the raster at a single rotation, returning lines already
@@ -466,6 +483,80 @@ fn merge_rotate4x_candidates(mut candidates: Vec<OcrLine>) -> Vec<OcrLine> {
     kept
 }
 
+/// Reorder `lines` into human reading order: top-to-bottom, then
+/// left-to-right within a row. Called once, right after
+/// `merge_rotate4x_candidates`, so every downstream consumer (the invisible
+/// text-layer writer, and therefore any later text extraction — `lopdf`'s
+/// `extract_text` for the Tantivy folder index, PDFium's own text search)
+/// sees a page's recognized lines in the same order a person reading the
+/// drawing would encounter them.
+///
+/// Lines are grouped into rows by snapping each line's top edge (`bbox_pdf`'s
+/// `max_y`, since PDF user space is y-up) to the nearest `Y_BAND_PTS`
+/// multiple — two lines within the same band are treated as visually "the
+/// same row" (tolerant of the few points of jitter real OCR boxes have even
+/// for text that is genuinely on one line) and ordered by ascending `min_x`
+/// within it; rows themselves are ordered top-of-page first (descending y).
+/// Sorting on a precomputed `(band, x)` key (rather than a tolerance-based
+/// comparator) keeps this a proper total order — a banded *comparator*
+/// (`|a, b| (a.y - b.y).abs() < TOL`) is not transitive and can leave
+/// `sort_by` with an inconsistent result.
+///
+/// `Y_BAND_PTS = 6.0` is a deliberately small band: real title-block/label
+/// rows in the benchmark corpus (`docs/ocr.md`'s "Measured numbers") are
+/// several points apart at minimum, and a too-generous band would risk
+/// merging two genuinely distinct rows (e.g. stacked dimension labels) into
+/// one, defeating the ordering fix for exactly the layouts it matters most
+/// for. Not tuned against a corpus this session — a reasonable follow-up if
+/// a real drawing's row spacing turns out tighter than this.
+fn sort_by_reading_order(lines: &mut [OcrLine]) {
+    const Y_BAND_PTS: f64 = 6.0;
+    // Sort on a precomputed integer key: (band index descending, x
+    // ascending). `f64` isn't `Ord`, so both components are quantized to
+    // `i64` — the band via rounding to `Y_BAND_PTS` multiples, x at
+    // sub-point (1/1000 pt) precision, far finer than any real layout
+    // distinguishes, purely so `sort_by_key` has a total order to work with.
+    lines.sort_by_key(|l| {
+        let top_y = l.bbox_pdf.3;
+        let band = (top_y / Y_BAND_PTS).round() as i64;
+        let x_key = (l.bbox_pdf.0 * 1000.0).round() as i64;
+        (-band, x_key)
+    });
+}
+
+/// Whether `text` plausibly contains real recognized content, as opposed to
+/// the short symbol-heavy noise fragments Tesseract routinely produces from
+/// the 3 "wrong orientation" rotate-4x passes reading misc. line-work/
+/// hatching/borders (`docs/ocr.md`'s "Measured numbers" section: 9-30%
+/// precision on lines that already passed the confidence filter, with worked
+/// examples like `"fo)"`, `"(=)"`). A line qualifies if it has at least one
+/// whitespace-separated token with 2+ characters where a strict majority are
+/// alphanumeric — real content (words, initials, drawing numbers, dimension
+/// figures) always has at least one such token; a garbage line built from
+/// isolated punctuation/symbol characters (`"2 = S"`, `"&z"`) does not,
+/// because every one of ITS tokens is either a single stray character or is
+/// itself mostly punctuation.
+///
+/// Deliberately independent of (and applied in addition to) the confidence
+/// filter — `docs/ocr.md` already measured that confidence alone doesn't
+/// separate noise from real content well (correct lines: 63-82% mean
+/// confidence; wrong-orientation noise scores qualitatively low but not
+/// reliably below any single fixed threshold). This is a narrow shape check,
+/// not a language model: it does not attempt to reject noise that happens to
+/// look word-shaped, and does not claim to raise precision to any measured
+/// number — see `render_line_ops`'s call site for how it composes with the
+/// existing confidence/empty/degenerate-box filters.
+pub(crate) fn looks_like_text(text: &str) -> bool {
+    text.split_whitespace().any(|token| {
+        let total = token.chars().count();
+        if total < 2 {
+            return false;
+        }
+        let alnum = token.chars().filter(|c| c.is_alphanumeric()).count();
+        alnum * 2 > total
+    })
+}
+
 /// Map one raster pixel-space point (origin top-left, y down) to PDF
 /// user-space (origin bottom-left, y up), per `render::PageRaster::scale`'s
 /// doc comment. Unchanged from Phase 1.
@@ -736,5 +827,101 @@ mod tests {
     fn parse_tsv_words_ignores_structural_rows_with_negative_confidence() {
         let words = parse_tsv_words(SAMPLE_TSV);
         assert!(words.iter().all(|w| w.conf >= 0.0));
+    }
+
+    // -----------------------------------------------------------------------
+    // sort_by_reading_order / looks_like_text (2026-09-08 search-snippet fix)
+    //
+    // Owner report: searching "DRAWN" against two OCR'd fixtures returned
+    // snippets "DRAWN 2 = S" and "DRAWN &z" — a real matched word glued to
+    // an unrelated symbol-heavy noise fragment. Root cause: OcrLines were
+    // embedded into the page's invisible text layer (and therefore later
+    // extracted, by lopdf for the Tantivy folder index and by PDFium for
+    // in-document search) in `merge_rotate4x_candidates`'s internal
+    // confidence-descending order, not the page's actual reading order — so
+    // a real word and an unrelated noise fragment from a totally different
+    // part of the page could land right next to each other in extracted
+    // text purely because they scored similarly. These tests cover the two
+    // fixes: reordering into reading order, and filtering out symbol-heavy
+    // noise shapes before they can ever be embedded.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sort_by_reading_order_orders_top_to_bottom_left_to_right() {
+        // Three lines given in an order that does NOT match their spatial
+        // layout — mirrors merge_rotate4x_candidates's confidence-descending
+        // output, which reading order must not depend on.
+        let mut lines = vec![
+            line("BOTTOM RIGHT", 0.6, (100.0, 10.0, 200.0, 20.0)),
+            line("TOP LEFT", 0.5, (10.0, 780.0, 60.0, 790.0)),
+            line("TOP RIGHT", 0.9, (200.0, 780.0, 260.0, 790.0)),
+        ];
+        sort_by_reading_order(&mut lines);
+        let order: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(order, vec!["TOP LEFT", "TOP RIGHT", "BOTTOM RIGHT"]);
+    }
+
+    #[test]
+    fn sort_by_reading_order_treats_lines_within_the_y_band_as_one_row() {
+        // Top edges differ by 2pt — real jitter a rotate-4x pass can
+        // introduce for text genuinely on one visual row (Y_BAND_PTS is
+        // 6.0) — so these must order by x, not by input order.
+        let mut lines = vec![
+            line("RIGHT", 0.9, (100.0, 100.0, 150.0, 110.0)),
+            line("LEFT", 0.5, (10.0, 102.0, 60.0, 112.0)),
+        ];
+        sort_by_reading_order(&mut lines);
+        let order: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(order, vec!["LEFT", "RIGHT"]);
+    }
+
+    #[test]
+    fn reading_order_recovers_spatial_order_from_confidence_ordered_merge_output() {
+        // Reproduces the owner-reported shape at the merge+sort boundary
+        // (no Tesseract/raster needed): a real word near the TOP of the page
+        // at LOWER confidence, and a noise-shaped fragment near the BOTTOM
+        // at HIGHER confidence — confidence order glues them together with
+        // no relation to where they actually sit on the page.
+        let candidates = vec![
+            line("DRAWN", 0.55, (10.0, 780.0, 60.0, 790.0)), // top of page, real, lower conf
+            line("2 = S", 0.95, (10.0, 100.0, 60.0, 110.0)), // bottom of page, noise, higher conf
+        ];
+        let mut merged = merge_rotate4x_candidates(candidates);
+        // Sanity: this IS confidence order — what write_page_text_layer used
+        // to embed verbatim before this fix, gluing the two together with no
+        // regard for their actual page positions.
+        assert_eq!(
+            merged[0].text, "2 = S",
+            "merge output starts confidence-sorted"
+        );
+
+        sort_by_reading_order(&mut merged);
+        assert_eq!(
+            merged.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec!["DRAWN", "2 = S"],
+            "reading order must put the top-of-page line first, regardless of confidence"
+        );
+    }
+
+    #[test]
+    fn looks_like_text_accepts_real_content() {
+        for s in ["DRAWN", "MR", "A-101", "REV A", "2026", "CHECKED BY JR"] {
+            assert!(looks_like_text(s), "expected {s:?} to pass");
+        }
+    }
+
+    #[test]
+    fn looks_like_text_rejects_symbol_heavy_noise() {
+        // The owner-reported fragments themselves, plus other shapes drawn
+        // from the raw extraction dump this fix was diagnosed against
+        // (every token in each is either a single stray character or is
+        // itself mostly punctuation — see the module doc comment for why
+        // `"(=)"` is rejected but a letter-containing fragment like `"fo)"`
+        // is deliberately NOT: this is a narrow shape check, not a language
+        // model, and doesn't claim to catch noise that happens to look
+        // word-shaped).
+        for s in ["2 = S", "&z", "? O", "~", ". O =", "> N .", "(=)"] {
+            assert!(!looks_like_text(s), "expected {s:?} to be rejected");
+        }
     }
 }

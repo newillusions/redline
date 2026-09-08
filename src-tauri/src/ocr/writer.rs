@@ -302,6 +302,19 @@ fn render_line_ops(line: &OcrLine, min_confidence: f32) -> Option<Vec<u8>> {
         return None;
     }
 
+    // Shape filter (see `looks_like_text`'s doc comment) — independent of
+    // and in addition to the confidence filter above. Confidence alone
+    // doesn't reliably separate real content from the symbol-heavy noise
+    // fragments the rotate-4x merge's "wrong orientation" passes routinely
+    // produce (`docs/ocr.md`'s "Measured numbers": 9-30% precision on lines
+    // that already passed a confidence filter). Rejecting those here means
+    // they never enter the invisible text layer at all, so no later text
+    // extraction (Tantivy folder-index snippets, PDFium in-document search)
+    // can surface them next to a real match.
+    if !super::looks_like_text(text) {
+        return None;
+    }
+
     // corners_pdf: [top-left, top-right, bottom-right, bottom-left] (see
     // ocr::OcrLine's doc comment). Baseline runs along bottom-left→bottom-right
     // in a purely axis-aligned line, but the RELIABLE edge across every
@@ -476,6 +489,21 @@ mod tests {
         )
     }
 
+    /// A horizontal line at an explicit `(min_x, min_y, max_x, max_y)` box —
+    /// convenience for tests that need to control page POSITION (not just
+    /// text/confidence), e.g. the reading-order regression tests below.
+    fn line_at(text: &str, confidence: Option<f32>, bbox: (f64, f64, f64, f64)) -> OcrLine {
+        let (min_x, min_y, max_x, max_y) = bbox;
+        line(
+            text,
+            confidence,
+            (min_x, max_y),
+            (max_x, max_y),
+            (min_x, min_y),
+            (max_x, min_y),
+        )
+    }
+
     fn one_page_pdf() -> Document {
         // Minimal single-page document, same shape the docops tests already
         // use (see docops::mod's own test helpers) — a Page with an empty
@@ -640,6 +668,70 @@ mod tests {
         assert!(
             !text.contains("NOISE FRAGMENT"),
             "low-confidence line should have been filtered out, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn symbol_heavy_noise_line_is_dropped_even_at_high_confidence() {
+        // The owner-reported search-snippet bug (2026-09-08): a symbol-heavy
+        // noise fragment shaped exactly like the real ones seen in the
+        // fixtures' extracted text ("2 = S", "&z"). Confidence alone doesn't
+        // catch this — set it well ABOVE DEFAULT_MIN_CONFIDENCE so only the
+        // new shape filter (`looks_like_text`) can be why it's dropped.
+        let base = {
+            let mut d = one_page_pdf();
+            let mut out = Vec::new();
+            d.save_to(&mut out).unwrap();
+            out
+        };
+        for noise in ["2 = S", "&z"] {
+            let lines = vec![horizontal_line(noise, Some(0.95))];
+            let out = write_ocr_pdf(&base, &[(0, lines)], DEFAULT_MIN_CONFIDENCE).unwrap();
+            let doc = Document::load_from(Cursor::new(&out)).unwrap();
+            let text = doc.extract_text(&[1]).unwrap_or_default();
+            assert!(
+                !text.contains(noise),
+                "symbol-heavy noise {noise:?} should have been filtered out, got: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_word_survives_next_to_filtered_noise_and_extracts_in_reading_order() {
+        // End-to-end regression for the exact owner-reported symptom: a real
+        // word ("DRAWN") plus a noise-shaped fragment ("2 = S") both make it
+        // into `write_ocr_pdf`'s input in CONFIDENCE order (noise first,
+        // exactly `merge_rotate4x_candidates`'s pre-fix output shape) but
+        // with the noise positioned at the BOTTOM of the page and the real
+        // word at the TOP — the opposite of their write order. Asserts (a)
+        // the noise never reaches extracted text, and (b) the real word does
+        // — i.e. even without a reading-order-aware caller, the shape filter
+        // alone keeps this specific pair from ever being glued together in
+        // extraction order, because the noise side of the pair is dropped
+        // entirely.
+        let base = {
+            let mut d = one_page_pdf();
+            let mut out = Vec::new();
+            d.save_to(&mut out).unwrap();
+            out
+        };
+        let top_of_page = line_at("DRAWN", Some(0.55), (10.0, 780.0, 60.0, 790.0));
+        let bottom_of_page = line_at("2 = S", Some(0.95), (10.0, 100.0, 60.0, 110.0));
+        // Confidence order: noise first, exactly what a pre-fix caller would
+        // hand this function without the ocr::mod reading-order sort.
+        let lines = vec![bottom_of_page, top_of_page];
+
+        let out = write_ocr_pdf(&base, &[(0, lines)], DEFAULT_MIN_CONFIDENCE).unwrap();
+        let doc = Document::load_from(Cursor::new(&out)).unwrap();
+        let text = doc.extract_text(&[1]).unwrap_or_default();
+
+        assert!(
+            text.contains("DRAWN"),
+            "real word should survive, got: {text:?}"
+        );
+        assert!(
+            !text.contains("2 = S"),
+            "noise fragment should have been filtered out, got: {text:?}"
         );
     }
 
