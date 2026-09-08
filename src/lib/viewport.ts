@@ -87,6 +87,90 @@ export function wheelZoomFactor(deltaY: number): number {
 /** Zoom-snap presets - 1:1 (actual size / 100%). */
 export const ACTUAL_SIZE_ZOOM = 1.0;
 
+// ---------------------------------------------------------------------------
+// Wheel-event classification (owner-decided pan/zoom scheme, 2026-09-08)
+// ---------------------------------------------------------------------------
+// Trackpad two-finger swipe and pinch both arrive as native `wheel` events on every
+// platform this app ships to (macOS WKWebView, Windows WebView2/Chromium) - the
+// discriminator for a pinch specifically is `ctrlKey`/`metaKey`: the OS sets it on a
+// pinch (and on an explicit Cmd/Ctrl+wheel from a mouse) but never on a plain two-finger
+// pan swipe. macOS additionally dispatches WebKit-only `gesturestart`/`gesturechange`/
+// `gestureend` events during a pinch (handled separately in Viewport.svelte, guarded so
+// the two paths never both apply the same pinch) - Windows WebView2 never fires those, so
+// the ctrlKey-wheel path here is the ONLY pinch-zoom route there. Shift held is a THIRD
+// zoom trigger (owner amendment 2026-09-08) - Shift+wheel zooms live at the cursor,
+// exactly like Ctrl/Cmd+wheel; it is not a horizontal-pan modifier in this app.
+
+export interface WheelEventLike {
+  deltaX: number;
+  deltaY: number;
+  /** 0 = pixel, 1 = line, 2 = page (WheelEvent.DOM_DELTA_*). */
+  deltaMode: number;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  shiftKey: boolean;
+}
+
+export type WheelAction =
+  | { kind: "zoom"; factor: number }
+  | { kind: "pan"; dx: number; dy: number };
+
+/** Approximate CSS-px-per-unit for line/page-mode wheel deltas (rare outside old mouse
+ *  drivers; most trackpads and modern mice report deltaMode 0/pixel). */
+const WHEEL_LINE_PX = 16;
+const WHEEL_PAGE_PX = 800;
+
+/** Normalize a wheel delta to CSS pixels regardless of the event's deltaMode. */
+export function normalizeWheelDelta(delta: number, deltaMode: number): number {
+  if (deltaMode === 1) return delta * WHEEL_LINE_PX;
+  if (deltaMode === 2) return delta * WHEEL_PAGE_PX;
+  return delta;
+}
+
+/**
+ * Classify a wheel event into a pan or a zoom action.
+ *   - Ctrl/Cmd held (pinch, or an explicit Ctrl/Cmd+wheel from a mouse) -> zoom, using the
+ *     existing `wheelZoomFactor` curve on the normalized deltaY.
+ *   - Shift held (owner amendment 2026-09-08, supersedes the original Shift-pans-horizontally
+ *     draft of this scheme) -> ALSO zoom, live at the cursor, through the same
+ *     `wheelZoomFactor` curve - Shift+two-finger-swipe and Shift+mouse-wheel are both a
+ *     zoom gesture, not a horizontal-pan one, in this app's final scheme. The zoom source
+ *     prefers deltaY but FALLS BACK to deltaX when deltaY is zero (review finding 2026-09-08,
+ *     PR #111 round 2, blocking): Chromium/WebView2 - i.e. every Windows build of this app -
+ *     remaps Shift+vertical-wheel into deltaX and zeroes deltaY at the browser level (the
+ *     same axis-swap convention that makes Shift+wheel scroll horizontally on an ordinary
+ *     web page), so a Windows user's plain mouse wheel would otherwise classify as
+ *     wheelZoomFactor(0) === 1 - a silent, deterministic no-op.
+ *   - Otherwise -> pan. A plain mouse wheel reports only deltaY, so it pans vertically; a
+ *     two-finger trackpad swipe reports both axes, so it pans diagonally. Horizontal pan
+ *     comes only from deltaX on an UNMODIFIED wheel event - a trackpad's own two-finger
+ *     horizontal component, or a mouse's tilt-wheel deltaX when the hardware reports one.
+ */
+export function classifyWheelEvent(e: WheelEventLike): WheelAction {
+  if (e.ctrlKey || e.metaKey) {
+    return { kind: "zoom", factor: wheelZoomFactor(normalizeWheelDelta(e.deltaY, e.deltaMode)) };
+  }
+  const dx = normalizeWheelDelta(e.deltaX, e.deltaMode);
+  const dy = normalizeWheelDelta(e.deltaY, e.deltaMode);
+  if (e.shiftKey) {
+    return { kind: "zoom", factor: wheelZoomFactor(dy !== 0 ? dy : dx) };
+  }
+  return { kind: "pan", dx, dy };
+}
+
+/**
+ * Parse a user-typed zoom-percent string (toolbar input, e.g. "150" or "150%") into a
+ * clamped zoom multiplier. Returns null for empty, non-numeric, or non-positive input so
+ * the caller can reject the edit instead of silently jumping to a clamped extreme.
+ */
+export function parseZoomPercent(input: string, min = ZOOM_MIN, max = ZOOM_MAX): number | null {
+  const trimmed = input.trim().replace(/%$/, "");
+  if (trimmed === "") return null;
+  const pct = Number(trimmed);
+  if (!Number.isFinite(pct) || pct <= 0) return null;
+  return Math.max(min, Math.min(max, pct / 100));
+}
+
 /**
  * Discrete geometric zoom ladder used to bound tile-cache churn during a smooth zoom gesture
  * (Windows-freeze fix, 2026-07). Snapping the RASTER zoom to this ladder means many nearby

@@ -37,12 +37,13 @@
     TILE_SIZE_CSS,
     visibleTiles,
     screenToPdfUserSpace,
-    wheelZoomFactor,
     fitWidthZoom,
     fitHeightZoom,
     ACTUAL_SIZE_ZOOM,
     quantizeZoom,
     clampTileDpr,
+    classifyWheelEvent,
+    parseZoomPercent,
     ZOOM_MIN,
     ZOOM_MAX,
     type ViewportState,
@@ -54,7 +55,7 @@
     type SvgShape, type SelectionChrome, type VertexChrome,
   } from "$lib/markup-render";
   import { charIndexAtPoint, getTextSelection, selectionRange, type Quad } from "$lib/text-select";
-  import { MarkupStore } from "$lib/markup-store.svelte";
+  import { MarkupStore, type ToolKind } from "$lib/markup-store.svelte";
   import {
     hitTest, marqueeHits, boundsOf, isRectResizable,
     handleAnchors, resizeBounds, translateGeometry, scaleGeometryToBounds,
@@ -182,6 +183,13 @@
   let panFps        = $state(0);   // smoothed FPS during pan
   let zoomSettleMs  = $state(0);   // last zoom → all-tiles-sharp settle time (ms)
   let rssMb         = $state(0);   // live process RSS (MB), polled
+
+  // --- Zoom-percent toolbar input (owner-decided 2026-09-08 scheme) ---
+  // Shows the live zoom rounded to a percent while unfocused; while the user is typing it
+  // shows their in-progress draft instead, so the live value doesn't fight their keystrokes.
+  let zoomInputFocused = $state(false);
+  let zoomInputDraft = $state("");
+  const zoomInputDisplay = $derived(zoomInputFocused ? zoomInputDraft : String(Math.round(zoom * 100)));
 
   let lastFrameTs   = 0;           // rAF timestamp of previous pan frame
   let zoomStartTs   = 0;           // performance.now() at last zoom change (0 = settled)
@@ -845,8 +853,49 @@
 
   function onMouseUp() { dragging = false; }
 
+  // ---------------------------------------------------------------------------
+  // Space-bar temporary hand-pan (owner-decided 2026-09-08 scheme) — holding Space
+  // overrides whatever tool is active so a drag pans the viewport; releasing Space
+  // restores the tool that was active before. Swapping store.activeTool is enough:
+  // isCreateTool/isSelectTool/overlayActive all derive from it, so the overlay stops
+  // capturing pointer events and onMouseDown's drag-pan path opens up automatically,
+  // with no special-casing needed anywhere else.
+  // ---------------------------------------------------------------------------
+  let spacePanPreviousTool: ToolKind | null = null;
+
+  function isTypingTarget(target: EventTarget | null): boolean {
+    return target instanceof HTMLElement && (target.tagName === "INPUT" || target.tagName === "TEXTAREA");
+  }
+
+  function onSpaceKeyDown(e: KeyboardEvent) {
+    if (e.code !== "Space") return;
+    if (editor) return; // Text/Callout inline editor — Space must type a literal space
+    if (isTypingTarget(e.target)) return; // e.g. the zoom-percent toolbar input
+    if (spacePanPreviousTool !== null) return; // already held (key-repeat) — no-op
+    spacePanPreviousTool = store.activeTool;
+    store.activeTool = "hand";
+    e.preventDefault();
+  }
+
+  function onSpaceKeyUp(e: KeyboardEvent) {
+    if (e.code !== "Space") return;
+    if (spacePanPreviousTool === null) return;
+    store.activeTool = spacePanPreviousTool;
+    spacePanPreviousTool = null;
+  }
+
   // Keyboard handler: bench overlay toggle + multi-click finish/cancel.
   function onKeyDown(e: KeyboardEvent) {
+    // Every shortcut below (bare-key AND modifier) is this component's own feature
+    // surface, not something a focused text field should ever cede keystrokes to - the
+    // zoom-percent toolbar input and the Text/Callout inline editor <textarea> are the
+    // only INPUT/TEXTAREA elements here, and both must own every key they receive
+    // (typing "v"/"b"/Enter/Escape/Delete must never hijack a tool or toggle chrome out
+    // from under the user). Review finding 2026-09-08 (PR #111 round 2): the "b"/"v"
+    // bare-key branches below were guarded only by `editor`, not this check, so typing
+    // into the new zoom-percent input could still trigger them.
+    if (isTypingTarget(e.target)) return;
+    onSpaceKeyDown(e);
     if (e.key === "b" || e.key === "B") {
       benchOverlay = !benchOverlay;
     }
@@ -871,7 +920,9 @@
       // Fit-height: Cmd/Ctrl+2 (legacy) or Cmd/Ctrl+9
       if (e.key === "2") { e.preventDefault(); fitHeight(); return; }
       if (e.key === "9") { e.preventDefault(); fitHeight(); return; }
-      // Actual size (100%): Cmd/Ctrl+Shift+0
+      // Actual size (100%): Cmd/Ctrl+8 (owner directive 2026-09-08, "8 can be original"),
+      // with the pre-existing Cmd/Ctrl+Shift+0 kept as a legacy alias.
+      if (!e.shiftKey && e.key === "8") { e.preventDefault(); actualSize(); return; }
       if (e.shiftKey && (e.key === "0" || e.key === ")")) { e.preventDefault(); actualSize(); return; }
       // Page navigation: Cmd/Ctrl+ArrowLeft / ArrowRight
       if (e.key === "ArrowLeft")  { e.preventDefault(); prevPage(); return; }
@@ -1073,18 +1124,95 @@
     if (pageHeightPts <= 0) return;
     applySnapZoom(fitHeightZoom(pageHeightPts, containerHeight), "height");
   }
-  /** Snap to 1:1 / 100% (Cmd/Ctrl+0). */
+  /** Snap to 1:1 / 100% (Cmd/Ctrl+8; legacy alias Cmd/Ctrl+Shift+0). */
   function actualSize() {
     applySnapZoom(ACTUAL_SIZE_ZOOM, "actual");
   }
 
+  /** Apply the zoom-percent toolbar input's draft value, anchored at the viewport centre
+   *  (matching the Cmd/Ctrl+=/- keyboard zoom). Invalid input (empty/non-numeric/≤0) is
+   *  silently discarded — the input just reverts to showing the live zoom. */
+  function commitZoomInput() {
+    const parsed = parseZoomPercent(zoomInputDraft, ZOOM_MIN, ZOOM_MAX);
+    if (parsed !== null) {
+      applyZoom(parsed, containerWidth / 2, containerHeight / 2);
+    }
+  }
+
+  /**
+   * Owner-decided pan/zoom scheme (2026-09-08): a two-finger trackpad swipe pans, a pinch
+   * (or an explicit Ctrl/Cmd+wheel from a mouse) zooms — see classifyWheelEvent in
+   * $lib/viewport for the actual pan-vs-zoom decision table and its rationale.
+   */
   function onWheel(e: WheelEvent) {
     e.preventDefault();
     if (!containerEl) return;
+    // A macOS pinch fires ctrlKey-true wheel events AND gesturechange events for the same
+    // physical gesture (see the gesture handlers below). While a gesture is live, OR
+    // within a short grace window after gestureend (a trailing ctrlKey wheel event can
+    // still arrive just after gestureend fires - review finding 2026-09-08, PR #111 round
+    // 2, should-fix), a ctrlKey/metaKey-carrying wheel event is treated as part of that
+    // same pinch and skipped, so the gesture path's own scale-based zoom is never
+    // double-applied. Plain pan events and Shift-zoom (a keyboard modifier, unrelated to a
+    // trackpad pinch) are unaffected either way - only the ctrlKey/metaKey pinch-wheel
+    // shape is suppressed.
+    if ((e.ctrlKey || e.metaKey) && (gestureActive || Date.now() < gestureGraceUntil)) return;
+    const action = classifyWheelEvent(e);
+    if (action.kind === "zoom") {
+      const r = containerEl.getBoundingClientRect();
+      applyZoom(zoom * action.factor, e.clientX - r.left, e.clientY - r.top);
+    } else {
+      scrollX += action.dx;
+      scrollY += action.dy;
+      clampScroll();
+      requestTiles();
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pinch-to-zoom (macOS trackpad) — WebKit-only gesture events. Chromium (Windows
+  // WebView2, incl. precision touchpads) never dispatches gesturestart/change/end at all,
+  // so the ctrlKey-wheel branch of onWheel/classifyWheelEvent above is the ONLY pinch-zoom
+  // route there — no platform check needed, these listeners are simply inert on Windows.
+  // Guarded against double-applying the same pinch via the `gestureActive` flag (plus a
+  // short trailing grace window, `gestureGraceUntil`) onWheel checks above (WebKit fires
+  // both event families for one physical pinch, and a trailing ctrlKey wheel event can
+  // arrive after gestureend has already fired).
+  // ---------------------------------------------------------------------------
+  /** How long after gestureend a ctrlKey/metaKey wheel event is still treated as a
+   *  trailing artifact of the just-ended pinch, rather than a fresh Ctrl/Cmd+wheel zoom. */
+  const GESTURE_TRAILING_GRACE_MS = 100;
+  let gestureActive = false;
+  let gestureStartZoom = 1;
+  /** Date.now() timestamp until which a ctrlKey/metaKey wheel event is suppressed by
+   *  onWheel, set by onGestureEnd. 0 (the default) is always in the past. */
+  let gestureGraceUntil = 0;
+
+  /** Minimal shape of WebKit's non-standard GestureEvent (no DOM lib types for it). */
+  interface WebKitGestureEvent extends Event {
+    scale: number;
+    clientX: number;
+    clientY: number;
+  }
+
+  function onGestureStart(e: Event) {
+    e.preventDefault();
+    gestureActive = true;
+    gestureStartZoom = zoom;
+  }
+
+  function onGestureChange(e: Event) {
+    e.preventDefault();
+    if (!containerEl) return;
+    const ge = e as WebKitGestureEvent;
     const r = containerEl.getBoundingClientRect();
-    // Zoom step proportional to the wheel delta (see wheelZoomFactor) so a fast flick can't
-    // rocket to the max in a few events.
-    applyZoom(zoom * wheelZoomFactor(e.deltaY), e.clientX - r.left, e.clientY - r.top);
+    applyZoom(gestureStartZoom * ge.scale, ge.clientX - r.left, ge.clientY - r.top);
+  }
+
+  function onGestureEnd(e: Event) {
+    e.preventDefault();
+    gestureActive = false;
+    gestureGraceUntil = Date.now() + GESTURE_TRAILING_GRACE_MS;
   }
 
   // ---------------------------------------------------------------------------
@@ -2362,8 +2490,14 @@
     if (containerEl) {
       resizeObserver = new ResizeObserver(onResize);
       resizeObserver.observe(containerEl);
+      // WebKit-only pinch events (see onGestureStart/Change/End) — inert on Chromium
+      // (Windows WebView2), which never dispatches them.
+      containerEl.addEventListener("gesturestart", onGestureStart);
+      containerEl.addEventListener("gesturechange", onGestureChange);
+      containerEl.addEventListener("gestureend", onGestureEnd);
     }
     window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onSpaceKeyUp);
     loadPageSize();
     // Load user identity for markup authoring. On failure, surface a notice so the
     // crosshair-but-nothing-happens state isn't silent.
@@ -2374,7 +2508,13 @@
 
   onDestroy(() => {
     resizeObserver?.disconnect();
+    if (containerEl) {
+      containerEl.removeEventListener("gesturestart", onGestureStart);
+      containerEl.removeEventListener("gesturechange", onGestureChange);
+      containerEl.removeEventListener("gestureend", onGestureEnd);
+    }
     window.removeEventListener("keydown", onKeyDown);
+    window.removeEventListener("keyup", onSpaceKeyUp);
     if (zoomSettleTimer) clearTimeout(zoomSettleTimer);
     tileCache.clear();
     pendingTiles.clear();
@@ -2391,7 +2531,7 @@
   onmouseleave={onMouseUp}
   onwheel={onWheel}
   role="application"
-  aria-label="PDF viewport — pan with drag, zoom with scroll"
+  aria-label="PDF viewport — two-finger swipe or wheel to pan, pinch or Ctrl/Cmd/Shift+scroll to zoom, Space+drag to pan with any tool"
 >
   <!-- Tile canvas (Rust-rendered, display only) -->
   <canvas bind:this={canvasEl} class="tile-canvas"></canvas>
@@ -2753,11 +2893,27 @@
     <button class="btn-nav" onclick={nextPage} disabled={pageIndex >= docInfo.page_count - 1}>›</button>
   </nav>
 
-  <!-- Zoom-snap presets: full-width, full-height, 1:1 (key-commands ⌘/Ctrl 1/2/0). -->
+  <!-- Zoom-snap presets: full-width, full-height, 1:1 (key-commands ⌘/Ctrl 0/9/8), plus a
+       type-a-percent input. -->
   <div class="zoom-controls" role="group" aria-label="Zoom presets">
-    <button class="btn-zoom" title="Fit width (⌘/Ctrl 1)" onclick={fitWidth}>Fit W</button>
-    <button class="btn-zoom" title="Fit height (⌘/Ctrl 2)" onclick={fitHeight}>Fit H</button>
-    <button class="btn-zoom" title="Actual size · 100% (⌘/Ctrl 0)" onclick={actualSize}>100%</button>
+    <button class="btn-zoom" title="Fit width (⌘/Ctrl 0)" onclick={fitWidth}>Fit W</button>
+    <button class="btn-zoom" title="Fit height (⌘/Ctrl 9)" onclick={fitHeight}>Fit H</button>
+    <button class="btn-zoom" title="Actual size · 100% (⌘/Ctrl 8)" onclick={actualSize}>100%</button>
+    <input
+      class="zoom-percent-input"
+      type="text"
+      inputmode="numeric"
+      aria-label="Zoom percent"
+      title="Type a zoom percentage and press Enter"
+      value={zoomInputDisplay}
+      onfocus={() => { zoomInputFocused = true; zoomInputDraft = String(Math.round(zoom * 100)); }}
+      onblur={() => { zoomInputFocused = false; }}
+      oninput={(e) => { zoomInputDraft = (e.target as HTMLInputElement).value; }}
+      onkeydown={(e) => {
+        if (e.key === "Enter") { e.preventDefault(); commitZoomInput(); (e.target as HTMLInputElement).blur(); }
+        else if (e.key === "Escape") { e.preventDefault(); (e.target as HTMLInputElement).blur(); }
+      }}
+    />
   </div>
 
   <!-- Zoom indicator + bench stats (M1 validation) -->
@@ -3027,6 +3183,24 @@
     transition: background 120ms, color 120ms;
   }
   .btn-zoom:hover { background: var(--color-bg-hover); color: var(--color-text); }
+
+  .zoom-percent-input {
+    width: 3.25em;
+    background: none;
+    border: none;
+    border-radius: var(--radius-sm);
+    color: var(--color-text-secondary);
+    font-size: var(--font-size-xs);
+    font-family: var(--font-mono);
+    text-align: center;
+    padding: var(--space-1) 0;
+  }
+  .zoom-percent-input:hover { background: var(--color-bg-hover); color: var(--color-text); }
+  .zoom-percent-input:focus {
+    background: var(--color-bg-hover);
+    color: var(--color-text);
+    outline: 1px solid var(--color-border);
+  }
 
   /* --- §20 live bench overlay --- */
   .bench-overlay {

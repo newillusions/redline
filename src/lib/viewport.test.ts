@@ -9,6 +9,10 @@ import {
   MAX_TILE_DPR,
   ZOOM_MIN,
   ZOOM_MAX,
+  classifyWheelEvent,
+  normalizeWheelDelta,
+  parseZoomPercent,
+  type WheelEventLike,
 } from "./viewport";
 
 // ---------------------------------------------------------------------------
@@ -109,5 +113,157 @@ describe("clampTileDpr", () => {
   it("clamps the real Windows 250% scaling case (dpr 2.5) down to MAX_TILE_DPR", () => {
     expect(clampTileDpr(2.5)).toBe(MAX_TILE_DPR);
     expect(clampTileDpr(3)).toBe(MAX_TILE_DPR);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// normalizeWheelDelta - deltaMode-aware px conversion (0=pixel, 1=line, 2=page).
+// ---------------------------------------------------------------------------
+describe("normalizeWheelDelta", () => {
+  it("passes deltaMode 0 (pixel) through unchanged", () => {
+    expect(normalizeWheelDelta(42, 0)).toBe(42);
+    expect(normalizeWheelDelta(-7.5, 0)).toBe(-7.5);
+  });
+
+  it("scales deltaMode 1 (line) up to an approximate px value", () => {
+    expect(normalizeWheelDelta(1, 1)).toBeGreaterThan(1);
+    expect(normalizeWheelDelta(-2, 1)).toBeLessThan(-2);
+  });
+
+  it("scales deltaMode 2 (page) up further than line mode", () => {
+    expect(normalizeWheelDelta(1, 2)).toBeGreaterThan(normalizeWheelDelta(1, 1));
+  });
+
+  it("preserves sign", () => {
+    expect(normalizeWheelDelta(-3, 1)).toBeLessThan(0);
+    expect(normalizeWheelDelta(3, 1)).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// classifyWheelEvent - owner-decided pan/zoom scheme (2026-09-08): a two-finger
+// trackpad swipe pans, a pinch (or explicit Ctrl/Cmd+wheel) zooms.
+// ---------------------------------------------------------------------------
+describe("classifyWheelEvent", () => {
+  function wheel(overrides: Partial<WheelEventLike>): WheelEventLike {
+    return { deltaX: 0, deltaY: 0, deltaMode: 0, ctrlKey: false, metaKey: false, shiftKey: false, ...overrides };
+  }
+
+  it("mac trackpad two-finger swipe (ctrlKey false, small deltaX/deltaY, deltaMode 0) pans diagonally", () => {
+    const action = classifyWheelEvent(wheel({ deltaX: 3.2, deltaY: -1.7 }));
+    expect(action).toEqual({ kind: "pan", dx: 3.2, dy: -1.7 });
+  });
+
+  it("mac pinch (ctrlKey true, small deltaY - WebKit's synthetic pinch-wheel shape) zooms", () => {
+    const action = classifyWheelEvent(wheel({ deltaY: -12, ctrlKey: true }));
+    expect(action.kind).toBe("zoom");
+    if (action.kind === "zoom") {
+      expect(action.factor).toBeCloseTo(wheelZoomFactor(-12));
+      expect(action.factor).toBeGreaterThan(1); // negative deltaY → zoom in
+    }
+  });
+
+  it("Windows precision-touchpad pan (same shape as mac trackpad) pans", () => {
+    const action = classifyWheelEvent(wheel({ deltaX: -5, deltaY: 4 }));
+    expect(action).toEqual({ kind: "pan", dx: -5, dy: 4 });
+  });
+
+  it("Windows precision-touchpad pinch (ctrlKey true) zooms, same as mac", () => {
+    const action = classifyWheelEvent(wheel({ deltaY: 8, ctrlKey: true }));
+    expect(action.kind).toBe("zoom");
+  });
+
+  it("plain mouse wheel (deltaMode 1 lines, deltaY only) pans vertically", () => {
+    const action = classifyWheelEvent(wheel({ deltaY: 3, deltaMode: 1 }));
+    expect(action).toEqual({ kind: "pan", dx: 0, dy: normalizeWheelDelta(3, 1) });
+  });
+
+  it("plain mouse wheel with a large raw deltaY (deltaMode 0) pans vertically", () => {
+    const action = classifyWheelEvent(wheel({ deltaY: 240 }));
+    expect(action).toEqual({ kind: "pan", dx: 0, dy: 240 });
+  });
+
+  it("Shift+wheel zooms (owner amendment 2026-09-08) - Shift is a zoom trigger, not a horizontal-pan remap", () => {
+    const action = classifyWheelEvent(wheel({ deltaY: 50, shiftKey: true }));
+    expect(action).toEqual({ kind: "zoom", factor: wheelZoomFactor(50) });
+  });
+
+  it("Shift+two-finger-swipe (deltaX and deltaY both nonzero) still zooms - deltaY is preferred over deltaX", () => {
+    const action = classifyWheelEvent(wheel({ deltaX: 12, deltaY: -8, shiftKey: true }));
+    expect(action).toEqual({ kind: "zoom", factor: wheelZoomFactor(-8) });
+  });
+
+  it("Shift+wheel on a Windows mouse (Chromium/WebView2 remaps the delta to deltaX, zeroing deltaY) falls back to deltaX so it isn't a silent no-op", () => {
+    // Regression case (review finding 2026-09-08, PR #111 round 2, BLOCKING): before the
+    // deltaY-or-deltaX fallback, this shape classified as wheelZoomFactor(0) === 1, a
+    // deterministic no-op that silently broke Shift+wheel zoom for every Windows mouse.
+    const action = classifyWheelEvent(wheel({ deltaX: 120, deltaY: 0, shiftKey: true }));
+    expect(action).toEqual({ kind: "zoom", factor: wheelZoomFactor(120) });
+    expect((action as { factor: number }).factor).not.toBe(1);
+  });
+
+  it("Shift+wheel on a Windows mouse scrolling the other direction (negative deltaX, deltaY zero) zooms in, not out", () => {
+    const action = classifyWheelEvent(wheel({ deltaX: -120, deltaY: 0, shiftKey: true }));
+    expect(action).toEqual({ kind: "zoom", factor: wheelZoomFactor(-120) });
+    expect((action as { factor: number }).factor).toBeGreaterThan(1); // negative delta -> zoom in
+  });
+
+  it("Shift+wheel with both deltas zero (a genuinely empty event) is the one legitimate no-op - not a regression, just nothing to classify", () => {
+    const action = classifyWheelEvent(wheel({ deltaX: 0, deltaY: 0, shiftKey: true }));
+    expect(action).toEqual({ kind: "zoom", factor: 1 });
+  });
+
+  it("Cmd+wheel (metaKey, macOS convention) zooms same as ctrlKey", () => {
+    const action = classifyWheelEvent(wheel({ deltaY: -20, metaKey: true }));
+    expect(action.kind).toBe("zoom");
+  });
+
+  it("Ctrl+wheel from an explicit mouse zooms using the shared wheelZoomFactor curve", () => {
+    const action = classifyWheelEvent(wheel({ deltaY: 100, ctrlKey: true }));
+    expect(action).toEqual({ kind: "zoom", factor: wheelZoomFactor(100) });
+  });
+
+  it("Ctrl+Shift+wheel still zooms - both modifiers independently trigger zoom", () => {
+    const action = classifyWheelEvent(wheel({ deltaY: -20, ctrlKey: true, shiftKey: true }));
+    expect(action.kind).toBe("zoom");
+  });
+
+  it("an unmodified two-finger swipe with a horizontal component pans horizontally (deltaX from the trackpad itself)", () => {
+    const action = classifyWheelEvent(wheel({ deltaX: 50, deltaY: 0 }));
+    expect(action).toEqual({ kind: "pan", dx: 50, dy: 0 });
+  });
+
+  it("a mouse tilt-wheel's deltaX (no modifier) pans horizontally", () => {
+    const action = classifyWheelEvent(wheel({ deltaX: 30, deltaY: 0, deltaMode: 1 }));
+    expect(action).toEqual({ kind: "pan", dx: normalizeWheelDelta(30, 1), dy: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseZoomPercent - toolbar zoom-percent input parsing.
+// ---------------------------------------------------------------------------
+describe("parseZoomPercent", () => {
+  it("parses a plain integer percent into a zoom multiplier", () => {
+    expect(parseZoomPercent("150")).toBeCloseTo(1.5);
+    expect(parseZoomPercent("100")).toBeCloseTo(1.0);
+    expect(parseZoomPercent("50")).toBeCloseTo(0.5);
+  });
+
+  it("tolerates a trailing % sign and surrounding whitespace", () => {
+    expect(parseZoomPercent("150%")).toBeCloseTo(1.5);
+    expect(parseZoomPercent("  150  ")).toBeCloseTo(1.5);
+  });
+
+  it("clamps to [ZOOM_MIN, ZOOM_MAX]", () => {
+    expect(parseZoomPercent("1")).toBeCloseTo(ZOOM_MIN);
+    expect(parseZoomPercent("99999")).toBeCloseTo(ZOOM_MAX);
+  });
+
+  it("returns null for empty, non-numeric, zero, or negative input", () => {
+    expect(parseZoomPercent("")).toBeNull();
+    expect(parseZoomPercent("   ")).toBeNull();
+    expect(parseZoomPercent("abc")).toBeNull();
+    expect(parseZoomPercent("0")).toBeNull();
+    expect(parseZoomPercent("-50")).toBeNull();
   });
 });

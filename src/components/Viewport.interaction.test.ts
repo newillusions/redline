@@ -240,8 +240,9 @@ describe("Viewport G3 drag-draw", () => {
     const w0 = parseFloat(rectEl.getAttribute("width")!);
     expect(w0).toBeCloseTo(50); // 50pt × zoom 1 = 50 screen px
 
-    // Zoom in one wheel step. Viewport.onWheel: deltaY<0 → zoom += 0.1 → 1.1.
-    fireEvent.wheel(container.querySelector(".viewport-root")!, { deltaY: -100 });
+    // Zoom in one wheel step (Ctrl held — trackpad pinch / mouse zoom path; a plain
+    // wheel now pans per the owner-decided 2026-09-08 scheme, see classifyWheelEvent).
+    fireEvent.wheel(container.querySelector(".viewport-root")!, { deltaY: -100, ctrlKey: true });
     await tick(); // let the $derived overlay re-derive from the new viewState
 
     const rectEl2 = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
@@ -505,8 +506,8 @@ describe("Viewport G4 multi-click tools", () => {
     // Expected at zoom 1: "50,50 150,100"
     expect(points0).toContain("50");
 
-    // Zoom in one wheel step: deltaY < 0 → zoom += 0.1 → zoom = 1.1.
-    fireEvent.wheel(container.querySelector(".viewport-root")!, { deltaY: -100 });
+    // Zoom in one wheel step (Ctrl held — see classifyWheelEvent; a plain wheel pans).
+    fireEvent.wheel(container.querySelector(".viewport-root")!, { deltaY: -100, ctrlKey: true });
     await tick();
 
     // After zoom, the screen coordinates must scale with zoom.
@@ -779,6 +780,286 @@ describe("Viewport zoom-snap controls", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Owner-decided trackpad pan / pinch zoom scheme (2026-09-08) — the DOM-level
+// counterpart to $lib/viewport's classifyWheelEvent unit tests: proves the real
+// onWheel/onKeyDown wiring routes events the way the classifier says it should,
+// and covers the new UI surface (Ctrl/Cmd+8, tooltips, zoom-percent input, Space-pan).
+// ---------------------------------------------------------------------------
+describe("Viewport wheel pan/zoom + new zoom controls (owner-decided 2026-09-08 scheme)", () => {
+  let ipc: ReturnType<typeof fakeIpc>;
+  let store: MarkupStore;
+
+  // A page bigger than the container so a pan has somewhere to go (400×400 pts vs a
+  // 200×200 container at zoom 1 → 200px of scroll room on each axis).
+  const LARGE_PAGE = { doc_id: "d1", page_index: 0, width_pts: 400, height_pts: 400 };
+
+  beforeEach(() => {
+    vi.mocked(ipcMocks.getPageSize).mockResolvedValue(LARGE_PAGE);
+    vi.mocked(ipcMocks.renderTile).mockResolvedValue({
+      doc_id: "d1", page_index: 0, tile_x: 0, tile_y: 0,
+      width_px: 512, height_px: 512, zoom: 1, dpr: 1,
+      png_base64: "", render_ms: 1,
+    });
+    vi.mocked(ipcMocks.processRssMb).mockResolvedValue(0);
+    vi.mocked(ipcMocks.getUserIdentity).mockResolvedValue(FAKE_IDENTITY);
+
+    ipc = fakeIpc();
+    store = new MarkupStore("d1", ipc);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function zoomPercent(container: HTMLElement): string {
+    return container.querySelector(".zoom-indicator")?.textContent ?? "";
+  }
+
+  it("a plain two-finger wheel event (no ctrlKey) pans and does NOT zoom", async () => {
+    const { container, overlay } = await mountViewport(store);
+    store.activeTool = "Rectangle";
+    // 50pt-wide rect at zoom 1, scroll 0 → screen x=50, width=50 (see T6 for the math).
+    ptr(overlay, "pointerdown", 50, 50);
+    ptr(overlay, "pointermove", 100, 100);
+    ptr(overlay, "pointerup", 100, 100);
+    const rectEl = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const x0 = parseFloat(rectEl.getAttribute("x")!);
+    const w0 = parseFloat(rectEl.getAttribute("width")!);
+
+    fireEvent.wheel(container.querySelector(".viewport-root")!, { deltaX: 40, deltaY: 0 });
+    await tick();
+
+    expect(zoomPercent(container)).toContain("100%"); // unchanged — this was a pan, not a zoom
+    const rectEl2 = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const w1 = parseFloat(rectEl2.getAttribute("width")!);
+    const x1 = parseFloat(rectEl2.getAttribute("x")!);
+    expect(w1).toBeCloseTo(w0); // width unchanged — no zoom happened
+    expect(x1).toBeCloseTo(x0 - 40); // scrollX += 40 → screen x shifts left by 40
+  });
+
+  it("a diagonal two-finger swipe pans both axes at once", async () => {
+    const { container, overlay } = await mountViewport(store);
+    store.activeTool = "Rectangle";
+    ptr(overlay, "pointerdown", 50, 50);
+    ptr(overlay, "pointermove", 100, 100);
+    ptr(overlay, "pointerup", 100, 100);
+    const rectEl = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const x0 = parseFloat(rectEl.getAttribute("x")!);
+    const y0 = parseFloat(rectEl.getAttribute("y")!);
+
+    fireEvent.wheel(container.querySelector(".viewport-root")!, { deltaX: 30, deltaY: 20 });
+    await tick();
+
+    const rectEl2 = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    expect(parseFloat(rectEl2.getAttribute("x")!)).toBeCloseTo(x0 - 30);
+    expect(parseFloat(rectEl2.getAttribute("y")!)).toBeCloseTo(y0 - 20);
+  });
+
+  it("Shift+wheel zooms (owner amendment 2026-09-08) - Shift is a zoom trigger, not a horizontal-pan modifier", async () => {
+    const { container, overlay } = await mountViewport(store);
+    store.activeTool = "Rectangle";
+    ptr(overlay, "pointerdown", 50, 50);
+    ptr(overlay, "pointermove", 100, 100);
+    ptr(overlay, "pointerup", 100, 100);
+    const rectEl = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const w0 = parseFloat(rectEl.getAttribute("width")!);
+
+    fireEvent.wheel(container.querySelector(".viewport-root")!, { deltaX: 0, deltaY: -100, shiftKey: true });
+    await tick();
+
+    // Width scaled by the zoom factor, exactly like a Ctrl/Cmd+wheel zoom (T6) - proving
+    // this was a zoom, not a pan.
+    const rectEl2 = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const w1 = parseFloat(rectEl2.getAttribute("width")!);
+    expect(w1).toBeCloseTo(w0 * wheelZoomFactor(-100), 1);
+    expect(zoomPercent(container)).not.toContain("100%");
+  });
+
+  it("Shift+two-finger-swipe (deltaX and deltaY both nonzero) zooms too, not a diagonal pan", async () => {
+    const { container, overlay } = await mountViewport(store);
+    store.activeTool = "Rectangle";
+    ptr(overlay, "pointerdown", 50, 50);
+    ptr(overlay, "pointermove", 100, 100);
+    ptr(overlay, "pointerup", 100, 100);
+    const rectEl = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const w0 = parseFloat(rectEl.getAttribute("width")!);
+
+    fireEvent.wheel(container.querySelector(".viewport-root")!, { deltaX: 15, deltaY: -50, shiftKey: true });
+    await tick();
+
+    const rectEl2 = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const w1 = parseFloat(rectEl2.getAttribute("width")!);
+    expect(w1).toBeCloseTo(w0 * wheelZoomFactor(-50), 1);
+  });
+
+  it("an unmodified two-finger swipe with a horizontal component (deltaX only, no Shift) pans horizontally", async () => {
+    const { container, overlay } = await mountViewport(store);
+    store.activeTool = "Rectangle";
+    ptr(overlay, "pointerdown", 50, 50);
+    ptr(overlay, "pointermove", 100, 100);
+    ptr(overlay, "pointerup", 100, 100);
+    const rectEl = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const x0 = parseFloat(rectEl.getAttribute("x")!);
+    const y0 = parseFloat(rectEl.getAttribute("y")!);
+    const w0 = parseFloat(rectEl.getAttribute("width")!);
+
+    fireEvent.wheel(container.querySelector(".viewport-root")!, { deltaX: 40, deltaY: 0 });
+    await tick();
+
+    const rectEl2 = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    expect(parseFloat(rectEl2.getAttribute("width")!)).toBeCloseTo(w0); // no zoom
+    expect(parseFloat(rectEl2.getAttribute("x")!)).toBeCloseTo(x0 - 40); // horizontal pan
+    expect(parseFloat(rectEl2.getAttribute("y")!)).toBeCloseTo(y0); // vertical unaffected
+  });
+
+  it("Ctrl/Cmd+8 snaps to actual size (100%), with Ctrl/Cmd+Shift+0 kept as a legacy alias", async () => {
+    const { container } = await mountViewport(store);
+    fireEvent.keyDown(window, { key: "0", metaKey: true }); // fit-width → 50% (400pt square page / 200px)
+    await tick();
+    expect(zoomPercent(container)).toContain("50%");
+
+    fireEvent.keyDown(window, { key: "8", metaKey: true });
+    await tick();
+    expect(zoomPercent(container)).toContain("100%");
+
+    // Legacy alias still works.
+    fireEvent.keyDown(window, { key: "0", metaKey: true }); // back to 50%
+    await tick();
+    expect(zoomPercent(container)).toContain("50%");
+    fireEvent.keyDown(window, { key: "0", metaKey: true, shiftKey: true });
+    await tick();
+    expect(zoomPercent(container)).toContain("100%");
+  });
+
+  it("the three preset button tooltips name the current key-commands (0/9/8), not the stale 1/2/0", async () => {
+    const { container } = await mountViewport(store);
+    const titles = Array.from(container.querySelectorAll(".zoom-controls button")).map((b) =>
+      b.getAttribute("title"),
+    );
+    expect(titles).toContain("Fit width (⌘/Ctrl 0)");
+    expect(titles).toContain("Fit height (⌘/Ctrl 9)");
+    expect(titles).toContain("Actual size · 100% (⌘/Ctrl 8)");
+    // None of the old tooltip text (which described 1/2/0) should remain.
+    expect(titles.some((t) => t?.includes("⌘/Ctrl 1"))).toBe(false);
+    expect(titles.some((t) => t?.includes("⌘/Ctrl 2"))).toBe(false);
+  });
+
+  it("the zoom-percent input: typing 150 + Enter zooms to 150%, clamped via parseZoomPercent", async () => {
+    const { container } = await mountViewport(store);
+    const input = container.querySelector('input[aria-label="Zoom percent"]') as HTMLInputElement;
+    expect(input).not.toBeNull();
+
+    await fireEvent.focus(input);
+    await fireEvent.input(input, { target: { value: "150" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+    await tick();
+
+    expect(zoomPercent(container)).toContain("150%");
+  });
+
+  it("the zoom-percent input ignores invalid text and shows the live zoom rounded when unfocused", async () => {
+    const { container } = await mountViewport(store);
+    const input = container.querySelector('input[aria-label="Zoom percent"]') as HTMLInputElement;
+
+    await fireEvent.focus(input);
+    await fireEvent.input(input, { target: { value: "not a number" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+    await tick();
+    expect(zoomPercent(container)).toContain("100%"); // rejected — zoom unchanged
+
+    await fireEvent.blur(input);
+    await tick();
+    expect(input.value).toBe("100"); // reverts to showing the live zoom rounded
+  });
+
+  it("Space held switches to the hand tool regardless of the active tool; release restores it", async () => {
+    await mountViewport(store);
+    store.activeTool = "Rectangle";
+    await tick();
+
+    await fireEvent.keyDown(window, { code: "Space" });
+    await tick();
+    expect(store.activeTool).toBe("hand");
+
+    await fireEvent.keyUp(window, { code: "Space" });
+    await tick();
+    expect(store.activeTool).toBe("Rectangle");
+  });
+
+  it("Space held is not intercepted while the zoom-percent input has focus (typing must not hijack the tool)", async () => {
+    const { container } = await mountViewport(store);
+    const input = container.querySelector('input[aria-label="Zoom percent"]') as HTMLInputElement;
+    store.activeTool = "Rectangle";
+    await tick();
+
+    await fireEvent.keyDown(input, { code: "Space" });
+    await tick();
+    expect(store.activeTool).toBe("Rectangle"); // guard held — no hand-pan override
+  });
+
+  it("typing 'v' into the zoom-percent input does not switch to the select tool (review finding, PR #111 round 2)", async () => {
+    // Regression case: onKeyDown's bare-key branches (b/v) were guarded only by `editor`,
+    // not isTypingTarget - typing into the new zoom input could hijack the active tool.
+    const { container } = await mountViewport(store);
+    const input = container.querySelector('input[aria-label="Zoom percent"]') as HTMLInputElement;
+    store.activeTool = "Rectangle";
+    await tick();
+
+    await fireEvent.keyDown(input, { key: "v" });
+    await tick();
+    expect(store.activeTool).toBe("Rectangle"); // "v" typed in the input must not hijack the tool
+  });
+
+  it("typing 'b' into the zoom-percent input does not toggle the bench overlay", async () => {
+    const { container } = await mountViewport(store);
+    const input = container.querySelector('input[aria-label="Zoom percent"]') as HTMLInputElement;
+    expect(container.querySelector(".bench-overlay")).toBeNull();
+
+    await fireEvent.keyDown(input, { key: "b" });
+    await tick();
+    expect(container.querySelector(".bench-overlay")).toBeNull(); // still off
+  });
+
+  it("a trailing ctrlKey wheel event within the grace window after gestureend does not double-apply the pinch zoom (macOS)", async () => {
+    // Review finding 2026-09-08, PR #111 round 2, should-fix: WebKit can deliver one more
+    // ctrlKey-true wheel tick just after gestureend fires. Without the grace window that
+    // trailing event would re-apply Ctrl-wheel zoom on top of the gesture's own scale-based
+    // zoom, double-counting a single physical pinch.
+    vi.useFakeTimers();
+    try {
+      const { container, containerEl } = await mountViewport(store);
+      expect(containerEl).not.toBeNull();
+
+      containerEl!.dispatchEvent(new Event("gesturestart", { cancelable: true }));
+      const gc = Object.assign(new Event("gesturechange", { cancelable: true }), {
+        scale: 1.5, clientX: 100, clientY: 100,
+      });
+      containerEl!.dispatchEvent(gc);
+      await tick();
+      const afterGesture = zoomPercent(container);
+      expect(afterGesture).toContain("150%");
+
+      containerEl!.dispatchEvent(new Event("gestureend", { cancelable: true }));
+
+      // Trailing ctrlKey wheel event 30ms later - well within the 100ms grace window.
+      vi.advanceTimersByTime(30);
+      fireEvent.wheel(containerEl!, { deltaY: -100, ctrlKey: true });
+      await tick();
+      expect(zoomPercent(container)).toBe(afterGesture); // unchanged - trailing event ignored
+
+      // Once the grace window elapses, a genuine new Ctrl/Cmd+wheel zoom applies normally -
+      // the guard doesn't permanently wedge Ctrl+wheel zoom after any pinch.
+      vi.advanceTimersByTime(200);
+      fireEvent.wheel(containerEl!, { deltaY: -100, ctrlKey: true });
+      await tick();
+      expect(zoomPercent(container)).not.toBe(afterGesture);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Auth guard: identity unavailable prevents draw
 // ---------------------------------------------------------------------------
 describe("Viewport draw guard — identity unavailable", () => {
@@ -1036,8 +1317,8 @@ describe("Viewport G5 text + callout", () => {
     expect(x0).toBeGreaterThan(0);
     expect(fontSize0).toBeCloseTo(12 * 1); // 12pt × zoom 1
 
-    // Zoom in one step (deltaY < 0 → zoom = 1.1).
-    fireEvent.wheel(container.querySelector(".viewport-root")!, { deltaY: -100 });
+    // Zoom in one step (Ctrl held — see classifyWheelEvent; a plain wheel pans).
+    fireEvent.wheel(container.querySelector(".viewport-root")!, { deltaY: -100, ctrlKey: true });
     await tick();
 
     const textEl2 = container.querySelector("svg.markup-overlay text") as SVGTextElement;
@@ -1349,8 +1630,8 @@ describe("Viewport G6 select", () => {
     const w0 = parseFloat(box0.getAttribute("width")!);
     expect(w0).toBeCloseTo(70); // 70pt × zoom 1
 
-    // Zoom in one wheel step.
-    fireEvent.wheel(container.querySelector(".viewport-root")!, { deltaY: -100 });
+    // Zoom in one wheel step (Ctrl held — see classifyWheelEvent; a plain wheel pans).
+    fireEvent.wheel(container.querySelector(".viewport-root")!, { deltaY: -100, ctrlKey: true });
     await tick();
 
     const box1 = container.querySelector("svg.markup-overlay .selection-box") as SVGRectElement;
