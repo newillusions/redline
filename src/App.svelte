@@ -1213,22 +1213,38 @@
   <div class="body-row">
     <!-- Left panel -->
     {#if !leftCollapsed}
-      <aside class="panel panel-left" class:panel-left--search={searchPanelVisible} data-testid="panel-left">
+      <aside class="panel panel-left" data-testid="panel-left">
         <!-- Search (search-parity: current doc / open docs / folder+subfolders). Placed
              first — the toolbar Find button / Cmd-Ctrl-F is the primary way in.
 
-             Owner-reported defect (2026-09-07, v0.3.17 live use): "the search window
-             was collapsed when it opened... that needs to be fully open and visible."
-             Root cause (confirmed via tools/gui-harness.mjs, not just reading the code):
-             leftCollapsed/searchPanelVisible were both already correct (no stale
-             persisted collapse state, none exists in this file), but Search shared the
-             fixed 260px sidebar with three other always-visible sections and only got
-             a 2/5 flex-basis share of the height — plenty of DOM presence, but visually
-             reads as "collapsed" next to what Bluebeam's dedicated Search panel looks
-             like. Fix: while search is open, it takes over the whole left column (the
-             other sections resume when it's closed — nothing they show is needed while
-             actively searching), and the column itself widens via
-             --panel-left-width-search so the input/results aren't cramped. -->
+             Owner-reported defects (2026-09-08, v0.3.20 live use), both fixed here.
+             Terminology (owner-set): the left/right panel-left/panel-right elements are
+             SIDEBARS; the collapsible modules stacked inside one (Search, Tool Chest,
+             Properties, etc.) are PANELS. Existing identifiers (panel-left,
+             --panel-left-width, .panel-section, data-testid="panel-left") are unchanged -
+             only new prose uses the new words.
+             1) "opening the search panel changes the sidebar to a different width" -
+                sidebar width is a property of the SIDEBAR, not of whichever panel happens
+                to be showing. The old class:panel-left--search width override (and the
+                --panel-left-width-search token) is gone; panel-left keeps ONE width
+                (--panel-left-width) whether or not Search is open, matching the
+                persisted/default sidebar width like every other panel switch.
+             2) "the other panel boxes" (Recent Documents / Tool Chest / Navigator) "get
+                hidden behind search" - per spec §17 a sidebar hosts a STACK of
+                individually collapsible panels, so Search no longer swaps them out via
+                {:else}; it renders ABOVE them with a bounded height
+                (.panel-section--search, capped so it can't crowd the rest of the stack
+                out) while its own result list (.search-groups) scrolls internally -
+                Recent Documents/Tool Chest/Navigator stay visible and reachable below
+                it, with their existing Accordion collapse/expand affordances untouched.
+                One side effect worth knowing: these three panels no longer unmount when
+                Search opens (they used to live behind the {:else} branch) - they now
+                stay mounted the whole time, which is strictly safer for their Accordion
+                sessionStorage-backed collapsed state (see ToolChestPanel.svelte's
+                comment) than the old unmount/remount cycle was.
+
+             (Superseded 2026-09-07 comment: Search "takes over the whole left column" (the
+             pre-2026-09-08 wording for this sidebar) - no longer true, see above.) -->
         {#if searchPanelVisible}
           <div class="panel-section panel-section--search">
             <div class="panel-header">
@@ -1248,56 +1264,57 @@
               />
             </div>
           </div>
-        {:else}
-          <!-- Document History section (MRU list). Owner defect (2026-09-07):
-               "the recent documents panel needs to be able to accordion -
-               actually, all subpanels in the side panels" - every left/right
-               panel section below is now collapsible via the shared Accordion
-               component (src/components/Accordion.svelte), remembering its
-               state for this app session via sessionStorage (storageKey). -->
-          <div class="panel-section">
-            <Accordion
-              title="Recent Documents"
-              storageKey="left-recent-docs"
-              bodyClass="panel-body panel-body-flush"
-              testId="accordion-recent-docs"
-            >
-              <DocumentHistoryPanel
-                recentDocs={recentDocs}
-                onOpen={openFilePath}
-              />
-            </Accordion>
-          </div>
-          <!-- Tool Chest (spec "Tools & Tool Sets") - Tool Sets + Recent Tools; click a
-               tool to make it active. Discoverable here regardless of which doc tab is
-               active (Tool Sets are a workspace resource, not per-document). -->
-          <div class="panel-section panel-section--secondary">
-            <Accordion
-              title="Tool Chest"
-              storageKey="left-toolchest"
-              bodyClass="panel-body panel-body-flush"
-              testId="accordion-tool-chest"
-            >
-              <ToolChestPanel toolChest={toolChestStore} markupStore={activeTab?.store ?? null} />
-            </Accordion>
-          </div>
-          <!-- Navigator placeholder (M4 - thumbnails/bookmarks/layers) -->
-          <div class="panel-section panel-section--secondary">
-            <Accordion
-              title="Navigator"
-              storageKey="left-navigator"
-              bodyClass="panel-body"
-              testId="accordion-navigator"
-            >
-              {#if activeTab}
-                <p class="panel-hint">Thumbnails · Bookmarks · Layers</p>
-                <p class="panel-hint muted">(M4)</p>
-              {:else}
-                <p class="panel-hint muted">Open a PDF to begin.</p>
-              {/if}
-            </Accordion>
-          </div>
         {/if}
+        <!-- Document History section (MRU list). Owner defect (2026-09-07):
+             "the recent documents panel needs to be able to accordion -
+             actually, all subpanels in the side panels" - every left/right
+             panel section below is now collapsible via the shared Accordion
+             component (src/components/Accordion.svelte), remembering its
+             state for this app session via sessionStorage (storageKey).
+             Always rendered (stacked below Search when it's open - see the
+             panel-section--search comment above). -->
+        <div class="panel-section panel-section--recent">
+          <Accordion
+            title="Recent Documents"
+            storageKey="left-recent-docs"
+            bodyClass="panel-body panel-body-flush"
+            testId="accordion-recent-docs"
+          >
+            <DocumentHistoryPanel
+              recentDocs={recentDocs}
+              onOpen={openFilePath}
+            />
+          </Accordion>
+        </div>
+        <!-- Tool Chest (spec "Tools & Tool Sets") - Tool Sets + Recent Tools; click a
+             tool to make it active. Discoverable here regardless of which doc tab is
+             active (Tool Sets are a workspace resource, not per-document). -->
+        <div class="panel-section panel-section--secondary">
+          <Accordion
+            title="Tool Chest"
+            storageKey="left-toolchest"
+            bodyClass="panel-body panel-body-flush"
+            testId="accordion-tool-chest"
+          >
+            <ToolChestPanel toolChest={toolChestStore} markupStore={activeTab?.store ?? null} />
+          </Accordion>
+        </div>
+        <!-- Navigator placeholder (M4 - thumbnails/bookmarks/layers) -->
+        <div class="panel-section panel-section--secondary">
+          <Accordion
+            title="Navigator"
+            storageKey="left-navigator"
+            bodyClass="panel-body"
+            testId="accordion-navigator"
+          >
+            {#if activeTab}
+              <p class="panel-hint">Thumbnails · Bookmarks · Layers</p>
+              <p class="panel-hint muted">(M4)</p>
+            {:else}
+              <p class="panel-hint muted">Open a PDF to begin.</p>
+            {/if}
+          </Accordion>
+        </div>
       </aside>
     {/if}
 
@@ -1596,11 +1613,9 @@
     flex-shrink: 0;
     overflow: hidden;
   }
+  /* Fixed sidebar width regardless of which panel(s) are showing (owner defect fix,
+     2026-09-08) - width is a property of the sidebar, not of the panel. */
   .panel-left  { width: var(--panel-left-width); }
-  /* While Search is open it owns the whole left column (see the panel-left--search
-     class in the template) — wider than the shared-sidebar default so the query
-     row, scope tabs and result snippets aren't cramped. */
-  .panel-left.panel-left--search { width: var(--panel-left-width-search); }
   .panel-right { width: var(--panel-right-width); border-right: none; border-left: 1px solid var(--color-border); }
 
   .panel-header {
@@ -1625,15 +1640,16 @@
   }
   .panel-hint.muted { color: var(--color-text-muted); }
 
-  /* --- Left panel sections (history + navigator stacked) --- */
+  /* --- Left sidebar panels (search + history + tool chest + navigator, stacked) --- */
   .panel-section {
     display: flex;
     flex-direction: column;
     border-bottom: 1px solid var(--color-border);
     flex-shrink: 0;
   }
-  /* History panel gets more room; Navigator placeholder collapses to fit-content. */
-  .panel-section:first-child {
+  /* Recent Documents gets more room than Tool Chest/Navigator, but never all of it -
+     keyed off its own class (not :first-child) because Search can render above it. */
+  .panel-section--recent {
     flex: 1;
     overflow: hidden;
     max-height: 55%;
@@ -1642,13 +1658,14 @@
     flex: 1;
     overflow: hidden;
   }
-  /* Search is the ONLY section rendered in .panel-left while open (the
-     template hides Recent Documents/Tool Chest/Navigator behind an
-     {:else} — see the panel-left--search comment) so it gets the full
-     column height, not a shared fraction of it. */
+  /* Search stacks ABOVE Recent Documents/Tool Chest/Navigator (owner defect fix,
+     2026-09-08 - see the panel-section--search comment in the template), not instead
+     of them - bounded to a fraction of the sidebar so the rest of the stack stays
+     visible/reachable below it. Its own result list (.search-groups, SearchPanel.svelte)
+     already scrolls internally within this box. */
   .panel-section.panel-section--search {
     flex: 1;
-    max-height: 100%;
+    max-height: 45%;
     overflow: hidden;
   }
   .panel-section--search .panel-header {

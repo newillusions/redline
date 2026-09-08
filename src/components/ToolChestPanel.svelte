@@ -60,9 +60,12 @@
   // it remembers each set's collapsed state for the rest of this app session
   // via sessionStorage, which the old local-only $state did not (owner defect,
   // 2026-09-07: "accordion... collapsed state remembered per sub-panel for
-  // the session" - this also matters because closing/reopening Search now
-  // unmounts and remounts ToolChestPanel, see App.svelte's panel-left--search
-  // comment, which would have reset the old in-memory Set every time).
+  // the session" - originally this also mattered because closing/reopening
+  // Search unmounted and remounted ToolChestPanel, which would have reset the
+  // old in-memory Set every time; as of the 2026-09-08 panel-stacking fix
+  // ToolChestPanel stays mounted the whole time and no longer remounts on
+  // Search toggle at all, but the sessionStorage persistence is still correct
+  // and still needed for a real app restart).
 
   // ---------------------------------------------------------------------------
   // New set

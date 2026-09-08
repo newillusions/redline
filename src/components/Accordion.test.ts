@@ -98,10 +98,10 @@ describe("Accordion — uncontrolled mode", () => {
     expect(first.getByTestId("acc").getAttribute("aria-expanded")).toBe("false");
     first.unmount();
 
-    // Simulates App.svelte's own remount case: closing/reopening Search
-    // unmounts and remounts ToolChestPanel (see App.svelte's
-    // panel-left--search comment) - a fresh mount of the same storageKey
-    // must pick the persisted state back up.
+    // Simulates a real app restart (App.svelte's panels stay mounted across a
+    // Search toggle as of the 2026-09-08 panel-stacking fix, so this no longer
+    // happens mid-session) - a fresh mount of the same storageKey must still
+    // pick the persisted state back up.
     const second = render(AccordionHarness, { props });
     await tick();
     expect(second.getByTestId("acc").getAttribute("aria-expanded")).toBe("false");

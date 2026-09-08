@@ -67,37 +67,56 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe("SearchPanel — scope tabs", () => {
-  it("renders all five scope tabs, Document active by default", () => {
+describe("SearchPanel — scope selector (owner defect fix, 2026-09-08: click-tabs -> single-select dropdown, since only one scope ever applies at a time)", () => {
+  it("renders a single dropdown with all five scope options, Document selected by default", () => {
     const store = new SearchStore(fakeDeps());
     const { getByTestId } = mountPanel(store);
-    expect(getByTestId("scope-tab-document").getAttribute("aria-selected")).toBe("true");
-    expect(getByTestId("scope-tab-page").getAttribute("aria-selected")).toBe("false");
-    expect(getByTestId("scope-tab-open").getAttribute("aria-selected")).toBe("false");
-    expect(getByTestId("scope-tab-recents").getAttribute("aria-selected")).toBe("false");
-    expect(getByTestId("scope-tab-folder").getAttribute("aria-selected")).toBe("false");
+    const select = getByTestId("search-scope-select") as HTMLSelectElement;
+    expect(select.tagName).toBe("SELECT");
+    expect(select.value).toBe("document");
+    expect(Array.from(select.options).map((o) => o.value)).toEqual([
+      "document",
+      "page",
+      "open",
+      "recents",
+      "folder",
+    ]);
   });
 
-  it("clicking a scope tab switches store.scope", async () => {
+  it("changing the dropdown switches store.scope", async () => {
     const store = new SearchStore(fakeDeps());
     const { getByTestId } = mountPanel(store, { folderPath: "/plans" });
-    await fireEvent.click(getByTestId("scope-tab-open"));
+    const select = getByTestId("search-scope-select") as HTMLSelectElement;
+    await fireEvent.change(select, { target: { value: "open" } });
     expect(store.scope).toBe("open");
   });
 
-  it("clicking Folder with no folder chosen calls onPickFolder", async () => {
+  it("selecting Folder with no folder chosen calls onPickFolder", async () => {
     const store = new SearchStore(fakeDeps());
     const { getByTestId, onPickFolder } = mountPanel(store, { folderPath: null });
-    await fireEvent.click(getByTestId("scope-tab-folder"));
+    const select = getByTestId("search-scope-select") as HTMLSelectElement;
+    await fireEvent.change(select, { target: { value: "folder" } });
     expect(onPickFolder).toHaveBeenCalled();
+    expect(store.scope).toBe("folder");
   });
 
   it("re-runs the search immediately on scope switch when a query is already present", async () => {
     const store = new SearchStore(fakeDeps());
     store.query = "concrete";
     const { getByTestId, onSearch } = mountPanel(store, { folderPath: "/plans" });
-    await fireEvent.click(getByTestId("scope-tab-open"));
+    const select = getByTestId("search-scope-select") as HTMLSelectElement;
+    await fireEvent.change(select, { target: { value: "open" } });
     expect(onSearch).toHaveBeenCalledTimes(1);
+  });
+
+  it("scope selection persists across a remount (SearchStore.setScope already writes localStorage)", async () => {
+    const store = new SearchStore(fakeDeps());
+    const { getByTestId } = mountPanel(store, { folderPath: "/plans" });
+    const select = getByTestId("search-scope-select") as HTMLSelectElement;
+    await fireEvent.change(select, { target: { value: "recents" } });
+
+    const reloaded = new SearchStore(fakeDeps());
+    expect(reloaded.scope).toBe("recents");
   });
 });
 

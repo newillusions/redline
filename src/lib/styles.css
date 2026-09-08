@@ -51,11 +51,10 @@
   --radius-lg: 10px;
 
   /* --- Panel sizing (Bluebeam-like 3-column layout) --- */
-  --panel-left-width:        260px;
-  /* Search takes over the whole left column while open (owner defect fix,
-     2026-09-07 — see App.svelte's panel-left--search comment) and needs more
-     room than the shared-sidebar default for the query row + result list. */
-  --panel-left-width-search: 340px;
+  /* Fixed regardless of which panel(s) are showing in the sidebar (owner defect
+     fix, 2026-09-08 - width is a property of the sidebar, not the panel; see
+     App.svelte's panel-left comment). */
+  --panel-left-width:   260px;
   --panel-right-width:  260px;
   --toolbar-height:     40px;
   --bottom-panel-height: 200px;

@@ -110,7 +110,11 @@
     }
   }
 
-  function handleScopeClick(scope: SearchScope) {
+  // Owner defect (2026-09-08): scope was a row of click-tabs, but only one scope ever
+  // applies at a time - single-select semantics, so it's a native <select> now (styled
+  // to the design tokens below). Folder-picker-on-select and scope persistence
+  // (SearchStore.setScope already persists to localStorage) are unchanged.
+  function handleScopeChange(scope: SearchScope) {
     if (scope === "folder" && !folderPath) {
       onPickFolder();
       store.setScope(scope);
@@ -157,17 +161,19 @@
 </script>
 
 <div class="search-panel" role="search" aria-label="Search">
-  <div class="search-tabs" role="tablist" aria-label="Search scope">
-    {#each SCOPES as s (s.value)}
-      <button
-        class="search-tab"
-        class:active={store.scope === s.value}
-        role="tab"
-        aria-selected={store.scope === s.value}
-        data-testid={`scope-tab-${s.value}`}
-        onclick={() => handleScopeClick(s.value)}
-      >{s.label}</button>
-    {/each}
+  <div class="search-scope-row">
+    <label class="search-scope-label" for="search-scope-select">Search in</label>
+    <select
+      id="search-scope-select"
+      class="search-scope-select"
+      data-testid="search-scope-select"
+      value={store.scope}
+      onchange={(e) => handleScopeChange(e.currentTarget.value as SearchScope)}
+    >
+      {#each SCOPES as s (s.value)}
+        <option value={s.value} data-testid={`scope-option-${s.value}`}>{s.label}</option>
+      {/each}
+    </select>
   </div>
 
   {#if store.scope === "folder"}
@@ -405,32 +411,37 @@
     overflow: hidden;
   }
 
-  .search-tabs {
+  .search-scope-row {
     display: flex;
-    gap: var(--space-1, 2px);
+    align-items: center;
+    gap: var(--space-2, 4px);
     border-bottom: 1px solid var(--color-border, #45475a);
-    padding-bottom: var(--space-1, 2px);
-    flex-wrap: wrap;
+    padding-bottom: var(--space-2, 4px);
   }
 
-  .search-tab {
-    background: none;
-    border: none;
-    border-radius: var(--radius-sm, 3px) var(--radius-sm, 3px) 0 0;
+  .search-scope-label {
     color: var(--color-text-muted, #6c7086);
-    cursor: pointer;
-    font-size: inherit;
-    padding: var(--space-1, 2px) var(--space-3, 8px);
-    white-space: nowrap;
+    font-size: var(--text-xs, 11px);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    flex-shrink: 0;
   }
 
-  .search-tab:hover {
+  .search-scope-select {
+    flex: 1;
+    min-width: 0;
+    padding: var(--space-1, 2px) var(--space-2, 4px);
+    background: var(--color-surface-raised, #313244);
     color: var(--color-text, #cdd6f4);
+    border: 1px solid var(--color-border, #45475a);
+    border-radius: var(--radius-sm, 3px);
+    font-size: inherit;
+    cursor: pointer;
   }
 
-  .search-tab.active {
-    color: var(--color-accent, #89b4fa);
-    border-bottom: 2px solid var(--color-accent, #89b4fa);
+  .search-scope-select:focus {
+    outline: 2px solid var(--color-accent, #89b4fa);
+    outline-offset: -1px;
   }
 
   .folder-row {
