@@ -1,8 +1,10 @@
 name: CI
 
+# Rule 13.1.6 - push limited to main and version tags; pull_request only targets main.
 on:
   push:
-    branches: [main, 'v*']
+    branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
 
@@ -10,84 +12,135 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# NOTE ON `permissions:` - deliberately absent. Forgejo ignores the key
+# ("Certain subkeys on the job key in workflow files are ignored, like permissions, and
+# continue-on-error." - forgejo.org/docs/latest/user/actions/github-actions/).
+
 jobs:
+  # ---------------------------------------------------------------------------
+  # test-rust - compiles and runs pull-request-controlled Rust.
+  #
+  # CI-HARDENING MIGRATION (WORKSPACE_STANDARDS.md 13.1, tier-1 backlog row): this job
+  # used to build .forgejo/Dockerfile.test-rust with --network=host against the shared
+  # DinD daemon at 10.0.23.137:2376 - reachable from every pull_request, with the build
+  # graph able to reach the Primary host's own network. Moved onto the `rust-1.89`
+  # runner label instead (no Docker daemon involved at all): this doesn't just isolate
+  # the daemon access, it removes it, so CI-2/CI-3 no longer apply to this job. The
+  # Dockerfile's apt-get install list is reproduced here as a plain runner step; nothing
+  # about what gets installed or how the tests run has changed.
+  # ---------------------------------------------------------------------------
   test-rust:
-    # Routes the heavy Tauri+PDFium compile to the remote Docker daemon (10.0.23.137)
-    # via DOCKER_HOST. BuildKit cache mounts in the Dockerfile persist apt and cargo
-    # caches between runs on that daemon, making subsequent CI runs fast.
-    # The first run is slow (full apt + cargo compile); subsequent runs skip both.
-    runs-on: ubuntu-latest
-    env:
-      DOCKER_HOST: tcp://10.0.23.137:2376
-      DOCKER_TLS_VERIFY: "1"
-      DOCKER_CERT_PATH: /certs/client-primary
+    runs-on: rust-1.89
     steps:
-      - uses: actions/checkout@v4
+      # Rule 13.1.4 - fully qualified URL plus a 40-character commit SHA, tag in the
+      # trailing comment. Verified via `git ls-remote https://data.forgejo.org/actions/checkout v4.4.0`.
+      - uses: https://data.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Install Docker CLI
+      # Same package list as the former .forgejo/Dockerfile.test-rust: Tauri 2 system
+      # deps (tauri-build links against webkit/GTK even for `cargo test --lib`) plus the
+      # `leptess` crate's native build deps (clang for bindgen, tesseract/leptonica -dev
+      # for pkg-config) and the runtime English tessdata the `ocr` feature's own tests
+      # need. libayatana-appindicator3-dev intentionally omitted (Ubuntu-only; tray-icon
+      # feature not enabled) - unchanged from the Dockerfile.
+      - name: Install Tauri + leptess system deps
         run: |
           apt-get update -qq
-          apt-get install -y -qq docker.io > /dev/null 2>&1
-          echo "Docker CLI version: $(docker --version)"
-          echo "DOCKER_HOST: $DOCKER_HOST"
-          docker info --format 'Remote daemon: {{.ServerVersion}} OS={{.OperatingSystem}}'
+          apt-get install -y -qq \
+            pkg-config \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            wget \
+            file \
+            libxdo-dev \
+            librsvg2-dev \
+            clang \
+            libtesseract-dev \
+            libleptonica-dev \
+            tesseract-ocr-eng \
+            > /dev/null
 
-      - name: Build and run tests
+      # Rule 13.1.2 - nothing below this line may reference `secrets.*`. No secret is
+      # used anywhere in this workflow today; kept as a live invariant for the future.
+      #
+      # PDFIUM_DYNAMIC_LIB_PATH deliberately unset here (matches the former Dockerfile):
+      # PDFium-dependent tests in src-tauri skip gracefully via early-return when the env
+      # var is absent (render::tests::corpus() helper pattern). The `ocr` job below sets
+      # it explicitly for the feature-gated benchmark that needs a real PDFium.
+      - name: Test
         run: |
-          docker build \
-            --network=host \
-            --progress=plain \
-            -t redline-test \
-            -f .forgejo/Dockerfile.test-rust \
-            .
+          cargo test --lib -p redline
+          cargo test --lib -p pdf-diff
 
+  # ---------------------------------------------------------------------------
+  # ocr - Auto-OCR `ocr` feature (Tesseract via leptess) leg, separate job so a
+  # regression here doesn't block test-rust above, and so the heavier PDFium fetch
+  # only runs when this leg is invoked. Same runner-label move as test-rust: no Docker
+  # daemon, no --network=host, no --build-arg RUN_OCR_TESTS toggle needed since there's
+  # no shared image to opt a build-arg into - this job simply runs the extra steps.
+  # ---------------------------------------------------------------------------
   ocr:
-    # Auto-OCR `ocr` feature (Tesseract via leptess) leg - separate job so a
-    # regression here doesn't block the default test-rust job, and so the
-    # heavier apt/PDFium/tessdata setup only runs when this leg is invoked.
-    # Runs the ocr module's unit tests plus the full corpus accuracy
-    # benchmark (tests/ocr_benchmark.rs, asserts >=90% overall recall - see
-    # the `ocr` module doc comment) via the same Dockerfile.test-rust image,
-    # opted in with --build-arg RUN_OCR_TESTS=1 (default-off, so the
-    # test-rust job above is unaffected).
-    runs-on: ubuntu-latest
-    env:
-      DOCKER_HOST: tcp://10.0.23.137:2376
-      DOCKER_TLS_VERIFY: "1"
-      DOCKER_CERT_PATH: /certs/client-primary
+    runs-on: rust-1.89
     steps:
-      - uses: actions/checkout@v4
+      - uses: https://data.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Install Docker CLI
+      - name: Install Tauri + leptess system deps
         run: |
           apt-get update -qq
-          apt-get install -y -qq docker.io > /dev/null 2>&1
-          echo "Docker CLI version: $(docker --version)"
-          echo "DOCKER_HOST: $DOCKER_HOST"
-          docker info --format 'Remote daemon: {{.ServerVersion}} OS={{.OperatingSystem}}'
+          apt-get install -y -qq \
+            pkg-config \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            wget \
+            file \
+            libxdo-dev \
+            librsvg2-dev \
+            clang \
+            libtesseract-dev \
+            libleptonica-dev \
+            tesseract-ocr-eng \
+            > /dev/null
 
-      - name: Build and run ocr feature tests + benchmark
+      # Same pinned PDFium release scripts/fetch-pdfium.sh uses (chromium/7869,
+      # linux-x64) - reproduced here rather than duplicating that script's platform-
+      # detection logic into a second file, exactly as the former Dockerfile did.
+      - name: Fetch PDFium (linux-x64, pinned)
         run: |
-          docker build \
-            --network=host \
-            --progress=plain \
-            --build-arg RUN_OCR_TESTS=1 \
-            -t redline-test-ocr \
-            -f .forgejo/Dockerfile.test-rust \
-            .
+          wget -q --timeout=60 -O /tmp/pdfium.tgz \
+            "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F7869/pdfium-linux-x64.tgz"
+          mkdir -p /tmp/pdfium
+          tar -xzf /tmp/pdfium.tgz -C /tmp/pdfium
 
+      # TESSDATA_PREFIX resolved from the actually-installed tesseract-ocr-eng package
+      # path via `dpkg -L`, not a hardcoded path - the Debian tessdata directory layout
+      # differs by tesseract major version (same rationale as the former Dockerfile).
+      - name: Test ocr feature + accuracy benchmark
+        env:
+          PDFIUM_DYNAMIC_LIB_PATH: /tmp/pdfium/lib/libpdfium.so
+        run: |
+          set -eu
+          TESSDATA_DIR="$(dirname "$(dpkg -L tesseract-ocr-eng | grep 'tessdata/eng\.traineddata$')")"
+          echo "Resolved TESSDATA_PREFIX=$TESSDATA_DIR"
+          export TESSDATA_PREFIX="$TESSDATA_DIR"
+          cargo test --lib -p redline --features ocr
+          cargo test --features ocr --test ocr_benchmark -- --ignored --nocapture
+
+  # ---------------------------------------------------------------------------
+  # test-frontend - unchanged. No Docker daemon, no secrets; already compliant.
+  # ---------------------------------------------------------------------------
   test-frontend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: https://data.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: https://data.forgejo.org/actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
 
       - name: Cache npm dependencies
-        uses: actions/cache@v4
+        uses: https://data.forgejo.org/actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.npm
           key: npm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}

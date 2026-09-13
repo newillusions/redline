@@ -52,12 +52,14 @@ yet):
   `/opt/homebrew/share/tessdata/` (Apple Silicon) or the Intel-prefix
   equivalent. `OcrEngineHandle::load(None)` finds it via Tesseract's
   compiled-in default search relative to the linked library.
-- **Linux CI** (`.forgejo/Dockerfile.test-rust`, the `ocr` build-arg leg):
+- **Linux CI** (`.forgejo/workflows/ci.yml`'s `ocr` job, runs directly on the
+  `rust-1.89` runner label — CI-hardening migration 2026-09-13 moved this
+  off a Docker-in-Docker build against the shared daemon):
   the `tesseract-ocr-eng` apt package installs it under
   `/usr/share/tesseract-ocr/<major>/tessdata/` (the exact subpath varies by
-  Tesseract's packaged major version — the Dockerfile resolves it at build
-  time via `dpkg -L tesseract-ocr-eng` rather than hardcoding a path, and
-  exports `TESSDATA_PREFIX` explicitly before running the ocr tests).
+  Tesseract's packaged major version — the job resolves it at run time via
+  `dpkg -L tesseract-ocr-eng` rather than hardcoding a path, and exports
+  `TESSDATA_PREFIX` explicitly before running the ocr tests).
 - **Windows:** static-linked via vcpkg (`tesseract:x64-windows-static-md`)
   in the GitHub Actions OCR-proof leg as of Phase 2b — no dev machine or
   Forgejo CI leg exercises the `ocr` feature on Windows; see "Phase 2b"
@@ -448,14 +450,13 @@ in-app/Bluebeam-equivalent search path) AND `lopdf::Document::extract_text`
 This is the "does a scanned fixture become searchable" proof, exercised
 against real engines rather than mocked. **Caveat:** like `ocr_benchmark.rs`,
 this test is `#[ignore]`d and needs a real PDFium dylib + Tesseract install
-neither Forgejo CI's `test-rust` job nor its `ocr` job's `RUN_OCR_TESTS`
-build-arg leg provisions for the WRITER path specifically (the `ocr` job's
-`RUN_OCR_TESTS` block does run `ocr_benchmark.rs`, but `ocr_writer_e2e.rs`
-was added after that Dockerfile step was written and is not yet wired into
-it) — the "proven end-to-end" claim above rests on a real local run (quoted
-in the shipping PR's test plan), not on CI evidence. Wiring it into the
-Linux CI `ocr` job (same Tesseract/PDFium setup that leg already has) is a
-cheap, real follow-up, not yet done.
+neither Forgejo CI's `test-rust` job nor its `ocr` job provisions for the
+WRITER path specifically (the `ocr` job's Test step does run
+`ocr_benchmark.rs`, but `ocr_writer_e2e.rs` was added after that step was
+written and is not yet wired into it) — the "proven end-to-end" claim above
+rests on a real local run (quoted in the shipping PR's test plan), not on CI
+evidence. Wiring it into the Linux CI `ocr` job (same Tesseract/PDFium setup
+that leg already has) is a cheap, real follow-up, not yet done.
 
 **Not done this phase, explicitly Phase 2c-ii** (owner-approved split,
 2026-09-04): no Tauri command/MCP tool wiring a "Run OCR" action to
