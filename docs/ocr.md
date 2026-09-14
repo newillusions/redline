@@ -99,7 +99,7 @@ builds with (`x64-windows-static-md`), Rust's `std::env::set_var` calls
 NOT the C runtime's own private copy — and `leptess::LepTess::new`'s call
 into Tesseract's C++ init path reads `TESSDATA_PREFIX` via the C library's
 `getenv`, the CRT's copy. A genuinely NSIS-installed `Redline 0.3.21` on a
-real Windows machine (mr-desktop, 2026-09-14) reproduced this exactly: OCR
+real Windows machine (mr-laptop, 2026-09-14) reproduced this exactly: OCR
 failed with `leptess::LepTess::new failed (TessInitError{-1}) ...
 tessdata_dir arg: None` even though
 `C:\Program Files\Redline\resources\ocr\tessdata\eng.traineddata` was
@@ -507,7 +507,7 @@ posture `.claude/rules/judgment.md` already applies to G9).
   user didn't ask for), and a human visual/search confirmation in real
   Bluebeam/Acrobat.
 - ~~Windows NSIS-installed-layout verification~~ **VERIFIED 2026-09-14** on a
-  real machine (mr-desktop): a genuinely NSIS-installed `Redline 0.3.21`
+  real machine (mr-laptop): a genuinely NSIS-installed `Redline 0.3.21`
   reproduced OCR failing at runtime (`leptess::LepTess::new failed
   (TessInitError{-1}) ... tessdata_dir arg: None`) despite
   `C:\Program Files\Redline\resources\ocr\tessdata\eng.traineddata` being

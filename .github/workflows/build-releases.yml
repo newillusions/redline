@@ -638,7 +638,7 @@ jobs:
           # checks (its 3rd candidate).
           #
           # The NSIS-installed layout itself WAS verified end-to-end on a real
-          # machine 2026-09-14 (mr-desktop, Redline 0.3.21) - it reproduced a
+          # machine 2026-09-14 (mr-laptop, Redline 0.3.21) - it reproduced a
           # genuine OCR failure at runtime despite the correct tessdata file
           # being present at the installed path. The residual gap this
           # comment used to name (proving the installed layout) was never the

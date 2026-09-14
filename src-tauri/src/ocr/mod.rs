@@ -79,7 +79,7 @@ pub mod writer;
 /// which reads `TESSDATA_PREFIX` via the C library's `getenv` — the CRT's copy, not
 /// Win32's — so on a genuinely NSIS-installed build it always saw an unset
 /// `TESSDATA_PREFIX` and fell back to `./eng.traineddata`, even though the env var was
-/// set correctly from Rust's point of view. Proof (2026-09-14, mr-desktop, a real
+/// set correctly from Rust's point of view. Proof (2026-09-14, mr-laptop, a real
 /// `Redline 0.3.21` NSIS install): the shipped `ocr-selftest.exe --tessdata-dir
 /// "C:\Program Files\Redline\resources\ocr\tessdata"` printed `PASS`, rc=0; the same
 /// binary invoked with no argument (i.e. exercising exactly the `TESSDATA_PREFIX`
