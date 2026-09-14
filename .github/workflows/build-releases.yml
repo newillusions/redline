@@ -635,9 +635,24 @@ jobs:
           # this instead exercises the RAW build output plus a manually
           # placed resources/ dir, mirroring the "next to the executable"
           # portable-layout candidate `lib.rs::resolve_tessdata_dir` already
-          # checks (its 3rd candidate). Proving the NSIS-installed layout
-          # end-to-end is flagged as a residual gap for a follow-up, not
-          # silently assumed to work.
+          # checks (its 3rd candidate).
+          #
+          # The NSIS-installed layout itself WAS verified end-to-end on a real
+          # machine 2026-09-14 (mr-laptop, Redline 0.3.21) - it reproduced a
+          # genuine OCR failure at runtime despite the correct tessdata file
+          # being present at the installed path. The residual gap this
+          # comment used to name (proving the installed layout) was never the
+          # actual defect: `ocr-selftest.exe` with an explicit
+          # `--tessdata-dir` PASSED against the real install every time; only
+          # the app's own runtime path (relying on Tesseract's own
+          # `TESSDATA_PREFIX` env-var lookup, which silently fails on Windows
+          # due to a CRT `getenv` split - see docs/ocr.md) failed. Fixed by
+          # passing the resolved tessdata directory into `OcrEngineHandle::
+          # load` explicitly instead of through the env var. This smoke test
+          # step still only proxies the portable layout rather than running a
+          # real NSIS install on the CI runner, but the defect it existed to
+          # catch is understood and fixed - a CI-side NSIS-install leg would
+          # be additional hardening, not a known gap.
           mkdir -p target/release/resources/ocr/tessdata
           cp src-tauri/resources/ocr/tessdata/eng.traineddata target/release/resources/ocr/tessdata/
           cargo run --release --features ocr --bin ocr-selftest -- \

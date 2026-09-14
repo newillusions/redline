@@ -81,14 +81,44 @@ needed. At runtime, `lib.rs::resolve_tessdata_dir` (new, mirrors
 `resolve_pdfium_path`) checks, in order: an existing `TESSDATA_PREFIX` (dev
 override, never overwritten), the Tauri resource dir's
 `resources/ocr/tessdata`, then next-to-the-executable `resources/ocr/tessdata`
-(portable layout) — and sets `TESSDATA_PREFIX` so
-`OcrEngineHandle::load(None)` finds it via Tesseract's own standard lookup,
-same as `leptess`'s existing `None`-path already documented above. If
-nothing resolves, this logs loudly (`log::error!`) but does NOT panic app
-startup — OCR is off by default with no auto-trigger yet, so a missing
-tessdata directory must not block the rest of the app; the actual fail-loud
-behavior for a user attempting OCR happens at the point of use, inside
-`OcrEngineHandle::load`'s own error (unchanged from Phase 2a).
+(portable layout). If nothing resolves, this logs loudly (`log::error!`) but
+does NOT panic app startup — OCR is off by default with no auto-trigger yet,
+so a missing tessdata directory must not block the rest of the app; the
+actual fail-loud behavior for a user attempting OCR happens at the point of
+use, inside `OcrEngineHandle::load`'s own error (unchanged from Phase 2a).
+
+**The resolved directory is passed explicitly, not only via `TESSDATA_PREFIX`
+(fixed 2026-09-14 — Windows CRT `getenv` split).** `resolve_tessdata_dir`
+still calls `std::env::set_var("TESSDATA_PREFIX", ..)` as a secondary
+courtesy, but the load-bearing path is `app.manage`ing the resolved directory
+as `ocr::TessdataDir` and `commands::ocr::run_ocr_document` reading it back
+and passing it straight into `OcrEngineHandle::load(Some(&dir))`. This is
+necessary because on Windows, with the MSVC/UCRT static link this repo
+builds with (`x64-windows-static-md`), Rust's `std::env::set_var` calls
+`SetEnvironmentVariableW`, updating the Win32 process environment block but
+NOT the C runtime's own private copy — and `leptess::LepTess::new`'s call
+into Tesseract's C++ init path reads `TESSDATA_PREFIX` via the C library's
+`getenv`, the CRT's copy. A genuinely NSIS-installed `Redline 0.3.21` on a
+real Windows machine (mr-laptop, 2026-09-14) reproduced this exactly: OCR
+failed with `leptess::LepTess::new failed (TessInitError{-1}) ...
+tessdata_dir arg: None` even though
+`C:\Program Files\Redline\resources\ocr\tessdata\eng.traineddata` was
+present and `TESSDATA_PREFIX` was set correctly from Rust's point of view.
+The shipped `ocr-selftest.exe --tessdata-dir
+"C:\Program Files\Redline\resources\ocr\tessdata"` printed `PASS`, rc=0; the
+same binary invoked with no argument (exercising exactly the
+`TESSDATA_PREFIX`-only lookup path `run_ocr_document` used before this fix)
+printed `Error opening data file ./eng.traineddata ... TessInitError{-1}`,
+rc=1. macOS is unaffected (`setenv`/`getenv` share one `environ` there),
+which is why this shipped for months of macOS-only testing before the
+Windows regression was ever hit. See `ocr::TessdataDir`'s doc comment for
+the full mechanism.
+
+**Other native-library env-var paths in this codebase were checked and are
+NOT affected**: `PDFIUM_DYNAMIC_LIB_PATH` (`resolve_pdfium_path`, same file)
+is read back exclusively via Rust's own `std::env::var` in
+`render::RenderEngine::new` — Win32's `GetEnvironmentVariableW`, not the CRT
+`getenv` — so it never crosses the split this OCR fix routes around.
 
 **Source pinning, not "biggest/most accurate":**
 `tesseract-ocr/tessdata_fast`'s `eng.traineddata` (pinned to commit
@@ -476,14 +506,22 @@ posture `.claude/rules/judgment.md` already applies to G9).
   matching this repo's general posture of never taking a write action a
   user didn't ask for), and a human visual/search confirmation in real
   Bluebeam/Acrobat.
-- **Windows NSIS-installed-layout verification.** The Windows smoke test
-  (see "Bundling smoke test" above) proves the vcpkg-linked Tesseract binary
-  itself works and that `resolve_tessdata_dir`'s portable-layout candidate
-  resolves — it does NOT install the real NSIS package and verify resources
-  land where a genuinely installed app would look for them. A follow-up
-  should either silently-install the NSIS output on the CI runner and repeat
-  the smoke test against that layout, or accept the current portable-layout
-  proof as sufficient and say so explicitly (owner call).
+- ~~Windows NSIS-installed-layout verification~~ **VERIFIED 2026-09-14** on a
+  real machine (mr-laptop): a genuinely NSIS-installed `Redline 0.3.21`
+  reproduced OCR failing at runtime (`leptess::LepTess::new failed
+  (TessInitError{-1}) ... tessdata_dir arg: None`) despite
+  `C:\Program Files\Redline\resources\ocr\tessdata\eng.traineddata` being
+  present — proving the CI smoke test's portable-layout proxy (see
+  "Bundling smoke test" above) had NOT been catching a real defect. The
+  actual gap was never the resource layout itself; it was that
+  `run_ocr_document` relied on Tesseract's own `TESSDATA_PREFIX` lookup,
+  which silently fails on Windows due to a CRT `getenv` split (see "tessdata
+  (both platforms)" above for the full mechanism). Fixed by threading the
+  resolved directory into `OcrEngineHandle::load` explicitly instead of via
+  the env var. The CI smoke test itself still only proxies the portable
+  layout, not a real NSIS install — but the actual defect it existed to
+  catch is now understood and fixed, so a CI-side NSIS-install leg is a
+  nice-to-have hardening step, not a known gap.
 - ~~Codesigning + dylib bundling are mutually exclusive on macOS~~ **FIXED
   2026-09-07** (see "Shipping OCR in every tagged release" above): the
   dylib-bundling and smoke-test steps now run on the real tag-release path

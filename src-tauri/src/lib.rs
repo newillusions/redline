@@ -153,11 +153,20 @@ fn resolve_pdfium_path(app: &tauri::App) {
 /// fail-loud behavior for an end user attempting to run OCR happens at the
 /// point of use, in `OcrEngineHandle::load`'s own error message (Phase 2c's
 /// invoke command surfaces that error to the UI).
+///
+/// Returns the resolved directory (or `None`) as `ocr::TessdataDir`, which the caller
+/// `app.manage`s — see that struct's doc comment for why `run_ocr_document` must be
+/// handed this directory EXPLICITLY rather than relying solely on the `TESSDATA_PREFIX`
+/// env var this function still sets as a secondary courtesy (Windows CRT `getenv` split,
+/// found 2026-09-14).
 #[cfg(feature = "ocr")]
-fn resolve_tessdata_dir(app: &tauri::App) {
-    if std::env::var_os("TESSDATA_PREFIX").is_some() {
+fn resolve_tessdata_dir(app: &tauri::App) -> crate::ocr::TessdataDir {
+    if let Some(existing) = std::env::var_os("TESSDATA_PREFIX") {
         info!("TESSDATA_PREFIX already set — using it");
-        return;
+        return crate::ocr::TessdataDir {
+            dir: Some(std::path::PathBuf::from(existing)),
+            candidates_checked: Vec::new(),
+        };
     }
 
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
@@ -172,18 +181,38 @@ fn resolve_tessdata_dir(app: &tauri::App) {
         }
     }
 
-    for c in &candidates {
-        if c.join("eng.traineddata").exists() {
-            info!("Bundled tessdata found: {:?}", c);
-            std::env::set_var("TESSDATA_PREFIX", c);
-            return;
-        }
+    if let Some(found) = first_valid_tessdata_candidate(&candidates) {
+        info!("Bundled tessdata found: {:?}", found);
+        // Secondary courtesy export only — see `ocr::TessdataDir`'s doc comment for why
+        // this alone does not reach Tesseract's `getenv` on Windows. The `dir` field
+        // below, threaded explicitly into `OcrEngineHandle::load`, is load-bearing.
+        std::env::set_var("TESSDATA_PREFIX", &found);
+        return crate::ocr::TessdataDir {
+            dir: Some(found),
+            candidates_checked: candidates,
+        };
     }
     log::error!(
         "No bundled tessdata found ({} candidates checked); OCR will fail at first use \
          unless TESSDATA_PREFIX is set or a system Tesseract install provides eng.traineddata",
         candidates.len()
     );
+    crate::ocr::TessdataDir {
+        dir: None,
+        candidates_checked: candidates,
+    }
+}
+
+/// Pure candidate-resolution core of `resolve_tessdata_dir`, factored out so it is
+/// unit-testable without a `tauri::App` (which needs a real running app context to
+/// construct). Returns the first candidate directory that contains `eng.traineddata`,
+/// in the given order.
+#[cfg(feature = "ocr")]
+fn first_valid_tessdata_candidate(candidates: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    candidates
+        .iter()
+        .find(|c| c.join("eng.traineddata").exists())
+        .cloned()
 }
 
 /// Platform-specific PDFium shared-library filename.
@@ -232,7 +261,10 @@ pub fn run() {
             // must run here, not before the builder.
             resolve_pdfium_path(app);
             #[cfg(feature = "ocr")]
-            resolve_tessdata_dir(app);
+            {
+                let tessdata_dir = resolve_tessdata_dir(app);
+                app.manage(tessdata_dir);
+            }
             let render = RenderHandle::spawn().expect("failed to start render thread");
             let toolchest = app
                 .path()
@@ -357,4 +389,74 @@ pub fn run() {
         .expect("error while running redline");
 
     info!("Redline started");
+}
+
+#[cfg(all(test, feature = "ocr"))]
+mod tessdata_resolution_tests {
+    use super::first_valid_tessdata_candidate;
+
+    /// No candidates at all (e.g. neither the Tauri resource dir nor
+    /// `current_exe().parent()` resolved) — must return `None`, not panic.
+    #[test]
+    fn empty_candidate_list_returns_none() {
+        assert_eq!(first_valid_tessdata_candidate(&[]), None);
+    }
+
+    /// None of the candidate directories contain `eng.traineddata` — must return `None`
+    /// (the "no bundled tessdata found, log loudly" path), not silently accept a
+    /// directory that exists but is empty.
+    #[test]
+    fn candidates_without_traineddata_return_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Directory exists, but has no eng.traineddata inside it.
+        let empty_candidate = dir.path().join("ocr").join("tessdata");
+        std::fs::create_dir_all(&empty_candidate).expect("mkdir");
+
+        // A second candidate that doesn't even exist as a directory.
+        let missing_candidate = dir.path().join("does-not-exist").join("tessdata");
+
+        let result = first_valid_tessdata_candidate(&[empty_candidate, missing_candidate]);
+        assert_eq!(result, None);
+    }
+
+    /// The first candidate containing `eng.traineddata` wins, in list order — matching
+    /// `resolve_tessdata_dir`'s documented lookup order (resource dir before
+    /// next-to-executable, `resources/ocr/tessdata` before the bare `ocr/tessdata`
+    /// fallback within each).
+    #[test]
+    fn first_candidate_with_traineddata_wins_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let first = dir.path().join("first");
+        std::fs::create_dir_all(&first).expect("mkdir first");
+        std::fs::write(first.join("eng.traineddata"), b"stub").expect("write first");
+
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&second).expect("mkdir second");
+        std::fs::write(second.join("eng.traineddata"), b"stub").expect("write second");
+
+        let result =
+            first_valid_tessdata_candidate(&[first.clone(), second]).expect("some candidate");
+        assert_eq!(result, first);
+    }
+
+    /// A later candidate is found when earlier ones lack `eng.traineddata` — the
+    /// "portable layout" (next-to-executable) candidate resolving when the bundled
+    /// resource-dir candidate doesn't exist, which is exactly the shape the Windows CI
+    /// smoke test exercises (see `.github/workflows/build-releases.yml`).
+    #[test]
+    fn later_candidate_found_when_earlier_ones_lack_traineddata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let missing = dir.path().join("resources").join("ocr").join("tessdata");
+        // Deliberately not created — simulates a resource dir that doesn't resolve at all.
+
+        let portable = dir.path().join("ocr").join("tessdata");
+        std::fs::create_dir_all(&portable).expect("mkdir portable");
+        std::fs::write(portable.join("eng.traineddata"), b"stub").expect("write portable");
+
+        let result =
+            first_valid_tessdata_candidate(&[missing, portable.clone()]).expect("some candidate");
+        assert_eq!(result, portable);
+    }
 }
