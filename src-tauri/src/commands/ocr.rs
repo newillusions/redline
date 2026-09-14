@@ -178,9 +178,10 @@ async fn run_ocr_document_impl(
     min_confidence: Option<f32>,
 ) -> Result<OcrRunReport, String> {
     use tauri::Emitter as _;
+    use tauri::Manager as _;
 
     use crate::ocr::writer::{write_pages_text_layers, DEFAULT_MIN_CONFIDENCE};
-    use crate::ocr::OcrEngineHandle;
+    use crate::ocr::{OcrEngineHandle, TessdataDir};
 
     // Matches `tests/ocr_writer_e2e.rs` / `ocr_benchmark.rs`'s own DPI convention — see
     // those files for why 300 DPI is the accuracy/latency-benchmarked operating point.
@@ -253,9 +254,36 @@ async fn run_ocr_document_impl(
     let pages_total_this_run = rasters.len() as u32;
     let app_for_progress = app.clone();
     let doc_id_for_progress = doc_id.clone();
+    // Resolved once at app startup (`lib.rs::resolve_tessdata_dir`, `app.manage`d there)
+    // and threaded straight into `OcrEngineHandle::load` below instead of relying on
+    // Tesseract's own `TESSDATA_PREFIX` env-var lookup — see `TessdataDir`'s doc comment
+    // for why the env var alone is not sufficient on Windows (CRT `getenv` split, found
+    // 2026-09-14). A missing managed state (should not happen outside tests, since
+    // `setup` always manages it under the `ocr` feature) degrades to `None`, which still
+    // lets Tesseract try its own standard lookup rather than failing outright.
+    let tessdata = app.try_state::<TessdataDir>().map(|s| s.inner().clone());
+    let tessdata_dir = tessdata.as_ref().and_then(|t| t.dir.clone());
+    let tessdata_candidates_checked = tessdata
+        .as_ref()
+        .map(|t| t.candidates_checked.clone())
+        .unwrap_or_default();
     let pages_lines: Vec<(u32, Vec<crate::ocr::OcrLine>)> =
         tokio::task::spawn_blocking(move || -> Result<_, String> {
-            let mut engine = OcrEngineHandle::load(None).map_err(|e| format!("{e:#}"))?;
+            let mut engine = OcrEngineHandle::load(tessdata_dir.as_deref()).map_err(|e| {
+                if tessdata_dir.is_none() && !tessdata_candidates_checked.is_empty() {
+                    let checked = tessdata_candidates_checked
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "{e:#}\n\nno bundled tessdata directory was found at startup; \
+                             candidates checked: {checked}"
+                    )
+                } else {
+                    format!("{e:#}")
+                }
+            })?;
             let mut out = Vec::with_capacity(rasters.len());
             for (done, (page_index, raster)) in rasters.into_iter().enumerate() {
                 let lines = engine

@@ -51,7 +51,7 @@
 //! rotated upright for that pass, not the string.
 
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use image::ImageFormat;
@@ -61,6 +61,50 @@ use crate::render::PageRaster;
 /// Invisible searchable text-layer writer (Phase 2c-i) — see its own module
 /// doc comment for the in-place-vs-sidecar decision and design.
 pub mod writer;
+
+/// Tauri managed-state wrapper for the tessdata directory `lib.rs::resolve_tessdata_dir`
+/// resolved at startup — `app.manage`d once in the `setup` closure, read back by
+/// `commands::ocr::run_ocr_document` and passed EXPLICITLY into `OcrEngineHandle::load`.
+///
+/// # Why this exists instead of relying on the `TESSDATA_PREFIX` env var alone
+/// (Windows CRT `getenv` split, found 2026-09-14, laptop-verified)
+///
+/// `resolve_tessdata_dir` still calls `std::env::set_var("TESSDATA_PREFIX", ..)` as a
+/// secondary courtesy (any child process, or native code on macOS/Linux where `setenv`/
+/// `getenv` share one `environ`, still sees it) — but on Windows with the MSVC/UCRT
+/// static link this repo builds with (`x64-windows-static-md`, see
+/// `.github/workflows/build-releases.yml`), `set_var` calls `SetEnvironmentVariableW`,
+/// which updates the Win32 process environment block but NOT the C runtime's own private
+/// copy of the environment. `leptess::LepTess::new` calls into Tesseract's C++ init path,
+/// which reads `TESSDATA_PREFIX` via the C library's `getenv` — the CRT's copy, not
+/// Win32's — so on a genuinely NSIS-installed build it always saw an unset
+/// `TESSDATA_PREFIX` and fell back to `./eng.traineddata`, even though the env var was
+/// set correctly from Rust's point of view. Proof (2026-09-14, mr-desktop, a real
+/// `Redline 0.3.21` NSIS install): the shipped `ocr-selftest.exe --tessdata-dir
+/// "C:\Program Files\Redline\resources\ocr\tessdata"` printed `PASS`, rc=0; the same
+/// binary invoked with no argument (i.e. exercising exactly the `TESSDATA_PREFIX`
+/// lookup path `run_ocr_document_impl` used before this fix) printed `Error opening data
+/// file ./eng.traineddata ... TessInitError{-1}`, rc=1. macOS is unaffected (`setenv`/
+/// `getenv` share `environ` there), which is why this shipped for months of macOS-only
+/// testing before the Windows regression was ever hit.
+///
+/// The fix is to never depend on the env var reaching Tesseract's `getenv` at all —
+/// `dir` is threaded straight into `OcrEngineHandle::load(Some(&path))` as an explicit
+/// argument, which `leptess` passes to `TessBaseAPIInit` as a data path, bypassing
+/// `getenv` entirely on every platform.
+#[derive(Debug, Default, Clone)]
+pub struct TessdataDir {
+    /// The resolved bundled/dev-override tessdata directory, or `None` if no candidate
+    /// (including an already-set `TESSDATA_PREFIX`) was found. `run_ocr_document` passes
+    /// this straight through to `OcrEngineHandle::load` — `None` here still lets Tesseract
+    /// try its own standard lookup (system install), matching the pre-fix behavior for
+    /// that fallback case.
+    pub dir: Option<PathBuf>,
+    /// Every directory that was checked and found NOT to contain `eng.traineddata`,
+    /// recorded so a `run_ocr_document` failure with `dir: None` can list what was
+    /// checked instead of just repeating `leptess`'s own terse error.
+    pub candidates_checked: Vec<PathBuf>,
+}
 
 /// A single OCR-recognized text line, in PDF user-space coordinates.
 #[derive(Debug, Clone, serde::Serialize)]
