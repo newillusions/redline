@@ -205,6 +205,21 @@
     (document.querySelector('[data-testid="search-input"]') as HTMLInputElement | null)?.focus();
   }
 
+  /**
+   * The text-selection (I-beam) tool's action bar "Search" button - runs a
+   * document-scope search for the exact selected text. Viewport hands up the
+   * text (via the onsearchtext prop) rather than searching itself: App.svelte
+   * already owns SearchStore/openSearchPanel/runSearch, and duplicating that
+   * here would be a second search pipeline for the same feature.
+   */
+  async function handleSearchTextSelection(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    searchStore.query = trimmed;
+    await openSearchPanel();
+    await runSearch();
+  }
+
   function pollFolderIndexStatus() {
     if (folderIndexPollTimer) clearInterval(folderIndexPollTimer);
     folderIndexPollTimer = setInterval(async () => {
@@ -1412,6 +1427,9 @@
              so initialState (zoom/page/scroll snapshot) takes effect fresh either way. -->
         {#key activeTab.docId + ":" + viewerMode}
           {#if viewerMode === "reading"}
+            <!-- ReadingView has no MarkupStore/ToolPalette - the I-beam text-selection
+                 tool (and its onsearchtext callback) doesn't exist in this mode, so
+                 there is nothing to wire here (redline#text-select-ux). -->
             <ReadingView
               docInfo={activeTab.doc}
               initialState={activeTab.viewportSnapshot}
@@ -1425,6 +1443,7 @@
               takeoffStore={activeTab.takeoffStore}
               initialState={activeTab.viewportSnapshot}
               onviewportchange={handleViewportChange}
+              onsearchtext={handleSearchTextSelection}
               jumpRequest={viewportJumpRequest}
               searchHits={searchOverlay.hits}
               activeSearchHitIdx={searchOverlay.activeIdx}

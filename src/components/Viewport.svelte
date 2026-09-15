@@ -63,7 +63,8 @@
     markupToSvg, selectionChrome, vertexChrome, isClosedMarkupType, quadToScreenPolygon,
     type SvgShape, type SelectionChrome, type VertexChrome,
   } from "$lib/markup-render";
-  import { charIndexAtPoint, getTextSelection, selectionRange, type Quad } from "$lib/text-select";
+  import { charIndexAtPoint, getTextSelection, selectionRange, copyToClipboard, cursorForTextTool, type Quad } from "$lib/text-select";
+  import TextSelectionActionBar from "./TextSelectionActionBar.svelte";
   import { MarkupStore, type ToolKind } from "$lib/markup-store.svelte";
   import {
     hitTest, marqueeHits, boundsOf, isRectResizable,
@@ -99,6 +100,7 @@
     jumpRequest = null,
     initialState = undefined,
     onviewportchange = undefined,
+    onsearchtext = undefined,
   }: {
     docInfo: DocumentInfo;
     store: MarkupStore;
@@ -133,6 +135,13 @@
      * restored when the user switches back to this tab.
      */
     onviewportchange?: (s: ViewportSnapshot) => void;
+    /**
+     * Called with the extracted plain text when the text-selection (I-beam)
+     * tool's action bar's "Search" button is clicked - App.svelte owns the
+     * SearchPanel/SearchStore, so Viewport hands the text up rather than
+     * driving search itself (mirrors onviewportchange's callback-prop shape).
+     */
+    onsearchtext?: (text: string) => void;
   } = $props();
 
   // ---------------------------------------------------------------------------
@@ -270,6 +279,38 @@
    *  Cleared by Escape, by switching tools, or after committing a Highlight. */
   let textSelection = $state<{ page: number; start: number; end: number; quads: Quad[]; text: string } | null>(null);
 
+  // --- Text-selection (I-beam) tool: hover cursor + outcome UI (owner feedback,
+  // v0.3.22: no I-beam cursor over text, and "you often make a selection with
+  // nothing happening at the end"). See onOverlayPointerMove/Down/Up below. ---
+  /** True when the pointer is over selectable text with the I-beam tool active
+   *  and NOT dragging - drives the cursor (`cursorForTextTool`). Reset on tool
+   *  switch/leave; does not affect the drag gesture itself (dragging always
+   *  shows the text cursor regardless of this flag - see overlayCursor below). */
+  let textHoverOnText = $state(false);
+  /** Throttle for the hover hit-test: last PDF-space point queried, so a hover
+   *  IPC call only fires once the pointer has moved a couple of screen pixels -
+   *  mirrors the throttle convention `refreshTextSelection` already uses for
+   *  drag focus (comment there: "avoids re-calling IPC on every pixel"). */
+  let textHoverLastPoint: { x: number; y: number } | null = null;
+  /** At most one hover hit-test in flight at a time; a move that arrives while
+   *  one is pending is simply dropped (the next move re-queries). */
+  let textHoverPending = false;
+  /** True once a text-selection drag/click has ENDED (pointerup) - distinguishes
+   *  "haven't touched this tool yet" (bar hidden) from "just tried and got
+   *  nothing" (bar shows the miss). Reset on a new drag start, Escape, or
+   *  leaving the tool - see clearTextSelection(). */
+  let textSelAttempted = $state(false);
+  /** Screen-space release point (container-relative), captured at pointerup -
+   *  anchors the "no text found" bar when there's no selection bbox to anchor
+   *  against. Plain (non-reactive) companion to textSelAttempted, same pattern
+   *  as textSelAnchorChar/textSelPage above. */
+  let textSelReleaseScreen: { x: number; y: number } | null = null;
+  /** Transient confirmation after Copy/Highlight - independent of textSelection
+   *  itself so the toast survives commitTextSelectionHighlight() clearing the
+   *  selection. Anchored at the action-bar position the action fired from. */
+  let textSelToast = $state<{ x: number; y: number; text: string } | null>(null);
+  let textSelToastTimer: ReturnType<typeof setTimeout> | null = null;
+
   // --- Inline text editor (Text/Callout) ---
   // editor carries placement info; editorText is a separate $state so bind:value
   // never reaches into a potentially-null object (avoids a Svelte runtime crash when
@@ -346,6 +387,16 @@
    *  text-selection tool (not a create/select tool in the drawn-shape sense, but
    *  still needs pointer capture for its own drag gesture). */
   const overlayActive = $derived(isCreateTool() || isSelectTool() || store.activeTool === "selectText");
+
+  /** Cursor for the markup-overlay SVG. undefined for every tool except the
+   *  I-beam text-selection tool - CSS's `.markup-overlay.capture { cursor:
+   *  crosshair }` keeps governing create/select tools unchanged. For the
+   *  I-beam tool, never crosshair (owner feedback, v0.3.22): the text cursor
+   *  while dragging or hovering over selectable text, the plain arrow
+   *  otherwise (see cursorForTextTool's doc comment in $lib/text-select). */
+  const overlayCursor: "text" | "default" | undefined = $derived(
+    store.activeTool === "selectText" ? cursorForTextTool(textSelDragging || textHoverOnText) : undefined,
+  );
 
   // --- Vector snap (spec §5, v1) ---
   /**
@@ -547,6 +598,73 @@
       ? textSelection.quads.map((q) => quadToScreenPolygon(q, viewState))
       : [],
   );
+
+  /** Bottom-right screen-space corner of a set of PDF-space quads, or null for
+   *  an empty set - used to anchor the text-selection action bar just past the
+   *  end of what got selected (mirrors how a browser's own selection popover
+   *  anchors near the selection, not at a fixed screen position). */
+  function screenBoundsOfQuads(quads: readonly Quad[]): { x: number; y: number } | null {
+    if (quads.length === 0) return null;
+    let maxX = -Infinity, maxY = -Infinity;
+    for (const q of quads) {
+      for (const pt of q) {
+        const s = pdfUserSpaceToScreen(pt.x, pt.y, viewState);
+        if (s.x > maxX) maxX = s.x;
+        if (s.y > maxY) maxY = s.y;
+      }
+    }
+    return { x: maxX, y: maxY };
+  }
+
+  /** Clamp a proposed action-bar anchor into the container so it never renders
+   *  off-screen near the right/bottom edge. Estimated bar footprint, not exact
+   *  (the bar's own CSS wins visually; this only prevents gross overflow). */
+  const ACTION_BAR_W = 240;
+  const ACTION_BAR_H = 84;
+  const ACTION_BAR_MARGIN = 8;
+  function clampBarPos(x: number, y: number): { x: number; y: number } {
+    const maxX = Math.max(ACTION_BAR_MARGIN, containerWidth - ACTION_BAR_W - ACTION_BAR_MARGIN);
+    const maxY = Math.max(ACTION_BAR_MARGIN, containerHeight - ACTION_BAR_H - ACTION_BAR_MARGIN);
+    return {
+      x: Math.min(Math.max(x, ACTION_BAR_MARGIN), maxX),
+      y: Math.min(Math.max(y, ACTION_BAR_MARGIN), maxY),
+    };
+  }
+
+  /**
+   * Floating action-bar/status view for the I-beam tool, reactive so it stays
+   * correct even when the drag's final char-index IPC resolves a beat after
+   * pointerup (see onOverlayPointerUp - textSelAttempted flips first, the
+   * selection itself may still be in flight). null whenever there is nothing
+   * to report: a different tool is active, a drag is in progress (live
+   * highlight is enough mid-drag - see textSelectionPolygons above), or the
+   * tool has not been used yet this "session" on the page.
+   */
+  const textSelBar = $derived.by((): { x: number; y: number; mode: "selection" | "empty"; charCount: number } | null => {
+    if (store.activeTool !== "selectText" || textSelDragging || !textSelAttempted) return null;
+    if (textSelection && textSelection.page === pageIndex && textSelection.text.length > 0) {
+      const bbox = screenBoundsOfQuads(textSelection.quads);
+      const pos = clampBarPos((bbox?.x ?? containerWidth / 2) + 8, (bbox?.y ?? containerHeight / 2) + 8);
+      return { ...pos, mode: "selection", charCount: textSelection.text.length };
+    }
+    // Attempted (drag/click ended) but no usable text - owner feedback: say so
+    // instead of leaving the crosshair-then-nothing silence.
+    const rel = textSelReleaseScreen ?? { x: containerWidth / 2, y: containerHeight / 2 };
+    const pos = clampBarPos(rel.x + 8, rel.y + 8);
+    return { ...pos, mode: "empty", charCount: 0 };
+  });
+
+  /** Show a transient (auto-fading) confirmation toast for Copy/Highlight,
+   *  anchored wherever the action fired from. Independent of textSelBar so it
+   *  survives clearTextSelection() nulling the bar right after a commit. */
+  function showTextSelToast(text: string, at: { x: number; y: number }): void {
+    if (textSelToastTimer) clearTimeout(textSelToastTimer);
+    textSelToast = { x: at.x, y: at.y, text };
+    textSelToastTimer = setTimeout(() => {
+      textSelToast = null;
+      textSelToastTimer = null;
+    }, 1600);
+  }
 
   // ---------------------------------------------------------------------------
   // Load page size on mount / docInfo change
@@ -1492,6 +1610,32 @@
     }
   }
 
+  /**
+   * Hover hit-test for the I-beam tool's cursor (not dragging). Throttled to
+   * skip re-querying within ~2 screen px of the last query point, and to at
+   * most one in-flight IPC call - mirrors resolveCharAt/refreshTextSelection's
+   * existing throttle conventions above. Updates `textHoverOnText`, which
+   * `overlayCursor` reads to pick "text" vs "default" (never "crosshair" - see
+   * cursorForTextTool's doc comment in $lib/text-select).
+   */
+  async function updateTextHover(p: { x: number; y: number }, page: number): Promise<void> {
+    if (textHoverPending) return;
+    if (textHoverLastPoint) {
+      const dx = p.x - textHoverLastPoint.x;
+      const dy = p.y - textHoverLastPoint.y;
+      const thresholdPdf = 2 / zoom; // ~2 screen px, converted at current zoom
+      if (Math.hypot(dx, dy) < thresholdPdf) return;
+    }
+    textHoverPending = true;
+    textHoverLastPoint = p;
+    const char = await resolveCharAt(p, page);
+    textHoverPending = false;
+    // Stale-response guard: the tool may have changed, or a drag may have started,
+    // while this hover query was in flight.
+    if (store.activeTool !== "selectText" || textSelDragging) return;
+    textHoverOnText = char !== null;
+  }
+
   /** Clear the active text selection (Escape, tool switch, or after committing a Highlight). */
   function clearTextSelection(): void {
     textSelection = null;
@@ -1499,6 +1643,8 @@
     textSelPage = null;
     textSelLastFocusChar = null;
     textSelDragging = false;
+    textSelAttempted = false;
+    textSelReleaseScreen = null;
   }
 
   /**
@@ -1510,6 +1656,10 @@
    */
   function commitTextSelectionHighlight(): void {
     if (!textSelection || !identity || textSelection.quads.length === 0) return;
+    // Capture the bar's current anchor BEFORE clearTextSelection() nulls it out,
+    // so the "Highlighted" toast still lands in the right place (owner feedback:
+    // make the outcome of a completed selection explicit, not silent).
+    const anchor = textSelBar ? { x: textSelBar.x, y: textSelBar.y } : null;
     const m = buildMarkup({
       markupType: "Highlight",
       page: textSelection.page,
@@ -1521,14 +1671,22 @@
     });
     store.create(m);
     clearTextSelection();
+    if (anchor) showTextSelToast("Highlight created", anchor);
   }
 
-  /** Copy the active text selection's extracted text to the clipboard (Ctrl/Cmd+C). */
+  /** Copy the active text selection's extracted text to the clipboard (Ctrl/Cmd+C
+   *  or the action-bar Copy button). Shows a brief confirmation/failure toast -
+   *  owner feedback: a completed selection must not leave "nothing happening". */
   function copyTextSelection(): void {
     if (!textSelection || !textSelection.text) return;
-    navigator.clipboard.writeText(textSelection.text).catch((err) => {
-      console.error("clipboard writeText failed:", err);
-    });
+    const anchor = textSelBar ? { x: textSelBar.x, y: textSelBar.y } : { x: containerWidth / 2, y: containerHeight / 2 };
+    const n = textSelection.text.length;
+    copyToClipboard(textSelection.text)
+      .then(() => showTextSelToast(`Copied ${n} character${n === 1 ? "" : "s"}`, anchor))
+      .catch((err) => {
+        console.error("clipboard writeText failed:", err);
+        showTextSelToast("Copy failed", anchor);
+      });
   }
 
   /** Reset all draw state — used by pointerup teardown and pointercancel. */
@@ -1690,6 +1848,11 @@
     // I-beam tool (staying on it, or just arriving at it, must NOT clear).
     if (tool !== "selectText") {
       clearTextSelection();
+      textHoverOnText = false;
+      textHoverLastPoint = null;
+      textHoverPending = false;
+      if (textSelToastTimer) { clearTimeout(textSelToastTimer); textSelToastTimer = null; }
+      textSelToast = null;
     }
   });
 
@@ -1895,6 +2058,11 @@
       textSelAnchorChar = null;
       textSelLastFocusChar = null;
       textSelection = null;
+      // New drag started - hide any bar/toast left over from the previous attempt.
+      textSelAttempted = false;
+      textSelReleaseScreen = null;
+      if (textSelToastTimer) { clearTimeout(textSelToastTimer); textSelToastTimer = null; }
+      textSelToast = null;
       e.stopPropagation();
       e.preventDefault();
       void beginTextSelection(p, pageIndex);
@@ -1949,7 +2117,18 @@
 
     // --- TEXT SELECTION (I-beam) tool: extend the range to the current point. ---
     if (tool === "selectText") {
-      if (!textSelDragging || textSelAnchorChar === null || textSelPage === null) return;
+      if (!textSelDragging) {
+        // Not dragging: this is a hover move - update the cursor (owner feedback:
+        // "have some kind of icon change when we're over selectable text").
+        const p = localPdf(e);
+        if (!docInfo || !p) {
+          textHoverOnText = false;
+          return;
+        }
+        void updateTextHover(p, pageIndex);
+        return;
+      }
+      if (textSelAnchorChar === null || textSelPage === null) return;
       const p = localPdf(e);
       if (!p) return;
       const anchor = textSelAnchorChar;
@@ -2044,6 +2223,13 @@
     //     mouseup until the user does something else. ---
     if (tool === "selectText") {
       textSelDragging = false;
+      // Record the release point (container-relative) and mark this attempt as
+      // finished - textSelBar (reactive) picks up from here, showing the result
+      // once textSelection settles (owner feedback: a completed selection must
+      // say what happened, never nothing).
+      const r = containerEl?.getBoundingClientRect();
+      textSelReleaseScreen = { x: r ? e.clientX - r.left : e.clientX, y: r ? e.clientY - r.top : e.clientY };
+      textSelAttempted = true;
       return;
     }
 
@@ -2704,11 +2890,13 @@
   <svg
     class="markup-overlay"
     class:capture={overlayActive}
+    style:cursor={overlayCursor}
     aria-hidden="true"
     onpointerdown={onOverlayPointerDown}
     onpointermove={onOverlayPointerMove}
     onpointerup={onOverlayPointerUp}
     onpointercancel={cancelDraw}
+    onpointerleave={() => { textHoverOnText = false; textHoverLastPoint = null; }}
     onclick={onOverlayClick}
     ondblclick={onOverlayDblClick}
     onmousemove={onOverlayMouseMove}
@@ -3184,6 +3372,26 @@
       </div>
     </div>
   {/if}
+
+  <!-- Text-selection (I-beam tool) action bar + toast - explicit outcome for a
+       completed selection (owner feedback, v0.3.22: "you often make a selection
+       with nothing happening at the end"). -->
+  {#if textSelBar}
+    <TextSelectionActionBar
+      x={textSelBar.x}
+      y={textSelBar.y}
+      mode={textSelBar.mode}
+      charCount={textSelBar.charCount}
+      onCopy={copyTextSelection}
+      onHighlight={commitTextSelectionHighlight}
+      onSearchText={() => onsearchtext?.(textSelection?.text ?? "")}
+    />
+  {/if}
+  {#if textSelToast}
+    <div class="text-sel-toast" style:left="{textSelToast.x}px" style:top="{textSelToast.y}px" role="status" aria-live="polite">
+      {textSelToast.text}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -3366,6 +3574,25 @@
   }
 
   .bench-hint { color: var(--color-text-muted); opacity: 0.6; font-weight: normal; }
+
+  /* Text-selection (I-beam tool) transient confirmation toast (Copy/Highlight). */
+  .text-sel-toast {
+    position: absolute;
+    background: var(--color-bg-panel);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    color: var(--color-text);
+    font-size: var(--font-size-sm);
+    padding: var(--space-1) var(--space-3);
+    box-shadow: 0 4px 16px rgba(0 0 0 / 0.3);
+    pointer-events: none;
+    z-index: 30;
+    animation: text-sel-toast-fade 1.6s ease-out forwards;
+  }
+  @keyframes text-sel-toast-fade {
+    0%, 70% { opacity: 1; }
+    100% { opacity: 0; }
+  }
 
   /* --- Zoom-snap preset toolbar: position lives on the corner-anchored wrapper (see
        corner-* below), not on .zoom-controls itself, so the collapsed .toolbar-reopen

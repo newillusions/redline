@@ -36,6 +36,13 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   message: vi.fn().mockResolvedValue(null),
 }));
 
+// Mock Tauri clipboard-manager plugin ($lib/text-select's copyToClipboard, used by
+// the I-beam text-selection tool's Ctrl/Cmd+C and action-bar Copy button).
+vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({
+  writeText: vi.fn().mockResolvedValue(null),
+  readText: vi.fn().mockResolvedValue(""),
+}));
+
 beforeEach(() => {
   vi.clearAllMocks();
   if (typeof document !== "undefined" && document.body) {

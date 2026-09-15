@@ -15,6 +15,7 @@
     "updater:allow-install",
     "process:allow-restart",
     "log:default",
-    "wdio:default"
+    "wdio:default",
+    "clipboard-manager:allow-write-text"
   ]
 }

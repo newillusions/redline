@@ -9,6 +9,7 @@
  * commands are thin passthroughs (see src-tauri/src/commands/text_select.rs).
  */
 import { invoke } from "@tauri-apps/api/core";
+import { writeText as pluginWriteText } from "@tauri-apps/plugin-clipboard-manager";
 import type { PdfPoint } from "./ipc";
 
 // ---------------------------------------------------------------------------
@@ -65,6 +66,22 @@ export async function getTextSelection(
   return invoke<TextRangeSelection>("get_text_selection", { docId, pageIndex, start, end });
 }
 
+/**
+ * Copy `text` to the OS clipboard via `@tauri-apps/plugin-clipboard-manager`.
+ *
+ * NOT `navigator.clipboard.writeText()` - this project registered no clipboard
+ * plugin/permission before the text-selection-UX pass (redline#text-select-ux),
+ * so the bare Web API call had no Tauri capability grant behind it. It likely
+ * worked by accident on macOS (WKWebView serves the standard Clipboard API
+ * natively for a user-gesture call with no Tauri involvement) but is unreliable
+ * on Windows WebView2 without an explicit permission - exactly the "nothing
+ * happens" class of bug this pass exists to fix. `clipboard-manager:allow-write-text`
+ * is granted in `src-tauri/capabilities/default.json`.
+ */
+export async function copyToClipboard(text: string): Promise<void> {
+  await pluginWriteText(text);
+}
+
 // ---------------------------------------------------------------------------
 // Pure gesture math (no DOM, no Tauri - unit-testable in isolation)
 // ---------------------------------------------------------------------------
@@ -80,4 +97,21 @@ export function selectionRange(anchorChar: number, focusChar: number): { start: 
   const lo = Math.min(anchorChar, focusChar);
   const hi = Math.max(anchorChar, focusChar);
   return { start: lo, end: hi + 1 };
+}
+
+/**
+ * The pointer cursor for the I-beam tool's overlay, given whether it is
+ * currently dragging a selection and whether the last hit-test (hover, or the
+ * drag's own anchor/focus resolve) found a character nearby.
+ *
+ * Owner feedback (v0.3.22): the tool showed a generic crosshair everywhere,
+ * with no indication of where text could actually be selected. This never
+ * returns "crosshair" - that is the create-tool cursor, and the whole point of
+ * this fix is that the I-beam tool must never show it. Over text: the
+ * standard text-selection cursor. Off text (mid-drag or hovering): the
+ * default arrow - not a "not-allowed" glyph, since off-text is just where the
+ * drag hasn't reached text yet, not a forbidden action.
+ */
+export function cursorForTextTool(hoveringOrDraggingOverText: boolean): "text" | "default" {
+  return hoveringOrDraggingOverText ? "text" : "default";
 }

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { charIndexAtPoint, getTextSelection, selectionRange } from "./text-select";
+import { writeText as pluginWriteText } from "@tauri-apps/plugin-clipboard-manager";
+import { charIndexAtPoint, getTextSelection, selectionRange, copyToClipboard, cursorForTextTool } from "./text-select";
 
 /**
  * Casing-assertion guard for the two new text-selection IPC wrappers (Tauri v2
@@ -69,5 +70,45 @@ describe("selectionRange", () => {
   it("range width equals the number of characters covered", () => {
     const { start, end } = selectionRange(0, 9);
     expect(end - start).toBe(10);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cursorForTextTool (pure - owner feedback, v0.3.22: the I-beam tool must
+// never show the create-tool crosshair, and must reflect whether the pointer
+// is currently over selectable text)
+// ---------------------------------------------------------------------------
+
+describe("cursorForTextTool", () => {
+  it("over text (or dragging): the text cursor", () => {
+    expect(cursorForTextTool(true)).toBe("text");
+  });
+
+  it("off text and not dragging: the default arrow, never crosshair", () => {
+    expect(cursorForTextTool(false)).toBe("default");
+    expect(cursorForTextTool(false)).not.toBe("crosshair");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// copyToClipboard (Tauri clipboard-manager plugin wrapper, NOT
+// navigator.clipboard - see the function's doc comment for why bare
+// navigator.clipboard.writeText() was unreliable under Windows WebView2)
+// ---------------------------------------------------------------------------
+
+describe("copyToClipboard", () => {
+  it("delegates to the clipboard-manager plugin's writeText", async () => {
+    const mockWrite = vi.mocked(pluginWriteText);
+    mockWrite.mockClear();
+    mockWrite.mockResolvedValue(undefined as never);
+    await copyToClipboard("hello world");
+    expect(mockWrite).toHaveBeenCalledWith("hello world");
+  });
+
+  it("propagates a rejection instead of swallowing it", async () => {
+    const mockWrite = vi.mocked(pluginWriteText);
+    mockWrite.mockClear();
+    mockWrite.mockRejectedValue(new Error("no permission"));
+    await expect(copyToClipboard("x")).rejects.toThrow("no permission");
   });
 });

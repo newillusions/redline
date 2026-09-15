@@ -69,6 +69,11 @@ tauri-plugin-log = "2.9.0"
 # the frontend can restart into the new version after install.
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# Ctrl/Cmd+C copy for the I-beam text-selection tool (redline#text-select-ux). Bare
+# `navigator.clipboard.writeText()` has no Tauri permission grant and is unreliable
+# under WebView2 (Windows) without it - this project had no clipboard plugin wired
+# at all before this change, so the frontend call was silently a no-op there.
+tauri-plugin-clipboard-manager = "2.3.3"
 
 # Tier-2 real-app E2E harness (WebdriverIO + @wdio/tauri-service, embedded provider). Both
 # gated cfg(debug_assertions) in lib.rs - never compiled into a release build, matching the

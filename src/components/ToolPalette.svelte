@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { MarkupStore, ToolKind } from "$lib/markup-store.svelte";
   const { store }: { store: MarkupStore } = $props();
-  const TOOLS: { kind: ToolKind; label: string; title: string }[] = [
+  const TOOLS: { kind: ToolKind; label: string; title: string; iconClass?: string }[] = [
     { kind: "hand", label: "✋", title: "Pan (Hand)" },
     { kind: "select", label: "↖", title: "Select / Pointer (V)" },
     { kind: "Rectangle", label: "▢", title: "Rectangle" },
@@ -12,7 +12,20 @@
     // Placed immediately after Highlight (not with the other draw tools) so the
     // text-anchored alternative is discoverable right where users look for it -
     // Acrobat/Bluebeam users expect "Highlight" itself to snap to text (redline#29).
-    { kind: "selectText", label: "I", title: "Select Text (drag to select; Enter highlights, Ctrl/Cmd+C copies)" },
+    //
+    // The label is a serif capital I, styled via .icon-ibeam below - a sans-serif
+    // "I" (the app's default UI font) renders as a bare vertical stroke, nearly
+    // invisible against the button and indistinguishable from an empty button
+    // (owner feedback, v0.3.22: "the icon on the toolbar isn't obvious"). A serif
+    // face gives it top/bottom serifs, the actual shape a text-cursor/I-beam
+    // glyph is named for - recognisable at a glance and distinct from the Text
+    // tool's "A" (Callout icon, positioned well away from this one already).
+    {
+      kind: "selectText",
+      label: "I",
+      title: "Select Text (drag to select; Enter highlights, Ctrl/Cmd+C copies)",
+      iconClass: "icon-ibeam",
+    },
     { kind: "Polyline", label: "⋁", title: "Polyline" },
     { kind: "Polygon", label: "⬠", title: "Polygon" },
     { kind: "Cloud", label: "☁", title: "Cloud" },
@@ -34,6 +47,7 @@
     <button
       class="tool-btn"
       class:active={store.activeTool === t.kind}
+      class:icon-ibeam={t.iconClass === "icon-ibeam"}
       title={t.title}
       aria-pressed={store.activeTool === t.kind}
       onclick={() => (store.activeTool = t.kind)}
@@ -57,4 +71,9 @@
   }
   .tool-btn:hover { background: var(--color-bg-hover); }
   .tool-btn.active { background: var(--color-primary); color: var(--color-text-inverse); border-color: var(--color-primary); }
+  /* Select Text tool: a serif "I" reads as an I-beam/text-cursor glyph (top/bottom
+     serifs) - the app's default sans-serif font renders a bare "I" as a single
+     stroke, easy to miss entirely (owner feedback, v0.3.22). font-family here is
+     a shape choice, not a colour/token override. */
+  .tool-btn.icon-ibeam { font-family: Georgia, "Times New Roman", serif; font-weight: 700; }
 </style>
