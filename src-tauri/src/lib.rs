@@ -317,6 +317,7 @@ pub fn run() {
             commands::document::delete_page,
             commands::document::reorder_pages,
             commands::document::insert_blank_page,
+            commands::document::extract_pages,
             // Diagnostics (in-app §20 bench overlay)
             commands::diag::process_rss_mb,
             commands::diag::auto_open_path,

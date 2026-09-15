@@ -159,6 +159,79 @@ pub fn reorder_pages(doc: &mut Document, new_order: Vec<u32>) -> Result<()> {
     Ok(())
 }
 
+/// Reduce a document to only the given pages, in the given order (owner request
+/// 2026-09-15, PR-C of the reading-mode/thumbnails/extract feature set).
+///
+/// `keep_order` is a list of 0-based page indices into the CURRENT document, in the
+/// order they should appear in the result - not necessarily sorted, and not necessarily
+/// every page (that's the point: this is the "extract N pages into a new file" op, one
+/// step of which is calling this against a COPY of the source document, then saving
+/// that copy to a new path - see `commands::document::extract_pages`, which never
+/// touches the original file).
+///
+/// Reuses the same two primitives the existing page ops already use rather than
+/// inventing a third page-restructuring code path: `Document::delete_pages` (exactly
+/// what `delete_page` calls, batched here instead of one at a time) removes every page
+/// NOT in `keep_order`, then the Kids array is rewritten to `keep_order`'s exact
+/// sequence (exactly what `reorder_pages` does) so the result reflects the requested
+/// order, not whatever relative order the kept pages happened to have.
+///
+/// Errors on an empty `keep_order`, an out-of-range index, or a duplicate index -
+/// mirrors `reorder_pages`'s validation.
+pub fn extract_pages(doc: &mut Document, keep_order: &[u32]) -> Result<()> {
+    let pages = pages_map(doc)?;
+    let page_count = pages.len() as u32;
+
+    if keep_order.is_empty() {
+        bail!("keep_order must not be empty");
+    }
+
+    let mut seen = vec![false; page_count as usize];
+    for &idx in keep_order {
+        if idx >= page_count {
+            bail!("keep_order contains index {idx} which is out of range (0..{page_count})");
+        }
+        if seen[idx as usize] {
+            bail!("keep_order contains duplicate index {idx}");
+        }
+        seen[idx as usize] = true;
+    }
+
+    // Capture the kept pages' ObjectIds in the REQUESTED order before any mutation -
+    // deleting the dropped pages below does not invalidate these (lopdf ObjectIds are
+    // stable; only the Kids array and the deleted objects themselves change).
+    let ordered_ids: Vec<lopdf::ObjectId> = keep_order
+        .iter()
+        .map(|&idx| *pages.get(&(idx + 1)).expect("validated above"))
+        .collect();
+
+    // Physically remove every page NOT in keep_order (1-based page numbers, as
+    // delete_pages expects).
+    let delete_nos: Vec<u32> = (0..page_count)
+        .filter(|i| !seen[*i as usize])
+        .map(|i| i + 1)
+        .collect();
+    if !delete_nos.is_empty() {
+        doc.delete_pages(&delete_nos);
+    }
+
+    // Rewrite Kids to the requested order (same pattern as reorder_pages) - the kept
+    // ObjectIds still exist regardless of what delete_pages did to the Kids array above.
+    let pages_id = pages_node_id(doc)?;
+    let pages_node = doc.get_dictionary_mut(pages_id).context("pages node")?;
+    pages_node.set(
+        "Kids",
+        Object::Array(
+            ordered_ids
+                .iter()
+                .map(|id| Object::Reference(*id))
+                .collect(),
+        ),
+    );
+    pages_node.set("Count", Object::Integer(ordered_ids.len() as i64));
+    Ok(())
+}
+
 /// Insert a blank page of the given size at position `at` (0-based).
 ///
 /// `at == 0` inserts before the first page. `at == page_count` appends at the end.
@@ -412,6 +485,77 @@ pub(crate) mod tests {
     fn reorder_pages_out_of_range_errors() {
         let (mut doc, _) = n_page_doc(3);
         assert!(reorder_pages(&mut doc, vec![0, 1, 5]).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // extract_pages tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn extract_pages_keeps_only_the_selected_pages() {
+        let (mut doc, page_ids) = n_page_doc(5);
+        extract_pages(&mut doc, &[1, 3]).unwrap();
+        let pages = doc.get_pages();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[&1], page_ids[1]);
+        assert_eq!(pages[&2], page_ids[3]);
+    }
+
+    #[test]
+    fn extract_pages_respects_the_requested_order_not_original_order() {
+        let (mut doc, page_ids) = n_page_doc(4);
+        // Select pages 3 and 1 (0-based), in that order - a reorder + subset in one op.
+        extract_pages(&mut doc, &[3, 1]).unwrap();
+        let pages = doc.get_pages();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[&1], page_ids[3]);
+        assert_eq!(pages[&2], page_ids[1]);
+    }
+
+    #[test]
+    fn extract_pages_single_page_from_a_multi_page_doc() {
+        let (mut doc, page_ids) = n_page_doc(5);
+        extract_pages(&mut doc, &[2]).unwrap();
+        let pages = doc.get_pages();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[&1], page_ids[2]);
+    }
+
+    #[test]
+    fn extract_pages_keeping_every_page_in_original_order_is_a_full_copy() {
+        let (mut doc, page_ids) = n_page_doc(3);
+        extract_pages(&mut doc, &[0, 1, 2]).unwrap();
+        let pages = doc.get_pages();
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[&1], page_ids[0]);
+        assert_eq!(pages[&2], page_ids[1]);
+        assert_eq!(pages[&3], page_ids[2]);
+    }
+
+    #[test]
+    fn extract_pages_empty_keep_order_errors() {
+        let (mut doc, _) = n_page_doc(3);
+        assert!(extract_pages(&mut doc, &[]).is_err());
+    }
+
+    #[test]
+    fn extract_pages_out_of_range_index_errors() {
+        let (mut doc, _) = n_page_doc(3);
+        assert!(extract_pages(&mut doc, &[0, 5]).is_err());
+    }
+
+    #[test]
+    fn extract_pages_duplicate_index_errors() {
+        let (mut doc, _) = n_page_doc(3);
+        assert!(extract_pages(&mut doc, &[0, 0]).is_err());
+    }
+
+    #[test]
+    fn extract_pages_does_not_require_keeping_every_page() {
+        // Sanity check distinguishing this from reorder_pages: a shorter keep_order
+        // than page_count is valid (that's the whole point of "extract").
+        let (mut doc, _) = n_page_doc(4);
+        assert!(extract_pages(&mut doc, &[0]).is_ok());
     }
 
     // ------------------------------------------------------------------

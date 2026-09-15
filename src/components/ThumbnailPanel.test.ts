@@ -387,4 +387,157 @@ describe("ThumbnailPanel", () => {
       await expect(fireEvent.click(page1)).resolves.not.toThrow();
     });
   });
+
+  describe("selection (PR-C, 2026-09-15)", () => {
+    it("a plain click selects only that page and still navigates", async () => {
+      const onjump = vi.fn();
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 3, onjump, onPageOp: vi.fn() } });
+      await fireEvent.click(screen.getByLabelText("Page 2"));
+
+      expect(screen.getByLabelText("Page 2").getAttribute("aria-selected")).toBe("true");
+      expect(screen.getByLabelText("Page 1").getAttribute("aria-selected")).toBe("false");
+      expect(onjump).toHaveBeenCalledWith(1);
+    });
+
+    it("ctrl-click toggles a page into the selection without navigating", async () => {
+      const onjump = vi.fn();
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 3, onjump, onPageOp: vi.fn() } });
+      await fireEvent.click(screen.getByLabelText("Page 1"), { ctrlKey: true });
+
+      expect(screen.getByLabelText("Page 1").getAttribute("aria-selected")).toBe("true");
+      expect(onjump).not.toHaveBeenCalled();
+    });
+
+    it("cmd-click (metaKey) also toggles without navigating", async () => {
+      const onjump = vi.fn();
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 3, onjump, onPageOp: vi.fn() } });
+      await fireEvent.click(screen.getByLabelText("Page 1"), { metaKey: true });
+      expect(screen.getByLabelText("Page 1").getAttribute("aria-selected")).toBe("true");
+      expect(onjump).not.toHaveBeenCalled();
+    });
+
+    it("ctrl-clicking an already-selected page deselects it", async () => {
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 3, onPageOp: vi.fn() } });
+      await fireEvent.click(screen.getByLabelText("Page 1"), { ctrlKey: true });
+      expect(screen.getByLabelText("Page 1").getAttribute("aria-selected")).toBe("true");
+      await fireEvent.click(screen.getByLabelText("Page 1"), { ctrlKey: true });
+      expect(screen.getByLabelText("Page 1").getAttribute("aria-selected")).toBe("false");
+    });
+
+    it("ctrl-click accumulates multiple pages into the selection", async () => {
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 5, onPageOp: vi.fn() } });
+      await fireEvent.click(screen.getByLabelText("Page 1"), { ctrlKey: true });
+      await fireEvent.click(screen.getByLabelText("Page 3"), { ctrlKey: true });
+      expect(screen.getByLabelText("Page 1").getAttribute("aria-selected")).toBe("true");
+      expect(screen.getByLabelText("Page 3").getAttribute("aria-selected")).toBe("true");
+      expect(screen.getByLabelText("Page 2").getAttribute("aria-selected")).toBe("false");
+    });
+
+    it("shift-click selects the contiguous range from the last plain click", async () => {
+      const onjump = vi.fn();
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 6, onjump, onPageOp: vi.fn() } });
+      await fireEvent.click(screen.getByLabelText("Page 2")); // anchor = index 1
+      onjump.mockClear();
+      await fireEvent.click(screen.getByLabelText("Page 5"), { shiftKey: true }); // range 1..4
+
+      for (const label of ["Page 2", "Page 3", "Page 4", "Page 5"]) {
+        expect(screen.getByLabelText(label).getAttribute("aria-selected")).toBe("true");
+      }
+      expect(screen.getByLabelText("Page 1").getAttribute("aria-selected")).toBe("false");
+      expect(screen.getByLabelText("Page 6").getAttribute("aria-selected")).toBe("false");
+      expect(onjump).not.toHaveBeenCalled(); // shift-click does not navigate
+    });
+
+    it("shift-click works in reverse (clicking backwards from the anchor)", async () => {
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 6, onPageOp: vi.fn() } });
+      await fireEvent.click(screen.getByLabelText("Page 5")); // anchor = index 4
+      await fireEvent.click(screen.getByLabelText("Page 2"), { shiftKey: true }); // range 1..4
+
+      for (const label of ["Page 2", "Page 3", "Page 4", "Page 5"]) {
+        expect(screen.getByLabelText(label).getAttribute("aria-selected")).toBe("true");
+      }
+      expect(screen.getByLabelText("Page 1").getAttribute("aria-selected")).toBe("false");
+    });
+
+    it("a second shift-click extends/shrinks from the SAME original anchor", async () => {
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 6, onPageOp: vi.fn() } });
+      await fireEvent.click(screen.getByLabelText("Page 2")); // anchor = index 1
+      await fireEvent.click(screen.getByLabelText("Page 4"), { shiftKey: true }); // range 1..3
+      await fireEvent.click(screen.getByLabelText("Page 3"), { shiftKey: true }); // range 1..2, NOT 2..3
+
+      expect(screen.getByLabelText("Page 1").getAttribute("aria-selected")).toBe("false");
+      expect(screen.getByLabelText("Page 2").getAttribute("aria-selected")).toBe("true");
+      expect(screen.getByLabelText("Page 3").getAttribute("aria-selected")).toBe("true");
+      expect(screen.getByLabelText("Page 4").getAttribute("aria-selected")).toBe("false");
+    });
+
+    it("shows the extract action bar with a count once anything is selected", async () => {
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 3, onPageOp: vi.fn() } });
+      expect(screen.queryByText(/selected/)).toBeNull();
+
+      await fireEvent.click(screen.getByLabelText("Page 1"), { ctrlKey: true });
+      await fireEvent.click(screen.getByLabelText("Page 2"), { ctrlKey: true });
+
+      expect(screen.getByText("2 pages selected")).toBeTruthy();
+    });
+
+    it("uses singular wording for a one-page selection", async () => {
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 3, onPageOp: vi.fn() } });
+      await fireEvent.click(screen.getByLabelText("Page 1"));
+      expect(screen.getByText("1 page selected")).toBeTruthy();
+    });
+
+    it("Extract… button calls onextract with the selected indices", async () => {
+      const onextract = vi.fn();
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 5, onextract, onPageOp: vi.fn() } });
+      await fireEvent.click(screen.getByLabelText("Page 1"), { ctrlKey: true });
+      await fireEvent.click(screen.getByLabelText("Page 3"), { ctrlKey: true });
+      await fireEvent.click(screen.getByRole("button", { name: /extract…/i }));
+
+      expect(onextract).toHaveBeenCalledOnce();
+      const [calledWith] = onextract.mock.calls[0];
+      expect(new Set(calledWith)).toEqual(new Set([0, 2]));
+    });
+
+    it("the clear-selection button empties the selection and hides the action bar", async () => {
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 3, onPageOp: vi.fn() } });
+      await fireEvent.click(screen.getByLabelText("Page 1"), { ctrlKey: true });
+      expect(screen.getByText("1 page selected")).toBeTruthy();
+
+      await fireEvent.click(screen.getByTitle("Clear selection"));
+
+      expect(screen.queryByText(/selected/)).toBeNull();
+      expect(screen.getByLabelText("Page 1").getAttribute("aria-selected")).toBe("false");
+    });
+
+    it("a delete clears the selection (indices have shifted)", async () => {
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 3, onPageOp: vi.fn() } });
+      await fireEvent.click(screen.getByLabelText("Page 2"), { ctrlKey: true });
+      expect(screen.getByText("1 page selected")).toBeTruthy();
+
+      await fireEvent.click(screen.getByLabelText("Delete page 1"));
+      await tick();
+
+      expect(screen.queryByText(/selected/)).toBeNull();
+    });
+
+    it("a rotate does NOT clear the selection (no index shift)", async () => {
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 3, onPageOp: vi.fn() } });
+      await fireEvent.click(screen.getByLabelText("Page 2"), { ctrlKey: true });
+      expect(screen.getByText("1 page selected")).toBeTruthy();
+
+      await fireEvent.click(screen.getByLabelText("Rotate page 1 90 degrees clockwise"));
+      await tick();
+
+      expect(screen.getByText("1 page selected")).toBeTruthy();
+    });
+
+    it("does not throw when onextract is not provided", async () => {
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 1, onPageOp: vi.fn() } });
+      await fireEvent.click(screen.getByLabelText("Page 1"), { ctrlKey: true });
+      await expect(
+        fireEvent.click(screen.getByRole("button", { name: /extract…/i })),
+      ).resolves.not.toThrow();
+    });
+  });
 });

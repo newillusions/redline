@@ -78,6 +78,24 @@ mode is a separate sibling component, not a rewrite of the tiled viewer.
 - **Scope** — read/navigate only: markup creation and editing are not available in reading
   mode in this release; switch to single-page mode for markup work.
 
+## Page thumbnails and extraction
+
+Status: shipped 2026-09-15 (owner request). Implementation: `src/components/
+ThumbnailPanel.svelte` (the Navigator panel, left side) and `src/components/
+ExtractPagesDialog.svelte`.
+
+- **Thumbnails** — a low-resolution raster of every page, rendered lazily as it scrolls
+  into view, with the currently-viewed page highlighted. Click a thumbnail to jump there
+  (also selects just that page).
+- **Selection** — click selects one page (and navigates); **Ctrl/Cmd+click** toggles a
+  page in or out of a multi-select without navigating; **Shift+click** selects the
+  contiguous range from the last plain click to the clicked page.
+- **Extract** — once anything is selected, an action bar offers **Extract…**, which opens
+  a small dialog confirming the page count/range, then a native Save-As dialog to choose
+  where to write the new PDF. Extraction never modifies the source document; the new file
+  contains only the selected pages, in ascending page order (click order does not reorder
+  the output).
+
 ## Known gap
 
 Real-device pinch behaviour (macOS trackpad, Windows precision touchpad) has not been

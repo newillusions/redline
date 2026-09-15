@@ -75,6 +75,7 @@
   import ReadingView from "./components/ReadingView.svelte";
   import PageIndicator from "./components/PageIndicator.svelte";
   import ThumbnailPanel from "./components/ThumbnailPanel.svelte";
+  import ExtractPagesDialog from "./components/ExtractPagesDialog.svelte";
 
   // ---------------------------------------------------------------------------
   // S2b client entitlement gate - null while the initial (offline, fast) check
@@ -541,6 +542,9 @@
   // Settings dialog visibility
   let settingsOpen = $state(false);
   let aboutOpen = $state(false);
+  /** Pages selected in ThumbnailPanel awaiting extraction - null when the dialog is
+   *  closed, an array (possibly unsorted/duplicated as clicked) while it's open. */
+  let extractPagesDialogIndices = $state<number[] | null>(null);
 
   // ---------------------------------------------------------------------------
   // Open flow — dedup by path, new tab per file
@@ -1389,6 +1393,7 @@
                   searchJumpNonce += 1;
                   viewportJumpRequest = { page: idx, nonce: searchJumpNonce };
                 }}
+                onextract={(indices) => (extractPagesDialogIndices = indices)}
                 onPageOp={handleThumbnailPageOp}
               />
             {:else}
@@ -1536,6 +1541,17 @@
   <!-- About dialog -->
   {#if aboutOpen}
     <AboutDialog onClose={() => (aboutOpen = false)} />
+  {/if}
+
+  <!-- Extract pages dialog (PR-C, 2026-09-15) -->
+  {#if extractPagesDialogIndices && activeTab}
+    <ExtractPagesDialog
+      docId={activeTab.docId}
+      docPath={activeTab.doc.path}
+      pageIndices={extractPagesDialogIndices}
+      onClose={() => (extractPagesDialogIndices = null)}
+      onExtracted={() => (extractPagesDialogIndices = null)}
+    />
   {/if}
 
   <!-- License grace-period warning: shown once per launch while running on

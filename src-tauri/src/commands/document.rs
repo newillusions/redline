@@ -589,6 +589,105 @@ pub async fn insert_blank_page(
     .await
 }
 
+// ---------------------------------------------------------------------------
+// Extract pages into a NEW file (owner request 2026-09-15, PR-C)
+//
+// Deliberately NOT built on apply_page_edit: every other page op (rotate/delete/
+// reorder/insert) rewrites the SAME file the open document points at, then closes and
+// reopens the render engine under the same doc_id so tiles refresh. Extraction is a
+// Save-As of a SUBSET, not an edit of the open document - the source file and the open
+// render session must be completely untouched; only a brand new file at `dest_path` is
+// written. Shares the same load -> write_markups -> op -> atomic-save skeleton as
+// apply_edit_and_save (see that function's doc comment for why markups are written
+// BEFORE the page op runs), just targeting a different destination and skipping the
+// render-engine swap entirely.
+// ---------------------------------------------------------------------------
+
+/// Core logic behind [`extract_pages`], extracted so it's directly testable (file
+/// round-trip, tempfile + lopdf) the same way [`apply_edit_and_save`] is.
+fn extract_pages_to_new_file(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    markups: &[Markup],
+    page_indices: &[u32],
+) -> anyhow::Result<()> {
+    let mut doc =
+        lopdf::Document::load(src).with_context(|| format!("load {}", src.display()))?;
+    if doc.is_encrypted() {
+        anyhow::bail!(
+            "Extracting pages from a password-protected PDF is not supported yet - saving \
+             would strip its password protection."
+        );
+    }
+    // Bring annotations up to the CURRENT markup state first (matches every other page
+    // op - see apply_edit_and_save's doc comment), so extracted pages carry whatever's
+    // actually on screen, not a stale on-disk snapshot.
+    crate::document::annots::write_markups(&mut doc, markups)?;
+    crate::document::page_ops::extract_pages(&mut doc, page_indices)?;
+
+    let dir = dest.parent().context("no parent dir for destination path")?;
+    let tmp = dir.join(format!(
+        ".redline-tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| -> anyhow::Result<()> {
+        let f = doc
+            .save(&tmp)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all().context("fsync temp")?;
+        std::fs::rename(&tmp, dest).context("atomic rename to destination")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Extract `page_indices` (0-based, in the given order - not necessarily sorted or
+/// covering every page) from `doc_id` into a brand-new file at `dest_path`. The source
+/// document (and its currently open render session) is never modified; `dest_path`
+/// must not already point at the same file the source document is open from.
+#[tauri::command]
+pub async fn extract_pages(
+    state: State<'_, AppState>,
+    doc_id: String,
+    page_indices: Vec<u32>,
+    dest_path: String,
+) -> Result<(), String> {
+    let src = state
+        .markups
+        .path(&doc_id)
+        .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+    let dest = PathBuf::from(dest_path);
+    if dest == src {
+        return Err("extraction destination must be a different file from the source \
+                     document - use Save As on the open document instead if that's the \
+                     intent"
+            .to_string());
+    }
+
+    let password = state.markups.password(&doc_id);
+    if !state.markups.is_loaded(&doc_id) {
+        let p = src.clone();
+        let pw = password.clone();
+        let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?;
+        state.markups.seed_loaded(&doc_id, loaded)?;
+    }
+    let markups = state.markups.list(&doc_id)?;
+
+    tokio::task::spawn_blocking(move || {
+        extract_pages_to_new_file(&src, &dest, &markups, &page_indices)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,5 +952,95 @@ mod tests {
 
         let err = apply_edit_and_save(&path, &[], |doc| optimize_in_place(doc, 1));
         assert!(err.is_err(), "encrypted PDFs must be refused, not silently de-protected");
+    }
+
+    // ------------------------------------------------------------------
+    // extract_pages_to_new_file tests (PR-C, 2026-09-15)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn extract_creates_a_new_file_leaving_the_source_untouched() {
+        use crate::document::page_ops::tests::n_page_doc;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.pdf");
+        let dest = dir.path().join("extracted.pdf");
+        let (mut doc, _) = n_page_doc(5);
+        doc.save(&src).unwrap();
+        let src_bytes_before = std::fs::read(&src).unwrap();
+
+        extract_pages_to_new_file(&src, &dest, &[], &[1, 3]).unwrap();
+
+        assert!(dest.exists(), "destination file must be created");
+        let src_bytes_after = std::fs::read(&src).unwrap();
+        assert_eq!(
+            src_bytes_before, src_bytes_after,
+            "the source document must be byte-for-byte untouched by extraction"
+        );
+
+        let extracted = lopdf::Document::load(&dest).unwrap();
+        assert_eq!(extracted.get_pages().len(), 2, "only the requested pages must be present");
+    }
+
+    #[test]
+    fn extract_preserves_markups_on_kept_pages() {
+        use crate::document::page_ops::tests::n_page_doc;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.pdf");
+        let dest = dir.path().join("extracted.pdf");
+        let (mut doc, _) = n_page_doc(3);
+        doc.save(&src).unwrap();
+
+        let m = redline_markup(1); // markup lives on page index 1
+        extract_pages_to_new_file(&src, &dest, std::slice::from_ref(&m), &[1]).unwrap();
+
+        let extracted = lopdf::Document::load(&dest).unwrap();
+        let markups = crate::document::annots::read_markups(&extracted).unwrap();
+        assert_eq!(markups.len(), 1, "the markup on the kept page must survive extraction");
+    }
+
+    #[test]
+    fn extract_drops_markups_on_pages_not_kept() {
+        use crate::document::page_ops::tests::n_page_doc;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.pdf");
+        let dest = dir.path().join("extracted.pdf");
+        let (mut doc, _) = n_page_doc(3);
+        doc.save(&src).unwrap();
+
+        let m = redline_markup(2); // markup lives on page index 2 - NOT extracted below
+        extract_pages_to_new_file(&src, &dest, std::slice::from_ref(&m), &[0, 1]).unwrap();
+
+        let extracted = lopdf::Document::load(&dest).unwrap();
+        assert_eq!(extracted.get_pages().len(), 2);
+        let markups = crate::document::annots::read_markups(&extracted).unwrap();
+        assert_eq!(markups.len(), 0, "a markup on a page that was NOT extracted must not appear");
+    }
+
+    #[test]
+    fn extract_encrypted_source_is_refused() {
+        use crate::document::annots::tests::encrypted_one_page_doc;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("encrypted.pdf");
+        let dest = dir.path().join("extracted.pdf");
+        let mut doc = encrypted_one_page_doc("redline-pw", "owner-pw");
+        doc.save(&src).unwrap();
+
+        let err = extract_pages_to_new_file(&src, &dest, &[], &[0]);
+        assert!(err.is_err(), "encrypted PDFs must be refused, not silently de-protected");
+        assert!(!dest.exists(), "no partial destination file on refusal");
+    }
+
+    #[test]
+    fn extract_invalid_page_indices_propagates_the_page_ops_error() {
+        use crate::document::page_ops::tests::n_page_doc;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.pdf");
+        let dest = dir.path().join("extracted.pdf");
+        let (mut doc, _) = n_page_doc(2);
+        doc.save(&src).unwrap();
+
+        let err = extract_pages_to_new_file(&src, &dest, &[], &[5]);
+        assert!(err.is_err(), "an out-of-range page index must be refused");
+        assert!(!dest.exists());
     }
 }

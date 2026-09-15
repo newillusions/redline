@@ -479,6 +479,28 @@ export async function insertBlankPage(args: InsertBlankPageArgs): Promise<void> 
   });
 }
 
+export interface ExtractPagesArgs {
+  doc_id: string;
+  /** 0-based page indices, in the order they should appear in the new file - not
+   *  necessarily sorted, not necessarily every page. */
+  page_indices: number[];
+  /** Destination path for the new PDF - must differ from the source document's path. */
+  dest_path: string;
+}
+
+/**
+ * Extract `page_indices` from `doc_id` into a brand-new PDF at `dest_path`. The source
+ * document (and its currently open view) is never modified - this is a Save-As of a
+ * subset, not an edit of the open document.
+ */
+export async function extractPages(args: ExtractPagesArgs): Promise<void> {
+  return invoke<void>("extract_pages", {
+    docId: args.doc_id,
+    pageIndices: args.page_indices,
+    destPath: args.dest_path,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Text search types + commands (M4 S3)
 // ---------------------------------------------------------------------------

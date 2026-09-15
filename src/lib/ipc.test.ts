@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import * as ipc from "./ipc";
 import type { Markup, TileRequest } from "./ipc";
-import type { RotatePageArgs, DeletePageArgs, ReorderPagesArgs, InsertBlankPageArgs } from "./ipc";
+import type { RotatePageArgs, DeletePageArgs, ReorderPagesArgs, InsertBlankPageArgs, ExtractPagesArgs } from "./ipc";
 import type { FolderSearchHit, IndexStatus } from "./ipc";
 import type { Tool, ToolSet } from "./ipc";
 
@@ -177,6 +177,22 @@ describe("page operation ipc wrappers (Tauri v2 camelCase keys)", () => {
   it("insertBlankPage returns void on success", async () => {
     const args: InsertBlankPageArgs = { doc_id: "d1", at: 0, width: 595, height: 842 };
     const result = await ipc.insertBlankPage(args);
+    expect(result).toBeUndefined();
+  });
+
+  it("extractPages → docId / pageIndices / destPath", async () => {
+    const args: ExtractPagesArgs = { doc_id: "d1", page_indices: [3, 1], dest_path: "/tmp/out.pdf" };
+    await ipc.extractPages(args);
+    expect(mockInvoke).toHaveBeenCalledWith("extract_pages", {
+      docId: "d1",
+      pageIndices: [3, 1],
+      destPath: "/tmp/out.pdf",
+    });
+  });
+
+  it("extractPages returns void on success", async () => {
+    const args: ExtractPagesArgs = { doc_id: "d1", page_indices: [0], dest_path: "/tmp/out.pdf" };
+    const result = await ipc.extractPages(args);
     expect(result).toBeUndefined();
   });
 });
