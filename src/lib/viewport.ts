@@ -251,3 +251,138 @@ export function visibleTiles(v: ViewportState): Array<{ tx: number; ty: number }
   }
   return tiles;
 }
+
+// ---------------------------------------------------------------------------
+// Space-drag / click-drag pan: forgiving axis lock (owner feedback 2026-09-15)
+// ---------------------------------------------------------------------------
+// The mouse-drag pan locks to a single axis (straight H or V panning, the classic
+// "hand tool" feel) rather than always following the pointer diagonally - but the
+// direction detection must be forgiving, not a hair-trigger dominant-axis snap:
+//   - Decide from the first ~9px of movement (PAN_LOCK_DETECT_PX), not the very first
+//     event - a couple of noisy sub-pixel deltas at drag-start must not decide the lock.
+//   - Lock to an axis only when the drag vector falls within a ~30-35deg cone of it
+//     (PAN_LOCK_CONE_DEG); a genuinely diagonal drag (e.g. ~45deg) pans freely in 2D
+//     instead of being forced onto whichever axis is nominally "closer".
+//   - The lock can be re-evaluated mid-drag: after a pause (no move event for
+//     PAN_LOCK_PAUSE_MS) or a sharp turn against the current lock, a fresh detection
+//     window starts from the current point - so a user who pans right then stops and
+//     pans down isn't stuck panning right.
+// Kept as pure functions (no DOM/component state) so the decision logic is unit
+// tested directly; Viewport.svelte owns the segment state (origin/scroll0/lock) and
+// calls these on every mousemove.
+
+/** Axis-lock state for one pan "segment" (from drag-start, or from the last re-lock). */
+export type PanAxisLock = "undecided" | "horizontal" | "vertical" | "free";
+
+/** Movement magnitude (px, from the segment's origin) needed before a lock decision is
+ *  made. Below this, movement is applied freely in 2D (no lock has committed yet). */
+export const PAN_LOCK_DETECT_PX = 9;
+
+/** Half-angle (degrees) of the cone around each axis that locks to it; a vector outside
+ *  both cones (i.e. within [PAN_LOCK_CONE_DEG, 90 - PAN_LOCK_CONE_DEG] of horizontal)
+ *  pans freely instead of snapping to the nearer axis. */
+export const PAN_LOCK_CONE_DEG = 32;
+
+/** Gap (ms, wall-clock) between move events past which a fresh detection segment starts
+ *  at the current point, discarding the old lock decision. */
+export const PAN_LOCK_PAUSE_MS = 150;
+
+/**
+ * Decide (or keep) a segment's axis lock from its cumulative movement since origin.
+ * A no-op once a decision has been made ("horizontal"/"vertical"/"free") for this
+ * segment - re-locking only happens by starting a NEW segment (see isSharpTurnAgainstLock
+ * and the pause check below), never by silently overriding an existing decision.
+ */
+export function resolvePanLock(dx: number, dy: number, currentLock: PanAxisLock): PanAxisLock {
+  if (currentLock !== "undecided") return currentLock;
+  if (Math.hypot(dx, dy) < PAN_LOCK_DETECT_PX) return "undecided";
+  const angleFromHorizontalDeg = Math.atan2(Math.abs(dy), Math.abs(dx)) * (180 / Math.PI);
+  if (angleFromHorizontalDeg <= PAN_LOCK_CONE_DEG) return "horizontal";
+  if (angleFromHorizontalDeg >= 90 - PAN_LOCK_CONE_DEG) return "vertical";
+  return "free";
+}
+
+/**
+ * Whether a single frame's movement (delta since the LAST processed move event, not
+ * the segment origin) is a decisive turn against the currently locked axis - e.g. the
+ * user was panning horizontally and just flicked sharply downward. Ignored while
+ * "free" or "undecided" (nothing to turn against). Uses the same cone as the initial
+ * lock decision, so a turn "sharp" enough to have locked the OPPOSITE axis if it were
+ * the first movement is what triggers a re-evaluation - not any perpendicular drift.
+ */
+export function isSharpTurnAgainstLock(frameDx: number, frameDy: number, lock: PanAxisLock): boolean {
+  if (lock !== "horizontal" && lock !== "vertical") return false;
+  if (Math.hypot(frameDx, frameDy) < PAN_LOCK_DETECT_PX) return false;
+  const angleFromHorizontalDeg = Math.atan2(Math.abs(frameDy), Math.abs(frameDx)) * (180 / Math.PI);
+  return lock === "horizontal"
+    ? angleFromHorizontalDeg >= 90 - PAN_LOCK_CONE_DEG
+    : angleFromHorizontalDeg <= PAN_LOCK_CONE_DEG;
+}
+
+/** Which scroll axes a lock state allows to move. "undecided"/"free" both move both -
+ *  the difference between them is only about whether a FUTURE lock decision is still
+ *  pending, not about what's currently allowed to move. */
+export function panLockAxes(lock: PanAxisLock): { applyX: boolean; applyY: boolean } {
+  if (lock === "horizontal") return { applyX: true, applyY: false };
+  if (lock === "vertical") return { applyX: false, applyY: true };
+  return { applyX: true, applyY: true };
+}
+
+// ---------------------------------------------------------------------------
+// Zoom toolbar: collapse + reposition persistence (owner feedback 2026-09-15)
+// ---------------------------------------------------------------------------
+
+/** Which corner of the viewport the zoom toolbar is anchored to. */
+export type ToolbarCorner = "top-left" | "top-right" | "bottom-left" | "bottom-right";
+
+const TOOLBAR_PREFS_STORAGE_KEY = "redline.viewport.zoomToolbar";
+const VALID_CORNERS: readonly ToolbarCorner[] = ["top-left", "top-right", "bottom-left", "bottom-right"];
+const DEFAULT_TOOLBAR_CORNER: ToolbarCorner = "bottom-right";
+
+export interface ToolbarPrefs {
+  collapsed: boolean;
+  corner: ToolbarCorner;
+}
+
+/** Load persisted toolbar prefs (per-viewer convenience, not critical state) - mirrors
+ *  $lib/search-store.svelte.ts's localStorage pattern. Never throws; a missing/corrupt/
+ *  blocked store just yields the defaults. */
+export function loadToolbarPrefs(): ToolbarPrefs {
+  const defaults: ToolbarPrefs = { collapsed: false, corner: DEFAULT_TOOLBAR_CORNER };
+  try {
+    if (typeof localStorage === "undefined") return defaults;
+    const raw = localStorage.getItem(TOOLBAR_PREFS_STORAGE_KEY);
+    if (!raw) return defaults;
+    const parsed = JSON.parse(raw) as Partial<ToolbarPrefs>;
+    return {
+      collapsed: typeof parsed.collapsed === "boolean" ? parsed.collapsed : defaults.collapsed,
+      corner: (VALID_CORNERS as readonly string[]).includes(parsed.corner ?? "")
+        ? (parsed.corner as ToolbarCorner)
+        : defaults.corner,
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+/** Persist toolbar prefs. Best-effort only - a blocked/private-mode store must not break
+ *  the toolbar itself. */
+export function persistToolbarPrefs(prefs: ToolbarPrefs): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(TOOLBAR_PREFS_STORAGE_KEY, JSON.stringify(prefs));
+  } catch {
+    // best-effort
+  }
+}
+
+/**
+ * Nearest corner of a width x height rect to a dropped point (clientX/Y relative to the
+ * rect's own origin, i.e. already offset by the rect's top-left) - used to snap the zoom
+ * toolbar to one of the 4 corners on drag-release. Pure geometry, no DOM.
+ */
+export function nearestCorner(x: number, y: number, width: number, height: number): ToolbarCorner {
+  const isLeft = x < width / 2;
+  const isTop = y < height / 2;
+  return `${isTop ? "top" : "bottom"}-${isLeft ? "left" : "right"}` as ToolbarCorner;
+}

@@ -1,4 +1,8 @@
-import { describe, it, expect } from "vitest";
+// @vitest-environment jsdom
+// jsdom is required for the loadToolbarPrefs/persistToolbarPrefs localStorage tests below
+// (mirrors search-store.test.ts's own note on the same pattern) - every other test in this
+// file is a pure function and unaffected by which environment runs it.
+import { describe, it, expect, beforeEach } from "vitest";
 import {
   fitWidthZoom,
   fitHeightZoom,
@@ -12,6 +16,13 @@ import {
   classifyWheelEvent,
   normalizeWheelDelta,
   parseZoomPercent,
+  resolvePanLock,
+  isSharpTurnAgainstLock,
+  panLockAxes,
+  PAN_LOCK_DETECT_PX,
+  loadToolbarPrefs,
+  persistToolbarPrefs,
+  nearestCorner,
   type WheelEventLike,
 } from "./viewport";
 
@@ -265,5 +276,127 @@ describe("parseZoomPercent", () => {
     expect(parseZoomPercent("abc")).toBeNull();
     expect(parseZoomPercent("0")).toBeNull();
     expect(parseZoomPercent("-50")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolvePanLock / isSharpTurnAgainstLock / panLockAxes - forgiving axis-lock pan
+// (owner feedback 2026-09-15: keep the lock, make the direction detection forgiving).
+// ---------------------------------------------------------------------------
+describe("resolvePanLock", () => {
+  it("stays undecided below the detection-distance threshold", () => {
+    expect(resolvePanLock(3, 1, "undecided")).toBe("undecided");
+    expect(resolvePanLock(PAN_LOCK_DETECT_PX - 1, 0, "undecided")).toBe("undecided");
+  });
+
+  it("a ~20-degree-off-horizontal drag locks horizontal", () => {
+    // 20 deg from horizontal at magnitude well past the detection threshold.
+    const dx = 30, dy = 30 * Math.tan((20 * Math.PI) / 180);
+    expect(resolvePanLock(dx, dy, "undecided")).toBe("horizontal");
+  });
+
+  it("a ~20-degree-off-vertical drag locks vertical", () => {
+    const dy = 30, dx = 30 * Math.tan((20 * Math.PI) / 180);
+    expect(resolvePanLock(dx, dy, "undecided")).toBe("vertical");
+  });
+
+  it("a 45-degree drag does not lock - pans both axes freely", () => {
+    expect(resolvePanLock(20, 20, "undecided")).toBe("free");
+  });
+
+  it("a drag right at the lock-cone boundary (32 degrees) still locks", () => {
+    const dx = 30, dy = 30 * Math.tan((32 * Math.PI) / 180);
+    expect(resolvePanLock(dx, dy, "undecided")).toBe("horizontal");
+  });
+
+  it("a drag just past the lock-cone boundary (35 degrees) does not lock", () => {
+    const dx = 30, dy = 30 * Math.tan((35 * Math.PI) / 180);
+    expect(resolvePanLock(dx, dy, "undecided")).toBe("free");
+  });
+
+  it("never overrides an already-decided lock for the same segment", () => {
+    // Even though this vector alone would decide "vertical", a segment already
+    // locked "horizontal" keeps its decision - only a NEW segment re-decides.
+    expect(resolvePanLock(1, 100, "horizontal")).toBe("horizontal");
+    expect(resolvePanLock(100, 1, "free")).toBe("free");
+  });
+
+  it("is symmetric in sign (direction doesn't matter, only angle)", () => {
+    expect(resolvePanLock(-30, -2, "undecided")).toBe("horizontal");
+    expect(resolvePanLock(2, -30, "undecided")).toBe("vertical");
+  });
+});
+
+describe("isSharpTurnAgainstLock", () => {
+  it("a decisive vertical flick while locked horizontal is a sharp turn", () => {
+    expect(isSharpTurnAgainstLock(0, 30, "horizontal")).toBe(true);
+  });
+
+  it("a decisive horizontal flick while locked vertical is a sharp turn", () => {
+    expect(isSharpTurnAgainstLock(30, 0, "vertical")).toBe(true);
+  });
+
+  it("continuing along the locked axis is never a sharp turn", () => {
+    expect(isSharpTurnAgainstLock(30, 1, "horizontal")).toBe(false);
+    expect(isSharpTurnAgainstLock(1, 30, "vertical")).toBe(false);
+  });
+
+  it("small jitter below the detection threshold is never a sharp turn", () => {
+    expect(isSharpTurnAgainstLock(1, PAN_LOCK_DETECT_PX - 1, "horizontal")).toBe(false);
+  });
+
+  it("has no meaning while free or undecided - always false", () => {
+    expect(isSharpTurnAgainstLock(0, 100, "free")).toBe(false);
+    expect(isSharpTurnAgainstLock(0, 100, "undecided")).toBe(false);
+  });
+});
+
+describe("panLockAxes", () => {
+  it("horizontal lock allows only X", () => {
+    expect(panLockAxes("horizontal")).toEqual({ applyX: true, applyY: false });
+  });
+  it("vertical lock allows only Y", () => {
+    expect(panLockAxes("vertical")).toEqual({ applyX: false, applyY: true });
+  });
+  it("free and undecided both allow both axes", () => {
+    expect(panLockAxes("free")).toEqual({ applyX: true, applyY: true });
+    expect(panLockAxes("undecided")).toEqual({ applyX: true, applyY: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Zoom toolbar: collapse + reposition persistence (owner feedback 2026-09-15)
+// ---------------------------------------------------------------------------
+describe("loadToolbarPrefs / persistToolbarPrefs", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("defaults to expanded, bottom-right when nothing is persisted", () => {
+    expect(loadToolbarPrefs()).toEqual({ collapsed: false, corner: "bottom-right" });
+  });
+
+  it("round-trips a persisted collapsed state and corner", () => {
+    persistToolbarPrefs({ collapsed: true, corner: "top-left" });
+    expect(loadToolbarPrefs()).toEqual({ collapsed: true, corner: "top-left" });
+  });
+
+  it("falls back to defaults on corrupt JSON rather than throwing", () => {
+    localStorage.setItem("redline.viewport.zoomToolbar", "{not json");
+    expect(loadToolbarPrefs()).toEqual({ collapsed: false, corner: "bottom-right" });
+  });
+
+  it("falls back to the default corner on an invalid corner value", () => {
+    localStorage.setItem("redline.viewport.zoomToolbar", JSON.stringify({ collapsed: true, corner: "middle-earth" }));
+    expect(loadToolbarPrefs()).toEqual({ collapsed: true, corner: "bottom-right" });
+  });
+});
+
+describe("nearestCorner", () => {
+  it("picks each of the 4 corners correctly", () => {
+    expect(nearestCorner(10, 10, 200, 200)).toBe("top-left");
+    expect(nearestCorner(190, 10, 200, 200)).toBe("top-right");
+    expect(nearestCorner(10, 190, 200, 200)).toBe("bottom-left");
+    expect(nearestCorner(190, 190, 200, 200)).toBe("bottom-right");
   });
 });

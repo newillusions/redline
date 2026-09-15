@@ -78,6 +78,7 @@ tauri-plugin-wdio-webdriver = "1"
 tauri-plugin-wdio = "1"
 
 # --- Async runtime ---
+
 tokio = { version = "1", features = ["full"] }
 
 # --- Serialization ---
@@ -174,6 +175,16 @@ async-trait = "0.1"
 # build). Feature stays OFF by default: no `-ocr.pdf` writer, no UI, no
 # auto-trigger yet - see the `ocr` module doc comment for phase scope.
 leptess = { version = "0.14", optional = true }
+
+# --- Windows-only: disable WebView2's own native Ctrl+wheel/pinch-synthesized-ctrl+wheel
+# zoom control (obs pending, redline gesture-feedback PR) so it can't compete with this
+# app's own JS-driven canvas-tile zoom. Pinned to the exact version `tauri`/`wry` already
+# resolve (verified via `cargo tree -i webview2-com` against this Cargo.lock - tauri 2.11.2
+# -> wry 0.55.1 -> webview2-com 0.38.2) so `PlatformWebview::controller()`'s COM type and
+# ours are the SAME crate version - a mismatched version would be a different Rust type
+# even with an identical name and fail to compile.
+[target.'cfg(target_os = "windows")'.dependencies]
+webview2-com = "=0.38.2"
 
 [features]
 default = []

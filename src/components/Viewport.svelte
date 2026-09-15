@@ -46,8 +46,17 @@
     parseZoomPercent,
     ZOOM_MIN,
     ZOOM_MAX,
+    resolvePanLock,
+    isSharpTurnAgainstLock,
+    panLockAxes,
+    PAN_LOCK_PAUSE_MS,
+    loadToolbarPrefs,
+    persistToolbarPrefs,
+    nearestCorner,
     type ViewportState,
     type ViewportSnapshot,
+    type PanAxisLock,
+    type ToolbarCorner,
   } from "$lib/viewport";
   import { BoundedTileCache, DEFAULT_TILE_CACHE_CAP_BYTES } from "$lib/tile-cache";
   import {
@@ -170,14 +179,30 @@
   let containerWidth  = $state(0);
   let containerHeight = $state(0);
 
-  // Bench stats (surfaced in UI for M1 validation — §20)
+  // Bench stat (surfaced in the §20 bench overlay for M1 validation)
   let lastTileMs = $state(0);
-  let tileCount  = $state(0);
 
   // --- §20 GUI-only metrics overlay (toggle with the B key) ---
   // These are the §20 acceptance metrics the headless harness CANNOT measure:
   // interactive pan frame-time, zoom-settle, and live process RSS.
   let benchOverlay  = $state(false);
+
+  // --- Pan/zoom shortcuts cheat-sheet (discoverability, owner feedback 2026-09-15:
+  // Shift+wheel zoom "works but I'll forget that") — reachable via the toolbar's [?]
+  // button or the ? key; dismiss on Esc or an outside click. Bindings are unchanged
+  // (owner-decided 2026-09-08 scheme, docs/navigation.md) - this is discovery only. ---
+  let showShortcuts = $state(false);
+
+  // --- Zoom toolbar collapse + reposition (owner feedback 2026-09-15: hideable/
+  // re-showable via a collapse handle + the T key, and draggable to any of the 4
+  // viewport corners, both persisted). Initialized from localStorage in onMount
+  // (component-scope $state can't read browser APIs at declaration time). ---
+  let zoomToolbarCollapsed = $state(false);
+  let zoomToolbarCorner = $state<ToolbarCorner>("bottom-right");
+  /** Live drag offset (css px) applied as a CSS transform while dragging the toolbar
+   *  by its grip handle; reset to {0,0} once the drag ends and snaps to a corner. */
+  let toolbarDragOffset = $state<{ x: number; y: number } | null>(null);
+
   let panFrameMs    = $state(0);   // last pan frame delta (ms)
   let panWorstMs    = $state(0);   // worst frame in the current pan gesture (ms)
   let panFps        = $state(0);   // smoothed FPS during pan
@@ -714,7 +739,6 @@
       });
 
       lastTileMs = result.render_ms;
-      tileCount += 1;
 
       // Decode PNG base64 -> HTMLImageElement.
       const img = new Image();
@@ -809,23 +833,58 @@
   // Pan (mouse drag) — only active when no draw tool is capturing
   // ---------------------------------------------------------------------------
   let dragging = false;
+  // Current pan "segment": origin + scroll baseline the live dx/dy is measured against,
+  // and that segment's axis-lock decision (owner feedback 2026-09-15 - see $lib/viewport's
+  // resolvePanLock/isSharpTurnAgainstLock/panLockAxes doc comment for the full rationale).
+  // A segment is reset - new origin/baseline, lock back to "undecided" - on a pause or a
+  // sharp turn against the current lock, without ending the drag itself.
   let dragStartX = 0;
   let dragStartY = 0;
   let dragScrollX0 = 0;
   let dragScrollY0 = 0;
+  let panLock: PanAxisLock = "undecided";
+  /** Previous move event's pointer position/wall-clock time, for sharp-turn/pause
+   *  detection. null while no move has landed yet in the current drag. */
+  let panLastMoveX: number | null = null;
+  let panLastMoveY: number | null = null;
+  let panLastMoveTs = 0;
+
+  /** Start a fresh detection segment at `(x, y)` with the CURRENT live scroll as its
+   *  baseline - used both at drag-start and at every mid-drag re-lock, so there's never
+   *  a discontinuity: the axis that was frozen keeps exactly the value it last held. */
+  function resetPanSegment(x: number, y: number) {
+    dragStartX = x;
+    dragStartY = y;
+    dragScrollX0 = scrollX;
+    dragScrollY0 = scrollY;
+    panLock = "undecided";
+  }
 
   function onMouseDown(e: MouseEvent) {
     // Don't start pan when any creation tool or select tool is active (overlay captures those events)
     if (isCreateTool() || isSelectTool()) return;
     if (e.button !== 0) return;
+    if (dragging) return; // already mid-drag (defensive - browsers don't double-fire mousedown)
     dragging = true;
-    dragStartX  = e.clientX;
-    dragStartY  = e.clientY;
-    dragScrollX0 = scrollX;
-    dragScrollY0 = scrollY;
+    resetPanSegment(e.clientX, e.clientY);
+    panLastMoveX = null;
+    panLastMoveY = null;
+    panLastMoveTs = 0;
     // Reset per-gesture pan metrics.
     lastFrameTs = performance.now();
     panWorstMs = 0;
+    // Free-follow, survives leaving the viewport mid-drag (owner feedback 2026-09-15: the
+    // previous container-only mousemove/mouseup + an onmouseleave-aborts-the-drag sibling
+    // made the gesture "feel too forced" - a fast or large pan swipe routinely carries the
+    // cursor outside viewport-root's bounds (into a side panel, or past the window edge),
+    // and mouseleave killed the drag the instant that happened, forcing the user to
+    // re-press and restart mid-gesture. Listening on window for the duration of the drag
+    // (removed again in onMouseUp/onDestroy) keeps following the pointer wherever it goes;
+    // the gesture now only ends on an actual button release (or the window losing focus,
+    // via the blur listener below - the one case a mouseup can never arrive).
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("blur", onMouseUp);
   }
 
   function onMouseMove(e: MouseEvent) {
@@ -844,14 +903,49 @@
       panFps = panFps === 0 ? inst : panFps * 0.8 + inst * 0.2;
     }
 
+    // Axis-lock re-evaluation (owner feedback 2026-09-15): a pause since the last move
+    // event, OR a decisive turn against the currently locked axis, starts a FRESH
+    // detection segment right here rather than staying stuck on the old decision - see
+    // $lib/viewport's resolvePanLock doc comment. Date.now() (wall clock), not
+    // performance.now() above (§20 frame-time metric) - mirrors the existing
+    // gestureGraceUntil pattern so both are fake-timer-testable the same way.
+    const wallNow = Date.now();
+    const pausedTooLong = panLastMoveTs > 0 && wallNow - panLastMoveTs > PAN_LOCK_PAUSE_MS;
+    const sharpTurn =
+      !pausedTooLong &&
+      panLastMoveX !== null &&
+      panLastMoveY !== null &&
+      isSharpTurnAgainstLock(e.clientX - panLastMoveX, e.clientY - panLastMoveY, panLock);
+    if (pausedTooLong || sharpTurn) {
+      resetPanSegment(e.clientX, e.clientY);
+    }
+    panLastMoveX = e.clientX;
+    panLastMoveY = e.clientY;
+    panLastMoveTs = wallNow;
+
     const dx = e.clientX - dragStartX;
     const dy = e.clientY - dragStartY;
-    scrollX = Math.max(0, Math.min(pageWidthPx  - containerWidth,  dragScrollX0 - dx));
-    scrollY = Math.max(0, Math.min(pageHeightPx - containerHeight, dragScrollY0 - dy));
+    panLock = resolvePanLock(dx, dy, panLock);
+    const axes = panLockAxes(panLock);
+    // Only assign the axis the lock allows - the frozen axis is left untouched (not
+    // reset to its segment-start value), so locking mid-gesture never causes a visible
+    // snap-back of whatever small perpendicular movement happened during detection.
+    if (axes.applyX) scrollX = Math.max(0, Math.min(pageWidthPx  - containerWidth,  dragScrollX0 - dx));
+    if (axes.applyY) scrollY = Math.max(0, Math.min(pageHeightPx - containerHeight, dragScrollY0 - dy));
     requestTiles();
   }
 
-  function onMouseUp() { dragging = false; }
+  function endMousePan() {
+    dragging = false;
+    window.removeEventListener("mousemove", onMouseMove);
+    window.removeEventListener("mouseup", onMouseUp);
+    window.removeEventListener("blur", onMouseUp);
+  }
+
+  function onMouseUp() {
+    if (!dragging) return;
+    endMousePan();
+  }
 
   // ---------------------------------------------------------------------------
   // Space-bar temporary hand-pan (owner-decided 2026-09-08 scheme) — holding Space
@@ -884,6 +978,52 @@
     spacePanPreviousTool = null;
   }
 
+  // ---------------------------------------------------------------------------
+  // Zoom toolbar: collapse/re-show + drag-to-corner reposition (owner feedback
+  // 2026-09-15). Persistence lives in $lib/viewport (loadToolbarPrefs/
+  // persistToolbarPrefs) so it's unit-testable without mounting the component.
+  // ---------------------------------------------------------------------------
+  function setToolbarCollapsed(collapsed: boolean) {
+    zoomToolbarCollapsed = collapsed;
+    persistToolbarPrefs({ collapsed, corner: zoomToolbarCorner });
+  }
+
+  let toolbarDragStartX = 0;
+  let toolbarDragStartY = 0;
+
+  function onToolbarGripMouseDown(e: MouseEvent) {
+    if (e.button !== 0) return;
+    e.preventDefault(); // don't start a page-content drag/selection
+    e.stopPropagation(); // don't fall through to onMouseDown's viewport pan
+    toolbarDragStartX = e.clientX;
+    toolbarDragStartY = e.clientY;
+    toolbarDragOffset = { x: 0, y: 0 };
+    window.addEventListener("mousemove", onToolbarGripMouseMove);
+    window.addEventListener("mouseup", onToolbarGripMouseUp);
+  }
+
+  function onToolbarGripMouseMove(e: MouseEvent) {
+    if (!toolbarDragOffset) return;
+    toolbarDragOffset = { x: e.clientX - toolbarDragStartX, y: e.clientY - toolbarDragStartY };
+  }
+
+  function onToolbarGripMouseUp(e: MouseEvent) {
+    window.removeEventListener("mousemove", onToolbarGripMouseMove);
+    window.removeEventListener("mouseup", onToolbarGripMouseUp);
+    if (!toolbarDragOffset || !containerEl) {
+      toolbarDragOffset = null;
+      return;
+    }
+    // Snap to whichever of the 4 viewport corners the pointer ended up nearest -
+    // "snap to the 4 corners is enough" (owner). Position relative to the container's
+    // own bounds, not the page, since the toolbar is absolutely positioned within it.
+    const r = containerEl.getBoundingClientRect();
+    const corner = nearestCorner(e.clientX - r.left, e.clientY - r.top, r.width, r.height);
+    toolbarDragOffset = null;
+    zoomToolbarCorner = corner;
+    persistToolbarPrefs({ collapsed: zoomToolbarCollapsed, corner });
+  }
+
   // Keyboard handler: bench overlay toggle + multi-click finish/cancel.
   function onKeyDown(e: KeyboardEvent) {
     // Every shortcut below (bare-key AND modifier) is this component's own feature
@@ -898,6 +1038,19 @@
     onSpaceKeyDown(e);
     if (e.key === "b" || e.key === "B") {
       benchOverlay = !benchOverlay;
+    }
+    // "?" toggles the pan/zoom shortcuts cheat-sheet (discoverability - see showShortcuts'
+    // declaration). e.key already reflects Shift (browsers report the produced character),
+    // so no separate e.shiftKey check is needed.
+    if (e.key === "?") {
+      e.preventDefault();
+      showShortcuts = !showShortcuts;
+    }
+    // "T" toggles the zoom toolbar's collapsed state (owner feedback 2026-09-15 -
+    // hideable/re-showable via a collapse handle OR this key).
+    if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === "t" || e.key === "T")) {
+      e.preventDefault();
+      setToolbarCollapsed(!zoomToolbarCollapsed);
     }
     // Keyboard zoom (Cmd/Ctrl + = / -), anchored to the viewport centre, plus zoom-snap
     // presets and page navigation. Guard all of these when the text editor is active
@@ -1003,6 +1156,12 @@
       } else {
         finishMultiClick();
       }
+    }
+    // Escape closes the shortcuts overlay ONLY - it must not also reset the active
+    // tool/selection below (the overlay is a read-only aid, not a gesture in progress).
+    if (e.key === "Escape" && showShortcuts) {
+      showShortcuts = false;
+      return;
     }
     if (e.key === "Escape") {
       resetMultiClick();
@@ -2498,6 +2657,9 @@
     }
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onSpaceKeyUp);
+    const toolbarPrefs = loadToolbarPrefs();
+    zoomToolbarCollapsed = toolbarPrefs.collapsed;
+    zoomToolbarCorner = toolbarPrefs.corner;
     loadPageSize();
     // Load user identity for markup authoring. On failure, surface a notice so the
     // crosshair-but-nothing-happens state isn't silent.
@@ -2515,6 +2677,9 @@
     }
     window.removeEventListener("keydown", onKeyDown);
     window.removeEventListener("keyup", onSpaceKeyUp);
+    // Mid-drag unmount safety net (e.g. tab switch while panning) - endMousePan() also
+    // removes these, but this covers the case where mouseup/blur never fires at all.
+    if (dragging) endMousePan();
     if (zoomSettleTimer) clearTimeout(zoomSettleTimer);
     tileCache.clear();
     pendingTiles.clear();
@@ -2526,9 +2691,6 @@
   data-doc-id={docInfo.doc_id}
   bind:this={containerEl}
   onmousedown={onMouseDown}
-  onmousemove={onMouseMove}
-  onmouseup={onMouseUp}
-  onmouseleave={onMouseUp}
   onwheel={onWheel}
   role="application"
   aria-label="PDF viewport — two-finger swipe or wheel to pan, pinch or Ctrl/Cmd/Shift+scroll to zoom, Space+drag to pan with any tool"
@@ -2894,42 +3056,107 @@
   </nav>
 
   <!-- Zoom-snap presets: full-width, full-height, 1:1 (key-commands ⌘/Ctrl 0/9/8), plus a
-       type-a-percent input. -->
-  <div class="zoom-controls" role="group" aria-label="Zoom presets">
-    <button class="btn-zoom" title="Fit width (⌘/Ctrl 0)" onclick={fitWidth}>Fit W</button>
-    <button class="btn-zoom" title="Fit height (⌘/Ctrl 9)" onclick={fitHeight}>Fit H</button>
-    <button class="btn-zoom" title="Actual size · 100% (⌘/Ctrl 8)" onclick={actualSize}>100%</button>
-    <input
-      class="zoom-percent-input"
-      type="text"
-      inputmode="numeric"
-      aria-label="Zoom percent"
-      title="Type a zoom percentage and press Enter"
-      value={zoomInputDisplay}
-      onfocus={() => { zoomInputFocused = true; zoomInputDraft = String(Math.round(zoom * 100)); }}
-      onblur={() => { zoomInputFocused = false; }}
-      oninput={(e) => { zoomInputDraft = (e.target as HTMLInputElement).value; }}
-      onkeydown={(e) => {
-        if (e.key === "Enter") { e.preventDefault(); commitZoomInput(); (e.target as HTMLInputElement).blur(); }
-        else if (e.key === "Escape") { e.preventDefault(); (e.target as HTMLInputElement).blur(); }
-      }}
-    />
+       type-a-percent input. Hideable (collapse handle or T key) and repositionable
+       (drag the grip to any corner) - owner feedback 2026-09-15, both persisted via
+       $lib/viewport's loadToolbarPrefs/persistToolbarPrefs. -->
+  <div
+    class={`zoom-controls-wrap corner-${zoomToolbarCorner}`}
+    style={toolbarDragOffset ? `transform: translate(${toolbarDragOffset.x}px, ${toolbarDragOffset.y}px)` : undefined}
+  >
+    {#if !zoomToolbarCollapsed}
+      <div class="zoom-controls" role="group" aria-label="Zoom presets">
+        <button
+          class="btn-zoom toolbar-grip"
+          title="Drag to move this toolbar to a corner"
+          aria-label="Drag to reposition the zoom toolbar"
+          onmousedown={onToolbarGripMouseDown}
+        >⠿</button>
+        <button class="btn-zoom" title="Fit width (⌘/Ctrl 0)" onclick={fitWidth}>Fit W</button>
+        <button class="btn-zoom" title="Fit height (⌘/Ctrl 9)" onclick={fitHeight}>Fit H</button>
+        <button class="btn-zoom" title="Actual size · 100% (⌘/Ctrl 8)" onclick={actualSize}>100%</button>
+        <input
+          class="zoom-percent-input"
+          type="text"
+          inputmode="numeric"
+          aria-label="Zoom percent"
+          title="Type a zoom percentage and press Enter"
+          value={zoomInputDisplay}
+          onfocus={() => { zoomInputFocused = true; zoomInputDraft = String(Math.round(zoom * 100)); }}
+          onblur={() => { zoomInputFocused = false; }}
+          oninput={(e) => { zoomInputDraft = (e.target as HTMLInputElement).value; }}
+          onkeydown={(e) => {
+            if (e.key === "Enter") { e.preventDefault(); commitZoomInput(); (e.target as HTMLInputElement).blur(); }
+            else if (e.key === "Escape") { e.preventDefault(); (e.target as HTMLInputElement).blur(); }
+          }}
+        />
+        <button
+          class="btn-zoom btn-shortcuts"
+          title={"Pan & zoom shortcuts (?)\nPinch or Shift+scroll or ⌘/Ctrl+scroll — zoom\nTwo-finger swipe or wheel — pan\nSpace+drag — pan with any tool"}
+          aria-label="Show pan and zoom shortcuts"
+          onclick={() => (showShortcuts = !showShortcuts)}
+        >?</button>
+        <button
+          class="btn-zoom toolbar-collapse-btn"
+          title="Hide zoom toolbar (T)"
+          aria-label="Hide zoom toolbar"
+          onclick={() => setToolbarCollapsed(true)}
+        >×</button>
+      </div>
+    {:else}
+      <button
+        class="btn-zoom toolbar-reopen"
+        title="Show zoom toolbar (T)"
+        aria-label="Show zoom toolbar"
+        onclick={() => setToolbarCollapsed(false)}
+      >⚙</button>
+    {/if}
   </div>
 
-  <!-- Zoom indicator + bench stats (M1 validation) -->
-  <div class="zoom-indicator">
-    {Math.round(zoom * 100)}%
-    {#if tileCount > 0}
-      <span class="bench-stat">last tile: {lastTileMs}ms</span>
-    {/if}
-    <span class="bench-hint">[B] bench</span>
-  </div>
+  <!-- Pan/zoom shortcuts cheat-sheet overlay (discoverability - see showShortcuts'
+       declaration above). Dismiss on Esc (onKeyDown) or a click outside the card. -->
+  {#if showShortcuts}
+    <div
+      class="shortcuts-scrim"
+      role="button"
+      tabindex="0"
+      aria-label="Close shortcuts"
+      onclick={() => (showShortcuts = false)}
+      onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") showShortcuts = false; }}
+    >
+      <div
+        class="shortcuts-card"
+        role="dialog"
+        tabindex="-1"
+        aria-label="Pan and zoom shortcuts"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => e.stopPropagation()}
+      >
+        <div class="shortcuts-title">Pan &amp; zoom</div>
+        <div class="shortcuts-row"><span>Two-finger swipe / mouse wheel</span><span>Pan</span></div>
+        <div class="shortcuts-row"><span>Pinch (trackpad)</span><span>Zoom at fingers</span></div>
+        <div class="shortcuts-row"><span>Shift + scroll</span><span>Zoom at cursor</span></div>
+        <div class="shortcuts-row"><span>⌘/Ctrl + scroll</span><span>Zoom at cursor</span></div>
+        <div class="shortcuts-row"><span>⌘/Ctrl + / −</span><span>Zoom in / out</span></div>
+        <div class="shortcuts-row"><span>Space + drag</span><span>Pan with any tool</span></div>
+        <div class="shortcuts-row"><span>⌘/Ctrl + 0</span><span>Fit width</span></div>
+        <div class="shortcuts-row"><span>⌘/Ctrl + 9</span><span>Fit height</span></div>
+        <div class="shortcuts-row"><span>⌘/Ctrl + 8</span><span>Actual size (100%)</span></div>
+        <div class="shortcuts-row"><span>T</span><span>Show/hide the zoom toolbar</span></div>
+        <div class="shortcuts-hint">Esc or click outside to close</div>
+      </div>
+    </div>
+  {/if}
 
   <!-- §20 bench/FPS overlay (toggle with B). Captures the GUI-only metrics:
-       pan frame-time, zoom-settle, live RSS — mapped to §20 thresholds. -->
+       pan frame-time, zoom-settle, live RSS — mapped to §20 thresholds.
+       The always-on zoom%/last-tile/[B] HUD that used to sit here was removed
+       (owner feedback 2026-09-15, "get rid of the zoom % window" - it duplicated the
+       toolbar's own zoom-percent input and was a leftover of M1 bench instrumentation).
+       The [B] hint and "last tile" stat now live inside this overlay instead, visible
+       only while it's toggled on. -->
   {#if benchOverlay}
     <div class="bench-overlay">
-      <div class="bench-title">§20 LIVE METRICS</div>
+      <div class="bench-title">§20 LIVE METRICS <span class="bench-hint">[B] to close</span></div>
       <div class="bench-row">
         <span>pan frame</span>
         <span class={panFrameMs <= 33 ? "ok" : "warn"}>
@@ -3138,30 +3365,19 @@
     text-align: center;
   }
 
-  /* --- Zoom indicator / bench stats --- */
-  .zoom-indicator {
-    position: absolute;
-    top: var(--space-3);
-    right: var(--space-3);
-    background: rgba(26, 26, 28, 0.75);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-sm);
-    color: var(--color-text-secondary);
-    font-size: var(--font-size-xs);
-    font-family: var(--font-mono);
-    padding: var(--space-1) var(--space-2);
-    display: flex;
-    gap: var(--space-2);
-    pointer-events: none;
-  }
-  .bench-stat { color: var(--color-text-muted); }
-  .bench-hint { color: var(--color-text-muted); opacity: 0.6; }
+  .bench-hint { color: var(--color-text-muted); opacity: 0.6; font-weight: normal; }
 
-  /* --- Zoom-snap preset buttons --- */
-  .zoom-controls {
+  /* --- Zoom-snap preset toolbar: position lives on the corner-anchored wrapper (see
+       corner-* below), not on .zoom-controls itself, so the collapsed .toolbar-reopen
+       tab renders at the same anchored spot as the full bar. --- */
+  .zoom-controls-wrap {
     position: absolute;
-    bottom: var(--space-4);
-    right: var(--space-4);
+  }
+  .zoom-controls-wrap.corner-top-left    { top: var(--space-4);    left: var(--space-4); }
+  .zoom-controls-wrap.corner-top-right   { top: var(--space-4);    right: var(--space-4); }
+  .zoom-controls-wrap.corner-bottom-left { bottom: var(--space-4); left: var(--space-4); }
+  .zoom-controls-wrap.corner-bottom-right{ bottom: var(--space-4); right: var(--space-4); }
+  .zoom-controls {
     display: flex;
     gap: var(--space-1);
     background: rgba(26, 26, 28, 0.85);
@@ -3169,6 +3385,19 @@
     border-radius: var(--radius-lg);
     padding: var(--space-1);
     backdrop-filter: blur(8px);
+  }
+  .toolbar-grip {
+    cursor: grab;
+    color: var(--color-text-muted);
+  }
+  .toolbar-grip:active { cursor: grabbing; }
+  .toolbar-collapse-btn { color: var(--color-text-muted); }
+  .toolbar-reopen {
+    background: rgba(26, 26, 28, 0.85);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    backdrop-filter: blur(8px);
+    padding: var(--space-1) var(--space-2);
   }
   .btn-zoom {
     background: none;
@@ -3202,6 +3431,57 @@
     outline: 1px solid var(--color-border);
   }
 
+  .btn-shortcuts {
+    font-weight: 600;
+    min-width: 1.6em;
+  }
+
+  /* --- Pan/zoom shortcuts cheat-sheet overlay --- */
+  .shortcuts-scrim {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.35);
+    cursor: default;
+    /* Sits above tiles/markups but below nothing else in this component - it's the
+       topmost interactive layer while open. */
+    z-index: 20;
+  }
+  .shortcuts-card {
+    background: var(--color-bg, #1a1a1c);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    padding: var(--space-4);
+    min-width: 280px;
+    color: var(--color-text-secondary);
+    font-size: var(--font-size-sm);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+  }
+  .shortcuts-title {
+    color: var(--color-text);
+    font-weight: 600;
+    margin-bottom: var(--space-2);
+  }
+  .shortcuts-row {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-4);
+    padding: var(--space-1) 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+  .shortcuts-row:last-of-type { border-bottom: none; }
+  .shortcuts-row span:first-child { color: var(--color-text-secondary); }
+  .shortcuts-row span:last-child { color: var(--color-text-muted); font-family: var(--font-mono); font-size: var(--font-size-xs); }
+  .shortcuts-hint {
+    margin-top: var(--space-2);
+    color: var(--color-text-muted);
+    opacity: 0.7;
+    font-size: var(--font-size-xs);
+    text-align: center;
+  }
+
   /* --- §20 live bench overlay --- */
   .bench-overlay {
     position: absolute;
@@ -3219,6 +3499,9 @@
     backdrop-filter: blur(8px);
   }
   .bench-title {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
     color: var(--color-text);
     font-weight: 600;
     margin-bottom: var(--space-1);

@@ -713,8 +713,12 @@ describe("Viewport zoom-snap controls", () => {
     vi.restoreAllMocks();
   });
 
+  // The always-on zoom-indicator HUD was removed (owner feedback 2026-09-15) - live zoom
+  // is now read from the toolbar's own zoom-percent input, which shows the rounded live
+  // value while unfocused (see zoomInputDisplay in Viewport.svelte).
   function zoomPercent(container: HTMLElement): string {
-    return container.querySelector(".zoom-indicator")?.textContent ?? "";
+    const input = container.querySelector('input[aria-label="Zoom percent"]') as HTMLInputElement | null;
+    return input ? `${input.value}%` : "";
   }
 
   it("Z1: Cmd+1 fits page width to the viewport (zoom → 200%)", async () => {
@@ -811,8 +815,12 @@ describe("Viewport wheel pan/zoom + new zoom controls (owner-decided 2026-09-08 
     vi.restoreAllMocks();
   });
 
+  // The always-on zoom-indicator HUD was removed (owner feedback 2026-09-15) - live zoom
+  // is now read from the toolbar's own zoom-percent input, which shows the rounded live
+  // value while unfocused (see zoomInputDisplay in Viewport.svelte).
   function zoomPercent(container: HTMLElement): string {
-    return container.querySelector(".zoom-indicator")?.textContent ?? "";
+    const input = container.querySelector('input[aria-label="Zoom percent"]') as HTMLInputElement | null;
+    return input ? `${input.value}%` : "";
   }
 
   it("a plain two-finger wheel event (no ctrlKey) pans and does NOT zoom", async () => {
@@ -965,10 +973,13 @@ describe("Viewport wheel pan/zoom + new zoom controls (owner-decided 2026-09-08 
     await fireEvent.input(input, { target: { value: "not a number" } });
     await fireEvent.keyDown(input, { key: "Enter" });
     await tick();
-    expect(zoomPercent(container)).toContain("100%"); // rejected — zoom unchanged
-
+    // Enter's own handler calls blur(), but a synthetic keydown's target.blur() call
+    // doesn't reliably flip jsdom's activeElement/dispatch the blur event within the
+    // same tick - the explicit blur below is what actually settles zoomInputFocused,
+    // exactly as the assertion after it already relied on before this test existed.
     await fireEvent.blur(input);
     await tick();
+    expect(zoomPercent(container)).toContain("100%"); // rejected — zoom unchanged
     expect(input.value).toBe("100"); // reverts to showing the live zoom rounded
   });
 
@@ -1056,6 +1067,486 @@ describe("Viewport wheel pan/zoom + new zoom controls (owner-decided 2026-09-08 
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // Windows trackpad pinch: Chromium synthesizes a ctrlKey wheel event from a
+  // Precision Touchpad pinch gesture (WebViewImpl::HandleSyntheticWheelFromTouchpad
+  // PinchEvent - verified via Chromium source/issue tracker, 2026-09-15) with a small
+  // fractional deltaY representing the proposed scale, NOT a mouse's ±100/120-per-notch
+  // deltaY. classifyWheelEvent already routes any ctrlKey wheel event to zoom regardless
+  // of magnitude - these tests pin that a trackpad-shaped pinch event (small deltaY,
+  // deltaMode 0/pixel) zooms, and by a SMALLER factor than a full mouse Ctrl+wheel notch,
+  // so a pinch doesn't feel twitchy relative to an explicit Ctrl+wheel.
+  // -------------------------------------------------------------------------
+  it("a Chromium-synthesized trackpad-pinch wheel event (small ctrlKey deltaY) zooms in", async () => {
+    const { container, overlay } = await mountViewport(store);
+    store.activeTool = "Rectangle";
+    ptr(overlay, "pointerdown", 50, 50);
+    ptr(overlay, "pointermove", 100, 100);
+    ptr(overlay, "pointerup", 100, 100);
+    const rectEl = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const w0 = parseFloat(rectEl.getAttribute("width")!);
+
+    // Pinch-out (fingers spreading) -> Chromium reports a negative deltaY, same sign
+    // convention as scrolling up / Ctrl+wheel-in.
+    fireEvent.wheel(container.querySelector(".viewport-root")!, { deltaY: -3, deltaMode: 0, ctrlKey: true });
+    await tick();
+
+    const rectEl2 = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const w1 = parseFloat(rectEl2.getAttribute("width")!);
+    expect(w1).toBeCloseTo(w0 * wheelZoomFactor(-3), 3);
+    expect(w1).toBeGreaterThan(w0); // pinch-out zoomed in
+  });
+
+  it("wheelZoomFactor gives a trackpad-pinch-sized deltaY (~3) a smaller zoom step than a full mouse Ctrl+wheel notch (~100) - guards against a twitchy pinch", () => {
+    // Pure-function check (no DOM needed) - classifyWheelEvent/onWheel apply this same
+    // curve to both shapes uniformly (see the "zooms in" test above for the DOM path);
+    // this pins the curve itself doesn't make a pinch's small deltaY feel identical to
+    // a full mouse notch.
+    const pinchFactor = wheelZoomFactor(-3);
+    const mouseNotchFactor = wheelZoomFactor(-100);
+    expect(Math.abs(pinchFactor - 1)).toBeLessThan(Math.abs(mouseNotchFactor - 1));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Space-drag / mouse pan: free 2D, no axis lock, survives the pointer leaving the
+// viewport mid-drag (owner feedback 2026-09-15 - see onMouseDown's comment in
+// Viewport.svelte for the root cause: onmouseleave used to abort the gesture).
+// ---------------------------------------------------------------------------
+describe("Viewport mouse-drag pan (owner feedback 2026-09-15 — looser, more forgiving)", () => {
+  let ipc: ReturnType<typeof fakeIpc>;
+  let store: MarkupStore;
+
+  const LARGE_PAGE = { doc_id: "d1", page_index: 0, width_pts: 400, height_pts: 400 };
+
+  beforeEach(() => {
+    vi.mocked(ipcMocks.getPageSize).mockResolvedValue(LARGE_PAGE);
+    vi.mocked(ipcMocks.renderTile).mockResolvedValue({
+      doc_id: "d1", page_index: 0, tile_x: 0, tile_y: 0,
+      width_px: 512, height_px: 512, zoom: 1, dpr: 1,
+      png_base64: "", render_ms: 1,
+    });
+    vi.mocked(ipcMocks.processRssMb).mockResolvedValue(0);
+    vi.mocked(ipcMocks.getUserIdentity).mockResolvedValue(FAKE_IDENTITY);
+    ipc = fakeIpc();
+    store = new MarkupStore("d1", ipc);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** Draw a marker Rectangle (while briefly on the Rectangle tool), then switch to
+   *  the hand tool so onMouseDown's pan path is live - mirrors the wheel-pan tests'
+   *  own "draw a marker, then perturb the view, then re-measure the marker" pattern. */
+  async function drawMarkerThenSwitchToHand(overlay: SVGElement, store: MarkupStore) {
+    store.activeTool = "Rectangle";
+    ptr(overlay, "pointerdown", 50, 50);
+    ptr(overlay, "pointermove", 100, 100);
+    ptr(overlay, "pointerup", 100, 100);
+    store.activeTool = "hand";
+    await tick();
+  }
+
+  it("a diagonal mouse drag pans both axes proportionally (free 2D, no axis lock)", async () => {
+    const { container, containerEl, overlay } = await mountViewport(store);
+    await drawMarkerThenSwitchToHand(overlay, store);
+    const rectEl = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const x0 = parseFloat(rectEl.getAttribute("x")!);
+    const y0 = parseFloat(rectEl.getAttribute("y")!);
+
+    // Drag toward the upper-left (clientX/Y both decrease) - scrollX/Y start at 0, so
+    // this is the direction with clamp room (dragging the other way is immediately
+    // clamped at the scroll-origin bound, see the next test's comment).
+    await fireEvent.mouseDown(containerEl!, { clientX: 100, clientY: 100, button: 0 });
+    await fireEvent.mouseMove(window, { clientX: 60, clientY: 75 }); // dx=-40, dy=-25
+    await fireEvent.mouseUp(window, { clientX: 60, clientY: 75 });
+    await tick();
+
+    // Natural hand-drag: content follows the drag direction 1:1 (screen shift = dx/dy).
+    // Both axes must move together and in proportion to the raw pointer delta - no
+    // dominant-axis lock, no dead zone, no snapping one axis to zero.
+    const rectEl2 = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    expect(parseFloat(rectEl2.getAttribute("x")!)).toBeCloseTo(x0 - 40);
+    expect(parseFloat(rectEl2.getAttribute("y")!)).toBeCloseTo(y0 - 25);
+  });
+
+  it("the pan continues tracking the pointer after mousemove crosses outside viewport-root mid-drag (root cause: onmouseleave used to abort it)", async () => {
+    const { container, containerEl, overlay } = await mountViewport(store);
+    await drawMarkerThenSwitchToHand(overlay, store);
+    const rectEl = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const x0 = parseFloat(rectEl.getAttribute("x")!);
+
+    // Drag toward the LEFT so the resulting scroll (up to the 200px room LARGE_PAGE
+    // leaves at this zoom) isn't immediately clamped back to the origin - dragging the
+    // other way from an unscrolled start hits the scrollX>=0 clamp with no visible pan,
+    // which would false-pass this test regardless of whether the fix works.
+    await fireEvent.mouseDown(containerEl!, { clientX: 100, clientY: 100, button: 0 });
+    // A mouseleave firing on the container mid-drag (as it would the instant the real
+    // cursor crosses the container's edge) must NOT end the gesture - only an actual
+    // mouseup (dispatched on window, tracked below) does.
+    await fireEvent.mouseLeave(containerEl!, { clientX: -60, clientY: 100 });
+    // The pointer is now physically outside the 200×200 container (clientX=-60, past its
+    // left edge) - the drag must still be receiving/applying this move, via the
+    // window-level listener registered in onMouseDown, not the (removed) container-bound
+    // one that used to die the instant mouseleave fired.
+    await fireEvent.mouseMove(window, { clientX: -60, clientY: 100 }); // dx=-160
+    await tick();
+
+    const rectEl2 = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    expect(parseFloat(rectEl2.getAttribute("x")!)).toBeCloseTo(x0 - 160);
+
+    await fireEvent.mouseUp(window, { clientX: -60, clientY: 100 });
+  });
+
+  it("mouseup on window ends the drag - a further mousemove no longer pans", async () => {
+    const { container, containerEl, overlay } = await mountViewport(store);
+    await drawMarkerThenSwitchToHand(overlay, store);
+
+    await fireEvent.mouseDown(containerEl!, { clientX: 100, clientY: 100, button: 0 });
+    await fireEvent.mouseMove(window, { clientX: 80, clientY: 100 });
+    await tick();
+    const rectEl = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const xAfterFirstMove = parseFloat(rectEl.getAttribute("x")!);
+
+    await fireEvent.mouseUp(window, { clientX: 80, clientY: 100 });
+    await fireEvent.mouseMove(window, { clientX: 40, clientY: 100 }); // after release - must be ignored
+    await tick();
+
+    const rectEl2 = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    expect(parseFloat(rectEl2.getAttribute("x")!)).toBeCloseTo(xAfterFirstMove);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Discoverability: pan/zoom shortcuts cheat-sheet (owner feedback 2026-09-15 -
+// "I'll forget that" re: Shift+wheel zoom).
+// ---------------------------------------------------------------------------
+describe("Viewport shortcuts cheat-sheet", () => {
+  let store: MarkupStore;
+
+  beforeEach(() => {
+    vi.mocked(ipcMocks.getPageSize).mockResolvedValue(FAKE_PAGE_SIZE);
+    vi.mocked(ipcMocks.renderTile).mockResolvedValue({
+      doc_id: "d1", page_index: 0, tile_x: 0, tile_y: 0,
+      width_px: 512, height_px: 512, zoom: 1, dpr: 1,
+      png_base64: "", render_ms: 1,
+    });
+    vi.mocked(ipcMocks.processRssMb).mockResolvedValue(0);
+    vi.mocked(ipcMocks.getUserIdentity).mockResolvedValue(FAKE_IDENTITY);
+    store = new MarkupStore("d1", fakeIpc());
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("the [?] toolbar button opens the shortcuts overlay, listing Shift+scroll zoom", async () => {
+    const { container } = await mountViewport(store);
+    expect(container.querySelector(".shortcuts-scrim")).toBeNull();
+
+    await fireEvent.click(container.querySelector(".btn-shortcuts")!);
+    await tick();
+
+    const scrim = container.querySelector(".shortcuts-scrim");
+    expect(scrim).not.toBeNull();
+    expect(scrim!.textContent).toContain("Shift");
+  });
+
+  it("the ? key toggles the overlay open, and Escape closes it without resetting the active tool", async () => {
+    const { container } = await mountViewport(store);
+    store.activeTool = "Rectangle";
+    await tick();
+
+    await fireEvent.keyDown(window, { key: "?" });
+    await tick();
+    expect(container.querySelector(".shortcuts-scrim")).not.toBeNull();
+
+    await fireEvent.keyDown(window, { key: "Escape" });
+    await tick();
+    expect(container.querySelector(".shortcuts-scrim")).toBeNull();
+    // Escape-to-close-the-overlay must not fall through to the general Escape handler
+    // and reset the active tool.
+    expect(store.activeTool).toBe("Rectangle");
+  });
+
+  it("clicking outside the card (the scrim) closes the overlay", async () => {
+    const { container } = await mountViewport(store);
+    await fireEvent.keyDown(window, { key: "?" });
+    await tick();
+    expect(container.querySelector(".shortcuts-scrim")).not.toBeNull();
+
+    await fireEvent.click(container.querySelector(".shortcuts-scrim")!);
+    await tick();
+    expect(container.querySelector(".shortcuts-scrim")).toBeNull();
+  });
+
+  it("typing '?' into the zoom-percent input does not toggle the overlay (isTypingTarget guard)", async () => {
+    const { container } = await mountViewport(store);
+    const input = container.querySelector('input[aria-label="Zoom percent"]') as HTMLInputElement;
+
+    await fireEvent.keyDown(input, { key: "?" });
+    await tick();
+    expect(container.querySelector(".shortcuts-scrim")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Forgiving axis-lock pan (owner feedback 2026-09-15, item 3 REVISED - keep the lock,
+// make direction detection forgiving). Component-level integration on top of the pure
+// resolvePanLock/isSharpTurnAgainstLock/panLockAxes unit tests in viewport.test.ts.
+// ---------------------------------------------------------------------------
+describe("Viewport mouse-drag pan axis lock", () => {
+  let store: MarkupStore;
+  const LARGE_PAGE = { doc_id: "d1", page_index: 0, width_pts: 400, height_pts: 400 };
+
+  beforeEach(() => {
+    vi.mocked(ipcMocks.getPageSize).mockResolvedValue(LARGE_PAGE);
+    vi.mocked(ipcMocks.renderTile).mockResolvedValue({
+      doc_id: "d1", page_index: 0, tile_x: 0, tile_y: 0,
+      width_px: 512, height_px: 512, zoom: 1, dpr: 1,
+      png_base64: "", render_ms: 1,
+    });
+    vi.mocked(ipcMocks.processRssMb).mockResolvedValue(0);
+    vi.mocked(ipcMocks.getUserIdentity).mockResolvedValue(FAKE_IDENTITY);
+    store = new MarkupStore("d1", fakeIpc());
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  async function drawMarkerThenSwitchToHand(overlay: SVGElement, store: MarkupStore) {
+    store.activeTool = "Rectangle";
+    ptr(overlay, "pointerdown", 50, 50);
+    ptr(overlay, "pointermove", 100, 100);
+    ptr(overlay, "pointerup", 100, 100);
+    store.activeTool = "hand";
+    await tick();
+  }
+
+  it("a ~20-degree-off-horizontal drag locks to horizontal - the vertical axis stays frozen", async () => {
+    const { container, containerEl, overlay } = await mountViewport(store);
+    await drawMarkerThenSwitchToHand(overlay, store);
+    const rectEl = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const x0 = parseFloat(rectEl.getAttribute("x")!);
+    const y0 = parseFloat(rectEl.getAttribute("y")!);
+
+    // Drag toward the upper-left (both clientX/Y decrease) - scrollX/Y start at 0, so
+    // this is the direction with clamp room, matching the sibling "mouse-drag pan"
+    // describe's own convention (dragging the other way is immediately clamped at the
+    // scroll-origin bound with no visible movement, which would false-pass every
+    // assertion below regardless of whether the lock logic works).
+    await fireEvent.mouseDown(containerEl!, { clientX: 100, clientY: 100, button: 0 });
+    // dx=-30, dy=-11 -> ~20 deg from horizontal, well past the 9px detection distance.
+    await fireEvent.mouseMove(window, { clientX: 70, clientY: 89 });
+    await tick();
+
+    const rectEl2 = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    expect(parseFloat(rectEl2.getAttribute("x")!)).toBeCloseTo(x0 - 30);
+    expect(parseFloat(rectEl2.getAttribute("y")!)).toBeCloseTo(y0); // frozen - locked horizontal
+
+    await fireEvent.mouseUp(window, { clientX: 70, clientY: 89 });
+  });
+
+  it("a 45-degree drag does not lock - pans both axes together", async () => {
+    const { container, containerEl, overlay } = await mountViewport(store);
+    await drawMarkerThenSwitchToHand(overlay, store);
+    const rectEl = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const x0 = parseFloat(rectEl.getAttribute("x")!);
+    const y0 = parseFloat(rectEl.getAttribute("y")!);
+
+    await fireEvent.mouseDown(containerEl!, { clientX: 100, clientY: 100, button: 0 });
+    await fireEvent.mouseMove(window, { clientX: 70, clientY: 70 }); // dx=dy=-30 -> 45 deg
+    await tick();
+
+    const rectEl2 = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    expect(parseFloat(rectEl2.getAttribute("x")!)).toBeCloseTo(x0 - 30);
+    expect(parseFloat(rectEl2.getAttribute("y")!)).toBeCloseTo(y0 - 30);
+
+    await fireEvent.mouseUp(window, { clientX: 70, clientY: 70 });
+  });
+
+  it("a drag that starts horizontal then turns vertical after a pause re-locks vertical", async () => {
+    vi.useFakeTimers();
+    try {
+      const { container, containerEl, overlay } = await mountViewport(store);
+      await drawMarkerThenSwitchToHand(overlay, store);
+      const rectEl = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+      const x0 = parseFloat(rectEl.getAttribute("x")!);
+      const y0 = parseFloat(rectEl.getAttribute("y")!);
+
+      await fireEvent.mouseDown(containerEl!, { clientX: 100, clientY: 100, button: 0 });
+      await fireEvent.mouseMove(window, { clientX: 70, clientY: 98 }); // dx=-30,dy=-2 -> locks horizontal
+      await tick();
+      const afterHorizontal = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+      expect(parseFloat(afterHorizontal.getAttribute("x")!)).toBeCloseTo(x0 - 30);
+
+      // A pause longer than PAN_LOCK_PAUSE_MS with no move events - the NEXT move event
+      // starts a fresh detection segment anchored at wherever the pointer currently is
+      // (so it contributes no delta of its own; the turn shows up in the move after it).
+      vi.advanceTimersByTime(300);
+      await fireEvent.mouseMove(window, { clientX: 70, clientY: 98 }); // pause-triggering reset, zero delta
+      await tick();
+      await fireEvent.mouseMove(window, { clientX: 70, clientY: 48 }); // dy=-50 from the new origin -> locks vertical
+      await tick();
+
+      const final = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+      expect(parseFloat(final.getAttribute("y")!)).toBeCloseTo(y0 - 50);
+      expect(parseFloat(final.getAttribute("x")!)).toBeCloseTo(x0 - 30); // unchanged since the horizontal phase
+
+      await fireEvent.mouseUp(window, { clientX: 70, clientY: 48 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a sharp turn against the lock re-evaluates even without a pause", async () => {
+    const { container, containerEl, overlay } = await mountViewport(store);
+    await drawMarkerThenSwitchToHand(overlay, store);
+    const rectEl = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    const x0 = parseFloat(rectEl.getAttribute("x")!);
+    const y0 = parseFloat(rectEl.getAttribute("y")!);
+
+    await fireEvent.mouseDown(containerEl!, { clientX: 100, clientY: 100, button: 0 });
+    await fireEvent.mouseMove(window, { clientX: 70, clientY: 98 }); // dx=-30,dy=-2 -> locks horizontal
+    await tick();
+    // A decisive vertical flick in the very next frame (no pause): the frame delta alone
+    // (dx=0, dy=-40, from the LAST position) is a sharp turn against the horizontal lock,
+    // so THIS event resets the segment right here (contributing zero net delta of its
+    // own, same mechanic as the pause case) - the turn's actual movement shows up in the
+    // move that follows it.
+    await fireEvent.mouseMove(window, { clientX: 70, clientY: 58 });
+    await tick();
+    await fireEvent.mouseMove(window, { clientX: 70, clientY: 18 }); // dy=-40 from the new origin
+    await tick();
+
+    const final = container.querySelector("svg.markup-overlay rect") as SVGRectElement;
+    expect(parseFloat(final.getAttribute("x")!)).toBeCloseTo(x0 - 30); // unchanged from the horizontal phase
+    expect(parseFloat(final.getAttribute("y")!)).toBeCloseTo(y0 - 40); // the turn's own delta applied vertically
+
+    await fireEvent.mouseUp(window, { clientX: 70, clientY: 18 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Zoom-indicator HUD removed; toolbar collapse/reposition (owner feedback 2026-09-15,
+// items 4 and 5).
+// ---------------------------------------------------------------------------
+describe("Viewport zoom toolbar: HUD removal, collapse, reposition", () => {
+  let store: MarkupStore;
+
+  beforeEach(() => {
+    vi.mocked(ipcMocks.getPageSize).mockResolvedValue(FAKE_PAGE_SIZE);
+    vi.mocked(ipcMocks.renderTile).mockResolvedValue({
+      doc_id: "d1", page_index: 0, tile_x: 0, tile_y: 0,
+      width_px: 512, height_px: 512, zoom: 1, dpr: 1,
+      png_base64: "", render_ms: 1,
+    });
+    vi.mocked(ipcMocks.processRssMb).mockResolvedValue(0);
+    vi.mocked(ipcMocks.getUserIdentity).mockResolvedValue(FAKE_IDENTITY);
+    store = new MarkupStore("d1", fakeIpc());
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("the always-on zoom-indicator HUD is gone", async () => {
+    const { container } = await mountViewport(store);
+    expect(container.querySelector(".zoom-indicator")).toBeNull();
+  });
+
+  it("the bench overlay (B key) carries the last-tile stat and a [B] close hint, only while open", async () => {
+    const { container } = await mountViewport(store);
+    expect(container.querySelector(".bench-overlay")).toBeNull();
+
+    await fireEvent.keyDown(window, { key: "b" });
+    await tick();
+
+    const overlay = container.querySelector(".bench-overlay");
+    expect(overlay).not.toBeNull();
+    expect(overlay!.textContent).toContain("last tile");
+    expect(overlay!.textContent).toContain("[B]");
+
+    await fireEvent.keyDown(window, { key: "b" });
+    await tick();
+    expect(container.querySelector(".bench-overlay")).toBeNull();
+  });
+
+  it("the collapse button hides the toolbar, leaving a small re-open handle at the same corner", async () => {
+    const { container } = await mountViewport(store);
+    expect(container.querySelector(".zoom-controls")).not.toBeNull();
+    expect(container.querySelector(".toolbar-reopen")).toBeNull();
+
+    await fireEvent.click(container.querySelector(".toolbar-collapse-btn")!);
+    await tick();
+
+    expect(container.querySelector(".zoom-controls")).toBeNull();
+    const reopen = container.querySelector(".toolbar-reopen");
+    expect(reopen).not.toBeNull();
+    // Still anchored bottom-right (the default corner) while collapsed.
+    expect(container.querySelector(".zoom-controls-wrap.corner-bottom-right")).not.toBeNull();
+
+    await fireEvent.click(reopen!);
+    await tick();
+    expect(container.querySelector(".zoom-controls")).not.toBeNull();
+  });
+
+  it("the T key toggles the toolbar collapsed state, and persists across a remount", async () => {
+    const { container } = await mountViewport(store);
+    await fireEvent.keyDown(window, { key: "t" });
+    await tick();
+    expect(container.querySelector(".zoom-controls")).toBeNull();
+
+    // Persisted (localStorage) - a fresh mount picks up the collapsed state.
+    const { container: container2 } = await mountViewport(new MarkupStore("d1", fakeIpc()));
+    expect(container2.querySelector(".zoom-controls")).toBeNull();
+    expect(container2.querySelector(".toolbar-reopen")).not.toBeNull();
+  });
+
+  it("typing 't' into the zoom-percent input does not collapse the toolbar (isTypingTarget guard)", async () => {
+    const { container } = await mountViewport(store);
+    const input = container.querySelector('input[aria-label="Zoom percent"]') as HTMLInputElement;
+
+    await fireEvent.keyDown(input, { key: "t" });
+    await tick();
+    expect(container.querySelector(".zoom-controls")).not.toBeNull();
+  });
+
+  it("dragging the grip to a corner snaps and persists the toolbar's position", async () => {
+    const { container, containerEl } = await mountViewport(store);
+    // mountViewport's stub sizes the container to 200x200 at (0,0).
+    const grip = container.querySelector(".toolbar-grip")!;
+
+    await fireEvent.mouseDown(grip, { clientX: 190, clientY: 190, button: 0 });
+    // Drag up toward the top-left quadrant of the 200x200 container.
+    await fireEvent.mouseMove(window, { clientX: 20, clientY: 20 });
+    await fireEvent.mouseUp(window, { clientX: 20, clientY: 20 });
+    await tick();
+
+    expect(container.querySelector(".zoom-controls-wrap.corner-top-left")).not.toBeNull();
+    expect(containerEl).not.toBeNull(); // sanity: container ref still valid post-drag
+
+    // Persisted - a fresh mount keeps the chosen corner.
+    const { container: container2 } = await mountViewport(new MarkupStore("d1", fakeIpc()));
+    expect(container2.querySelector(".zoom-controls-wrap.corner-top-left")).not.toBeNull();
+  });
+
+  it("mousedown on the grip does not start a viewport pan (stopPropagation)", async () => {
+    const { container } = await mountViewport(store);
+    const grip = container.querySelector(".toolbar-grip")!;
+    const scrollXBefore = (container.querySelector(".zoom-percent-input") as HTMLInputElement).value;
+
+    await fireEvent.mouseDown(grip, { clientX: 190, clientY: 190, button: 0 });
+    await fireEvent.mouseMove(window, { clientX: 195, clientY: 195 });
+    await fireEvent.mouseUp(window, { clientX: 195, clientY: 195 });
+    await tick();
+
+    // Zoom (a proxy for "nothing about the page view changed") is unaffected by the grip drag.
+    expect((container.querySelector(".zoom-percent-input") as HTMLInputElement).value).toBe(scrollXBefore);
   });
 });
 

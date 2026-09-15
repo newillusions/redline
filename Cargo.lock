@@ -4399,6 +4399,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uuid",
+ "webview2-com",
  "zip 4.6.1",
 ]
 

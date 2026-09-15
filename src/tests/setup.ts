@@ -41,6 +41,11 @@ beforeEach(() => {
   if (typeof document !== "undefined" && document.body) {
     document.body.innerHTML = "";
   }
+  // localStorage-backed UI prefs (search scope, zoom-toolbar collapse/corner, etc.)
+  // must not leak between tests within a file - jsdom's localStorage otherwise
+  // persists across every test in the same file. Guarded: node-env test files
+  // never see this branch (no localStorage global there).
+  if (typeof localStorage !== "undefined") localStorage.clear();
 });
 
 afterEach(() => {

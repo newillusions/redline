@@ -98,6 +98,64 @@ pub struct AppState {
 ///
 /// If none resolve, the env var is left unset and `RenderEngine::new()` falls back to
 /// the system library (and errors clearly if absent).
+/// Windows-only: disable WebView2's own native zoom control so it can't compete with this
+/// app's own JS-driven canvas-tile zoom (Viewport.svelte `onWheel` / `$lib/viewport`
+/// `classifyWheelEvent`).
+///
+/// A Windows Precision Touchpad pinch and an explicit Ctrl+wheel both arrive at the DOM as
+/// a synthetic `wheel` event with `ctrlKey: true` (Chromium
+/// `WebViewImpl::HandleSyntheticWheelFromTouchpadPinchEvent`), which `classifyWheelEvent`
+/// already routes to the app's own zoom. But WebView2 ALSO has its own native zoom control
+/// (`ICoreWebView2Settings.IsZoomControlEnabled`, default `TRUE` per Microsoft Learn) that
+/// responds to the same Ctrl+wheel/pinch-synthesized-ctrl+wheel input at the WebView2 host
+/// layer, above the DOM - a host-level setting, not a page-level default action, so the
+/// page's own `e.preventDefault()` in `onWheel` cannot suppress it. Left enabled, it scales
+/// the whole rendered webview surface as a second, uncoordinated zoom on top of/instead of
+/// the app's own tile-based one. Disabling it here makes the JS zoom path the sole zoom
+/// mechanism on Windows, matching macOS (which has no equivalent competing native zoom).
+/// No effect on non-Windows builds - see the stub below.
+///
+/// Owner-reported symptom this addresses: "pinch doesn't seem to work" on a Windows
+/// trackpad (redline gesture-feedback PR, 2026-09-15). Not verified on real Windows
+/// hardware in this session (no Windows CI leg, no SSH to the test laptop) - see the PR's
+/// owner test checklist.
+#[cfg(target_os = "windows")]
+fn disable_native_zoom_control_on_windows(app: &tauri::App) {
+    use tauri::Manager;
+
+    let Some(window) = app.get_webview_window("main") else {
+        warn!("main webview window not found; native WebView2 zoom control left enabled");
+        return;
+    };
+    let result = window.with_webview(|webview| {
+        // SAFETY: a synchronous COM property set on the WebView2 settings object,
+        // executed on the main thread (per `with_webview`'s contract) - no aliasing or
+        // lifetime hazard, `settings`/`core`/`controller` don't outlive this closure.
+        unsafe {
+            let controller = webview.controller();
+            match controller.CoreWebView2() {
+                Ok(core) => match core.Settings() {
+                    Ok(settings) => {
+                        if let Err(e) = settings.SetIsZoomControlEnabled(false) {
+                            warn!("WebView2 SetIsZoomControlEnabled(false) failed: {e}");
+                        }
+                    }
+                    Err(e) => warn!("WebView2 ICoreWebView2::Settings() failed: {e}"),
+                },
+                Err(e) => warn!("WebView2 ICoreWebView2Controller::CoreWebView2() failed: {e}"),
+            }
+        }
+    });
+    if let Err(e) = result {
+        warn!("with_webview (disable native WebView2 zoom control) failed: {e}");
+    }
+}
+
+/// No-op on every non-Windows platform - WebView2's competing native zoom control (see the
+/// Windows implementation above) doesn't exist on macOS/WKWebView or Linux/webkit2gtk.
+#[cfg(not(target_os = "windows"))]
+fn disable_native_zoom_control_on_windows(_app: &tauri::App) {}
+
 fn resolve_pdfium_path(app: &tauri::App) {
     if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_some() {
         info!("PDFIUM_DYNAMIC_LIB_PATH already set — using it");
@@ -265,6 +323,7 @@ pub fn run() {
                 let tessdata_dir = resolve_tessdata_dir(app);
                 app.manage(tessdata_dir);
             }
+            disable_native_zoom_control_on_windows(app);
             let render = RenderHandle::spawn().expect("failed to start render thread");
             let toolchest = app
                 .path()

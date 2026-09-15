@@ -10,12 +10,23 @@ hand-pan handlers, the toolbar zoom-percent input).
 
 - **Two-finger trackpad swipe** (macOS and Windows precision touchpads), unmodified — pans,
   including diagonally. This is a plain `wheel` event with no `ctrlKey`/`metaKey`/`shiftKey`;
-  both axes are applied directly to scroll position.
+  both axes are applied directly to scroll position. No axis lock here — a trackpad swipe's
+  own two axes are hardware/OS-determined already.
 - **Mouse wheel**, unmodified — pans vertically. A mouse with a tilt-wheel's `deltaX` pans
   horizontally the same way, with no modifier needed.
-- **Space held + drag** — temporary hand-pan, regardless of which tool is active (a draw
-  tool, the select tool, etc.). Releasing Space restores whatever tool was active before.
-  Does not fire while typing in the Text/Callout inline editor or a toolbar input.
+- **Space held + drag, or click-drag with the hand tool** — mouse-driven pan, forgiving
+  axis-locked (owner feedback 2026-09-15): a near-horizontal or near-vertical drag locks to
+  that axis for straight panning; a genuinely diagonal drag (within ~32°-58° of horizontal)
+  pans both axes freely instead of snapping to the nearer one. The lock is decided from the
+  first ~9px of movement (not the first event) and re-evaluated mid-drag on a pause (>150ms
+  with no move event) or a decisive turn against the current lock — so panning right, then
+  pausing, then panning down re-locks to vertical rather than staying stuck horizontal. Pure
+  decision logic: `$lib/viewport.ts`'s `resolvePanLock`/`isSharpTurnAgainstLock`/
+  `panLockAxes`; segment state (origin/scroll-baseline/lock) lives in `Viewport.svelte`'s
+  `onMouseDown`/`onMouseMove`. Survives the pointer leaving the viewport bounds mid-drag
+  (window-level `mousemove`/`mouseup` + a `blur` listener for alt-tab) — releasing Space
+  restores whatever tool was active before. Does not fire while typing in the Text/Callout
+  inline editor or a toolbar input.
 
 ## Zoom
 
@@ -78,6 +89,44 @@ mode is a separate sibling component, not a rewrite of the tiled viewer.
 - **Scope** — read/navigate only: markup creation and editing are not available in reading
   mode in this release; switch to single-page mode for markup work.
 
+## Discoverability
+
+A `[?]` button next to the zoom controls (and the `?` key) opens a shortcuts cheat-sheet
+overlay listing the pan/zoom/page-navigation bindings above — dismiss with Esc or a click
+outside the card. Added 2026-09-15 after owner feedback that Shift+wheel zoom, while
+working, was easy to forget. Discovery only; no binding changed.
+
+## Zoom toolbar: hide/show and reposition
+
+Added 2026-09-15 (owner feedback: "how do we get rid of the zoom % window" plus a
+follow-up asking for the toolbar itself to be hideable and movable):
+
+- The always-on zoom-percentage HUD (a small floating "100%" box, independent of the
+  toolbar) is **removed** — it duplicated the toolbar's own zoom-percent input. Its "last
+  tile" render-time stat and the "[B] bench" hint now live inside the `B`-key bench overlay
+  instead, visible only while that's toggled on.
+- The zoom toolbar (Fit W / Fit H / 100% / zoom-percent input) can be **collapsed** via its
+  own `×` button or the `T` key, leaving a small `⚙` re-open handle at the same corner —
+  and **repositioned** by dragging its `⠿` grip to any of the 4 viewport corners, snapping
+  to the nearest one on release. Both the collapsed state and the chosen corner persist
+  (`$lib/viewport.ts`'s `loadToolbarPrefs`/`persistToolbarPrefs`, localStorage — the same
+  per-viewer-convenience pattern as `search-store.svelte.ts`'s scope persistence).
+
+## Windows: WebView2's own native zoom control must stay disabled
+
+Added 2026-09-15 (PR #117), after an owner report that pinch "didn't seem to work" on a
+Windows trackpad. The `ctrlKey`-wheel path above was already correct — Chromium
+synthesizes a `ctrlKey: true` wheel event from a Windows Precision Touchpad pinch, and
+`classifyWheelEvent` already routes it to zoom. The real cause: WebView2 has its own
+**native** zoom control (`ICoreWebView2Settings.IsZoomControlEnabled`, default `TRUE`) that
+reacts to the same Ctrl+wheel/pinch-synthesized-ctrl+wheel input at the WebView2 host
+layer, above the DOM — not suppressible via this page's own `e.preventDefault()` in
+`onWheel` — and scales the whole rendered webview surface as a second, uncoordinated zoom
+on top of the app's own tile-based one. `src-tauri/src/lib.rs`'s
+`disable_native_zoom_control_on_windows` (Windows-only, runs at window setup) turns it off
+so the JS zoom path above is the sole zoom mechanism on Windows, matching macOS (no
+equivalent competing native zoom there).
+
 ## Page thumbnails and extraction
 
 Status: shipped 2026-09-15 (owner request). Implementation: `src/components/
@@ -100,5 +149,7 @@ ExtractPagesDialog.svelte`.
 
 Real-device pinch behaviour (macOS trackpad, Windows precision touchpad) has not been
 exercised on physical hardware as part of this change — verified only via unit tests
-against synthetic wheel/gesture event shapes. Confirm on a real trackpad before treating
-the pinch UX as fully validated.
+against synthetic wheel/gesture event shapes, plus (for the Windows fix above) an isolated
+scratch-crate compile check against the `x86_64-pc-windows-msvc` target. Confirm on a real
+trackpad before treating the pinch UX as fully validated — see PR #117's owner test
+checklist.
