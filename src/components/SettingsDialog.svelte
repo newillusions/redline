@@ -178,19 +178,19 @@
     error = null;
     saving = true;
     try {
+      // Loaded first so this dialog's own fields can be merged on top of it - preserves
+      // every field this dialog does not edit (last_window, recent_colors, viewer_mode -
+      // the reading-mode toggle lives in the toolbar, not here).
+      const current = await loadSettings();
       const settings: AppSettings = {
+        ...current,
         theme,
         default_tool: defaultTool || null,
         measurement_unit: measurementUnit,
         author_name: authorName,
-        last_window: null,
-        recent_colors: [],
         auto_ocr_on_open: autoOcrOnOpen,
       };
-      // Preserve fields this dialog does not edit (last_window, recent_colors)
-      // by merging over whatever is currently persisted.
-      const current = await loadSettings();
-      await saveSettings({ ...current, ...settings });
+      await saveSettings(settings);
       onClose();
     } catch (e) {
       error = `Failed to save settings: ${e instanceof Error ? e.message : String(e)}`;

@@ -101,4 +101,27 @@ export class BoundedTileCache<T extends CacheableImage> {
     this.entries.clear();
     this.totalBytes = 0;
   }
+
+  /**
+   * Evict every entry whose key fails `keep`, regardless of recency or the byte cap.
+   *
+   * Reading mode's virtualization (ReadingView.svelte) uses this to drop rasters for
+   * pages that have scrolled out of the current render window (see
+   * reading-mode.ts's `visiblePageRange`) the moment the window changes, rather than
+   * waiting for the byte-cap LRU eviction in `set()` to eventually catch up — on a
+   * long scroll through a large sheet set, that lag would otherwise let many
+   * off-screen pages' rasters pile up simultaneously before the cap kicks in.
+   */
+  evictExcept(keep: (key: string) => boolean): void {
+    const toDelete: string[] = [];
+    for (const key of this.entries.keys()) {
+      if (!keep(key)) toDelete.push(key);
+    }
+    for (const key of toDelete) {
+      const entry = this.entries.get(key);
+      if (!entry) continue;
+      this.entries.delete(key);
+      this.totalBytes -= entry.bytes;
+    }
+  }
 }

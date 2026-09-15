@@ -93,3 +93,49 @@ describe("BoundedTileCache - the Windows freeze reproduction", () => {
     expect(cache.size).toBe(1);
   });
 });
+
+describe("BoundedTileCache.evictExcept", () => {
+  it("drops every entry whose key fails the predicate", () => {
+    const cache = new BoundedTileCache<ReturnType<typeof fakeImg>>(DEFAULT_TILE_CACHE_CAP_BYTES);
+    cache.set("page-1,1000", fakeImg(100, 100));
+    cache.set("page-2,1000", fakeImg(100, 100));
+    cache.set("page-5,1000", fakeImg(100, 100));
+
+    // Reading-mode style predicate: keep only pages 1 and 2 (the current render window).
+    const keepWindow = new Set(["page-1,1000", "page-2,1000"]);
+    cache.evictExcept((key) => keepWindow.has(key));
+
+    expect(cache.has("page-1,1000")).toBe(true);
+    expect(cache.has("page-2,1000")).toBe(true);
+    expect(cache.has("page-5,1000")).toBe(false);
+    expect(cache.size).toBe(2);
+  });
+
+  it("adjusts the byte total to match what actually remains", () => {
+    const tileBytes = estimateTileBytes(fakeImg(100, 100));
+    const cache = new BoundedTileCache<ReturnType<typeof fakeImg>>(DEFAULT_TILE_CACHE_CAP_BYTES);
+    cache.set("keep", fakeImg(100, 100));
+    cache.set("drop", fakeImg(100, 100));
+    expect(cache.bytes).toBe(tileBytes * 2);
+
+    cache.evictExcept((key) => key === "keep");
+
+    expect(cache.bytes).toBe(tileBytes);
+  });
+
+  it("is a no-op when everything passes the predicate", () => {
+    const cache = new BoundedTileCache<ReturnType<typeof fakeImg>>(DEFAULT_TILE_CACHE_CAP_BYTES);
+    cache.set("a", fakeImg(100, 100));
+    cache.set("b", fakeImg(100, 100));
+    cache.evictExcept(() => true);
+    expect(cache.size).toBe(2);
+  });
+
+  it("can evict everything (predicate always false)", () => {
+    const cache = new BoundedTileCache<ReturnType<typeof fakeImg>>(DEFAULT_TILE_CACHE_CAP_BYTES);
+    cache.set("a", fakeImg(100, 100));
+    cache.evictExcept(() => false);
+    expect(cache.size).toBe(0);
+    expect(cache.bytes).toBe(0);
+  });
+});

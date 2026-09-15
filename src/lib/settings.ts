@@ -19,6 +19,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 export type Theme = "dark" | "light" | "system";
 export type MeasurementUnit = "mm" | "m" | "km" | "in" | "ft";
+export type ViewerMode = "single" | "reading";
 
 export interface LastWindowState {
   width: number;
@@ -37,6 +38,10 @@ export interface AppSettings {
    *  extractable text on its sampled leading pages (see `documentNeedsOcr`). Defaults
    *  to `false` — a background CPU operation should not fire silently by default. */
   auto_ocr_on_open: boolean;
+  /** Viewer mode for the PDF surface — "single" (original tiled single-page/zoom-pan
+   *  behaviour) or "reading" (continuous vertically-scrolling column). Persisted so the
+   *  toggle survives a restart (owner request 2026-09-15, see ReadingView.svelte). */
+  viewer_mode: ViewerMode;
 }
 
 // ---------------------------------------------------------------------------
@@ -54,6 +59,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   last_window: null,
   recent_colors: [],
   auto_ocr_on_open: false,
+  viewer_mode: "single",
 };
 
 // ---------------------------------------------------------------------------

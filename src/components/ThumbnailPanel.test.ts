@@ -8,7 +8,7 @@
  *   drag-to-reorder triggers IPC with correct permutation, rotate button triggers IPC.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/svelte";
+import { render, screen, fireEvent, waitFor } from "@testing-library/svelte";
 import { tick } from "svelte";
 import ThumbnailPanel from "./ThumbnailPanel.svelte";
 
@@ -22,14 +22,29 @@ const mockReorderPages = vi.fn(async (_args: any) => {});
 const mockDeletePage = vi.fn(async (_args: any) => {});
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockRotatePage = vi.fn(async (_args: any) => {});
+// Thumbnail rendering (PR-B, 2026-09-15) — default resolved values so every existing
+// test (which never asserts on thumbnail content) mounts cleanly; thumbnail-specific
+// tests below override these per-case.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockGetPageSize = vi.fn(async (docId: string, pageIndex: number) => ({
+  doc_id: docId, page_index: pageIndex, width_pts: 200, height_pts: 260,
+}));
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mockRenderTile = vi.fn(async (req: any) => ({
+  doc_id: req.doc_id, page_index: req.page_index, tile_x: req.tile_x, tile_y: req.tile_y,
+  width_px: 100, height_px: 130, zoom: req.zoom, dpr: req.dpr,
+  png_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  render_ms: 1,
+}));
 
 vi.mock("$lib/ipc", () => ({
   reorderPages: (args: unknown) => mockReorderPages(args),
   deletePage: (args: unknown) => mockDeletePage(args),
   rotatePage: (args: unknown) => mockRotatePage(args),
+  getPageSize: (docId: string, pageIndex: number) => mockGetPageSize(docId, pageIndex),
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  renderTile: (req: any) => mockRenderTile(req),
   // other ipc functions (required by setup mock)
-  getPageSize: vi.fn(),
-  renderTile: vi.fn(),
   processRssMb: vi.fn(),
   getUserIdentity: vi.fn(),
   openDocument: vi.fn(),
@@ -64,6 +79,8 @@ describe("ThumbnailPanel", () => {
     mockReorderPages.mockReset();
     mockDeletePage.mockReset();
     mockRotatePage.mockReset();
+    mockGetPageSize.mockClear();
+    mockRenderTile.mockClear();
     // Stub window.confirm to auto-confirm for delete tests.
     vi.spyOn(window, "confirm").mockReturnValue(true);
   });
@@ -253,6 +270,121 @@ describe("ThumbnailPanel", () => {
       await tick();
 
       expect(onPageOp).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe("thumbnail rendering (PR-B, 2026-09-15)", () => {
+    it("fetches a page size and renders a tile for each page (jsdom has no IntersectionObserver, so this fails open to eager loading)", async () => {
+      mountPanel(3);
+      await tick();
+      await tick(); // one for getPageSize, one for the follow-up renderTile
+
+      expect(mockGetPageSize).toHaveBeenCalledTimes(3);
+      expect(mockRenderTile).toHaveBeenCalledTimes(3);
+      expect(mockRenderTile).toHaveBeenCalledWith(
+        expect.objectContaining({ doc_id: "doc-1", page_index: 0, tile_x: 0, tile_y: 0 }),
+      );
+    });
+
+    it("shows the rendered image once the raster resolves, replacing the placeholder", async () => {
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 1, onPageOp: vi.fn() } });
+
+      const img = await waitFor(() => {
+        const found = screen.getByRole("listitem").querySelector("img.thumbnail-image");
+        expect(found).toBeTruthy();
+        return found;
+      });
+      expect(img?.getAttribute("src")).toMatch(/^data:image\/png;base64,/);
+      expect(screen.queryByText("p1")).toBeNull();
+    });
+
+    it("does not re-fetch a page whose thumbnail is already cached", async () => {
+      const { rerender } = render(ThumbnailPanel, {
+        props: { docId: "doc-1", pageCount: 2, onPageOp: vi.fn() },
+      });
+      await waitFor(() => expect(mockRenderTile).toHaveBeenCalledTimes(2));
+
+      mockRenderTile.mockClear();
+      mockGetPageSize.mockClear();
+      await rerender({ docId: "doc-1", pageCount: 2, onPageOp: vi.fn(), currentPage: 1 });
+      await tick();
+
+      expect(mockRenderTile).not.toHaveBeenCalled();
+    });
+
+    it("invalidates every cached thumbnail after a rotate (aspect ratio may have changed)", async () => {
+      mountPanel(2);
+      await waitFor(() => expect(mockRenderTile).toHaveBeenCalledTimes(2));
+
+      mockRenderTile.mockClear();
+      mockGetPageSize.mockClear();
+      const rotateBtn = screen.getByLabelText("Rotate page 1 90 degrees clockwise");
+      await fireEvent.click(rotateBtn);
+
+      // Both thumbnails re-fetched, not just the rotated one — cache was cleared wholesale.
+      await waitFor(() => expect(mockRenderTile).toHaveBeenCalledTimes(2));
+    });
+
+    it("invalidates every cached thumbnail after a delete (indices shift)", async () => {
+      mountPanel(3);
+      await waitFor(() => expect(mockRenderTile).toHaveBeenCalledTimes(3));
+      mockRenderTile.mockClear();
+
+      const deleteBtn = screen.getByLabelText("Delete page 1");
+      await fireEvent.click(deleteBtn);
+
+      await waitFor(() => expect(mockRenderTile.mock.calls.length).toBeGreaterThan(0));
+    });
+  });
+
+  describe("current-page highlight", () => {
+    it("marks the current page's thumbnail with aria-current", () => {
+      mountPanel(3);
+      const page2 = screen.getByLabelText("Page 2");
+      expect(page2.getAttribute("aria-current")).toBeNull();
+
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 3, currentPage: 1, onPageOp: vi.fn() } });
+      const highlighted = screen.getAllByLabelText("Page 2").find((el) => el.getAttribute("aria-current") === "page");
+      expect(highlighted).toBeTruthy();
+    });
+
+    it("no page is marked current when currentPage is null", () => {
+      mountPanel(3);
+      for (const el of screen.getAllByRole("listitem")) {
+        expect(el.getAttribute("aria-current")).toBeNull();
+      }
+    });
+  });
+
+  describe("click-to-jump", () => {
+    it("clicking a thumbnail calls onjump with its 0-based index", async () => {
+      const onjump = vi.fn();
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 3, onjump, onPageOp: vi.fn() } });
+      const page3 = screen.getByLabelText("Page 3");
+      await fireEvent.click(page3);
+      expect(onjump).toHaveBeenCalledWith(2);
+    });
+
+    it("clicking the rotate button does not also trigger onjump (stopPropagation)", async () => {
+      const onjump = vi.fn();
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 2, onjump, onPageOp: vi.fn() } });
+      const rotateBtn = screen.getByLabelText("Rotate page 1 90 degrees clockwise");
+      await fireEvent.click(rotateBtn);
+      expect(onjump).not.toHaveBeenCalled();
+    });
+
+    it("clicking the delete button does not also trigger onjump (stopPropagation)", async () => {
+      const onjump = vi.fn();
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 2, onjump, onPageOp: vi.fn() } });
+      const deleteBtn = screen.getByLabelText("Delete page 1");
+      await fireEvent.click(deleteBtn);
+      expect(onjump).not.toHaveBeenCalled();
+    });
+
+    it("does not throw when onjump is not provided", async () => {
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 1, onPageOp: vi.fn() } });
+      const page1 = screen.getByLabelText("Page 1");
+      await expect(fireEvent.click(page1)).resolves.not.toThrow();
     });
   });
 });

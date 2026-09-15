@@ -1,6 +1,11 @@
 // @vitest-environment jsdom
 import { describe, it, expect } from "vitest";
-import { isEditableTarget, resolveUndoRedoShortcut, resolveSearchShortcut } from "./keyboard-shortcuts";
+import {
+  isEditableTarget,
+  resolveUndoRedoShortcut,
+  resolveSearchShortcut,
+  resolveViewerModeToggleShortcut,
+} from "./keyboard-shortcuts";
 
 function key(opts: Partial<{ key: string; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; target: EventTarget | null }>) {
   return { key: "z", metaKey: false, ctrlKey: false, shiftKey: false, target: null, ...opts };
@@ -119,5 +124,38 @@ describe("resolveSearchShortcut", () => {
     expect(resolveSearchShortcut(skey({ key: "a" }))).toBe(null);
     expect(resolveSearchShortcut(skey({ key: "Enter" }))).toBe(null);
     expect(resolveSearchShortcut(skey({ key: "f" }))).toBe(null); // bare "f", no modifier
+  });
+});
+
+describe("resolveViewerModeToggleShortcut", () => {
+  it("Ctrl+Shift+R resolves true", () => {
+    expect(resolveViewerModeToggleShortcut(key({ key: "r", ctrlKey: true, shiftKey: true }))).toBe(true);
+  });
+
+  it("Cmd+Shift+R resolves true", () => {
+    expect(resolveViewerModeToggleShortcut(key({ key: "r", metaKey: true, shiftKey: true }))).toBe(true);
+  });
+
+  it("is not case-sensitive", () => {
+    expect(resolveViewerModeToggleShortcut(key({ key: "R", ctrlKey: true, shiftKey: true }))).toBe(true);
+  });
+
+  it("plain 'r' with no modifier resolves false (that's the tool-palette shortcut)", () => {
+    expect(resolveViewerModeToggleShortcut(key({ key: "r" }))).toBe(false);
+  });
+
+  it("Ctrl+R without Shift resolves false", () => {
+    expect(resolveViewerModeToggleShortcut(key({ key: "r", ctrlKey: true }))).toBe(false);
+  });
+
+  it("Ctrl+Shift+<other key> resolves false", () => {
+    expect(resolveViewerModeToggleShortcut(key({ key: "g", ctrlKey: true, shiftKey: true }))).toBe(false);
+  });
+
+  it("returns false when the target is editable (typing 'R' in a text field)", () => {
+    const input = document.createElement("input");
+    expect(
+      resolveViewerModeToggleShortcut(key({ key: "r", ctrlKey: true, shiftKey: true, target: input })),
+    ).toBe(false);
   });
 });

@@ -32,6 +32,10 @@ fn default_measurement_unit() -> String {
     "m".to_string()
 }
 
+fn default_viewer_mode() -> String {
+    "single".to_string()
+}
+
 /// Last known main-window geometry, restored on next launch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct LastWindowState {
@@ -70,6 +74,12 @@ pub struct AppSettings {
     /// safe default; the user opts in from Settings.
     #[serde(default)]
     pub auto_ocr_on_open: bool,
+    /// Viewer mode for the PDF surface: "single" (one page, tiled zoom/pan — the
+    /// original behaviour) or "reading" (continuous vertically-scrolling column,
+    /// fit-to-width by default — owner request 2026-09-15). Persisted so the choice
+    /// survives a restart, matching every other viewer preference in this struct.
+    #[serde(default = "default_viewer_mode")]
+    pub viewer_mode: String,
 }
 
 impl Default for AppSettings {
@@ -82,6 +92,7 @@ impl Default for AppSettings {
             last_window: None,
             recent_colors: Vec::new(),
             auto_ocr_on_open: false,
+            viewer_mode: default_viewer_mode(),
         }
     }
 }
@@ -167,6 +178,7 @@ mod tests {
         assert!(s.last_window.is_none());
         assert!(s.recent_colors.is_empty());
         assert!(!s.auto_ocr_on_open);
+        assert_eq!(s.viewer_mode, "single");
     }
 
     #[test]
@@ -191,6 +203,7 @@ mod tests {
             }),
             recent_colors: vec!["#ff0000".to_string(), "#00ff00".to_string()],
             auto_ocr_on_open: true,
+            viewer_mode: "reading".to_string(),
         };
 
         save_settings(dir.path(), &settings).unwrap();
@@ -231,6 +244,10 @@ mod tests {
         assert!(
             !loaded.auto_ocr_on_open,
             "a pre-2c-ii settings file must not silently turn on a background CPU op"
+        );
+        assert_eq!(
+            loaded.viewer_mode, "single",
+            "a pre-reading-mode settings file must default to the original single-page viewer"
         );
     }
 

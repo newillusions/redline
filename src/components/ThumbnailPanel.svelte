@@ -4,17 +4,159 @@
    *
    * M4 S1: page thumbnail strip, drag-to-reorder, delete, rotate controls.
    * Calls page-op IPC functions on user action.
+   *
+   * Owner request 2026-09-15 (reading-mode/thumbnails/extract feature set, PR-B): real
+   * thumbnail rendering (was a "p{n}" text placeholder), the current-page highlight, and
+   * click-to-jump. Reuses the SAME render engine as everything else in this app - one
+   * whole-page raster per thumbnail via `render_tile`, sized with `fitWidthZoom` /
+   * `pageTileSizeCss` (the exact helpers ReadingView.svelte uses for its own one-raster-
+   * per-page render model) - no new rendering path, just a much smaller target width.
+   * Rendered LAZILY via IntersectionObserver as thumbnails scroll into view, so opening a
+   * large sheet set doesn't fire hundreds of renderTile calls at once; fetched thumbnails
+   * are kept for the component's lifetime (small, cheap - unlike ReadingView's full-page
+   * rasters, no eviction needed) and invalidated wholesale on any page-structure-changing
+   * op (rotate/delete/reorder), since indices/aspect-ratios shift under those.
    */
-  import { reorderPages, deletePage, rotatePage } from "$lib/ipc";
+  import { reorderPages, deletePage, rotatePage, getPageSize, renderTile } from "$lib/ipc";
+  import { fitWidthZoom } from "$lib/viewport";
+  import { pageTileSizeCss } from "$lib/reading-mode";
+  import { onDestroy } from "svelte";
 
   interface Props {
     docId: string;
     pageCount: number;
+    /** 0-based index of the page currently shown in the main viewport, or null when no
+     *  document is open — drives the current-page highlight. */
+    currentPage?: number | null;
+    /** Called with a 0-based page index when a thumbnail is clicked (navigate there). */
+    onjump?: (pageIndex: number) => void;
     /** Optional callback when pages change (e.g. to trigger re-render). */
     onPageOp?: () => void;
   }
 
-  const { docId, pageCount, onPageOp }: Props = $props();
+  const { docId, pageCount, currentPage = null, onjump, onPageOp }: Props = $props();
+
+  // ---------------------------------------------------------------------------
+  // Thumbnail rendering (lazy, cached per page index)
+  // ---------------------------------------------------------------------------
+
+  /** Target CSS width of a thumbnail's rendered raster - the panel's own width (see
+   *  --panel-left-width) sets the visual size; this only needs to be "small enough to
+   *  render cheaply, sharp enough to read at that size". */
+  const THUMBNAIL_WIDTH_CSS = 140;
+  /** Thumbnails never need more than one small tile - caps pageTileSizeCss well below
+   *  ReadingView's full-resolution cap. */
+  const THUMBNAIL_MAX_TILE_CSS = 600;
+
+  interface ThumbRaster {
+    src: string;
+    widthCss: number;
+    heightCss: number;
+  }
+
+  let thumbs = $state<Record<number, ThumbRaster>>({});
+  const pendingThumbs = new Set<number>();
+  /** Indices whose thumbnail element is currently observed as visible (or, in a jsdom/
+   *  no-IntersectionObserver test environment, every mounted index — see lazyThumbnail's
+   *  fail-open branch). Used by invalidateAllThumbnails() to re-fetch what's currently on
+   *  screen: a keyed {#each} block reuses the SAME DOM node across a page-count-unchanged
+   *  re-render (rotate), so the lazy-load action's one-shot observer setup never re-fires
+   *  on its own — clearing `thumbs` alone would otherwise leave already-visible
+   *  thumbnails stuck on their stale (pre-invalidation) raster until the user scrolls
+   *  them out of and back into view. */
+  const visibleIndices = new Set<number>();
+
+  async function ensureThumbnail(idx: number) {
+    if (idx < 0 || idx >= pageCount) return;
+    if (thumbs[idx] || pendingThumbs.has(idx)) return;
+    pendingThumbs.add(idx);
+    try {
+      const size = await getPageSize(docId, idx);
+      const zoom = fitWidthZoom(size.width_pts, THUMBNAIL_WIDTH_CSS);
+      const tileSizeCss = pageTileSizeCss(size.width_pts, size.height_pts, zoom, THUMBNAIL_MAX_TILE_CSS);
+      const result = await renderTile({
+        doc_id: docId,
+        page_index: idx,
+        tile_size_css: tileSizeCss,
+        tile_x: 0,
+        tile_y: 0,
+        zoom,
+        dpr: 1, // thumbnails are display-only and tiny - no need for device-pixel sharpening
+      });
+      thumbs = {
+        ...thumbs,
+        [idx]: {
+          src: `data:image/png;base64,${result.png_base64}`,
+          widthCss: size.width_pts * zoom,
+          heightCss: size.height_pts * zoom,
+        },
+      };
+    } catch (e) {
+      console.error(`Thumbnail render failed for page ${idx}:`, e);
+    } finally {
+      pendingThumbs.delete(idx);
+    }
+  }
+
+  /** Wholesale cache reset - any op that changes page structure invalidates every index
+   *  (a delete/reorder shifts which page an index refers to; a rotate changes aspect
+   *  ratio) - simpler and safer than trying to patch individual entries. */
+  function invalidateAllThumbnails() {
+    thumbs = {};
+    pendingThumbs.clear();
+    for (const idx of visibleIndices) void ensureThumbnail(idx);
+  }
+
+  // Initialized to the CURRENT docId (not null) so this effect is a no-op on first
+  // mount - it only invalidates on a later, genuine docId change (switching tabs to a
+  // different document), never doubling up with the lazy-load action's own initial
+  // fetch of every visible thumbnail.
+  let lastDocId: string | null = docId;
+  $effect(() => {
+    if (docId !== lastDocId) {
+      lastDocId = docId;
+      invalidateAllThumbnails();
+    }
+  });
+
+  /**
+   * Lazy-load action: observes the thumbnail element and fetches its raster once it
+   * scrolls near the viewport. Falls back to fetching immediately when
+   * IntersectionObserver isn't available (fail open to correctness, not silently never
+   * loading — also what makes this trivially testable in jsdom, which has no
+   * IntersectionObserver implementation at all).
+   */
+  function lazyThumbnail(node: HTMLElement, idx: number) {
+    if (typeof IntersectionObserver === "undefined") {
+      visibleIndices.add(idx);
+      void ensureThumbnail(idx);
+      return {};
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            visibleIndices.add(idx);
+            void ensureThumbnail(idx);
+          } else {
+            visibleIndices.delete(idx);
+          }
+        }
+      },
+      { rootMargin: "200px" },
+    );
+    observer.observe(node);
+    return {
+      destroy() {
+        observer.disconnect();
+        visibleIndices.delete(idx);
+      },
+    };
+  }
+
+  onDestroy(() => {
+    pendingThumbs.clear();
+  });
 
   // ---------------------------------------------------------------------------
   // Drag-to-reorder state
@@ -61,6 +203,7 @@
     order.splice(targetIdx, 0, src);
 
     await reorderPages({ doc_id: docId, new_order: order });
+    invalidateAllThumbnails();
     onPageOp?.();
   }
 
@@ -70,6 +213,7 @@
 
   async function handleRotate(idx: number, degrees: number) {
     await rotatePage({ doc_id: docId, page_idx: idx, degrees });
+    invalidateAllThumbnails();
     onPageOp?.();
   }
 
@@ -82,7 +226,16 @@
     const confirmed = window.confirm(`Delete page ${idx + 1}? This cannot be undone.`);
     if (!confirmed) return;
     await deletePage({ doc_id: docId, page_idx: idx });
+    invalidateAllThumbnails();
     onPageOp?.();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Click-to-jump
+  // ---------------------------------------------------------------------------
+
+  function handleThumbnailClick(idx: number) {
+    onjump?.(idx);
   }
 </script>
 
@@ -92,9 +245,12 @@
       class="thumbnail"
       class:drag-over={dragOverIdx === idx}
       class:drag-src={dragSrcIdx === idx}
+      class:current-page={currentPage === idx}
       draggable="true"
       aria-label={`Page ${idx + 1}`}
+      aria-current={currentPage === idx ? "page" : undefined}
       role="listitem"
+      onclick={() => handleThumbnailClick(idx)}
       ondragstart={(e) => handleDragStart(e, idx)}
       ondragover={(e) => handleDragOver(e, idx)}
       ondragleave={handleDragLeave}
@@ -102,23 +258,26 @@
       ondrop={(e) => handleDrop(e, idx)}
     >
       <div class="thumbnail-number">{idx + 1}</div>
-      <div class="thumbnail-preview" aria-hidden="true">
-        <!-- Placeholder: future PDFium tile render goes here -->
-        <span class="preview-placeholder">p{idx + 1}</span>
+      <div class="thumbnail-preview" aria-hidden="true" use:lazyThumbnail={idx}>
+        {#if thumbs[idx]}
+          <img src={thumbs[idx].src} alt="" class="thumbnail-image" />
+        {:else}
+          <span class="preview-placeholder">p{idx + 1}</span>
+        {/if}
       </div>
       <div class="thumbnail-controls">
         <button
           class="ctrl-btn"
           title="Rotate 90° clockwise"
           aria-label={`Rotate page ${idx + 1} 90 degrees clockwise`}
-          onclick={() => handleRotate(idx, 90)}
+          onclick={(e) => { e.stopPropagation(); handleRotate(idx, 90); }}
         >↻</button>
         <button
           class="ctrl-btn danger"
           title="Delete page"
           aria-label={`Delete page ${idx + 1}`}
           disabled={pageCount <= 1}
-          onclick={() => handleDelete(idx)}
+          onclick={(e) => { e.stopPropagation(); handleDelete(idx); }}
         >✕</button>
       </div>
     </div>
@@ -147,7 +306,7 @@
     background: var(--color-bg-panel-alt);
     border: 1px solid var(--color-border-subtle);
     border-radius: var(--radius-md);
-    cursor: grab;
+    cursor: pointer;
     user-select: none;
     transition: border-color 120ms, background 120ms;
   }
@@ -166,6 +325,12 @@
     opacity: 0.5;
   }
 
+  .thumbnail.current-page {
+    border-color: var(--color-primary);
+    border-width: 2px;
+    background: var(--color-bg-active);
+  }
+
   .thumbnail-number {
     font-size: var(--font-size-xs);
     color: var(--color-text-muted);
@@ -181,6 +346,13 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    overflow: hidden;
+  }
+
+  .thumbnail-image {
+    display: block;
+    max-width: 100%;
+    max-height: 100%;
   }
 
   .preview-placeholder {

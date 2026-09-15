@@ -21,6 +21,7 @@ const FAKE_SETTINGS: AppSettings = {
   last_window: null,
   recent_colors: [],
   auto_ocr_on_open: false,
+  viewer_mode: "single",
 };
 
 vi.mock("$lib/settings", () => ({

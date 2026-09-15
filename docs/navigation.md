@@ -48,6 +48,36 @@ hand-pan handlers, the toolbar zoom-percent input).
 
 - **Ctrl/Cmd + ArrowLeft / ArrowRight** — previous / next page.
 
+## Reading mode
+
+Status: shipped 2026-09-15 (owner request). Implementation: `src/lib/reading-mode.ts`
+(layout + virtualization math — pure, unit-tested) and `src/components/ReadingView.svelte`
+(the continuous-scroll viewer, mounted by App.svelte in place of `Viewport.svelte` when
+active). Single-page mode (this whole file, above) is unchanged and unaffected — reading
+mode is a separate sibling component, not a rewrite of the tiled viewer.
+
+- **Toggle** — the 📖 toolbar button, or **Ctrl/Cmd+Shift+R**. Persisted (`viewer_mode` in
+  settings.json) so the choice survives a restart; applies across every open tab, not
+  per-document.
+- **Layout** — every page of the document stacked in one vertically scrolling column,
+  fit-to-width by default. Each page keeps its own aspect ratio (a mixed-size sheet set
+  is not forced to a common width).
+- **Zoom** — Ctrl/Cmd+wheel or Shift+wheel zooms live at the cursor position's page (same
+  trigger as single-page mode); the **Fit W** button and the zoom-percent input work the
+  same way as the single-page toolbar's. A plain wheel/trackpad swipe is NOT
+  intercepted — native scrolling of the column already IS panning in a continuous view.
+- **Page indicator** — the toolbar's "current / total" control (`PageIndicator.svelte`)
+  tracks the topmost visible page as you scroll, and its field is editable: type a page
+  number and press Enter to jump there (Escape discards the edit).
+- **Rendering model** — deliberately simpler than the single-page tile grid: each page is
+  rasterized whole (one `render_tile` call sized to the page, not a 512px tile grid), and
+  only pages within the visible range plus a one-page lookahead are ever fetched or kept
+  cached — scrolling through a long document never holds more than a handful of page
+  rasters in memory. See `ReadingView.svelte`'s header comment for the full scoping
+  rationale, including the extreme-zoom raster cap on very large sheets.
+- **Scope** — read/navigate only: markup creation and editing are not available in reading
+  mode in this release; switch to single-page mode for markup work.
+
 ## Known gap
 
 Real-device pinch behaviour (macOS trackpad, Windows precision touchpad) has not been

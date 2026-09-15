@@ -33,10 +33,11 @@
   import SavePromptDialog from "./components/SavePromptDialog.svelte";
   import PasswordPromptDialog from "./components/PasswordPromptDialog.svelte";
   import ConfirmDialog from "./components/ConfirmDialog.svelte";
-  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity } from "$lib/ipc";
+  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity, getPageCount } from "$lib/ipc";
   import type { IndexStatus, OcrProgressEvent } from "$lib/ipc";
   import { listen } from "@tauri-apps/api/event";
-  import { loadSettings } from "$lib/settings";
+  import { loadSettings, saveSettings } from "$lib/settings";
+  import type { ViewerMode } from "$lib/settings";
   import SearchPanel from "./components/SearchPanel.svelte";
   import { SearchStore, computeViewportSearchOverlay, type UnifiedSearchHit, type SearchGroup, type DocSearchInput } from "$lib/search-store.svelte";
   import { createPasswordCache, getCachedPassword, setCachedPassword } from "$lib/password-cache";
@@ -65,8 +66,15 @@
   import { getLicenseStatus, checkInIfActivated, isUsable } from "$lib/license";
   import type { LicenseState } from "$lib/license";
   import UndoRedoControls from "./components/UndoRedoControls.svelte";
-  import { resolveUndoRedoShortcut, resolveSearchShortcut } from "$lib/keyboard-shortcuts";
+  import {
+    resolveUndoRedoShortcut,
+    resolveSearchShortcut,
+    resolveViewerModeToggleShortcut,
+  } from "$lib/keyboard-shortcuts";
   import { runDocOpAndReseed, formatBytes } from "$lib/docops-handlers";
+  import ReadingView from "./components/ReadingView.svelte";
+  import PageIndicator from "./components/PageIndicator.svelte";
+  import ThumbnailPanel from "./components/ThumbnailPanel.svelte";
 
   // ---------------------------------------------------------------------------
   // S2b client entitlement gate - null while the initial (offline, fast) check
@@ -474,6 +482,13 @@
   }
 
   onMount(async () => {
+    // Reading mode is a persisted viewer preference (owner request 2026-09-15) - load it
+    // up front, independent of the license flow below. A load failure just keeps the
+    // single-page default rather than blocking startup.
+    loadSettings()
+      .then((settings) => { viewerMode = settings.viewer_mode; })
+      .catch(() => {});
+
     licenseState = await getLicenseStatus().catch(
       (e): LicenseState => ({ state: "invalid", reason: e instanceof Error ? e.message : String(e) }),
     );
@@ -500,6 +515,23 @@
     _ocrProgressUnlisten?.();
     if (folderIndexPollTimer) clearInterval(folderIndexPollTimer);
   });
+
+  // Viewer mode: "single" (original tiled zoom/pan viewer) or "reading" (continuous
+  // scrolling column). Persisted setting (see settings.ts/storage/settings.rs), loaded in
+  // the onMount above; defaults to "single" until that load resolves.
+  let viewerMode = $state<ViewerMode>("single");
+
+  /** Toggle button + Ctrl/Cmd+Shift+R - persists the choice for next launch. A save
+   *  failure is non-fatal (logged, not surfaced) - the toggle itself already applied. */
+  async function toggleViewerMode() {
+    viewerMode = viewerMode === "single" ? "reading" : "single";
+    try {
+      const current = await loadSettings();
+      await saveSettings({ ...current, viewer_mode: viewerMode });
+    } catch (e) {
+      console.error("Failed to persist viewer mode:", e);
+    }
+  }
 
   // Panel collapse state
   let leftCollapsed  = $state(false);
@@ -780,6 +812,26 @@
     }
   }
 
+  /**
+   * Called by ThumbnailPanel after a rotate/delete/reorder IPC resolves (PR-B,
+   * 2026-09-15 - the first GUI surface for these page ops; they previously existed
+   * MCP-only). A delete changes the document's page count, which every other page-aware
+   * surface (PageIndicator, ReadingView, the tab bar) reads from `activeTab.doc.page_count`
+   * - refetch it here so they all stay in sync rather than each polling separately.
+   */
+  async function handleThumbnailPageOp() {
+    const docId = tabStore.activeDocId;
+    if (!docId) return;
+    try {
+      const newCount = await getPageCount(docId);
+      tabStore.tabs = tabStore.tabs.map((t) =>
+        t.docId === docId ? { ...t, doc: { ...t.doc, page_count: newCount } } : t,
+      );
+    } catch (e) {
+      console.error("Failed to refresh page count after a page operation:", e);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Save handlers (operate on the active tab)
   // ---------------------------------------------------------------------------
@@ -994,6 +1046,13 @@
       }
     }
 
+    // Ctrl/Cmd+Shift+R — toggle reading mode (owner request 2026-09-15).
+    if (resolveViewerModeToggleShortcut(e)) {
+      e.preventDefault();
+      void toggleViewerMode();
+      return;
+    }
+
     // Cmd/Ctrl+Z — undo; Cmd/Ctrl+Shift+Z / Cmd/Ctrl+Y — redo. Resolver returns null (and
     // does nothing here) while a text/callout inline editor or other input has focus, so
     // the field keeps its own native undo (see keyboard-shortcuts.ts).
@@ -1133,10 +1192,23 @@
         {compareVisible ? "Compare ▲" : "Compare"}
       </button>
       {#if activeTab}
-        <span class="doc-pages">{activeTab.doc.page_count} pages</span>
+        <PageIndicator
+          currentPage={activeTab.viewportSnapshot.pageIndex}
+          pageCount={activeTab.doc.page_count}
+          onjump={(idx) => {
+            searchJumpNonce += 1;
+            viewportJumpRequest = { page: idx, nonce: searchJumpNonce };
+          }}
+        />
       {/if}
     </div>
     <div class="toolbar-right">
+      <button
+        class="btn-toolbar btn-icon"
+        class:btn-icon-active={viewerMode === "reading"}
+        onclick={toggleViewerMode}
+        title="Toggle continuous reading mode (Ctrl/Cmd+Shift+R)"
+      >{viewerMode === "reading" ? "📖 Reading" : "📖"}</button>
       <button
         class="btn-toolbar btn-icon"
         onclick={() => (leftCollapsed = !leftCollapsed)}
@@ -1299,17 +1371,26 @@
             <ToolChestPanel toolChest={toolChestStore} markupStore={activeTab?.store ?? null} />
           </Accordion>
         </div>
-        <!-- Navigator placeholder (M4 - thumbnails/bookmarks/layers) -->
+        <!-- Navigator: page thumbnails (PR-B, 2026-09-15). Bookmarks/Layers remain
+             unbuilt - not part of this feature set. -->
         <div class="panel-section panel-section--secondary">
           <Accordion
             title="Navigator"
             storageKey="left-navigator"
-            bodyClass="panel-body"
+            bodyClass="panel-body panel-body-flush"
             testId="accordion-navigator"
           >
             {#if activeTab}
-              <p class="panel-hint">Thumbnails · Bookmarks · Layers</p>
-              <p class="panel-hint muted">(M4)</p>
+              <ThumbnailPanel
+                docId={activeTab.docId}
+                pageCount={activeTab.doc.page_count}
+                currentPage={activeTab.viewportSnapshot.pageIndex}
+                onjump={(idx) => {
+                  searchJumpNonce += 1;
+                  viewportJumpRequest = { page: idx, nonce: searchJumpNonce };
+                }}
+                onPageOp={handleThumbnailPageOp}
+              />
             {:else}
               <p class="panel-hint muted">Open a PDF to begin.</p>
             {/if}
@@ -1318,22 +1399,32 @@
       </aside>
     {/if}
 
-    <!-- Centre viewport — only one Viewport mounted at a time -->
+    <!-- Centre viewport — only one Viewport/ReadingView mounted at a time. Mode is a
+         persisted toggle (viewerMode), not per-tab - see toggleViewerMode. -->
     <main class="viewport-container">
       {#if activeTab}
-        <!-- Key forces Viewport to remount when switching tabs, so initialState
-             (zoom/page/scroll snapshot) takes effect fresh for each tab. -->
-        {#key activeTab.docId}
-          <Viewport
-            docInfo={activeTab.doc}
-            store={activeTab.store}
-            takeoffStore={activeTab.takeoffStore}
-            initialState={activeTab.viewportSnapshot}
-            onviewportchange={handleViewportChange}
-            jumpRequest={viewportJumpRequest}
-            searchHits={searchOverlay.hits}
-            activeSearchHitIdx={searchOverlay.activeIdx}
-          />
+        <!-- Key forces a remount both when switching tabs AND when toggling viewer mode,
+             so initialState (zoom/page/scroll snapshot) takes effect fresh either way. -->
+        {#key activeTab.docId + ":" + viewerMode}
+          {#if viewerMode === "reading"}
+            <ReadingView
+              docInfo={activeTab.doc}
+              initialState={activeTab.viewportSnapshot}
+              onviewportchange={handleViewportChange}
+              jumpRequest={viewportJumpRequest ? { page: viewportJumpRequest.page, nonce: viewportJumpRequest.nonce } : null}
+            />
+          {:else}
+            <Viewport
+              docInfo={activeTab.doc}
+              store={activeTab.store}
+              takeoffStore={activeTab.takeoffStore}
+              initialState={activeTab.viewportSnapshot}
+              onviewportchange={handleViewportChange}
+              jumpRequest={viewportJumpRequest}
+              searchHits={searchOverlay.hits}
+              activeSearchHitIdx={searchOverlay.activeIdx}
+            />
+          {/if}
         {/key}
       {:else}
         <div class="empty-state">
@@ -1502,9 +1593,9 @@
     color: var(--color-primary);
     margin-right: var(--space-2);
   }
-  .doc-pages {
-    font-size: var(--font-size-xs);
-    color: var(--color-text-muted);
+  .btn-icon-active {
+    background: var(--color-bg-active);
+    border-color: var(--color-primary);
   }
 
   /* --- Buttons --- */

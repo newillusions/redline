@@ -97,3 +97,32 @@ export function resolveSearchShortcut(e: SearchKeyEvent): SearchShortcut {
   if (e.key === "F3") return e.shiftKey ? "prev" : "next";
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// Reading mode toggle (continuous scroll vs single-page — owner request 2026-09-15)
+// ---------------------------------------------------------------------------
+
+/** Minimal shape App.svelte's real `KeyboardEvent` satisfies. */
+export interface ViewerModeKeyEvent {
+  key: string;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  target?: EventTarget | null;
+}
+
+/**
+ * Resolves Ctrl/Cmd+Shift+R -> toggle between single-page and continuous reading mode.
+ * Neither plain "r" (a tool-palette shortcut, handled elsewhere with no modifier) nor
+ * Ctrl/Cmd+G/Cmd+Shift+G (group/ungroup, Viewport.svelte) are anywhere near this
+ * binding, so there's no shared-keystroke ambiguity to guard against here the way
+ * resolveSearchShortcut's Cmd+G exclusion does. Still respects isEditableTarget so
+ * typing "R" into a text field (author name, a markup comment, the zoom-percent input)
+ * never toggles the viewer out from under the user.
+ */
+export function resolveViewerModeToggleShortcut(e: ViewerModeKeyEvent): boolean {
+  const mod = e.metaKey || e.ctrlKey;
+  if (!mod || !e.shiftKey) return false;
+  if (isEditableTarget(e.target ?? null)) return false;
+  return e.key.toLowerCase() === "r";
+}

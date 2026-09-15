@@ -33,6 +33,11 @@ describe("withDefaults", () => {
     expect(result.auto_ocr_on_open).toBe(false);
   });
 
+  it("a pre-reading-mode partial missing viewer_mode defaults to single-page", () => {
+    const result = withDefaults({ theme: "dark" });
+    expect(result.viewer_mode).toBe("single");
+  });
+
   it("does not mutate DEFAULT_SETTINGS", () => {
     const frozen: AppSettings = { ...DEFAULT_SETTINGS };
     withDefaults({ theme: "light" });
