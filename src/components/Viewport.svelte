@@ -81,7 +81,7 @@
   } from "$lib/markup-tools";
   import { patchGroup } from "$lib/markup-properties";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
-  import { measureLength, measureArea, measurePerimeter, measureAngleDegrees } from "$lib/measurement-tools";
+  import { measureLength, measureArea, measurePerimeter, measureAngleDegrees, formatAngleLabel } from "$lib/measurement-tools";
   import { addScale, type MeasurementPayload, type SearchHit } from "$lib/ipc";
   import { pdfUserSpaceToScreen } from "$lib/viewport";
   import { getPageSnapTargets, findNearestSnap, type SnapTarget } from "$lib/snap";
@@ -496,6 +496,41 @@
   const previewShape = $derived<SvgShape | null>(
     previewMarkup ? markupToSvg(previewMarkup, viewState) : null,
   );
+
+  /** On-canvas label for one MeasurementAngle markup - positioned at its vertex (geometry
+   *  index 1 of the 3-point Polyline: ray-start, vertex, ray-end), screen space. Works
+   *  identically for a committed markup and for the live 3-point preview built while
+   *  drawing (Viewport's own multi-click preview already carries a real 3-point Polyline the
+   *  moment the second ray has a cursor position - see onOverlayMouseMove's isAngleTool
+   *  branch) - the degrees value is always recomputed from geometry rather than read from
+   *  `measurement.raw_measure` so the preview (which has no `measurement` yet) works the
+   *  same way as a committed markup, with one code path. */
+  function angleLabelFor(m: Markup): { id: string; x: number; y: number; text: string } | null {
+    if (m.markup_type !== "MeasurementAngle" || !("Polyline" in m.geometry)) return null;
+    const pts = m.geometry.Polyline;
+    if (pts.length < 3) return null;
+    const [a, vertex, b] = pts;
+    const screen = pdfUserSpaceToScreen(vertex.x, vertex.y, viewState);
+    return { id: m.id, x: screen.x, y: screen.y, text: formatAngleLabel(measureAngleDegrees(a, vertex, b)) };
+  }
+
+  // Owner feedback: the angle tool's value previously showed only in the Measurements
+  // panel - no feedback on canvas while drawing, and nothing left behind on the page after
+  // placing. Labels every MeasurementAngle markup on the current page PLUS the live preview
+  // (while its second ray is being dragged), same list-then-append shape as pageShapes above.
+  const angleLabels = $derived.by<{ id: string; x: number; y: number; text: string }[]>(() => {
+    const labels: { id: string; x: number; y: number; text: string }[] = [];
+    for (const m of store.markups) {
+      if (m.page !== pageIndex) continue;
+      const lbl = angleLabelFor(m);
+      if (lbl) labels.push(lbl);
+    }
+    if (previewMarkup && previewMarkup.page === pageIndex) {
+      const lbl = angleLabelFor(previewMarkup);
+      if (lbl) labels.push({ ...lbl, id: "preview-angle-label" });
+    }
+    return labels;
+  });
 
   // Markups on the current page that are selected.
   const selectedOnPage = $derived(
@@ -3069,6 +3104,21 @@
       {@render shape(previewShape)}
     {/if}
 
+    <!-- Angle-tool on-canvas labels (owner feedback: the value previously showed only in
+         the Measurements panel) - one per MeasurementAngle markup on this page, plus the
+         live preview while the second ray is being dragged. Halo (paint-order stroke) keeps
+         the text legible over any drawing content underneath, without needing a measured
+         background rect. -->
+    {#each angleLabels as lbl (lbl.id)}
+      <text
+        class="angle-label"
+        x={lbl.x} y={lbl.y}
+        dx="8" dy="-8"
+        text-anchor="start"
+        pointer-events="none"
+      >{lbl.text}</text>
+    {/each}
+
     <!-- Selection chrome: bounding box + resize handles (pointer-events:none so they don't steal gestures). -->
     {#if chrome}
       <rect
@@ -3433,6 +3483,20 @@
     stroke-width: 1.5px;
     stroke-dasharray: 5, 3;
     opacity: 0.9;
+  }
+
+  /* Angle-tool on-canvas value label. paint-order + stroke gives a halo so the text stays
+   * legible over any page content/markup colour underneath, without a measured-width
+   * background rect (SVG text has no reliable synchronous layout size to measure against). */
+  :global(.markup-overlay .angle-label) {
+    font-family: var(--font-sans);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    fill: var(--color-text);
+    paint-order: stroke fill;
+    stroke: var(--color-bg);
+    stroke-width: 3px;
+    stroke-linejoin: round;
   }
 
   /* Resize handles: small filled squares. */

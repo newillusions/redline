@@ -153,6 +153,18 @@ export function measureAngleDegrees(a: PdfPoint, vertex: PdfPoint, b: PdfPoint):
 }
 
 /**
+ * Format a MeasurementAngle's degree value for the on-canvas live/persisted label (owner
+ * feedback: the angle tool's value previously showed only in the Measurements panel, with
+ * no on-canvas feedback while drawing or after placing - see Viewport.svelte's
+ * `angleLabelFor`, which positions this text at the markup's vertex in screen space). One
+ * decimal place, degree symbol suffixed - distinct from `formatQuantity` (which needs a
+ * `ScaleRecord`) because angle is unit-less/scale-independent by construction.
+ */
+export function formatAngleLabel(degrees: number): string {
+  return `${degrees.toFixed(1)}°`;
+}
+
+/**
  * Convert a raw_measure to a display string using the given scale.
  *
  * @param rawMeasure  Scale-independent value in PDF points (length) or points² (area).

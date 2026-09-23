@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { getPageSnapTargets, invalidateSnapCache, findNearestSnap } from "./snap";
 import type { SnapTarget } from "./snap";
+import type { PdfPoint } from "./ipc";
 
 const mockInvoke = vi.mocked(invoke);
 
@@ -99,5 +100,58 @@ describe("findNearestSnap", () => {
     // Distance from (0,0) to (2,0) is exactly 2.
     const hit = findNearestSnap([{ point: { x: 0, y: 0 }, kind: "Endpoint" }], { x: 2, y: 0 }, 2);
     expect(hit).not.toBeNull();
+  });
+
+  it("finds a target several grid cells away when tolerance is larger than one cell (SNAP_GRID_CELL_SIZE_PTS is 50)", () => {
+    // Cursor and target are ~120pts apart (spans 2-3 grid cells) with a tolerance that
+    // covers it - exercises the multi-cell cellRadius expansion, not just the 3x3 default.
+    const hit = findNearestSnap([{ point: { x: 0, y: 0 }, kind: "Endpoint" }], { x: 0, y: 120 }, 150);
+    expect(hit?.point).toEqual({ x: 0, y: 0 });
+  });
+
+  it("matches a brute-force linear scan on dense random data (grid-index correctness)", () => {
+    // Regression guard for the grid-index rewrite (2026-09, tool-lag fix): the grid must
+    // return the exact same nearest target a full scan would, for arbitrary point clouds -
+    // not just the hand-picked cases above. Seeded PRNG so failures are reproducible.
+    let seed = 42;
+    const rand = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    const dense: SnapTarget[] = Array.from({ length: 2000 }, () => ({
+      point: { x: rand() * 1000, y: rand() * 1000 },
+      kind: "Endpoint" as const,
+    }));
+    const bruteForce = (cursor: PdfPoint, tolerancePts: number): SnapTarget | null => {
+      let best: SnapTarget | null = null;
+      let bestDist2 = tolerancePts * tolerancePts;
+      for (const t of dense) {
+        const dx = t.point.x - cursor.x;
+        const dy = t.point.y - cursor.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 <= bestDist2) {
+          best = t;
+          bestDist2 = d2;
+        }
+      }
+      return best;
+    };
+    for (let i = 0; i < 50; i++) {
+      const cursor = { x: rand() * 1000, y: rand() * 1000 };
+      const tolerance = 5 + rand() * 100;
+      const expected = bruteForce(cursor, tolerance);
+      const actual = findNearestSnap(dense, cursor, tolerance);
+      expect(actual?.point).toEqual(expected?.point);
+    }
+  });
+
+  it("rebuilds its index for a different array reference rather than reusing a stale grid", () => {
+    // Two distinct arrays with the same single point at different cache-relevant positions -
+    // querying the second must not return a hit cached against the first's identity.
+    const a: SnapTarget[] = [{ point: { x: 0, y: 0 }, kind: "Endpoint" }];
+    const b: SnapTarget[] = [{ point: { x: 500, y: 500 }, kind: "Endpoint" }];
+    expect(findNearestSnap(a, { x: 0, y: 0 }, 2)?.point).toEqual({ x: 0, y: 0 });
+    expect(findNearestSnap(b, { x: 500, y: 500 }, 2)?.point).toEqual({ x: 500, y: 500 });
+    expect(findNearestSnap(b, { x: 0, y: 0 }, 2)).toBeNull();
   });
 });

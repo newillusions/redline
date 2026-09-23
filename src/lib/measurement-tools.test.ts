@@ -4,6 +4,7 @@ import {
   measureArea,
   measurePerimeter,
   measureAngleDegrees,
+  formatAngleLabel,
   formatQuantity,
   countSubtotals,
   countSubtotalsByPage,
@@ -225,6 +226,19 @@ describe("measureAngleDegrees", () => {
   it("returns 0 for a degenerate (zero-length) ray rather than NaN", () => {
     const vertex = { x: 0, y: 0 };
     expect(measureAngleDegrees(vertex, vertex, { x: 1, y: 0 })).toBe(0);
+  });
+});
+
+describe("formatAngleLabel", () => {
+  it("formats to one decimal place with a trailing degree symbol", () => {
+    expect(formatAngleLabel(90)).toBe("90.0°");
+    expect(formatAngleLabel(59.9999)).toBe("60.0°");
+    expect(formatAngleLabel(0)).toBe("0.0°");
+  });
+
+  it("rounds rather than truncates", () => {
+    expect(formatAngleLabel(45.06)).toBe("45.1°");
+    expect(formatAngleLabel(45.04)).toBe("45.0°");
   });
 });
 
