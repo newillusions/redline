@@ -221,15 +221,12 @@ pub(crate) fn write_pages_text_layers(
 /// content-stream object and registering `font_id` under `/Resources/Font`
 /// (name `OCR_FONT_NAME`) if the page doesn't already reference it.
 ///
-/// **Not idempotent**: calling this twice on the same page (or `write_ocr_pdf`
-/// twice on the same document) appends a SECOND, duplicate invisible text
-/// object with the same lines — duplicate search hits at the same location,
-/// plus a second orphaned Helvetica font object per separate `write_ocr_pdf`
-/// call (`font_id` is only shared across pages WITHIN one call). No guard
-/// against this exists here; detecting/preventing re-OCR of an already-OCR'd
-/// page is left as a Phase 2c-ii command-layer responsibility (e.g. a marker
-/// checked before invoking this, once a "Run OCR" command exists to invoke
-/// it more than once).
+/// **Replaces, never stacks**: any Redline OCR layer already on the page (identified
+/// by its `OCR_FONT_NAME` reference, see `remove_ocr_layers`) is removed before the
+/// new one is appended, so calling this twice on the same page leaves exactly one
+/// layer. Files OCR'd by v0.3.24 and earlier, which stacked duplicates on every re-run,
+/// are cleaned up the same way. If every new line is filtered out, the old layer is
+/// left in place rather than deleted for nothing.
 ///
 /// Public (not just `pub(crate)`) so a future Phase 2c-ii command can call
 /// it directly per-page (e.g. re-OCR a single page without touching the
@@ -257,6 +254,7 @@ pub fn write_page_text_layer(
         return Ok(());
     }
 
+    remove_ocr_layers(doc, page_id)?;
     let content_id = doc.add_object(Stream::new(dictionary! {}, content));
     append_to_page_contents(doc, page_id, content_id)?;
     add_named_objects_to_page_resources(
@@ -267,6 +265,206 @@ pub fn write_page_text_layer(
     )?;
 
     Ok(())
+}
+
+/// Operators allowed between `Tf` and the closing `Q` of one Redline text object (the
+/// shape `render_line_ops` emits: `q BT /RLOCRFont n Tf 3 Tr n Tz <Tm> (..) Tj ET Q`).
+const LAYER_BODY_OPS: [&str; 6] = ["Tr", "Tz", "Tm", "Tj", "TJ", "ET"];
+
+/// Op-index ranges of the Redline text objects in `ops`. A text object is recognised by
+/// its exact shape and an EXACT `/RLOCRFont` name operand, never by a substring, so a
+/// native stream that merely mentions the name, or a font called `/RLOCRFont2`, is not
+/// mistaken for a layer.
+fn layer_groups(ops: &[lopdf::content::Operation]) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut i = 0;
+    while i + 2 < ops.len() {
+        let opens = ops[i].operator == "q"
+            && ops[i + 1].operator == "BT"
+            && ops[i + 2].operator == "Tf"
+            && ops[i + 2]
+                .operands
+                .first()
+                .and_then(|o| o.as_name().ok())
+                .is_some_and(|n| n == OCR_FONT_NAME.as_bytes());
+        if !opens {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 3;
+        while j < ops.len() && LAYER_BODY_OPS.contains(&ops[j].operator.as_str()) {
+            j += 1;
+        }
+        if j < ops.len() && ops[j].operator == "Q" && ops[j - 1].operator == "ET" {
+            groups.push(i..j + 1);
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    groups
+}
+
+/// What a content stream holds of Redline's OCR layer.
+struct LayerScan {
+    /// The stream contains Redline text objects (or, for an undecodable stream, its marker).
+    present: bool,
+    /// The stream consists of nothing but Redline text objects, so it can be dropped whole.
+    pure: bool,
+    /// Decoded operations and the Redline text-object ranges within them; only set when
+    /// the stream decoded cleanly and has no NUL bytes (NULs make lopdf stop parsing
+    /// silently, so re-encoding such a stream would lose the content after them).
+    editable: Option<(Vec<lopdf::content::Operation>, Vec<std::ops::Range<usize>>)>,
+}
+
+fn scan_layer_stream(stream: &Stream) -> LayerScan {
+    let none = LayerScan {
+        present: false,
+        pure: false,
+        editable: None,
+    };
+    let data = stream
+        .decompressed_content()
+        .unwrap_or_else(|_| stream.content.clone());
+    let marker = format!("/{OCR_FONT_NAME}");
+    let marker = marker.as_bytes();
+    // Cheap pre-filter: decoding every content stream of a large drawing set is costly.
+    if !data.windows(marker.len()).any(|w| w == marker) {
+        return none;
+    }
+    let has_nul = data.contains(&0);
+    let ops = match lopdf::content::Content::decode(&data) {
+        Ok(c) => c.operations,
+        // Unparseable but names our font: treat as a layer for the "already OCR'd"
+        // probe, never as something to edit or delete.
+        Err(_) => {
+            return LayerScan {
+                present: true,
+                ..none
+            }
+        }
+    };
+    let groups = layer_groups(&ops);
+    if has_nul {
+        return LayerScan {
+            present: true,
+            ..none
+        };
+    }
+    let covered: usize = groups.iter().map(|g| g.len()).sum();
+    LayerScan {
+        present: !groups.is_empty(),
+        pure: !groups.is_empty() && covered == ops.len(),
+        editable: (!groups.is_empty()).then_some((ops, groups)),
+    }
+}
+
+fn scan_stream_id(doc: &Document, id: ObjectId) -> LayerScan {
+    match doc.get_object(id) {
+        Ok(Object::Stream(s)) => scan_layer_stream(s),
+        _ => LayerScan {
+            present: false,
+            pure: false,
+            editable: None,
+        },
+    }
+}
+
+/// How many Redline OCR layers each page carries, keyed by 0-based page index; pages
+/// with none are absent. Reads only the document structure and content-stream bytes,
+/// so it works on scans whose NUL-padded streams defeat text extraction.
+pub(crate) fn ocr_layer_counts(doc: &Document) -> std::collections::BTreeMap<u32, usize> {
+    doc.get_pages()
+        .into_iter()
+        .filter_map(|(page_num_1based, page_id)| {
+            let n = doc
+                .get_page_contents(page_id)
+                .into_iter()
+                .filter(|id| scan_stream_id(doc, *id).present)
+                .count();
+            (n > 0).then(|| (page_num_1based - 1, n))
+        })
+        .collect()
+}
+
+/// Whether any page other than `page_id` lists content stream `id` in its `/Contents`.
+fn referenced_by_other_page(doc: &Document, id: ObjectId, page_id: ObjectId) -> bool {
+    doc.get_pages()
+        .values()
+        .any(|p| *p != page_id && doc.get_page_contents(*p).contains(&id))
+}
+
+/// Remove Redline's OCR layer from `page_id`, returning how many streams were affected.
+///
+/// Never deletes native page content:
+/// * a stream made up purely of Redline text objects is dropped from the page's
+///   `/Contents`, and the stream object is deleted only if no other page still lists it;
+/// * a stream that mixes Redline text objects with other content (another tool merged
+///   the layer into a native stream) has just those text objects cut out, when it decodes
+///   cleanly, has no NUL bytes, re-encodes to the same remaining operations, and no
+///   other page shares it;
+/// * anything else that names our font is left exactly as it is.
+fn remove_ocr_layers(doc: &mut Document, page_id: ObjectId) -> Result<usize> {
+    let ids = doc.get_page_contents(page_id);
+    let mut kept: Vec<ObjectId> = Vec::new();
+    let mut dropped: Vec<ObjectId> = Vec::new();
+    let mut stripped: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+    for id in ids {
+        let scan = scan_stream_id(doc, id);
+        match scan.editable {
+            Some(_) if scan.pure => dropped.push(id),
+            Some((ops, groups)) => {
+                kept.push(id);
+                if referenced_by_other_page(doc, id, page_id) {
+                    continue;
+                }
+                let remaining: Vec<_> = ops
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !groups.iter().any(|g| g.contains(i)))
+                    .map(|(_, op)| op.clone())
+                    .collect();
+                let expected = remaining.len();
+                let Ok(bytes) = (lopdf::content::Content {
+                    operations: remaining,
+                })
+                .encode() else {
+                    continue;
+                };
+                // Re-encoding must round-trip to the same operations or we leave it be.
+                if lopdf::content::Content::decode(&bytes)
+                    .map(|c| c.operations.len() == expected)
+                    .unwrap_or(false)
+                {
+                    stripped.push((id, bytes));
+                }
+            }
+            None => kept.push(id),
+        }
+    }
+    let affected = dropped.len() + stripped.len();
+    if affected == 0 {
+        return Ok(0);
+    }
+    if !dropped.is_empty() {
+        doc.get_dictionary_mut(page_id)
+            .context("page dict for OCR layer removal")?
+            .set(
+                "Contents",
+                Object::Array(kept.iter().copied().map(Object::Reference).collect()),
+            );
+        for id in dropped {
+            if !referenced_by_other_page(doc, id, page_id) {
+                doc.objects.remove(&id);
+            }
+        }
+    }
+    for (id, bytes) in stripped {
+        if let Some(Object::Stream(s)) = doc.objects.get_mut(&id) {
+            s.set_plain_content(bytes);
+        }
+    }
+    Ok(affected)
 }
 
 /// Build the `q BT ... ET Q` content-stream snippet for one line as raw
@@ -921,6 +1119,225 @@ mod tests {
         assert!(
             ops_str.contains("0 1 -1 0 "),
             "expected a 90-degree rotation text matrix, got: {ops_str}"
+        );
+    }
+
+    // --- re-run replaces the layer instead of stacking it -----------------------
+
+    fn two_lines() -> Vec<OcrLine> {
+        vec![
+            line_at(
+                "ROOM SCHEDULE FOR LEVEL THREE",
+                Some(0.9),
+                (50.0, 700.0, 300.0, 712.0),
+            ),
+            line_at(
+                "AUDITORIUM CEILING PLAN",
+                Some(0.9),
+                (50.0, 650.0, 300.0, 662.0),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_second_ocr_run_leaves_exactly_one_layer_per_page() {
+        let (mut doc, _) = crate::search::indexer::test_support::nul_padded_scan_doc(2);
+        let pages = vec![(0, two_lines()), (1, two_lines())];
+        write_pages_text_layers(&mut doc, &pages, DEFAULT_MIN_CONFIDENCE).unwrap();
+        assert_eq!(
+            ocr_layer_counts(&doc).values().copied().collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+
+        write_pages_text_layers(&mut doc, &pages, DEFAULT_MIN_CONFIDENCE).unwrap();
+        let counts = ocr_layer_counts(&doc);
+        assert_eq!(counts.len(), 2);
+        assert!(
+            counts.values().all(|&n| n == 1),
+            "layers stacked: {counts:?}"
+        );
+
+        // The old layer objects are gone, not just unreferenced.
+        let streams = doc
+            .objects
+            .values()
+            .filter(|o| matches!(o, Object::Stream(s) if scan_layer_stream(s).present))
+            .count();
+        assert_eq!(streams, 2);
+    }
+
+    #[test]
+    fn re_ocr_collapses_the_duplicate_layers_v0_3_24_stacked() {
+        let (mut doc, pages) = crate::search::indexer::test_support::nul_padded_scan_doc(1);
+        // Simulate the shipped bug: two layers appended by two un-guarded runs.
+        let font_id = doc.add_object(helvetica_font_dict());
+        for _ in 0..2 {
+            let id = doc.add_object(Stream::new(
+                dictionary! {},
+                b"q BT /RLOCRFont 10 Tf 3 Tr (OLD LAYER TEXT) Tj ET Q".to_vec(),
+            ));
+            append_to_page_contents(&mut doc, pages[0], id).unwrap();
+        }
+        add_named_objects_to_page_resources(
+            &mut doc,
+            pages[0],
+            b"Font",
+            &[(OCR_FONT_NAME.to_string(), font_id)],
+        )
+        .unwrap();
+        assert_eq!(ocr_layer_counts(&doc).get(&0), Some(&2));
+
+        write_pages_text_layers(&mut doc, &[(0, two_lines())], DEFAULT_MIN_CONFIDENCE).unwrap();
+        assert_eq!(ocr_layer_counts(&doc).get(&0), Some(&1));
+        let text = crate::search::indexer::extract_doc_text(&mut doc);
+        assert!(text[0].1.contains("ROOM SCHEDULE"), "{:?}", text[0]);
+        assert!(!text[0].1.contains("OLD LAYER"), "{:?}", text[0]);
+    }
+
+    #[test]
+    fn a_rerun_whose_lines_are_all_filtered_keeps_the_existing_layer() {
+        let (mut doc, _) = crate::search::indexer::test_support::nul_padded_scan_doc(1);
+        write_pages_text_layers(&mut doc, &[(0, two_lines())], DEFAULT_MIN_CONFIDENCE).unwrap();
+        let junk = vec![line_at("xx", Some(0.1), (50.0, 100.0, 80.0, 112.0))];
+        write_pages_text_layers(&mut doc, &[(0, junk)], DEFAULT_MIN_CONFIDENCE).unwrap();
+        assert_eq!(ocr_layer_counts(&doc).get(&0), Some(&1));
+        let text = crate::search::indexer::extract_doc_text(&mut doc);
+        assert!(text[0].1.contains("ROOM SCHEDULE"));
+    }
+
+    #[test]
+    fn a_nul_padded_scan_with_a_layer_is_detected_as_already_ocred() {
+        // The owner's Konica shape: NUL-padded scanner stream first, layer second. Both
+        // the layer probe and the (repaired) text probe must see the OCR.
+        let (mut doc, _) = crate::search::indexer::test_support::nul_padded_scan_doc(1);
+        write_pages_text_layers(&mut doc, &[(0, two_lines())], DEFAULT_MIN_CONFIDENCE).unwrap();
+        assert_eq!(ocr_layer_counts(&doc).get(&0), Some(&1));
+        let text = crate::search::indexer::extract_doc_text(&mut doc);
+        assert!(
+            text[0].1.chars().filter(|c| !c.is_whitespace()).count() >= 8,
+            "text probe blind to the layer: {:?}",
+            text[0]
+        );
+    }
+
+    #[test]
+    fn a_page_without_a_layer_is_not_reported() {
+        let (doc, _) = crate::search::indexer::test_support::nul_padded_scan_doc(2);
+        assert!(ocr_layer_counts(&doc).is_empty());
+    }
+
+    // --- never delete native content (review findings F1, F3) -------------------
+
+    const NATIVE_OPS: &[u8] = b"q\n1 0 0 1 0 0 cm\n10 10 200 100 re\nf\nQ\n";
+    const OLD_LAYER_OPS: &[u8] =
+        b"q\nBT\n/RLOCRFont 12 Tf\n3 Tr\n100 Tz\n1 0 0 1 50 700 Tm\n(OLD LAYER TEXT) Tj\nET\nQ\n";
+
+    fn set_stream(doc: &mut Document, id: ObjectId, bytes: Vec<u8>) {
+        if let Some(Object::Stream(s)) = doc.objects.get_mut(&id) {
+            s.set_plain_content(bytes);
+        }
+    }
+
+    fn stream_bytes(doc: &Document, id: ObjectId) -> Vec<u8> {
+        match doc.get_object(id) {
+            Ok(Object::Stream(s)) => s.decompressed_content().unwrap(),
+            other => panic!("not a stream: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_layer_merged_into_a_native_stream_is_cut_out_and_the_native_content_survives() {
+        // Another tool concatenated our old layer into the page's native stream.
+        let (mut doc, pages) = crate::search::indexer::test_support::nul_padded_scan_doc(1);
+        let stream_id = doc.get_page_contents(pages[0])[0];
+        let mut merged = NATIVE_OPS.to_vec();
+        merged.extend_from_slice(OLD_LAYER_OPS);
+        set_stream(&mut doc, stream_id, merged);
+        assert_eq!(ocr_layer_counts(&doc).get(&0), Some(&1));
+
+        write_pages_text_layers(&mut doc, &[(0, two_lines())], DEFAULT_MIN_CONFIDENCE).unwrap();
+
+        // The native stream still exists, still draws its rectangle, and the old text is gone.
+        let native = stream_bytes(&doc, stream_id);
+        let ops = lopdf::content::Content::decode(&native).unwrap().operations;
+        let names: Vec<&str> = ops.iter().map(|o| o.operator.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["q", "cm", "re", "f", "Q"],
+            "native ops changed: {names:?}"
+        );
+        assert!(!String::from_utf8_lossy(&native).contains("OLD LAYER"));
+        // Exactly one layer now: the freshly appended one.
+        assert_eq!(ocr_layer_counts(&doc).get(&0), Some(&1));
+        assert!(doc.get_page_contents(pages[0]).contains(&stream_id));
+        assert_eq!(doc.get_page_contents(pages[0]).len(), 2);
+    }
+
+    #[test]
+    fn a_stream_that_only_mentions_the_font_name_is_not_a_layer_and_is_never_touched() {
+        let (mut doc, pages) = crate::search::indexer::test_support::nul_padded_scan_doc(1);
+        let stream_id = doc.get_page_contents(pages[0])[0];
+        // Different font whose name merely starts with ours, plus ordinary drawing.
+        let lookalike =
+            b"q\nBT\n/RLOCRFont2 12 Tf\n(HELLO) Tj\nET\nQ\n10 10 20 20 re\nf\n".to_vec();
+        set_stream(&mut doc, stream_id, lookalike.clone());
+        assert!(ocr_layer_counts(&doc).is_empty());
+        write_pages_text_layers(&mut doc, &[(0, two_lines())], DEFAULT_MIN_CONFIDENCE).unwrap();
+        assert_eq!(stream_bytes(&doc, stream_id), lookalike);
+        assert!(doc.get_page_contents(pages[0]).contains(&stream_id));
+    }
+
+    #[test]
+    fn a_nul_containing_stream_that_names_our_font_is_left_untouched() {
+        // Undecodable-by-lopdf content must never be re-encoded (that would drop the
+        // part after the NUL) or deleted; it still counts as an existing layer.
+        let (mut doc, pages) = crate::search::indexer::test_support::nul_padded_scan_doc(1);
+        let stream_id = doc.get_page_contents(pages[0])[0];
+        let mut odd = NATIVE_OPS.to_vec();
+        odd.push(0);
+        odd.extend_from_slice(OLD_LAYER_OPS);
+        set_stream(&mut doc, stream_id, odd.clone());
+        assert_eq!(ocr_layer_counts(&doc).get(&0), Some(&1));
+        write_pages_text_layers(&mut doc, &[(0, two_lines())], DEFAULT_MIN_CONFIDENCE).unwrap();
+        assert_eq!(stream_bytes(&doc, stream_id), odd);
+    }
+
+    #[test]
+    fn a_layer_shared_by_two_pages_is_not_deleted_out_from_under_the_other_page() {
+        let (mut doc, pages) = crate::search::indexer::test_support::nul_padded_scan_doc(2);
+        let shared = doc.add_object(Stream::new(dictionary! {}, OLD_LAYER_OPS.to_vec()));
+        for page in &pages {
+            append_to_page_contents(&mut doc, *page, shared).unwrap();
+        }
+        assert_eq!(
+            ocr_layer_counts(&doc).values().copied().collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+
+        // Re-OCR page 0 only.
+        write_pages_text_layers(&mut doc, &[(0, two_lines())], DEFAULT_MIN_CONFIDENCE).unwrap();
+
+        assert!(doc.objects.contains_key(&shared), "shared stream deleted");
+        let page1 = doc.get_page_contents(pages[1]);
+        assert!(page1.contains(&shared));
+        assert!(
+            page1.iter().all(|id| doc.objects.contains_key(id)),
+            "page 1 holds a dangling /Contents reference"
+        );
+        assert!(!doc.get_page_contents(pages[0]).contains(&shared));
+
+        // Re-OCR page 1 as well: now nobody references it and it is deleted.
+        write_pages_text_layers(&mut doc, &[(1, two_lines())], DEFAULT_MIN_CONFIDENCE).unwrap();
+        assert!(!doc.objects.contains_key(&shared));
+        for page in &pages {
+            assert!(doc
+                .get_page_contents(*page)
+                .iter()
+                .all(|id| doc.objects.contains_key(id)));
+        }
+        assert_eq!(
+            ocr_layer_counts(&doc).values().copied().collect::<Vec<_>>(),
+            vec![1, 1]
         );
     }
 }

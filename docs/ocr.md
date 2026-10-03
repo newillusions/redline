@@ -410,6 +410,51 @@ run unconditionally); the dense A0 fixture at 19.1s reflects that cost on a
 40-label sheet at 150 DPI on this Mac. No latency ceiling is asserted by the
 benchmark.
 
+## Re-runs and rotated-pass noise (2026-10-02)
+
+Two defects found by probing the owner's scanned contract (KB observation:xwmsw4zfkbcr0i02hg4t),
+fixed together; regression test `src-tauri/tests/ocr_rerun_noise.rs` (ignored, needs PDFium and
+tessdata, wired into the CI `ocr` job).
+
+**Duplicate layers on re-run.** Some scanners (Konica Minolta MFPs) end the page content stream
+with NUL bytes. PDF counts NUL as whitespace, lopdf's content parser does not and stops parsing
+silently at the first one, so every later stream on the page, including Redline's own OCR layer,
+was invisible to `extract_text`. Consequences: `run_ocr_document`'s "page already has text" guard
+never fired and each re-run stacked another layer (the owner's file had two per page), and the
+Tantivy folder index could not see the OCR text.
+
+- `search::indexer::extract_doc_text` retries a text-less page once after turning that page's NULs
+  into spaces (in memory only), so both the guard and the folder index see the layer.
+- The guard also reads the layer directly: `ocr::writer::ocr_layer_counts` counts content streams
+  that select the writer's `/RLOCRFont` resource, which has marked every layer since the first
+  release. This works even when text extraction fails or the layer is too short.
+- `write_page_text_layer` removes any existing Redline layers before appending, so a write is a
+  replace. A page carrying more than one layer (files from v0.3.24 and earlier) is deliberately
+  not skipped by the guard, so a manual re-run collapses it to one.
+
+**Rotated junk.** The 90/180/270 passes read horizontal text sideways as letter salad (16% of the
+layer characters on the owner's file, 13% on the synthetic contract). Fix, rotated passes only:
+
+- a line must score at least 0.80 mean confidence (the writer's floor stays 0.5 for the 0 degree pass);
+- at least 70% of its characters must sit in plausible tokens: figures such as `3650` or `2'-6"`,
+  or words of 3+ letters with a vowel, no 4-consonant run and word-like casing. Redline ships no
+  dictionary, so this is a shape test, not a lookup; it keeps `DIM 3650 MM` and drops `P= os 4 3 2 s 3 as OSD =`;
+- `merge_rotate4x_candidates` also drops a candidate when a kept higher-confidence box covers over
+  60% of the candidate's own area. A thin fragment read out of the middle of a wide line has a
+  tiny IoU with it and used to survive.
+
+Measured (debug build, this repo's fixtures):
+
+| | before | after |
+|---|---|---|
+| synthetic contract, junk share of layer chars | 13.1% | 0.0% |
+| synthetic contract, word recall | n/a | 100% |
+| CAD corpus overall recall | 98% (56/57) | 98% (56/57) |
+| CAD corpus vertical-text recall | 100% | 100% |
+| b-rotated-dimension / c-mixed precision | 30% / 23% | 40% / 38% |
+
+Existing OCR'd files pick the noise fix up only when re-OCR'd.
+
 ## Phase 2c: text-layer writer
 
 `src-tauri/src/ocr/writer.rs` (`write_ocr_pdf`) embeds recognized `OcrLine`s

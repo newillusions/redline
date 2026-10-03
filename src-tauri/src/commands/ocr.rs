@@ -104,6 +104,37 @@ fn pages_needing_ocr(page_count: u32, existing_text_pages: &HashSet<u32>) -> Vec
         .collect()
 }
 
+/// 0-based indices of pages that must NOT be OCR'd again: pages with extractable text
+/// (native content or a prior OCR pass) plus pages carrying a Redline OCR layer even if
+/// that layer's text is too short or too unreadable to clear `MIN_TEXT_CHARS`.
+///
+/// A page carrying MORE than one Redline layer is deliberately NOT in the set: files OCR'd
+/// by v0.3.24 and earlier stacked a duplicate layer on every re-run, and re-OCR'ing such a
+/// page makes the writer replace all of them with one fresh layer, which cleans the file.
+///
+/// `text_pages` is `extract_doc_text`'s 1-based `(page_num, text)` output; `layer_counts`
+/// is `ocr::writer::ocr_layer_counts`'s 0-based `page -> layer count` map.
+#[cfg(feature = "ocr")]
+fn pages_already_ocred(
+    text_pages: &[(u64, String)],
+    layer_counts: &std::collections::BTreeMap<u32, usize>,
+) -> HashSet<u32> {
+    let mut done: HashSet<u32> = text_pages
+        .iter()
+        .filter(|(_, text)| text.chars().filter(|c| !c.is_whitespace()).count() >= MIN_TEXT_CHARS)
+        // extract_pdf_text's page_num is 1-based; this module's page indices are 0-based
+        // throughout (matches render_page_full).
+        .map(|(page_num_1based, _)| page_num_1based.saturating_sub(1) as u32)
+        .collect();
+    done.extend(layer_counts.keys().copied());
+    for (page, count) in layer_counts {
+        if *count > 1 {
+            done.remove(page);
+        }
+    }
+    done
+}
+
 /// Per-page progress, emitted on the `"ocr-progress"` Tauri event as `run_ocr_document`
 /// recognizes each page — the frontend listens via `@tauri-apps/api/event`'s `listen` to
 /// drive a live per-page status line (spec requirement 2).
@@ -203,23 +234,18 @@ async fn run_ocr_document_impl(
     let existing_text_pages: HashSet<u32> = {
         let path = path.clone();
         tokio::task::spawn_blocking(move || {
-            // A scan failure must not block OCR entirely — treat it as "no existing text
+            // A scan failure must not block OCR entirely - treat it as "no existing text
             // known" (nothing skipped), matching `search::indexer`'s own per-page-skip,
             // don't-abort-the-whole-document posture rather than erroring the whole run
             // over a pre-check that isn't the actual operation.
-            crate::search::indexer::extract_pdf_text(&path)
-                .map(|pages| {
-                    pages
-                        .into_iter()
-                        .filter(|(_, text)| {
-                            text.chars().filter(|c| !c.is_whitespace()).count() >= MIN_TEXT_CHARS
-                        })
-                        // extract_pdf_text's page_num is 1-based; this module's page
-                        // indices are 0-based throughout (matches render_page_full).
-                        .map(|(page_num_1based, _)| page_num_1based.saturating_sub(1) as u32)
-                        .collect()
-                })
-                .unwrap_or_default()
+            let Ok(mut doc) = lopdf::Document::load(&path) else {
+                return HashSet::new();
+            };
+            // Layer detection reads stream bytes directly, so it still sees Redline's own
+            // layer on scans whose NUL-padded streams defeat text extraction.
+            let layer_counts = crate::ocr::writer::ocr_layer_counts(&doc);
+            let text_pages = crate::search::indexer::extract_doc_text(&mut doc);
+            pages_already_ocred(&text_pages, &layer_counts)
         })
         .await
         .map_err(|e| e.to_string())?
@@ -411,5 +437,40 @@ mod tests {
         // but the filter must not panic or otherwise misbehave on it).
         let existing: HashSet<u32> = [0, 99].into_iter().collect();
         assert_eq!(pages_needing_ocr(2, &existing), vec![1]);
+    }
+
+    // --- pages_already_ocred ------------------------------------------------
+
+    #[cfg(feature = "ocr")]
+    mod already_ocred {
+        use super::*;
+        use std::collections::BTreeMap;
+
+        #[test]
+        fn a_page_with_text_is_done() {
+            let text = vec![(1, "ROOM SCHEDULE".to_string()), (2, String::new())];
+            let done = pages_already_ocred(&text, &BTreeMap::new());
+            assert_eq!(done, [0].into_iter().collect());
+        }
+
+        #[test]
+        fn a_redline_layer_counts_even_when_text_extraction_found_nothing() {
+            // The NUL-padded-scan case: lopdf extracted zero chars but the layer is there.
+            let text = vec![(1, String::new()), (2, String::new())];
+            let layers: BTreeMap<u32, usize> = [(0, 1), (1, 1)].into_iter().collect();
+            let done = pages_already_ocred(&text, &layers);
+            assert_eq!(done, [0, 1].into_iter().collect());
+        }
+
+        #[test]
+        fn a_page_with_duplicate_layers_is_redone_so_the_writer_can_collapse_them() {
+            let text = vec![
+                (1, "ROOM SCHEDULE".to_string()),
+                (2, "ROOM SCHEDULE".to_string()),
+            ];
+            let layers: BTreeMap<u32, usize> = [(0, 2), (1, 1)].into_iter().collect();
+            let done = pages_already_ocred(&text, &layers);
+            assert_eq!(done, [1].into_iter().collect());
+        }
     }
 }

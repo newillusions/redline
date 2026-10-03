@@ -100,6 +100,7 @@ jobs:
             libtesseract-dev \
             libleptonica-dev \
             tesseract-ocr-eng \
+            fonts-liberation \
             > /dev/null
 
       # Same pinned PDFium release scripts/fetch-pdfium.sh uses (chromium/7869,
@@ -118,6 +119,8 @@ jobs:
       - name: Test ocr feature + accuracy benchmark
         env:
           PDFIUM_DYNAMIC_LIB_PATH: /tmp/pdfium/lib/libpdfium.so
+          # ocr_rerun_noise must fail, not skip, when PDFium/tessdata/fonts are missing.
+          REDLINE_REQUIRE_OCR_TESTS: "1"
         run: |
           set -eu
           TESSDATA_DIR="$(dirname "$(dpkg -L tesseract-ocr-eng | grep 'tessdata/eng\.traineddata$')")"
@@ -125,6 +128,8 @@ jobs:
           export TESSDATA_PREFIX="$TESSDATA_DIR"
           cargo test --lib -p redline --features ocr
           cargo test --features ocr --test ocr_benchmark -- --ignored --nocapture
+          export REDLINE_TESSDATA_DIR="$TESSDATA_DIR"
+          cargo test --features ocr --test ocr_rerun_noise -- --ignored --nocapture
 
   # ---------------------------------------------------------------------------
   # test-frontend - unchanged. No Docker daemon, no secrets; already compliant.

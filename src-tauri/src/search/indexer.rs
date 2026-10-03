@@ -29,18 +29,76 @@ use super::{FolderIndex, IndexState};
 /// Pages that produce errors are silently skipped so a damaged page does not
 /// abort indexing of the whole file.
 pub fn extract_pdf_text(path: &Path) -> anyhow::Result<Vec<(u64, String)>> {
-    let doc = lopdf::Document::load(path)
-        .map_err(|e| anyhow::anyhow!("lopdf load {:?}: {}", path, e))?;
+    let mut doc =
+        lopdf::Document::load(path).map_err(|e| anyhow::anyhow!("lopdf load {:?}: {}", path, e))?;
+    Ok(extract_doc_text(&mut doc))
+}
 
+/// Per-page text extraction over an already-loaded document - the body of
+/// [`extract_pdf_text`], split out so a caller that needs the loaded document for
+/// other probes (e.g. `commands::ocr`'s existing-OCR-layer scan) does not parse the
+/// file twice.
+///
+/// A page that extracts no text is retried once if repairing NUL-padded content streams
+/// (see [`repair_nul_padded_content`]) actually changed something; the repair only
+/// mutates the in-memory `doc`, never the file. Pages that already yield text are never
+/// touched, and a text-less page without NUL bytes is not re-extracted.
+pub fn extract_doc_text(doc: &mut lopdf::Document) -> Vec<(u64, String)> {
     let page_map = doc.get_pages(); // BTreeMap<u32, ObjectId>, 1-based
     let mut result = Vec::with_capacity(page_map.len());
 
-    for page_num in page_map.keys() {
-        let text = doc.extract_text(&[*page_num]).unwrap_or_default();
+    for (page_num, page_id) in &page_map {
+        let mut text = doc.extract_text(&[*page_num]).unwrap_or_default();
+        if text.chars().all(char::is_whitespace) && repair_nul_padded_content(doc, *page_id) {
+            text = doc.extract_text(&[*page_num]).unwrap_or_default();
+        }
         result.push((*page_num as u64, text));
     }
 
-    Ok(result)
+    result
+}
+
+/// Make one page's content streams parseable by lopdf when they carry NUL padding, in
+/// memory.
+///
+/// Some scanners (a Konica Minolta MFP in the owner's case) end each page's content
+/// stream with a run of NUL bytes. PDF treats NUL as whitespace, but lopdf's content
+/// parser does not, and it parses a page's streams as ONE concatenation: parsing stops
+/// silently at the first NUL, so the next stream's operators (the OCR layer) are never
+/// seen and `extract_text` returns an empty string rather than an error.
+/// Because the stream order is scanner stream first, Redline's own OCR text layer
+/// second, every page of such a file extracted as zero characters even when a full OCR
+/// layer was present. That blinded the "already has text" guard in `run_ocr_document`
+/// (OCR re-ran and stacked a duplicate layer) and the Tantivy folder index (OCR'd scans
+/// were not searchable). The NULs become spaces, which are whitespace to both lopdf and
+/// the PDF spec.
+///
+/// Returns `true` if any stream was rewritten.
+pub(crate) fn repair_nul_padded_content(
+    doc: &mut lopdf::Document,
+    page_id: lopdf::ObjectId,
+) -> bool {
+    use lopdf::Object;
+
+    let mut changed = false;
+    for stream_id in doc.get_page_contents(page_id) {
+        let Some(Object::Stream(stream)) = doc.objects.get_mut(&stream_id) else {
+            continue;
+        };
+        let Ok(data) = stream.decompressed_content() else {
+            continue;
+        };
+        if !data.contains(&0) {
+            continue;
+        }
+        let fixed: Vec<u8> = data
+            .into_iter()
+            .map(|b| if b == 0 { b' ' } else { b })
+            .collect();
+        stream.set_plain_content(fixed);
+        changed = true;
+    }
+    changed
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +186,10 @@ pub fn index_folder_blocking(index: FolderIndex, folder_path: PathBuf) {
                 }
             }
             Err(e) => {
-                log::warn!("folder-index: text extraction failed for {:?}: {e}", pdf_path);
+                log::warn!(
+                    "folder-index: text extraction failed for {:?}: {e}",
+                    pdf_path
+                );
             }
         }
     }
@@ -227,6 +288,66 @@ fn handle_event(index: &FolderIndex, event: Event) {
 // Unit tests
 // ---------------------------------------------------------------------------
 
+/// Test-only fixture builders shared by the indexer and OCR-writer tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use lopdf::{dictionary, Document, Object, ObjectId, Stream};
+
+    /// How many NUL bytes the scanner-style content stream is padded with; the owner's
+    /// Konica page measured 1159 trailing NULs.
+    pub const SCANNER_NUL_PAD: usize = 1159;
+
+    /// An image-only `page_count`-page document whose every page content stream is a
+    /// scanner-style `q ... /Im0 Do Q` followed by `SCANNER_NUL_PAD` NUL bytes, with a
+    /// tiny 1x1 image so the file stays a few hundred bytes. Returns the document and
+    /// its page object ids in page order.
+    pub fn nul_padded_scan_doc(page_count: usize) -> (Document, Vec<ObjectId>) {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let image_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 1,
+                "Height" => 1,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8,
+            },
+            vec![0xFF],
+        ));
+        let mut page_ids = Vec::new();
+        for _ in 0..page_count {
+            let mut content = b"q\n595 0 0 842 0 0 cm\n/Im0 Do\nQ\n".to_vec();
+            content.extend(std::iter::repeat(0u8).take(SCANNER_NUL_PAD));
+            let content_id = doc.add_object(Stream::new(dictionary! {}, content));
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+                "Contents" => content_id,
+                "Resources" => dictionary! {
+                    "XObject" => dictionary! { "Im0" => image_id },
+                },
+            });
+            page_ids.push(page_id);
+        }
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => page_ids.iter().map(|id| Object::Reference(*id)).collect::<Vec<_>>(),
+                "Count" => page_ids.len() as i64,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        (doc, page_ids)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +438,94 @@ mod tests {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("nope.pdf");
         assert!(extract_pdf_text(&missing).is_err());
+    }
+
+    // --- NUL-padded scanner streams (owner-reported OCR duplicate-layer defect) ---
+
+    /// Append a hand-built Redline-style invisible text layer (same font resource name
+    /// the OCR writer uses) as a second content stream on `page_id`.
+    fn append_text_layer(doc: &mut lopdf::Document, page_id: lopdf::ObjectId, text: &str) {
+        use lopdf::{dictionary, Object, Stream};
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "Encoding" => "WinAnsiEncoding",
+        });
+        let layer = format!("q\nBT\n/RLOCRFont 12 Tf\n3 Tr\n50 700 Td\n({text}) Tj\nET\nQ\n");
+        let layer_id = doc.add_object(Stream::new(dictionary! {}, layer.into_bytes()));
+        let page = doc.get_dictionary_mut(page_id).unwrap();
+        let existing = page.get(b"Contents").unwrap().clone();
+        page.set(
+            "Contents",
+            Object::Array(vec![existing, Object::Reference(layer_id)]),
+        );
+        let res = match page.get_mut(b"Resources").unwrap() {
+            Object::Dictionary(d) => d,
+            other => panic!("unexpected Resources shape {other:?}"),
+        };
+        res.set("Font", dictionary! { "RLOCRFont" => font_id });
+    }
+
+    #[test]
+    fn stock_lopdf_extracts_nothing_from_a_nul_padded_scan_with_an_ocr_layer() {
+        // Pins the root cause: if a future lopdf makes this pass, the repair is no longer
+        // needed and this test (and `repair_nul_padded_content`) can be retired.
+        let (mut doc, pages) = test_support::nul_padded_scan_doc(1);
+        append_text_layer(&mut doc, pages[0], "ROOM SCHEDULE FOR LEVEL THREE");
+        let stock = doc.extract_text(&[1]).unwrap_or_default();
+        assert_eq!(
+            stock.chars().filter(|c| !c.is_whitespace()).count(),
+            0,
+            "stock lopdf now parses NUL-padded streams; retire repair_nul_padded_content"
+        );
+    }
+
+    #[test]
+    fn extract_doc_text_sees_an_ocr_layer_that_follows_a_nul_padded_scan_stream() {
+        let (mut doc, pages) = test_support::nul_padded_scan_doc(2);
+        append_text_layer(&mut doc, pages[0], "ROOM SCHEDULE FOR LEVEL THREE");
+        append_text_layer(&mut doc, pages[1], "AUDITORIUM CEILING PLAN");
+        let text = extract_doc_text(&mut doc);
+        assert_eq!(text.len(), 2);
+        assert!(
+            text[0].1.contains("ROOM SCHEDULE FOR LEVEL THREE"),
+            "{:?}",
+            text[0]
+        );
+        assert!(
+            text[1].1.contains("AUDITORIUM CEILING PLAN"),
+            "{:?}",
+            text[1]
+        );
+    }
+
+    #[test]
+    fn extract_pdf_text_reads_ocr_text_from_a_saved_nul_padded_scan() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("scan.pdf");
+        let (mut doc, pages) = test_support::nul_padded_scan_doc(1);
+        append_text_layer(&mut doc, pages[0], "ROOM SCHEDULE FOR LEVEL THREE");
+        doc.save(&path).unwrap();
+        let text = extract_pdf_text(&path).unwrap();
+        assert!(text[0].1.contains("ROOM SCHEDULE"), "{:?}", text[0]);
+    }
+
+    #[test]
+    fn extract_doc_text_does_not_rewrite_pages_that_already_yield_text() {
+        use lopdf::Object;
+        let (mut doc, pages) = test_support::nul_padded_scan_doc(1);
+        append_text_layer(&mut doc, pages[0], "ROOM SCHEDULE FOR LEVEL THREE");
+        // Make the scanner stream clean so stock extraction succeeds first time.
+        let scan_id = doc.get_page_contents(pages[0])[0];
+        if let Some(Object::Stream(s)) = doc.objects.get_mut(&scan_id) {
+            s.set_plain_content(b"q\nQ\n".to_vec());
+        }
+        let text = extract_doc_text(&mut doc);
+        assert!(text[0].1.contains("ROOM SCHEDULE"));
+        let Some(Object::Stream(s)) = doc.objects.get(&scan_id) else {
+            panic!()
+        };
+        assert_eq!(s.content, b"q\nQ\n");
     }
 }

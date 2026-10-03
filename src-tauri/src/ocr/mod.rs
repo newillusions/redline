@@ -177,10 +177,16 @@ impl OcrEngineHandle {
     pub fn recognize_page(&mut self, raster: &PageRaster) -> Result<Vec<OcrLine>> {
         let mut candidates = Vec::new();
         for rotation in Rotation::ALL {
-            candidates.extend(
-                self.recognize_pass(raster, rotation)
-                    .with_context(|| format!("recognize_pass failed at {rotation:?}"))?,
-            );
+            let mut pass = self
+                .recognize_pass(raster, rotation)
+                .with_context(|| format!("recognize_pass failed at {rotation:?}"))?;
+            if rotation != Rotation::Deg0 {
+                // The three wrong-orientation passes mostly read real horizontal
+                // text sideways as scattered symbol/letter salad; keep only
+                // lines that read as real words (see `plausible_rotated_line`).
+                pass.retain(|l| plausible_rotated_line(&l.text, l.confidence));
+            }
+            candidates.extend(pass);
         }
         let mut lines = merge_rotate4x_candidates(candidates);
         // `merge_rotate4x_candidates` returns its survivors in the
@@ -509,6 +515,11 @@ fn iou(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> f64 {
 /// survive per region.
 fn merge_rotate4x_candidates(mut candidates: Vec<OcrLine>) -> Vec<OcrLine> {
     const IOU_MERGE_THRESHOLD: f64 = 0.3;
+    // Share of a candidate's OWN area that a kept, higher-confidence box must
+    // cover for it to count as a duplicate. IoU alone misses a thin fragment
+    // read sideways out of the middle of a wide line: its IoU with the line is
+    // tiny, but the line covers nearly all of it.
+    const CONTAINED_THRESHOLD: f64 = 0.6;
     candidates.sort_by(|a, b| {
         b.confidence
             .unwrap_or(0.0)
@@ -517,14 +528,107 @@ fn merge_rotate4x_candidates(mut candidates: Vec<OcrLine>) -> Vec<OcrLine> {
     });
     let mut kept: Vec<OcrLine> = Vec::new();
     for candidate in candidates {
-        let overlaps_kept = kept
-            .iter()
-            .any(|k| iou(k.bbox_pdf, candidate.bbox_pdf) > IOU_MERGE_THRESHOLD);
+        let overlaps_kept = kept.iter().any(|k| {
+            iou(k.bbox_pdf, candidate.bbox_pdf) > IOU_MERGE_THRESHOLD
+                || covered_fraction(candidate.bbox_pdf, k.bbox_pdf) > CONTAINED_THRESHOLD
+        });
         if !overlaps_kept {
             kept.push(candidate);
         }
     }
     kept
+}
+
+/// Share (0.0-1.0) of box `inner`'s own area that lies inside box `outer`. Both are
+/// (min_x, min_y, max_x, max_y). Returns 0.0 for a degenerate `inner`.
+fn covered_fraction(inner: (f64, f64, f64, f64), outer: (f64, f64, f64, f64)) -> f64 {
+    let iw = (inner.2.min(outer.2) - inner.0.max(outer.0)).max(0.0);
+    let ih = (inner.3.min(outer.3) - inner.1.max(outer.1)).max(0.0);
+    let area = (inner.2 - inner.0).max(0.0) * (inner.3 - inner.1).max(0.0);
+    if area <= 0.0 {
+        0.0
+    } else {
+        iw * ih / area
+    }
+}
+
+/// Lowest mean line confidence (0.0-1.0) a line read at a 90/180/270-degree rotation
+/// must have to be kept. The 0-degree pass keeps only the writer's own floor (0.5);
+/// a sideways reading of real horizontal text routinely scores 0.5-0.8, while a
+/// genuinely rotated dimension string or label reads upright in its own pass and scores
+/// like any other real text (the CAD fixtures measure 63-82% means).
+const ROTATED_MIN_CONFIDENCE: f32 = 0.80;
+
+/// Share of a rotated line's non-whitespace characters that must sit in plausible
+/// tokens (see `plausible_token`) for the line to be kept.
+const ROTATED_MIN_PLAUSIBLE_SHARE: f64 = 0.70;
+
+/// Whether a line read at a wrong-orientation rotate-4x pass is worth keeping: its
+/// confidence clears `ROTATED_MIN_CONFIDENCE` and enough of its characters belong to
+/// tokens that look like real words or dimension figures.
+///
+/// Redline ships no dictionary, so "looks like a word" is a shape test, not a lookup
+/// (`plausible_token`). It rejects the letter salad Tesseract produces from text read
+/// sideways (`"P= os 4 3 2 s 3 as OSD ="`) while keeping the strings rotated passes
+/// exist to recover (`"DIM 3650 MM"`, `"GRID LINE A"`, `"3'-4\""`). Applied to the three
+/// rotated passes only: the 0-degree pass is unchanged.
+fn plausible_rotated_line(text: &str, confidence: Option<f32>) -> bool {
+    if confidence.unwrap_or(0.0) < ROTATED_MIN_CONFIDENCE {
+        return false;
+    }
+    let mut total = 0usize;
+    let mut plausible = 0usize;
+    let mut longest_plausible = 0usize;
+    for token in text.split_whitespace() {
+        let chars = token.chars().filter(|c| !c.is_whitespace()).count();
+        total += chars;
+        if plausible_token(token) {
+            plausible += chars;
+            longest_plausible = longest_plausible.max(chars);
+        }
+    }
+    total > 0
+        && longest_plausible >= 3
+        && plausible as f64 / total as f64 >= ROTATED_MIN_PLAUSIBLE_SHARE
+}
+
+/// Shape test for one whitespace-separated token: a dimension/number figure, or a
+/// word-shaped run of letters. Surrounding punctuation is ignored.
+fn plausible_token(token: &str) -> bool {
+    let t = token.trim_matches(|c: char| !c.is_alphanumeric());
+    let len = t.chars().count();
+    if len < 2 {
+        return false;
+    }
+    let digits = t.chars().filter(char::is_ascii_digit).count();
+    if digits > 0 {
+        // Dimension figures: mostly digits plus separators (3650, 1.25, 2'-6", 1/2).
+        let figure = t
+            .chars()
+            .filter(|c| c.is_ascii_digit() || "-'\".,/x\u{d7}\u{b0}\u{b1}".contains(*c))
+            .count();
+        return digits >= 2 && figure * 10 >= len * 8;
+    }
+    let letters: Vec<char> = t.chars().filter(|c| c.is_alphabetic()).collect();
+    if letters.len() < 3 || letters.len() * 10 < len * 8 {
+        return false;
+    }
+    let is_vowel = |c: &char| "aeiouyAEIOUY".contains(*c);
+    if !letters.iter().any(is_vowel) {
+        return false;
+    }
+    // No run of four consonants (English words almost never have one).
+    let mut run = 0;
+    for c in &letters {
+        run = if is_vowel(c) { 0 } else { run + 1 };
+        if run >= 4 {
+            return false;
+        }
+    }
+    // Casing must be a word's: all lower, all upper, or Capitalised. Mixed salad
+    // such as "oO" or "aS" is a misread.
+    let upper = letters.iter().filter(|c| c.is_uppercase()).count();
+    upper == 0 || upper == letters.len() || (upper == 1 && letters[0].is_uppercase())
 }
 
 /// Reorder `lines` into human reading order: top-to-bottom, then
@@ -967,5 +1071,84 @@ mod tests {
         for s in ["2 = S", "&z", "? O", "~", ". O =", "> N .", "(=)"] {
             assert!(!looks_like_text(s), "expected {s:?} to be rejected");
         }
+    }
+
+    // --- rotated-pass noise filter -----------------------------------------
+
+    #[test]
+    fn rotated_filter_keeps_real_rotated_dimension_text() {
+        for t in [
+            "DIM 3650 MM",
+            "GRID LINE A",
+            "Auditorium ceiling plan",
+            "2'-6\" AFF",
+            "3650",
+            "Level 3",
+        ] {
+            assert!(plausible_rotated_line(t, Some(0.9)), "expected {t:?} kept");
+        }
+    }
+
+    #[test]
+    fn rotated_filter_drops_letter_salad_from_sideways_reads() {
+        // Real junk lines Tesseract produced from the synthetic contract's rotated passes.
+        for t in [
+            "Z o > is SU S",
+            "P= os 4 3 2 s 3 as OSD =",
+            "= a < a8 + ay eS =",
+            "Oo 2 o ga on 33",
+            "See 33 B28 bb & 2\u{a2}",
+            "~ se = ot i Oo: o rt 5",
+            "a < 5 3 Oo =z. G2 oO",
+            "os AA",
+            "Me ?",
+        ] {
+            assert!(
+                !plausible_rotated_line(t, Some(0.95)),
+                "expected {t:?} dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn rotated_filter_applies_a_higher_confidence_floor_than_the_writer() {
+        assert!(!plausible_rotated_line("DIM 3650 MM", Some(0.7)));
+        assert!(!plausible_rotated_line("DIM 3650 MM", None));
+        assert!(plausible_rotated_line("DIM 3650 MM", Some(0.8)));
+    }
+
+    #[test]
+    fn plausible_token_shape_rules() {
+        assert!(plausible_token("Agreement,"));
+        assert!(plausible_token("(Client)"));
+        assert!(plausible_token("AED"));
+        assert!(!plausible_token("oO"));
+        assert!(!plausible_token("bcdfg"));
+        assert!(!plausible_token("aS"));
+        assert!(!plausible_token("5"));
+        assert!(!plausible_token("2\u{a2}"));
+    }
+
+    #[test]
+    fn covered_fraction_measures_share_of_the_inner_box() {
+        let wide = (0.0, 0.0, 400.0, 12.0);
+        let thin_inside = (100.0, 0.0, 104.0, 12.0);
+        assert!((covered_fraction(thin_inside, wide) - 1.0).abs() < 1e-9);
+        // The wide line is barely covered by the thin one.
+        assert!(covered_fraction(wide, thin_inside) < 0.02);
+        assert_eq!(covered_fraction((0.0, 0.0, 0.0, 5.0), wide), 0.0);
+        assert_eq!(covered_fraction((500.0, 0.0, 510.0, 5.0), wide), 0.0);
+    }
+
+    #[test]
+    fn merge_drops_a_sideways_fragment_contained_in_a_kept_wide_line() {
+        // IoU of these two is ~0.01, far below the 0.3 NMS threshold, but the fragment
+        // lies entirely inside the real line.
+        let real = line("the real horizontal line", 0.9, (0.0, 0.0, 400.0, 12.0));
+        let fragment = line("ao", 0.85, (100.0, 0.0, 104.0, 12.0));
+        let elsewhere = line("another line", 0.8, (0.0, 100.0, 300.0, 112.0));
+        let merged = merge_rotate4x_candidates(vec![fragment, real, elsewhere]);
+        let texts: Vec<&str> = merged.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["the real horizontal line", "another line"]);
     }
 }
