@@ -6,6 +6,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen } from "@testing-library/svelte";
 import { tick } from "svelte";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { fireEvent } from "@testing-library/svelte";
 import MeasurementPanel from "./MeasurementPanel.svelte";
 import { MarkupStore } from "$lib/markup-store.svelte";
 import { TakeoffStore } from "$lib/takeoff-store.svelte";
@@ -158,5 +160,24 @@ describe("MeasurementPanel", () => {
     takeoffStore.addScale(scale);
     render(MeasurementPanel, { props: { store, takeoffStore, docId: "d1" } });
     expect(screen.getByText("1:1000 (m)")).toBeTruthy();
+  });
+
+  it("enables the export buttons for a review mark-up even with no measurements (UX audit F3)", async () => {
+    render(MeasurementPanel, { store, takeoffStore, docId: "d1" });
+    expect((screen.getByRole("button", { name: /export xlsx/i }) as HTMLButtonElement).disabled).toBe(true);
+    const review = { ...makeMeasurementMarkup("r1", "MeasurementLength", 0, "m"), markup_type: "Rectangle" as const, measurement: null };
+    store.seed([review]);
+    await tick();
+    expect((screen.getByRole("button", { name: /export xlsx/i }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole("button", { name: /export csv/i }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("reports a successful export with the destination path (UX audit round 2)", async () => {
+    vi.mocked(saveDialog).mockResolvedValueOnce("/out/list.xlsx");
+    const review = { ...makeMeasurementMarkup("r1", "MeasurementLength", 0, "m"), markup_type: "Rectangle" as const, measurement: null };
+    store.seed([review]);
+    render(MeasurementPanel, { store, takeoffStore, docId: "d1" });
+    await fireEvent.click(screen.getByRole("button", { name: /export xlsx/i }));
+    expect(await screen.findByText("Exported 1 mark-up to /out/list.xlsx.")).toBeTruthy();
   });
 });

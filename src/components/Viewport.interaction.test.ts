@@ -24,6 +24,9 @@ import { TakeoffStore } from "$lib/takeoff-store.svelte";
 import { wheelZoomFactor } from "$lib/viewport";
 import { buildMarkup } from "$lib/markup-tools";
 
+/** The developer bench-overlay chord (bare "B" no longer toggles it - UX audit F8). */
+const BENCH_KEY = { key: "B", code: "KeyB", ctrlKey: true, altKey: true, shiftKey: true };
+
 // ---------------------------------------------------------------------------
 // jsdom does not implement PointerEvent — install a minimal shim.
 // ---------------------------------------------------------------------------
@@ -1021,12 +1024,19 @@ describe("Viewport wheel pan/zoom + new zoom controls (owner-decided 2026-09-08 
     expect(store.activeTool).toBe("Rectangle"); // "v" typed in the input must not hijack the tool
   });
 
+  it("a bare 'b' keypress no longer opens the developer bench overlay (UX audit F8)", async () => {
+    const { container } = await mountViewport(store);
+    await fireEvent.keyDown(window, { key: "b" });
+    await tick();
+    expect(container.querySelector(".bench-overlay")).toBeNull();
+  });
+
   it("typing 'b' into the zoom-percent input does not toggle the bench overlay", async () => {
     const { container } = await mountViewport(store);
     const input = container.querySelector('input[aria-label="Zoom percent"]') as HTMLInputElement;
     expect(container.querySelector(".bench-overlay")).toBeNull();
 
-    await fireEvent.keyDown(input, { key: "b" });
+    await fireEvent.keyDown(input, BENCH_KEY);
     await tick();
     expect(container.querySelector(".bench-overlay")).toBeNull(); // still off
   });
@@ -1459,19 +1469,19 @@ describe("Viewport zoom toolbar: HUD removal, collapse, reposition", () => {
     expect(container.querySelector(".zoom-indicator")).toBeNull();
   });
 
-  it("the bench overlay (B key) carries the last-tile stat and a [B] close hint, only while open", async () => {
+  it("the bench overlay (Ctrl+Alt+Shift+B) carries the last-tile stat and a close hint, only while open", async () => {
     const { container } = await mountViewport(store);
     expect(container.querySelector(".bench-overlay")).toBeNull();
 
-    await fireEvent.keyDown(window, { key: "b" });
+    await fireEvent.keyDown(window, BENCH_KEY);
     await tick();
 
     const overlay = container.querySelector(".bench-overlay");
     expect(overlay).not.toBeNull();
     expect(overlay!.textContent).toContain("last tile");
-    expect(overlay!.textContent).toContain("[B]");
+    expect(overlay!.textContent).toContain("Ctrl+Alt+Shift+B");
 
-    await fireEvent.keyDown(window, { key: "b" });
+    await fireEvent.keyDown(window, BENCH_KEY);
     await tick();
     expect(container.querySelector(".bench-overlay")).toBeNull();
   });
@@ -3202,13 +3212,13 @@ describe("S20 RSS poll gating", () => {
     expect(vi.mocked(ipcMocks.processRssMb)).not.toHaveBeenCalled();
 
     // Toggle the bench overlay on (B) - the effect samples immediately.
-    fireEvent.keyDown(window, { key: "b" });
+    fireEvent.keyDown(window, BENCH_KEY);
     await waitFor(() => {
       expect(vi.mocked(ipcMocks.processRssMb)).toHaveBeenCalled();
     });
 
     // Toggle off - the interval must be torn down.
-    fireEvent.keyDown(window, { key: "b" });
+    fireEvent.keyDown(window, BENCH_KEY);
     await tick();
     const callsAtToggleOff = vi.mocked(ipcMocks.processRssMb).mock.calls.length;
     await new Promise((r) => setTimeout(r, 1200));

@@ -11,4 +11,6 @@ pub mod recent_docs;
 pub mod settings;
 pub mod versioning;
 
-pub use versioning::{history_dir, list_versions, restore_version, save_version_snapshot};
+pub use versioning::{
+    history_dir, list_versions, restore_version, restore_version_with_backup, save_version_snapshot,
+};

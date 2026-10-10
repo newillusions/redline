@@ -3,7 +3,7 @@
 use tauri::State;
 
 use crate::sidecar::VersionRecord;
-use crate::storage::{list_versions, restore_version, save_version_snapshot};
+use crate::storage::{list_versions, restore_version_with_backup, save_version_snapshot};
 use crate::AppState;
 
 /// Default number of history snapshots to retain per file.
@@ -63,12 +63,15 @@ pub async fn restore_document_version(
         .path(&doc_id)
         .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
 
-    // Restore the snapshot (blocking IO).
+    // Restore the snapshot (blocking IO). The current file is snapshotted first so the
+    // restore can itself be undone from History.
     let path2 = path.clone();
-    tokio::task::spawn_blocking(move || restore_version(&path2, &version_id))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("{e}"))?;
+    tokio::task::spawn_blocking(move || {
+        restore_version_with_backup(&path2, &version_id, DEFAULT_RETAIN_N).map(|_| ())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e}"))?;
 
     // Invalidate the markup cache so the next load_markups re-parses the restored PDF.
     state.markups.invalidate_cache(&path);

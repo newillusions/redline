@@ -90,12 +90,12 @@ describe("SettingsDialog - License section", () => {
     expect(await findByText(/4 day/i)).toBeTruthy();
   });
 
-  it("shows the revoked reason when the license was revoked", async () => {
+  it("shows the revoked reason in plain language when the licence was revoked", async () => {
     mockGetLicenseInfo.mockResolvedValue(
       validInfo({ code: "ABCD-1234", state: { state: "revoked", reason: "staff_not_active" } }),
     );
     const { findByText } = render(SettingsDialog, { props: { onClose: vi.fn() } });
-    expect(await findByText(/staff_not_active/)).toBeTruthy();
+    expect(await findByText(/staff account is no longer active/)).toBeTruthy();
   });
 
   it("re-activates with a new code and reports it via onLicenseChanged", async () => {

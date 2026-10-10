@@ -173,3 +173,22 @@ describe("TabBar — × close button", () => {
     expect(capture).not.toHaveBeenCalled();
   });
 });
+
+describe("TabBar - unsaved marker (UX audit F2)", () => {
+  it("shows a marker only on tabs whose store is dirty, and removes it once saved", async () => {
+    const a = makeTab("a");
+    const b = makeTab("b");
+    a.store.dirty = true;
+    const { container } = render(TabBar, {
+      props: { tabs: [a, b], activeDocId: "a", ontabclick: vi.fn(), ontabclose: vi.fn(), onmoveTab: vi.fn() },
+    });
+    const tabs = container.querySelectorAll(".tab");
+    expect(tabs[0].querySelector(".tab-dirty")).not.toBeNull();
+    expect(tabs[1].querySelector(".tab-dirty")).toBeNull();
+    expect(tabs[0].querySelector(".tab-dirty")!.getAttribute("aria-label")).toBe("Unsaved changes");
+
+    a.store.clearDirty();
+    await tick();
+    expect(container.querySelector(".tab-dirty")).toBeNull();
+  });
+});

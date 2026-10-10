@@ -140,6 +140,44 @@ pub fn restore_version(pdf_path: &Path, version_id: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Label given to the automatic snapshot taken just before a restore.
+pub const PRE_RESTORE_LABEL: &str = "Before restore";
+
+/// Restore `version_id` over the live PDF, first snapshotting the CURRENT file so the
+/// restore is itself undoable (UX audit round 2, 2026-10-10: `restore_version` alone
+/// consumes the restored snapshot and overwrites the live file irrecoverably).
+///
+/// Order matters:
+/// 1. Confirm the target exists (an unknown id must not leave a stray backup behind).
+/// 2. Snapshot the live file with pruning disabled (`retain_n = 0`), so the backup can
+///    never prune the very snapshot about to be restored.
+/// 3. Restore. If this fails the backup simply remains in History.
+/// 4. Prune to `retain_n` (on success AND failure, so failed retries cannot pile up
+///    backups).
+///
+/// Returns the backup record. If the backup cannot be taken, nothing is restored.
+pub fn restore_version_with_backup(
+    pdf_path: &Path,
+    version_id: &str,
+    retain_n: usize,
+) -> io::Result<VersionRecord> {
+    let meta = load_meta(pdf_path)?;
+    if !meta.versions.iter().any(|r| r.id == version_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("version not found: {version_id}"),
+        ));
+    }
+    let backup = save_version_snapshot(pdf_path, Some(PRE_RESTORE_LABEL.to_string()), 0)?;
+    let restored = restore_version(pdf_path, version_id);
+    // Prune on the failure path too, so repeated failed retries cannot stack up
+    // "Before restore" backups without bound.
+    let pruned = prune_history(pdf_path, retain_n);
+    restored?;
+    pruned?;
+    Ok(backup)
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
@@ -376,6 +414,108 @@ mod tests {
 
         let result = restore_version(&pdf, "nope123");
         assert!(result.is_err(), "restoring unknown id must error");
+    }
+
+    #[test]
+    fn restore_with_backup_keeps_the_current_file_as_a_new_version() {
+        let dir = tempdir().unwrap();
+        let pdf = dir.path().join("plans.pdf");
+        fs::write(&pdf, b"%PDF A").unwrap();
+        let rec = save_version_snapshot(&pdf, None, 10).unwrap();
+        fs::write(&pdf, b"%PDF B live").unwrap();
+
+        let backup = restore_version_with_backup(&pdf, &rec.id, 10).unwrap();
+
+        assert_eq!(
+            fs::read(&pdf).unwrap(),
+            b"%PDF A",
+            "snapshot content restored"
+        );
+        assert_eq!(backup.label.as_deref(), Some(PRE_RESTORE_LABEL));
+        let backup_file = history_dir(&pdf).join(&backup.filename);
+        assert_eq!(
+            fs::read(&backup_file).unwrap(),
+            b"%PDF B live",
+            "the pre-restore live file must be preserved in History"
+        );
+        let ids: Vec<String> = list_versions(&pdf)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![backup.id.clone()],
+            "restored snapshot consumed, backup kept"
+        );
+    }
+
+    #[test]
+    fn restore_with_backup_makes_the_restore_undoable() {
+        let dir = tempdir().unwrap();
+        let pdf = dir.path().join("plans.pdf");
+        fs::write(&pdf, b"%PDF A").unwrap();
+        let rec = save_version_snapshot(&pdf, None, 10).unwrap();
+        fs::write(&pdf, b"%PDF B live").unwrap();
+
+        let backup = restore_version_with_backup(&pdf, &rec.id, 10).unwrap();
+        // Undo the restore by restoring the backup.
+        restore_version(&pdf, &backup.id).unwrap();
+        assert_eq!(fs::read(&pdf).unwrap(), b"%PDF B live");
+    }
+
+    #[test]
+    fn restore_with_backup_unknown_id_errors_without_leaving_a_backup() {
+        let dir = tempdir().unwrap();
+        let pdf = dir.path().join("plans.pdf");
+        make_fake_pdf(&pdf);
+        assert!(restore_version_with_backup(&pdf, "nope123", 10).is_err());
+        assert!(list_versions(&pdf).unwrap().is_empty(), "no stray backup");
+    }
+
+    #[test]
+    fn restore_with_backup_never_prunes_the_snapshot_being_restored() {
+        let dir = tempdir().unwrap();
+        let pdf = dir.path().join("plans.pdf");
+        fs::write(&pdf, b"%PDF oldest").unwrap();
+        // The oldest snapshot is the restore target; the history is already full (retain 3).
+        let target = save_version_snapshot(&pdf, None, 3).unwrap();
+        for i in 0..2 {
+            fs::write(&pdf, format!("%PDF {i}")).unwrap();
+            save_version_snapshot(&pdf, None, 3).unwrap();
+        }
+        fs::write(&pdf, b"%PDF live").unwrap();
+
+        let backup = restore_version_with_backup(&pdf, &target.id, 3).unwrap();
+
+        assert_eq!(fs::read(&pdf).unwrap(), b"%PDF oldest");
+        let versions = list_versions(&pdf).unwrap();
+        assert!(versions.len() <= 3, "history pruned back to retain_n");
+        assert!(
+            versions.iter().any(|r| r.id == backup.id),
+            "backup survives pruning"
+        );
+    }
+
+    #[test]
+    fn failed_restore_still_prunes_so_retries_cannot_stack_backups() {
+        let dir = tempdir().unwrap();
+        let pdf = dir.path().join("plans.pdf");
+        fs::write(&pdf, b"%PDF A").unwrap();
+        let target = save_version_snapshot(&pdf, None, 3).unwrap();
+        // Make the restore fail: remove the snapshot file but keep its record.
+        let meta = load_meta(&pdf).unwrap();
+        let snap = history_dir(&pdf).join(&meta.versions[0].filename);
+        fs::remove_file(&snap).unwrap();
+
+        for _ in 0..6 {
+            assert!(restore_version_with_backup(&pdf, &target.id, 3).is_err());
+        }
+        let n = list_versions(&pdf).unwrap().len();
+        assert!(
+            n <= 3,
+            "history must stay within retain_n after repeated failures, got {n}"
+        );
     }
 
     // -----------------------------------------------------------------------

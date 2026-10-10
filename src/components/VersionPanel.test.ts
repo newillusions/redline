@@ -138,7 +138,7 @@ describe("VersionPanel", () => {
     expect(screen.getByText("pre-issue")).toBeTruthy();
   });
 
-  it("VP-4: restore button calls restoreDocumentVersion with correct id", async () => {
+  it("VP-4: restore calls restoreDocumentVersion with the right id once confirmed", async () => {
     mockListDocumentVersions.mockResolvedValue(sampleVersions);
     const onRestore = vi.fn();
     render(VersionPanel, { props: { docId: "doc1", onRestore } });
@@ -151,6 +151,8 @@ describe("VersionPanel", () => {
 
     // Click the first restore button (corresponds to ver3 = newest first)
     await fireEvent.click(restoreButtons[0]);
+    await tick();
+    await fireEvent.click(document.querySelector(".btn-confirm") as HTMLElement);
     await tick();
     await tick();
 
@@ -232,8 +234,47 @@ describe("VersionPanel", () => {
     const restoreButtons = document.querySelectorAll("[data-testid='restore-btn']");
     await fireEvent.click(restoreButtons[0]);
     await tick();
+    await fireEvent.click(document.querySelector(".btn-confirm") as HTMLElement);
+    await tick();
     await tick();
 
     expect(onRestore).toHaveBeenCalled();
+  });
+
+  async function openVersionsAndClickRestore(props: Record<string, unknown> = {}) {
+    mockListDocumentVersions.mockResolvedValue(sampleVersions);
+    render(VersionPanel, { props: { docId: "doc1", ...props } });
+    await tick();
+    await tick();
+    await tick();
+    const restoreButtons = document.querySelectorAll("[data-testid='restore-btn']");
+    await fireEvent.click(restoreButtons[0]);
+    await tick();
+  }
+
+  it("VP-9: clicking Restore only asks; nothing is restored until confirmed (UX audit round 2)", async () => {
+    await openVersionsAndClickRestore();
+    expect(document.querySelector("dialog")).not.toBeNull();
+    expect(mockRestoreDocumentVersion).not.toHaveBeenCalled();
+  });
+
+  it("VP-10: cancelling the confirm restores nothing and closes the dialog", async () => {
+    await openVersionsAndClickRestore();
+    await fireEvent.click(document.querySelector(".btn-cancel") as HTMLElement);
+    await tick();
+    expect(mockRestoreDocumentVersion).not.toHaveBeenCalled();
+    expect(document.querySelector("dialog")).toBeNull();
+  });
+
+  it("VP-11: the confirm warns that unsaved mark-ups will be lost when the tab is dirty", async () => {
+    await openVersionsAndClickRestore({ hasUnsavedMarkups: true });
+    expect(document.querySelector("dialog")!.textContent).toMatch(/Unsaved mark-ups on this tab will be lost/);
+  });
+
+  it("VP-12: a clean tab is told the current file is kept as a pre-restore version", async () => {
+    await openVersionsAndClickRestore({ hasUnsavedMarkups: false });
+    const text = document.querySelector("dialog")!.textContent ?? "";
+    expect(text).toMatch(/Before restore/);
+    expect(text).not.toMatch(/will be lost/);
   });
 });

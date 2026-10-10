@@ -9,6 +9,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, fireEvent } from "@testing-library/svelte";
 import { tick } from "svelte";
+import userEvent from "@testing-library/user-event";
 import ConfirmDialog from "./ConfirmDialog.svelte";
 
 describe("ConfirmDialog", () => {
@@ -123,5 +124,31 @@ describe("ConfirmDialog", () => {
     await fireEvent.click(backdrop as Element);
     await tick();
     expect(onCancel).toHaveBeenCalledOnce();
+  });
+
+  it("Enter on a focused Cancel button cancels and never confirms (destructive-dialog guard)", async () => {
+    const onConfirm = vi.fn();
+    const onCancel = vi.fn();
+    const { getByRole } = render(ConfirmDialog, {
+      props: { title: "t", message: "m", confirmLabel: "Restore", cancelLabel: "Cancel", onConfirm, onCancel },
+    });
+    const user = userEvent.setup();
+    await user.tab(); // Restore
+    await user.tab(); // Cancel
+    expect(document.activeElement).toBe(getByRole("button", { name: "Cancel" }));
+    await user.keyboard("{Enter}");
+    expect(onCancel).toHaveBeenCalledOnce();
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
+
+  it("Enter on the focused confirm button confirms exactly once", async () => {
+    const onConfirm = vi.fn();
+    const { getByRole } = render(ConfirmDialog, {
+      props: { title: "t", message: "m", confirmLabel: "Restore", cancelLabel: "Cancel", onConfirm, onCancel: vi.fn() },
+    });
+    const user = userEvent.setup();
+    getByRole("button", { name: "Restore" }).focus();
+    await user.keyboard("{Enter}");
+    expect(onConfirm).toHaveBeenCalledOnce();
   });
 });

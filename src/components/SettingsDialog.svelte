@@ -10,6 +10,7 @@
    * backend the moment they succeed). Follows the CalibrationDialog modal
    * pattern.
    */
+  import { reasonText } from "$lib/licence-copy";
   import { onMount } from "svelte";
   import { loadSettings, saveSettings, withDefaults } from "$lib/settings";
   import type { AppSettings, Theme, MeasurementUnit } from "$lib/settings";
@@ -53,9 +54,9 @@
       case "expired":
         return "Expired — this device is locked out. Enter a new activation code below.";
       case "revoked":
-        return `Revoked by the administrator (${state.reason}). Enter a new activation code below.`;
+        return `Revoked by the administrator. ${reasonText(state.reason)} Enter a new activation code below.`;
       case "invalid":
-        return `Could not be verified (${state.reason}). Enter a new activation code below.`;
+        return `${reasonText(state.reason)} Enter a new activation code below.`;
       case "missing":
         return "Not activated on this device.";
     }
@@ -65,7 +66,7 @@
     try {
       licenseInfo = await getLicenseInfo();
     } catch (e) {
-      licenseError = `Failed to load license info: ${e instanceof Error ? e.message : String(e)}`;
+      licenseError = `Failed to load licence info: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
 
@@ -264,10 +265,10 @@
     {/if}
 
     <hr class="section-divider" />
-    <h4 class="section-title">License</h4>
+    <h4 class="section-title">Licence</h4>
 
     {#if licenseLoading}
-      <p class="dialog-hint">Loading license info...</p>
+      <p class="dialog-hint">Loading licence info...</p>
     {:else if licenseInfo}
       {#if licenseError}
         <p class="dialog-error">{licenseError}</p>
@@ -320,7 +321,7 @@
           disabled={deactivating}
           type="button"
         >
-          {deactivating ? "Removing..." : "Remove license from this device"}
+          {deactivating ? "Removing..." : "Remove licence from this device"}
         </button>
       {/if}
     {/if}
@@ -336,7 +337,7 @@
 
 {#if showDeactivateConfirm}
   <ConfirmDialog
-    title="Remove license from this device?"
+    title="Remove licence from this device?"
     message="This device will be deactivated immediately and locked back to the activation screen. This works offline and cannot be undone from here - you'll need a valid activation code to use Redline again."
     confirmLabel="Yes"
     cancelLabel="No"

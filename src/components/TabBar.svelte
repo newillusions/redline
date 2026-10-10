@@ -196,6 +196,9 @@
         onpointercancel={() => handlePointerCancel(i)}
       >
         <span class="tab-label">{filename(tab.doc.path)}</span>
+        {#if tab.store.dirty}
+          <span class="tab-dirty" role="img" aria-label="Unsaved changes" title="Unsaved changes">●</span>
+        {/if}
         <button
           class="tab-close"
           aria-label={`Close ${filename(tab.doc.path)}`}
@@ -280,6 +283,13 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .tab-dirty {
+    flex: none;
+    font-size: 0.7em;
+    line-height: 1;
+    color: var(--color-primary);
   }
 
   .tab-close {

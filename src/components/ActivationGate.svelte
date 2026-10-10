@@ -9,8 +9,16 @@
    * properties only, no Tailwind. Full-screen rather than a <dialog> overlay,
    * since there is no app content behind it to dim.
    */
-  import { activateLicense } from "$lib/license";
+  import { onMount } from "svelte";
+  import { activateLicense, renewLicense, getLicenseInfo, isUsable } from "$lib/license";
   import type { LicenseState } from "$lib/license";
+  import {
+    gateHint,
+    activationRefusedText,
+    activationErrorText,
+    retryOnlineFailureText,
+    normaliseCode,
+  } from "$lib/licence-copy";
 
   const {
     licenseState,
@@ -22,49 +30,83 @@
 
   let code = $state("");
   let submitting = $state(false);
+  let retrying = $state(false);
   let error = $state<string | null>(null);
+  let inputEl = $state<HTMLInputElement | null>(null);
+  /** This computer's device fingerprint, so staff can quote it to the administrator. */
+  let deviceId = $state<string | null>(null);
+  let copied = $state(false);
 
   const headline: Record<LicenseState["state"], string> = {
     valid: "", // never rendered - App.svelte only mounts this gate when not usable
     grace: "", // never rendered - grace is usable; see LicenseGraceWarning instead
     missing: "Activate Redline",
-    expired: "License expired",
-    invalid: "License invalid",
-    revoked: "License revoked",
+    expired: "Licence expired",
+    invalid: "Licence invalid",
+    revoked: "Licence revoked",
   };
 
-  const hint = $derived.by(() => {
-    if (licenseState.state === "invalid") {
-      if (licenseState.reason === "device_mismatch") {
-        return "This activation is bound to a different device. Contact the administrator for a new activation code.";
-      }
-      return `This installation's license could not be verified (${licenseState.reason}). Enter a new activation code below.`;
-    }
-    if (licenseState.state === "revoked") {
-      return `This device's license was revoked by the administrator (${licenseState.reason}). Enter a new activation code to continue.`;
-    }
-    if (licenseState.state === "expired") {
-      return "Your license has expired and could not be renewed automatically. Enter a new activation code, or contact the administrator.";
-    }
-    return "Enter the activation code provided by your administrator to unlock Redline on this device.";
+  const hint = $derived(gateHint(licenseState));
+
+  onMount(() => {
+    inputEl?.focus();
+    getLicenseInfo()
+      .then((info) => {
+        deviceId = info.device_fingerprint || null;
+      })
+      .catch(() => {
+        // Non-fatal: the gate works without showing the device id.
+      });
   });
+
+  async function copyDeviceId() {
+    if (!deviceId) return;
+    try {
+      await navigator.clipboard.writeText(deviceId);
+      copied = true;
+      setTimeout(() => (copied = false), 2000);
+    } catch {
+      // Clipboard unavailable: the id stays selectable on screen.
+    }
+  }
+
+  async function handleRetryOnline() {
+    if (retrying) return;
+    retrying = true;
+    error = null;
+    try {
+      const next = await renewLicense();
+      if (isUsable(next)) {
+        onActivated(next);
+      } else {
+        error = retryOnlineFailureText(next);
+        // A server refusal changes what the gate should say (revoked, not expired).
+        if (next.state === "revoked" || next.state === "invalid") onActivated(next);
+      }
+    } catch (e) {
+      error = activationErrorText(e instanceof Error ? e.message : String(e));
+    } finally {
+      retrying = false;
+    }
+  }
 
   async function handleSubmit(e: SubmitEvent) {
     e.preventDefault();
-    if (submitting || !code.trim()) return;
+    const trimmed = normaliseCode(code);
+    if (submitting || !trimmed) return;
     submitting = true;
     error = null;
     try {
-      const next = await activateLicense(code.trim());
+      const next = await activateLicense(trimmed);
       if (next.state === "valid") {
         onActivated(next);
       } else if (next.state === "invalid") {
-        error = `Activation refused (${next.reason}).`;
+        error = activationRefusedText(next.reason);
       } else {
         error = "Activation did not complete. Check the code and try again.";
       }
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      error = activationErrorText(e instanceof Error ? e.message : String(e));
     } finally {
       submitting = false;
     }
@@ -76,6 +118,18 @@
     <h1 class="gate-title">{headline[licenseState.state]}</h1>
     <p class="gate-hint">{hint}</p>
 
+    {#if licenseState.state === "expired"}
+      <button
+        class="gate-submit"
+        type="button"
+        data-testid="retry-online"
+        onclick={handleRetryOnline}
+        disabled={retrying || submitting}
+      >
+        {retrying ? "Retrying…" : "Retry online"}
+      </button>
+    {/if}
+
     <label class="gate-label" for="activation-code">Activation code</label>
     <input
       id="activation-code"
@@ -85,6 +139,7 @@
       spellcheck="false"
       placeholder="XXXX-XXXX-XXXX"
       bind:value={code}
+      bind:this={inputEl}
       disabled={submitting}
     />
 
@@ -95,6 +150,16 @@
     <button class="gate-submit" type="submit" disabled={submitting || !code.trim()}>
       {submitting ? "Activating…" : "Activate"}
     </button>
+
+    {#if deviceId}
+      <div class="gate-device" data-testid="device-id">
+        <span class="gate-label">Device ID</span>
+        <code class="gate-device-id">{deviceId}</code>
+        <button class="gate-copy" type="button" onclick={copyDeviceId}>
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+    {/if}
   </form>
 </div>
 
@@ -151,6 +216,32 @@
   }
   .gate-input:disabled {
     opacity: 0.6;
+  }
+
+  .gate-device {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+    padding-top: var(--space-2);
+    border-top: 1px solid var(--color-border);
+  }
+  .gate-device-id {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-size: var(--font-size-xs);
+    color: var(--color-text-secondary);
+    user-select: all;
+  }
+  .gate-copy {
+    background: transparent;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    color: var(--color-text);
+    cursor: pointer;
+    font-size: var(--font-size-xs);
+    padding: var(--space-1) var(--space-3);
   }
 
   .gate-error {

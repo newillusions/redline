@@ -50,7 +50,7 @@ describe("PasswordPromptDialog", () => {
     await fireEvent.input(getByLabelText(/pdf password/i), { target: { value: "secret" } });
     await fireEvent.click(getByRole("button", { name: /^open$/i }));
     await tick();
-    expect(onSubmit).toHaveBeenCalledWith("secret");
+    expect(onSubmit).toHaveBeenCalledWith("secret", false);
   });
 
   it("the Open button is disabled while the password field is empty", () => {
@@ -96,7 +96,7 @@ describe("PasswordPromptDialog", () => {
       code: "Enter",
     });
     await tick();
-    expect(onSubmit).toHaveBeenCalledWith("secret");
+    expect(onSubmit).toHaveBeenCalledWith("secret", false);
   });
 
   it("Enter key with an empty password does not call onSubmit", async () => {
@@ -117,5 +117,16 @@ describe("PasswordPromptDialog", () => {
       props: { filename: "b.pdf", errorHint: null, onSubmit: vi.fn(), onCancel: vi.fn() },
     });
     expect(getByRole("dialog")).toBeTruthy();
+  });
+
+  it("passes the remember-on-this-device choice with the password (replaces the separate dialog)", async () => {
+    const onSubmit = vi.fn();
+    const { getByLabelText, getByRole } = render(PasswordPromptDialog, {
+      props: { filename: "a.pdf", errorHint: null, onSubmit, onCancel: vi.fn() },
+    });
+    await fireEvent.input(getByLabelText("PDF password"), { target: { value: "secret" } });
+    await fireEvent.click(getByRole("checkbox"));
+    await fireEvent.click(getByRole("button", { name: "Open" }));
+    expect(onSubmit).toHaveBeenCalledWith("secret", true);
   });
 });

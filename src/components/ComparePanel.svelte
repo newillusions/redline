@@ -3,7 +3,7 @@
    * ComparePanel — two-tier PDF version comparison (M6 Phase 1.1, spec §10).
    *
    * Accepts two PDF file paths (passed as props by the parent, which uses the
-   * Tauri file-dialog to set them), optional 0-based page indices, and a
+   * Tauri file-dialog to set them), optional 1-based page numbers (converted to 0-based indices for the backend), and a
    * "Compare" button that calls `comparePages` and displays:
    *   - A color-overlay diff PNG (changed pixels = red, unchanged = grey)
    *   - Tier-1 text summary (character match, delta count)
@@ -37,6 +37,17 @@
   let error = $state<string | null>(null);
   let result = $state<PageDiffResult | null>(null);
 
+  /** File name only: full absolute paths are noise in the bar (hover shows the path). */
+  function fileName(path: string): string {
+    return path.split(/[\\/]/).at(-1) ?? path;
+  }
+
+  /** The inputs show 1-based page numbers (what the page indicator shows); the backend
+   *  takes 0-based indices, so `pageA`/`pageB` stay 0-based internally. */
+  function parsePageInput(raw: string): number {
+    return Math.max(0, (parseInt(raw) || 1) - 1);
+  }
+
   const canCompare = $derived(pathA.length > 0 && pathB.length > 0 && !busy);
 
   // ---------------------------------------------------------------------------
@@ -62,35 +73,35 @@
   <div class="compare-files">
     <div class="compare-file-row">
       <span class="compare-file-label">File A (old):</span>
-      <span class="compare-file-path">{pathA || "(none selected)"}</span>
+      <span class="compare-file-path" title={pathA}>{fileName(pathA) || "(none selected)"}</span>
     </div>
     <div class="compare-file-row">
       <span class="compare-file-label">File B (new):</span>
-      <span class="compare-file-path">{pathB || "(none selected)"}</span>
+      <span class="compare-file-path" title={pathB}>{fileName(pathB) || "(none selected)"}</span>
     </div>
   </div>
 
   <div class="compare-pages">
     <label class="compare-page-label">
-      Page A (0-based)
+      Page A
       <input
         class="compare-page-input"
         data-testid="page-a-input"
         type="number"
-        min="0"
-        value={pageA}
-        oninput={(e) => { pageA = Math.max(0, parseInt((e.target as HTMLInputElement).value) || 0); }}
+        min="1"
+        value={pageA + 1}
+        oninput={(e) => { pageA = parsePageInput((e.target as HTMLInputElement).value); }}
       />
     </label>
     <label class="compare-page-label">
-      Page B (0-based)
+      Page B
       <input
         class="compare-page-input"
         data-testid="page-b-input"
         type="number"
-        min="0"
-        value={pageB}
-        oninput={(e) => { pageB = Math.max(0, parseInt((e.target as HTMLInputElement).value) || 0); }}
+        min="1"
+        value={pageB + 1}
+        oninput={(e) => { pageB = parsePageInput((e.target as HTMLInputElement).value); }}
       />
     </label>
   </div>

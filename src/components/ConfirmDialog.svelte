@@ -4,7 +4,7 @@
    * "remember this password?" and "save an unprotected copy?" flows so both
    * get one native <dialog> implementation instead of near-duplicate ones.
    *
-   * Keyboard: Enter = confirm, Escape = cancel.
+   * Keyboard: Enter = confirm (unless a button has focus, then that button's own action), Escape = cancel.
    * Follows the SavePromptDialog/PasswordPromptDialog pattern: native
    * <dialog>, CSS custom properties only, no Tailwind.
    */
@@ -31,7 +31,10 @@
     if (e.key === "Escape") {
       e.preventDefault();
       onCancel();
-    } else if (e.key === "Enter") {
+    } else if (e.key === "Enter" && !(e.target instanceof HTMLButtonElement)) {
+      // Enter confirms from the dialog body only. On a focused button the browser's own
+      // click runs (Cancel cancels, Confirm confirms); intercepting it here made
+      // Tab -> Cancel -> Enter confirm a destructive action.
       e.preventDefault();
       onConfirm();
     }

@@ -32,8 +32,11 @@
   import TabBar from "./components/TabBar.svelte";
   import SavePromptDialog from "./components/SavePromptDialog.svelte";
   import PasswordPromptDialog from "./components/PasswordPromptDialog.svelte";
-  import ConfirmDialog from "./components/ConfirmDialog.svelte";
-  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity, getPageCount } from "$lib/ipc";
+  import DocOpDialog from "./components/DocOpDialog.svelte";
+  import VersionPanel from "./components/VersionPanel.svelte";
+  import ToolbarMenu from "./components/ToolbarMenu.svelte";
+  import type { ToolbarMenuItem } from "./components/ToolbarMenu.svelte";
+  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, snapshotVersion, exportMarkupList, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity, getPageCount } from "$lib/ipc";
   import type { IndexStatus, OcrProgressEvent } from "$lib/ipc";
   import { listen } from "@tauri-apps/api/event";
   import { loadSettings, saveSettings } from "$lib/settings";
@@ -44,6 +47,7 @@
   import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import type { DocumentInfo, ImageQualityPreset } from "$lib/ipc";
   import { MarkupStore } from "$lib/markup-store.svelte";
   import { buildMarkup } from "$lib/markup-tools";
@@ -72,6 +76,16 @@
     resolveViewerModeToggleShortcut,
   } from "$lib/keyboard-shortcuts";
   import { runDocOpAndReseed, formatBytes } from "$lib/docops-handlers";
+  import {
+    baseName,
+    samePath,
+    prepareDocOp,
+    exportFormatFromPath,
+    exportDoneMessage,
+  } from "$lib/doc-op-flow";
+  import type { DocOpKind, DocOpMode } from "$lib/doc-op-flow";
+  import { dirtyDocIds, advanceQuit } from "$lib/close-guard";
+  import type { QuitDecision } from "$lib/close-guard";
   import ReadingView from "./components/ReadingView.svelte";
   import PageIndicator from "./components/PageIndicator.svelte";
   import ThumbnailPanel from "./components/ThumbnailPanel.svelte";
@@ -383,6 +397,23 @@
    *  no-op action and a real one look identical - see docops-handlers.ts's doc comment. */
   let docOpsStatus = $state<string | null>(null);
 
+  /** Document-rewriting action awaiting the user's confirm (copy vs replace); null when closed. */
+  let docOpPrompt = $state<DocOpKind | null>(null);
+  /** Bumped after an automatic snapshot so the History panel re-lists versions. */
+  let historyNonce = $state(0);
+  /** Bumped after a version restore so the Viewport remounts and re-renders tiles. */
+  let reloadNonce = $state(0);
+  /** Apply Redactions needs a Redact authoring tool to be useful; none exists yet
+   *  (UX audit F5, owner decision D3: hide it until one ships). Flip when it lands. */
+  const REDACT_AUTHORING_AVAILABLE = false;
+  /** Window width in CSS px - drives the toolbar's overflow menu (UX audit F4). */
+  let viewportWidth = $state(1440);
+  const COMPACT_TOOLBAR_BELOW = 1280;
+  const compactToolbar = $derived(viewportWidth < COMPACT_TOOLBAR_BELOW);
+  /** Doc ids still to be asked about (save / discard) while the window is closing;
+   *  empty when no close is in progress. */
+  let quitQueue = $state<string[]>([]);
+
   // --- Save-prompt dialog state ---
   /** docId of the document awaiting save/discard/cancel decision; null when dialog is hidden. */
   let savePromptDocId = $state<string | null>(null);
@@ -396,10 +427,6 @@
   /** Session-only password cache (never persisted) - avoids re-prompting for a
       file already unlocked earlier in this session. */
   const passwordCache = createPasswordCache();
-
-  // --- Remember-password prompt state (offered after a successful MANUAL
-  //     password entry - never after a cache-reuse or known-list auto-try). ---
-  let rememberPasswordPrompt = $state<{ docId: string; password: string } | null>(null);
 
   // --- Save-unprotected-copy prompt state (offered whenever an encrypted PDF
   //     finishes opening - manual entry, cache reuse, or known-list auto-try). ---
@@ -415,6 +442,8 @@
   let _dropUnlisten: (() => void) | undefined;
   // Cleanup handle for the OCR per-page progress event listener (Phase 2c-ii).
   let _ocrProgressUnlisten: (() => void) | undefined;
+  // Cleanup handle for the window close-requested guard.
+  let _closeUnlisten: (() => void) | undefined;
 
   // ---------------------------------------------------------------------------
   // Recent-docs MRU list (Document History panel)
@@ -498,6 +527,22 @@
   }
 
   onMount(async () => {
+    // Window close guard: intercept close-requested while any tab has unsaved mark-ups.
+    // preventDefault must run synchronously inside the handler (Tauri destroys the window
+    // right after an awaited handler returns unless it was prevented). Not available in a
+    // plain browser (vite dev without Tauri), so a failure here is non-fatal.
+    getCurrentWindow()
+      .onCloseRequested((event) => {
+        const dirty = dirtyDocIds(tabStore.tabs);
+        if (dirty.length === 0) return;
+        event.preventDefault();
+        quitQueue = dirty;
+      })
+      .then((unlisten) => {
+        _closeUnlisten = unlisten;
+      })
+      .catch((e) => console.error("close guard unavailable:", e));
+
     // Reading mode is a persisted viewer preference (owner request 2026-09-15) - load it
     // up front, independent of the license flow below. A load failure just keeps the
     // single-page default rather than blocking startup.
@@ -529,6 +574,7 @@
   onDestroy(() => {
     _dropUnlisten?.();
     _ocrProgressUnlisten?.();
+    _closeUnlisten?.();
     if (folderIndexPollTimer) clearInterval(folderIndexPollTimer);
   });
 
@@ -576,7 +622,7 @@
    * error banner; submitting the dialog re-invokes this function with the
    * entered password (see handlePasswordSubmit).
    */
-  async function openFilePath(path: string, password?: string) {
+  async function openFilePath(path: string, password?: string, remember = false) {
     // Dedup: if this path is already open, just switch to it.
     const existing = tabStore.findByPath(path);
     if (existing) {
@@ -604,17 +650,16 @@
       // Record successful open in the MRU history.
       void recordRecentDoc(doc);
 
-      // Encrypted-PDF follow-ups: offer to remember a just-typed password,
-      // then (either way) offer to save an unprotected copy. `password` here
-      // is this function's ARGUMENT (only set on a manual retry submitted
-      // from PasswordPromptDialog) - cache-reuse and known-list auto-try
-      // leave it undefined, so those skip straight to the copy offer.
+      // Encrypted-PDF follow-ups: a typed password is remembered when the user ticked
+      // the box in the password dialog (one dialog, not a second prompt), then a
+      // non-modal banner offers an unprotected copy.
       if (doc.was_encrypted) {
-        if (password) {
-          rememberPasswordPrompt = { docId: doc.doc_id, password };
-        } else {
-          unprotectedCopyPromptDocId = doc.doc_id;
+        if (password && remember) {
+          rememberPassword(password).catch((e) => {
+            openError = `Remember password failed: ${e instanceof Error ? e.message : String(e)}`;
+          });
         }
+        unprotectedCopyPromptDocId = doc.doc_id;
       }
 
       // Load markups and scales asynchronously (non-blocking).
@@ -651,10 +696,10 @@
   }
 
   /** PasswordPromptDialog submit handler: retry the open with the entered password. */
-  async function handlePasswordSubmit(password: string) {
+  async function handlePasswordSubmit(password: string, remember: boolean) {
     const path = passwordPromptPath;
     if (!path) return;
-    await openFilePath(path, password);
+    await openFilePath(path, password, remember);
   }
 
   /** PasswordPromptDialog cancel handler: abandon the open attempt cleanly. */
@@ -664,29 +709,9 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Encrypted-PDF follow-ups: remember-password prompt + save-unprotected-copy
+  // Encrypted-PDF follow-up: save-unprotected-copy
   // (backlog #10/#9 - save-unprotected-copy + known-password-list).
   // ---------------------------------------------------------------------------
-
-  /** Remember-password prompt confirmed: persist it, then offer the unprotected-copy save. */
-  async function handleRememberPasswordConfirm() {
-    const pending = rememberPasswordPrompt;
-    rememberPasswordPrompt = null;
-    if (!pending) return;
-    try {
-      await rememberPassword(pending.password);
-    } catch (e) {
-      openError = `Remember password failed: ${e instanceof Error ? e.message : String(e)}`;
-    }
-    unprotectedCopyPromptDocId = pending.docId;
-  }
-
-  /** Remember-password prompt declined: still offer the unprotected-copy save. */
-  function handleRememberPasswordDecline() {
-    const pending = rememberPasswordPrompt;
-    rememberPasswordPrompt = null;
-    if (pending) unprotectedCopyPromptDocId = pending.docId;
-  }
 
   /**
    * Shared save-unprotected-copy flow: prompts for a destination (defaulting
@@ -870,6 +895,13 @@
     }
   }
 
+  /** Point a tab at a new file path after the backend re-homed the document (Save As). */
+  function adoptPath(docId: string, dest: string) {
+    tabStore.tabs = tabStore.tabs.map((t) =>
+      t.docId === docId ? { ...t, doc: { ...t.doc, path: dest } } : t,
+    );
+  }
+
   async function handleSaveAs() {
     if (!activeTab || isSaving) return;
     openError = null;
@@ -880,12 +912,7 @@
       await activeTab.store.flush();
       await saveDocumentAs(activeTab.docId, dest);
       activeTab.store.clearDirty();
-      // Update the path in the active tab's doc record.
-      tabStore.tabs = tabStore.tabs.map((t) =>
-        t.docId === activeTab.docId
-          ? { ...t, doc: { ...t.doc, path: dest } }
-          : t,
-      );
+      adoptPath(activeTab.docId, dest);
     } catch (e) {
       openError = `Save As failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
@@ -897,39 +924,36 @@
   // DocOps handlers (M5) — operate on the active tab
   // ---------------------------------------------------------------------------
 
-  async function handleFlatten() {
-    if (!activeTab || isFlattening) return;
-    openError = null;
-    docOpsStatus = null;
-    isFlattening = true;
-    const docId = activeTab.docId;
-    const store = activeTab.store;
-    try {
-      const count = await runDocOpAndReseed(
-        docId,
-        store,
-        { loadMarkups },
-        () => flattenDocument(docId),
-      );
-      docOpsStatus =
-        count === 0
-          ? "Flatten: no annotations with an appearance found on this document - nothing to flatten."
-          : `Flatten complete - ${count} annotation${count === 1 ? "" : "s"} baked into page content.`;
-    } catch (e) {
-      openError = `Flatten failed: ${e instanceof Error ? e.message : String(e)}`;
-    } finally {
-      isFlattening = false;
-    }
+  /**
+   * Flatten / Optimise / Apply Redactions rewrite the document, so each one opens
+   * DocOpDialog first (UX audit F1): what will happen, then copy (default) or replace.
+   */
+  function requestDocOp(kind: DocOpKind) {
+    if (!activeTab || isFlattening || isOptimizing || isRedacting || isSaving) return;
+    docOpPrompt = kind;
   }
 
-  async function handleOptimize() {
-    if (!activeTab || isOptimizing) return;
-    openError = null;
-    docOpsStatus = null;
-    isOptimizing = true;
-    const docId = activeTab.docId;
-    const store = activeTab.store;
-    try {
+  async function handleDocOpConfirm(mode: DocOpMode) {
+    const kind = docOpPrompt;
+    docOpPrompt = null;
+    if (kind) await performDocOp(kind, mode);
+  }
+
+  function setDocOpBusy(kind: DocOpKind, busy: boolean) {
+    if (kind === "flatten") isFlattening = busy;
+    else if (kind === "optimize") isOptimizing = busy;
+    else isRedacting = busy;
+  }
+
+  /** The backend operation itself plus the user-facing summary line. */
+  async function runDocOpBody(kind: DocOpKind, docId: string, store: MarkupStore): Promise<string> {
+    if (kind === "flatten") {
+      const count = await runDocOpAndReseed(docId, store, { loadMarkups }, () => flattenDocument(docId));
+      return count === 0
+        ? "Flatten: no annotations with an appearance found on this document - nothing to flatten."
+        : `Flatten complete - ${count} annotation${count === 1 ? "" : "s"} baked into page content.`;
+    }
+    if (kind === "optimize") {
       const report = await runDocOpAndReseed(
         docId,
         store,
@@ -944,37 +968,150 @@
             ? ` (${images_recompressed} of ${images_total} image${images_total === 1 ? "" : "s"} recompressed, ${images_downsampled} downsampled)`
             : ` (0 of ${images_total} image${images_total === 1 ? "" : "s"} could be recompressed further)`
           : "";
-      docOpsStatus =
-        saved > 0
-          ? `Optimize complete - file size reduced from ${formatBytes(report.bytes_before)} to ${formatBytes(report.bytes_after)} (saved ${formatBytes(saved)})${imageNote}.`
-          : `Optimize complete - the file was already optimal; no size reduction${imageNote}.`;
+      return saved > 0
+        ? `Optimise complete - file size reduced from ${formatBytes(report.bytes_before)} to ${formatBytes(report.bytes_after)} (saved ${formatBytes(saved)})${imageNote}.`
+        : `Optimise complete - the file was already optimal; no size reduction${imageNote}.`;
+    }
+    await runDocOpAndReseed(docId, store, { loadMarkups }, () => redactDocument(docId, [], true));
+    return "Apply Redactions complete.";
+  }
+
+  /**
+   * Run a document-rewriting action safely (UX audit F1). "copy" (the default) writes the
+   * current document to a new file first and runs the action on that copy, leaving the
+   * original untouched. "replace" saves, takes an automatic History snapshot, then rewrites
+   * the original; if the snapshot fails the action is NOT run.
+   */
+  async function performDocOp(kind: DocOpKind, requested: DocOpMode) {
+    const tab = activeTab;
+    if (!tab) return;
+    const docId = tab.docId;
+    const store = tab.store;
+    openError = null;
+    docOpsStatus = null;
+    setDocOpBusy(kind, true);
+    try {
+      const prepared = await prepareDocOp(kind, requested, {
+        currentPath: tab.doc.path,
+        flush: () => store.flush(),
+        pickCopyDest: (defaultPath) =>
+          saveDialog({
+            title: "Save the result as a copy",
+            defaultPath,
+            filters: [{ name: "PDF", extensions: ["pdf"] }],
+          }),
+        isOpenInAnotherTab: (dest) =>
+          tabStore.tabs.some((t) => t.docId !== docId && samePath(t.doc.path, dest)),
+        saveAs: (dest) => saveDocumentAs(docId, dest),
+        save: () => saveDocument(docId),
+        snapshot: async (label) => {
+          await snapshotVersion(docId, label);
+          historyNonce += 1;
+        },
+        adoptPath: (dest) => adoptPath(docId, dest),
+        clearDirty: () => store.clearDirty(),
+      });
+      if (!prepared.proceed) return; // user backed out of the file dialog: nothing has changed
+      const note = prepared.note;
+      const summary = await runDocOpBody(kind, docId, store);
+      docOpsStatus = `${note}${summary}`;
     } catch (e) {
-      openError = `Optimize failed: ${e instanceof Error ? e.message : String(e)}`;
+      const name = kind === "flatten" ? "Flatten" : kind === "optimize" ? "Optimise" : "Apply Redactions";
+      openError = `${name} failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
-      isOptimizing = false;
+      setDocOpBusy(kind, false);
     }
   }
 
-  async function handleRedact() {
-    if (!activeTab || isRedacting) return;
+  /** Re-sync the UI after the History panel restored an older version of the file. */
+  async function handleVersionRestore() {
+    const tab = activeTab;
+    if (!tab) return;
+    try {
+      const markups = await loadMarkups(tab.docId);
+      tab.store.seed(markups);
+      tab.store.clearDirty();
+      await handleThumbnailPageOp();
+      reloadNonce += 1;
+      docOpsStatus = "Version restored from History.";
+    } catch (e) {
+      openError = `Reload after restore failed: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  }
+
+  /**
+   * Export the mark-up list (XLSX or CSV, chosen by the file extension in the save dialog).
+   * Available whenever the document has any mark-up, not only measurements (UX audit F3).
+   */
+  async function handleExportMarkupList() {
+    const tab = activeTab;
+    if (!tab || tab.store.markups.length === 0) return;
     openError = null;
     docOpsStatus = null;
-    isRedacting = true;
-    const docId = activeTab.docId;
-    const store = activeTab.store;
+    const dest = await saveDialog({
+      title: "Export mark-up list",
+      defaultPath: `${tab.doc.path.replace(/\.pdf$/i, "")}-markups.xlsx`,
+      filters: [
+        { name: "Excel workbook", extensions: ["xlsx"] },
+        { name: "CSV", extensions: ["csv"] },
+      ],
+    });
+    if (!dest) return;
     try {
-      await runDocOpAndReseed(
-        docId,
-        store,
-        { loadMarkups },
-        () => redactDocument(docId, [], true),
-      );
-      docOpsStatus = "Apply Redactions complete.";
+      await tab.store.flush();
+      await exportMarkupList(tab.docId, dest, exportFormatFromPath(dest));
+      docOpsStatus = exportDoneMessage(dest, tab.store.markups.length);
     } catch (e) {
-      openError = `Redact failed: ${e instanceof Error ? e.message : String(e)}`;
-    } finally {
-      isRedacting = false;
+      openError = `Export failed: ${e instanceof Error ? e.message : String(e)}`;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Window close guard (UX audit F2) - ask about each tab with unsaved mark-ups
+  // before the window goes away.
+  // ---------------------------------------------------------------------------
+
+  async function finishQuitStep(decision: QuitDecision) {
+    const step = advanceQuit(quitQueue, decision);
+    if (step.action === "prompt") {
+      quitQueue = step.queue;
+    } else if (step.action === "abort") {
+      quitQueue = [];
+    } else {
+      quitQueue = [];
+      try {
+        await getCurrentWindow().destroy();
+      } catch (e) {
+        openError = `Could not close the window: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+  }
+
+  async function handleQuitSave() {
+    const docId = quitQueue[0];
+    const tab = tabStore.tabs.find((t) => t.docId === docId);
+    if (tab) {
+      try {
+        await tab.store.flush();
+        await saveDocument(docId);
+        tab.store.clearDirty();
+      } catch (e) {
+        // Keep the window open: closing now would lose this tab's mark-ups.
+        openError = `Save failed: ${e instanceof Error ? e.message : String(e)}`;
+        quitQueue = [];
+        return;
+      }
+    }
+    await finishQuitStep("save");
+  }
+
+  async function handleQuitDiscard() {
+    tabStore.tabs.find((t) => t.docId === quitQueue[0])?.store.clearDirty();
+    await finishQuitStep("discard");
+  }
+
+  function handleQuitCancel() {
+    void finishQuitStep("cancel");
   }
 
   /**
@@ -1040,6 +1177,118 @@
     });
     if (selected && !Array.isArray(selected)) comparePathB = selected as string;
   }
+
+  const COMPARE_BROWSE = "__browse__";
+
+  /** A Compare picker changed: an open tab's path, or "Browse…" for a file on disk. */
+  function onCompareSelect(side: "A" | "B", value: string) {
+    if (value === COMPARE_BROWSE) {
+      void (side === "A" ? handlePickCompareA() : handlePickCompareB());
+      return;
+    }
+    if (side === "A") comparePathA = value;
+    else comparePathB = value;
+  }
+
+  /** Open/close the Compare bar; opening presets File A to the active tab. */
+  function toggleCompare() {
+    compareVisible = !compareVisible;
+    if (compareVisible && !comparePathA && activeTab) comparePathA = activeTab.doc.path;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Toolbar menus (UX audit F4): File / Edit / Document / View groups, with the less
+  // common actions folded into a "More" menu on narrow windows.
+  // ---------------------------------------------------------------------------
+
+  const docBusy = $derived(isFlattening || isOptimizing || isRedacting || isSaving);
+  const hasMarkups = $derived((activeTab?.store.markups.length ?? 0) > 0);
+
+  const documentMenuItems = $derived.by<ToolbarMenuItem[]>(() => {
+    const items: ToolbarMenuItem[] = [
+      {
+        id: "flatten",
+        label: "Flatten annotations…",
+        title: "Bake annotation appearances into page content (asks before it runs)",
+        disabled: !activeTab || docBusy,
+        onselect: () => requestDocOp("flatten"),
+      },
+      {
+        id: "optimize",
+        label: "Optimise file size…",
+        title: "Remove unused objects, compress streams and recompress images (asks before it runs)",
+        disabled: !activeTab || docBusy,
+        onselect: () => requestDocOp("optimize"),
+      },
+    ];
+    if (REDACT_AUTHORING_AVAILABLE) {
+      items.push({
+        id: "redact",
+        label: "Apply Redactions…",
+        title: "Permanently cover all Redact-marked regions (asks before it runs)",
+        disabled: !activeTab || docBusy,
+        onselect: () => requestDocOp("redact"),
+      });
+    }
+    items.push(
+      {
+        id: "ocr",
+        label: isOcrRunning && ocrRunningDocId === activeTab?.docId ? "OCR running…" : "OCR this document",
+        title: "Recognise scanned text and embed it as an invisible, searchable layer",
+        disabled: !activeTab || isOcrRunning || isSaving,
+        onselect: () => void handleRunOcr(),
+      },
+      {
+        id: "unprotected",
+        label: isSavingUnprotectedCopy ? "Saving…" : "Save Unprotected Copy…",
+        title: "Save a copy of this PDF with its password protection removed",
+        disabled: !activeTab?.isEncrypted || isSavingUnprotectedCopy,
+        separator: true,
+        onselect: () => void handleSaveUnprotectedCopyMenuAction(),
+      },
+    );
+    for (const [value, label] of [
+      ["high", "High quality"],
+      ["balanced", "Balanced"],
+      ["small", "Small file"],
+    ] as const) {
+      items.push({
+        id: `quality-${value}`,
+        label: `${imageQualityPreset === value ? "✓" : "\u2003"} Optimise images: ${label}`,
+        title: "Image quality used by Optimise (trades file size against image quality)",
+        separator: value === "high",
+        onselect: () => (imageQualityPreset = value),
+      });
+    }
+    return items;
+  });
+
+  const moreMenuItems = $derived.by<ToolbarMenuItem[]>(() => [
+    { id: "save-as", label: "Save As…", disabled: !activeTab || isSaving, onselect: () => void handleSaveAs() },
+    {
+      id: "export-list",
+      label: "Export mark-up list…",
+      disabled: !hasMarkups,
+      onselect: () => void handleExportMarkupList(),
+    },
+    {
+      id: "find",
+      label: "Find (Ctrl/Cmd+F)",
+      separator: true,
+      onselect: () => (searchPanelVisible ? (searchPanelVisible = false) : void openSearchPanel()),
+    },
+    { id: "compare", label: compareVisible ? "Hide Compare" : "Compare revisions", onselect: toggleCompare },
+    {
+      id: "reading",
+      label: viewerMode === "reading" ? "Switch to single-page view" : "Switch to reading mode",
+      onselect: () => void toggleViewerMode(),
+    },
+    { id: "left", label: "Toggle left sidebar", separator: true, onselect: () => (leftCollapsed = !leftCollapsed) },
+    { id: "right", label: "Toggle right sidebar", onselect: () => (rightCollapsed = !rightCollapsed) },
+    { id: "bottom", label: "Toggle quantities panel", onselect: () => (bottomCollapsed = !bottomCollapsed) },
+    { id: "settings", label: "Settings", separator: true, onselect: () => (settingsOpen = true) },
+    { id: "about", label: "About Redline", onselect: () => (aboutOpen = true) },
+  ]);
 
   // ---------------------------------------------------------------------------
   // Keyboard shortcuts
@@ -1121,12 +1370,12 @@
   }
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
+<svelte:window onkeydown={handleKeydown} bind:innerWidth={viewportWidth} />
 
 {#if licenseState === null}
-  <!-- Initial license check in flight - avoid a flash of the activation gate
+  <!-- Initial licence check in flight - avoid a flash of the activation gate
        for the common case (already-activated install). -->
-  <div class="app-shell license-checking"></div>
+  <div class="app-shell license-checking"><p class="license-checking-text" role="status">Checking licence…</p></div>
 {:else if !isUsable(licenseState)}
   <ActivationGate licenseState={licenseState} onActivated={handleActivated} />
 {:else}
@@ -1135,81 +1384,60 @@
   <header class="toolbar">
     <div class="toolbar-left">
       <span class="app-name">Redline</span>
-      <button class="btn-toolbar" onclick={handleOpenFile} disabled={isOpening}>
-        {isOpening ? "Opening…" : "Open PDF"}
-      </button>
-      <button
-        class="btn-toolbar"
-        onclick={() => (searchPanelVisible ? (searchPanelVisible = false) : void openSearchPanel())}
-        title="Find (Cmd/Ctrl+F)"
-      >
-        {searchPanelVisible ? "🔍 Find ▲" : "🔍 Find"}
-      </button>
-      <button class="btn-toolbar" onclick={handleSave} disabled={!activeTab || isSaving} title="Save (Cmd/Ctrl+S)">
-        {isSaving ? "Saving…" : "Save"}
-      </button>
-      <button class="btn-toolbar" onclick={handleSaveAs} disabled={!activeTab || isSaving} title="Save As…">
-        Save As…
-      </button>
-      <UndoRedoControls store={activeTab?.store ?? null} />
-      <button
-        class="btn-toolbar"
-        onclick={handleSaveUnprotectedCopyMenuAction}
-        disabled={!activeTab?.isEncrypted || isSavingUnprotectedCopy}
-        title="Save a copy of this PDF with its password protection removed"
-      >
-        {isSavingUnprotectedCopy ? "Saving…" : "Save Unprotected Copy…"}
-      </button>
-      <button
-        class="btn-toolbar btn-docops"
-        onclick={handleFlatten}
-        disabled={!activeTab || isFlattening || isSaving}
-        title="Flatten — bake annotation appearances into page content (irreversible)"
-      >
-        {isFlattening ? "Flattening…" : "Flatten"}
-      </button>
-      <select
-        class="toolbar-select"
-        bind:value={imageQualityPreset}
-        disabled={!activeTab || isOptimizing || isSaving}
-        title="Image quality for Optimize — trades file size against raster image quality (Bluebeam-style compression preset)"
-        aria-label="Optimize image quality preset"
-      >
-        <option value="high">High quality</option>
-        <option value="balanced">Balanced</option>
-        <option value="small">Small file</option>
-      </select>
-      <button
-        class="btn-toolbar btn-docops"
-        onclick={handleOptimize}
-        disabled={!activeTab || isOptimizing || isSaving}
-        title="Optimize — remove unused objects, compress streams, and recompress images to reduce file size"
-      >
-        {isOptimizing ? "Optimizing…" : "Optimize"}
-      </button>
-      <button
-        class="btn-toolbar btn-docops"
-        onclick={handleRedact}
-        disabled={!activeTab || isRedacting || isSaving}
-        title="Apply Redactions — permanently cover all Redact-marked regions with solid-black overlays (irreversible)"
-      >
-        {isRedacting ? "Redacting…" : "Apply Redactions"}
-      </button>
-      <button
-        class="btn-toolbar btn-docops"
-        onclick={handleRunOcr}
-        disabled={!activeTab || isOcrRunning || isSaving}
-        title="OCR this document — recognize scanned text and embed it as an invisible, searchable layer"
-      >
-        {isOcrRunning && ocrRunningDocId === activeTab?.docId ? "OCR running…" : "OCR this document"}
-      </button>
-      <button
-        class="btn-toolbar btn-compare-toggle"
-        onclick={() => (compareVisible = !compareVisible)}
-        title="Toggle compare panel — diff two PDF revisions (spec §10)"
-      >
-        {compareVisible ? "Compare ▲" : "Compare"}
-      </button>
+
+      <!-- File -->
+      <div class="toolbar-group" role="group" aria-label="File">
+        <button class="btn-toolbar" onclick={handleOpenFile} disabled={isOpening}>
+          {isOpening ? "Opening…" : "Open PDF"}
+        </button>
+        <button class="btn-toolbar" onclick={handleSave} disabled={!activeTab || isSaving} title="Save (Cmd/Ctrl+S)">
+          {isSaving ? "Saving…" : "Save"}
+        </button>
+        {#if !compactToolbar}
+          <button class="btn-toolbar" onclick={handleSaveAs} disabled={!activeTab || isSaving} title="Save As…">
+            Save As…
+          </button>
+          <button
+            class="btn-toolbar"
+            data-testid="export-markup-list"
+            onclick={handleExportMarkupList}
+            disabled={!hasMarkups}
+            title={hasMarkups
+              ? "Export every mark-up (type, page, subject, author, contents, status) to Excel or CSV"
+              : "Add a mark-up to enable the mark-up list export"}
+          >
+            Export mark-up list…
+          </button>
+        {/if}
+      </div>
+
+      <span class="toolbar-sep" aria-hidden="true"></span>
+
+      <!-- Edit -->
+      <div class="toolbar-group" role="group" aria-label="Edit">
+        <UndoRedoControls store={activeTab?.store ?? null} />
+        {#if !compactToolbar}
+          <button
+            class="btn-toolbar"
+            onclick={() => (searchPanelVisible ? (searchPanelVisible = false) : void openSearchPanel())}
+            title="Find (Cmd/Ctrl+F)"
+          >
+            {searchPanelVisible ? "🔍 Find ▲" : "🔍 Find"}
+          </button>
+        {/if}
+      </div>
+
+      <span class="toolbar-sep" aria-hidden="true"></span>
+
+      <!-- Document: rare and destructive operations live in one menu -->
+      <ToolbarMenu
+        label="Document"
+        title="Flatten, optimise, OCR and other operations that rewrite the file"
+        items={documentMenuItems}
+        disabled={!activeTab}
+        testId="document-menu"
+      />
+
       {#if activeTab}
         <PageIndicator
           currentPage={activeTab.viewportSnapshot.pageIndex}
@@ -1222,37 +1450,78 @@
       {/if}
     </div>
     <div class="toolbar-right">
-      <button
-        class="btn-toolbar btn-icon"
-        class:btn-icon-active={viewerMode === "reading"}
-        onclick={toggleViewerMode}
-        title="Toggle continuous reading mode (Ctrl/Cmd+Shift+R)"
-      >{viewerMode === "reading" ? "📖 Reading" : "📖"}</button>
-      <button
-        class="btn-toolbar btn-icon"
-        onclick={() => (leftCollapsed = !leftCollapsed)}
-        title="Toggle left panel"
-      >☰</button>
-      <button
-        class="btn-toolbar btn-icon"
-        onclick={() => (rightCollapsed = !rightCollapsed)}
-        title="Toggle right panel"
-      >☰</button>
-      <button
-        class="btn-toolbar btn-icon"
-        onclick={() => (bottomCollapsed = !bottomCollapsed)}
-        title="Toggle markups list"
-      >▼</button>
-      <button
-        class="btn-toolbar btn-icon"
-        onclick={() => (settingsOpen = true)}
-        title="Settings"
-      >⚙</button>
-      <button
-        class="btn-toolbar btn-icon"
-        onclick={() => (aboutOpen = true)}
-        title="About Redline"
-      >ⓘ</button>
+      {#if compactToolbar}
+        <!-- Narrow window: the rest of File / Edit / View collapses into one menu. -->
+        <ToolbarMenu label="More" items={moreMenuItems} align="right" testId="more-menu" />
+      {:else}
+        <!-- View -->
+        <div class="toolbar-group" role="group" aria-label="View">
+          <button
+            class="btn-toolbar btn-compare-toggle"
+            onclick={toggleCompare}
+            title="Toggle compare panel - diff two PDF revisions (spec §10)"
+          >
+            {compareVisible ? "Compare ▲" : "Compare"}
+          </button>
+          <button
+            class="btn-toolbar btn-icon"
+            class:btn-icon-active={viewerMode === "reading"}
+            onclick={toggleViewerMode}
+            title="Toggle continuous reading mode (Ctrl/Cmd+Shift+R)"
+          >{viewerMode === "reading" ? "📖 Reading" : "📖"}</button>
+          <button
+            class="btn-toolbar btn-icon"
+            class:btn-icon-active={!leftCollapsed}
+            onclick={() => (leftCollapsed = !leftCollapsed)}
+            title="Toggle left sidebar"
+            aria-label="Toggle left sidebar"
+            aria-pressed={!leftCollapsed}
+          >
+            <svg class="sidebar-icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+              <rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke="currentColor" />
+              <rect x="1.5" y="2.5" width="5" height="11" rx="1.5" fill="currentColor" />
+            </svg>
+          </button>
+          <button
+            class="btn-toolbar btn-icon"
+            class:btn-icon-active={!rightCollapsed}
+            onclick={() => (rightCollapsed = !rightCollapsed)}
+            title="Toggle right sidebar (Properties)"
+            aria-label="Toggle right sidebar"
+            aria-pressed={!rightCollapsed}
+          >
+            <svg class="sidebar-icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+              <rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke="currentColor" />
+              <rect x="9.5" y="2.5" width="5" height="11" rx="1.5" fill="currentColor" />
+            </svg>
+          </button>
+          <button
+            class="btn-toolbar btn-icon"
+            class:btn-icon-active={!bottomCollapsed}
+            onclick={() => (bottomCollapsed = !bottomCollapsed)}
+            title="Toggle quantities panel (takeoff measurements)"
+            aria-label="Toggle quantities panel"
+            aria-pressed={!bottomCollapsed}
+          >
+            <svg class="sidebar-icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+              <rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke="currentColor" />
+              <rect x="1.5" y="9" width="13" height="4.5" rx="1.5" fill="currentColor" />
+            </svg>
+          </button>
+          <button
+            class="btn-toolbar btn-icon"
+            onclick={() => (settingsOpen = true)}
+            title="Settings"
+            aria-label="Settings"
+          >⚙</button>
+          <button
+            class="btn-toolbar btn-icon"
+            onclick={() => (aboutOpen = true)}
+            title="About Redline"
+            aria-label="About Redline"
+          >ⓘ</button>
+        </div>
+      {/if}
     </div>
   </header>
 
@@ -1269,12 +1538,26 @@
   {#if compareVisible}
     <div class="compare-bar">
       <div class="compare-bar-pickers">
-        <button class="btn-toolbar" onclick={handlePickCompareA}>
-          {comparePathA ? "A: " + comparePathA.split(/[\\/]/).at(-1) : "Pick File A (old)…"}
-        </button>
-        <button class="btn-toolbar" onclick={handlePickCompareB}>
-          {comparePathB ? "B: " + comparePathB.split(/[\\/]/).at(-1) : "Pick File B (new)…"}
-        </button>
+        {#each [["A", "File A (old)", comparePathA], ["B", "File B (new)", comparePathB]] as [side, label, current] (side)}
+          <label class="compare-pick">
+            <span class="compare-pick-label">{label}</span>
+            <select
+              class="toolbar-select"
+              value={current}
+              aria-label={label}
+              onchange={(e) => onCompareSelect(side as "A" | "B", (e.target as HTMLSelectElement).value)}
+            >
+              <option value="" disabled>Choose a file…</option>
+              {#if current && !tabStore.tabs.some((t) => t.doc.path === current)}
+                <option value={current}>{baseName(current as string)}</option>
+              {/if}
+              {#each tabStore.tabs as t (t.docId)}
+                <option value={t.doc.path}>{baseName(t.doc.path)}{t.docId === tabStore.activeDocId ? " (current tab)" : ""}</option>
+              {/each}
+              <option value={COMPARE_BROWSE}>Browse…</option>
+            </select>
+          </label>
+        {/each}
       </div>
       <ComparePanel pathA={comparePathA} pathB={comparePathB} />
     </div>
@@ -1294,6 +1577,15 @@
          frontend - a locked-markup edit or a genuine sync failure had no visible signal
          at all. Reuses the existing error-banner style. -->
     <div class="error-banner">{activeTab.store.mirrorError}</div>
+  {/if}
+
+  {#if unprotectedCopyPromptDocId !== null}
+    <!-- Non-modal offer (was a third modal in the encrypted-open chain, UX audit F9). -->
+    <div class="docops-status-banner unprotected-offer" role="status">
+      <span>This PDF is password-protected. Save a copy with no open password?</span>
+      <button class="btn-toolbar" onclick={handleUnprotectedCopyPromptConfirm}>Save copy…</button>
+      <button class="btn-toolbar" onclick={handleUnprotectedCopyPromptCancel}>Dismiss</button>
+    </div>
   {/if}
 
   {#if docOpsStatus}
@@ -1416,6 +1708,29 @@
             {/if}
           </Accordion>
         </div>
+        <!-- History: version snapshots (automatic before every in-place Flatten /
+             Optimise / Redactions, plus manual). Makes the restore path reachable (UX
+             audit F1). The key re-lists versions after an automatic snapshot. -->
+        <div class="panel-section panel-section--secondary">
+          <Accordion
+            title="History"
+            storageKey="left-history"
+            bodyClass="panel-body panel-body-flush"
+            testId="accordion-history"
+          >
+            {#if activeTab}
+              {#key activeTab.docId + ":" + historyNonce}
+                <VersionPanel
+                  docId={activeTab.docId}
+                  hasUnsavedMarkups={activeTab.store.dirty}
+                  onRestore={handleVersionRestore}
+                />
+              {/key}
+            {:else}
+              <p class="panel-hint muted">Open a PDF to see its saved versions.</p>
+            {/if}
+          </Accordion>
+        </div>
       </aside>
     {/if}
 
@@ -1425,7 +1740,7 @@
       {#if activeTab}
         <!-- Key forces a remount both when switching tabs AND when toggling viewer mode,
              so initialState (zoom/page/scroll snapshot) takes effect fresh either way. -->
-        {#key activeTab.docId + ":" + viewerMode}
+        {#key activeTab.docId + ":" + viewerMode + ":" + reloadNonce}
           {#if viewerMode === "reading"}
             <!-- ReadingView has no MarkupStore/ToolPalette - the I-beam text-selection
                  tool (and its onsearchtext callback) doesn't exist in this mode, so
@@ -1483,7 +1798,7 @@
   {#if !bottomCollapsed}
     <div class="bottom-panel">
       <Accordion
-        title={activeTab ? "Takeoff — Quantities" : "Markups / Comments"}
+        title="Quantities"
         storageKey="bottom-panel"
         bodyClass="panel-body panel-body-flush"
         testId="accordion-bottom-panel"
@@ -1495,7 +1810,7 @@
             docId={activeTab.docId}
           />
         {:else}
-          <p class="panel-hint muted">Open a PDF to see measurements.</p>
+          <p class="panel-hint muted">Open a PDF to see quantities.</p>
         {/if}
       </Accordion>
     </div>
@@ -1521,29 +1836,27 @@
     />
   {/if}
 
-  <!-- Remember-password prompt - shown after a successful MANUAL password entry -->
-  {#if rememberPasswordPrompt !== null}
-    <ConfirmDialog
-      title="Remember password?"
-      message="Remember this password so future opens of encrypted PDFs try it automatically?"
-      hint="Stored obfuscated on this device - not a secure credential store, but not plaintext either."
-      confirmLabel="Remember"
-      cancelLabel="Not now"
-      onConfirm={handleRememberPasswordConfirm}
-      onCancel={handleRememberPasswordDecline}
+  <!-- Flatten / Optimise / Apply Redactions confirm: what happens, copy vs replace -->
+  {#if docOpPrompt !== null && activeTab}
+    <DocOpDialog
+      kind={docOpPrompt}
+      path={activeTab.doc.path}
+      onConfirm={handleDocOpConfirm}
+      onCancel={() => (docOpPrompt = null)}
     />
   {/if}
 
-  <!-- Save-unprotected-copy prompt - shown whenever an encrypted PDF finishes opening -->
-  {#if unprotectedCopyPromptDocId !== null}
-    <ConfirmDialog
-      title="Save an unprotected copy?"
-      message="This PDF is password-protected. Save a copy with no open password?"
-      confirmLabel="Save Copy…"
-      cancelLabel="Not now"
-      onConfirm={handleUnprotectedCopyPromptConfirm}
-      onCancel={handleUnprotectedCopyPromptCancel}
-    />
+  <!-- Window-close guard: one save prompt per tab with unsaved mark-ups -->
+  {#if quitQueue.length > 0}
+    {@const quitTab = tabStore.tabs.find((t) => t.docId === quitQueue[0])}
+    {#if quitTab}
+      <SavePromptDialog
+        filename={baseName(quitTab.doc.path)}
+        onSave={handleQuitSave}
+        onDiscard={handleQuitDiscard}
+        onCancel={handleQuitCancel}
+      />
+    {/if}
   {/if}
 
   <!-- Settings dialog -->
@@ -1622,6 +1935,38 @@
     align-items: center;
     gap: var(--space-2);
   }
+  .toolbar-group {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .toolbar-sep {
+    width: 1px;
+    height: 20px;
+    background: var(--color-border);
+    margin: 0 var(--space-1);
+  }
+  .sidebar-icon {
+    display: block;
+  }
+  .compare-pick {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--font-size-sm);
+    color: var(--color-text-secondary);
+  }
+  .unprotected-offer {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+  }
+  .license-checking-text {
+    margin: 0;
+    padding: var(--space-5);
+    color: var(--color-text-secondary);
+    font-size: var(--font-size-sm);
+  }
   .app-name {
     font-weight: 600;
     font-size: var(--font-size-base);
@@ -1647,13 +1992,6 @@
   .btn-toolbar:hover:not(:disabled) { background: var(--color-bg-hover); }
   .btn-toolbar:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn-toolbar.btn-icon { padding: var(--space-1) var(--space-2); }
-  .btn-toolbar.btn-docops {
-    border-color: var(--color-warning, #b45309);
-    color: var(--color-warning, #b45309);
-  }
-  .btn-toolbar.btn-docops:hover:not(:disabled) {
-    background: var(--color-warning-surface, #fffbeb);
-  }
   .btn-toolbar.btn-compare-toggle {
     border-color: var(--color-primary, #2563eb);
     color: var(--color-primary, #2563eb);

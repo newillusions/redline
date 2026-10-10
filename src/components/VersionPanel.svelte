@@ -6,6 +6,7 @@
    * The user can take a new snapshot (with an optional label) and restore any prior
    * snapshot back over the live PDF.
    */
+  import ConfirmDialog from "./ConfirmDialog.svelte";
   import {
     listDocumentVersions,
     snapshotVersion,
@@ -17,9 +18,11 @@
     docId: string;
     /** Called after a successful restore so the parent can reload the document. */
     onRestore?: () => void;
+    /** True when the open document has mark-ups not yet saved: a restore discards them. */
+    hasUnsavedMarkups?: boolean;
   }
 
-  const { docId, onRestore }: Props = $props();
+  const { docId, onRestore, hasUnsavedMarkups = false }: Props = $props();
 
   // ---------------------------------------------------------------------------
   // State
@@ -63,6 +66,26 @@
     } finally {
       busy = false;
     }
+  }
+
+  /** The version the user clicked Restore on, awaiting confirmation; null when none. */
+  let pendingRestore = $state<VersionRecord | null>(null);
+
+  function requestRestore(ver: VersionRecord) {
+    if (busy) return;
+    pendingRestore = ver;
+  }
+
+  const restoreHint = $derived(
+    hasUnsavedMarkups
+      ? "Unsaved mark-ups on this tab will be lost. The saved file is kept in History as \"Before restore\", but mark-ups not yet saved are not part of it."
+      : "The current file is kept in History as \"Before restore\", so you can undo this restore.",
+  );
+
+  async function confirmRestore() {
+    const ver = pendingRestore;
+    pendingRestore = null;
+    if (ver) await handleRestore(ver.id);
   }
 
   async function handleRestore(versionId: string) {
@@ -138,7 +161,7 @@
         <button
           class="version-panel__restore-btn"
           data-testid="restore-btn"
-          onclick={() => handleRestore(ver.id)}
+          onclick={() => requestRestore(ver)}
           disabled={busy}
         >
           Restore
@@ -151,6 +174,18 @@
     {/if}
   </ul>
 </div>
+
+{#if pendingRestore}
+  <ConfirmDialog
+    title="Restore this version?"
+    message={`Replace the current file with the version from ${fmtDate(pendingRestore.created_at)}${pendingRestore.label ? ` (${pendingRestore.label})` : ""}? That version is used up by the restore.`}
+    hint={restoreHint}
+    confirmLabel="Restore"
+    cancelLabel="Cancel"
+    onConfirm={confirmRestore}
+    onCancel={() => (pendingRestore = null)}
+  />
+{/if}
 
 <style>
   .version-panel {

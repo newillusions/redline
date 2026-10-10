@@ -49,10 +49,10 @@
   open
   class="grace-warning"
   aria-modal="true"
-  aria-label="License offline"
+  aria-label="Licence offline"
   onkeydown={handleKeyDown}
 >
-  <h3 class="grace-title">Redline could not verify your license online</h3>
+  <h3 class="grace-title">Redline could not verify your licence online</h3>
   <p class="grace-message">
     This device has been offline since {new Date(state.expired_at).toLocaleDateString(undefined, {
       year: "numeric",

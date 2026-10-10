@@ -19,17 +19,19 @@
     filename: string;
     /** Set when re-prompting after a wrong password; null on the first prompt. */
     errorHint: string | null;
-    /** Called with the entered password when the user submits. */
-    onSubmit: (password: string) => void;
+    /** Called with the entered password and the "remember on this device" choice. */
+    onSubmit: (password: string, remember: boolean) => void;
     /** Called when the user cancels - the open attempt is abandoned cleanly. */
     onCancel: () => void;
   } = $props();
 
   let password = $state("");
+  /** Folded in from the former separate "Remember password?" dialog (UX audit F9). */
+  let remember = $state(false);
 
   function submit() {
     if (!password) return;
-    onSubmit(password);
+    onSubmit(password, remember);
   }
 
   function handleKeyDown(e: KeyboardEvent) {
@@ -72,6 +74,11 @@
     autofocus
     aria-label="PDF password"
   />
+
+  <label class="remember-row">
+    <input type="checkbox" bind:checked={remember} />
+    <span>Remember this password on this device (stored obfuscated, not in plain text)</span>
+  </label>
 
   <div class="button-row">
     <button class="btn-cancel" onclick={onCancel}>Cancel</button>
@@ -133,8 +140,18 @@
     background: var(--color-bg-input);
     color: var(--color-text);
     font-size: var(--font-size-base);
-    margin-bottom: var(--space-5);
+    margin-bottom: var(--space-3);
     box-sizing: border-box;
+  }
+
+  .remember-row {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+    margin-bottom: var(--space-5);
+    font-size: var(--font-size-sm);
+    color: var(--color-text-secondary);
+    cursor: pointer;
   }
 
   .button-row {

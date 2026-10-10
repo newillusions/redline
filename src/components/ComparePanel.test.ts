@@ -73,7 +73,7 @@ describe("ComparePanel (M6 compare UI)", () => {
     expect((btn as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it("calls comparePages with correct camelCase args on submit", async () => {
+  it("converts the 1-based page inputs to 0-based indices for comparePages", async () => {
     const { getByTestId } = render(ComparePanel, {
       pathA: "/docs/rev1.pdf",
       pathB: "/docs/rev2.pdf",
@@ -94,8 +94,8 @@ describe("ComparePanel (M6 compare UI)", () => {
     expect(mockComparePages).toHaveBeenCalledWith(
       "/docs/rev1.pdf",
       "/docs/rev2.pdf",
+      1,
       2,
-      3,
       undefined,
       undefined,
     );
@@ -165,5 +165,16 @@ describe("ComparePanel (M6 compare UI)", () => {
     resolve(SAMPLE_RESULT);
     await tick();
     await tick();
+  });
+
+  it("defaults to page 1 (index 0) and shows file names rather than full paths", async () => {
+    const { getByTestId, container } = render(ComparePanel, {
+      pathA: "/docs/rev1.pdf",
+      pathB: "/docs/rev2.pdf",
+    });
+    expect((getByTestId("page-a-input") as HTMLInputElement).value).toBe("1");
+    expect(container.textContent).toContain("rev1.pdf");
+    expect(container.textContent).not.toContain("/docs/rev1.pdf");
+    expect(container.textContent).not.toContain("0-based");
   });
 });

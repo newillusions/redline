@@ -1189,8 +1189,13 @@
     // into the new zoom-percent input could still trigger them.
     if (isTypingTarget(e.target)) return;
     onSpaceKeyDown(e);
-    if (e.key === "b" || e.key === "B") {
+    // Developer metrics overlay: Ctrl+Alt+Shift+B (was a bare "B", which a user could hit by
+    // accident in production - UX audit F8). `code` is checked because Alt rewrites `key` on
+    // macOS keyboards.
+    if (e.ctrlKey && e.altKey && e.shiftKey && (e.code === "KeyB" || e.key.toLowerCase() === "b")) {
+      e.preventDefault();
       benchOverlay = !benchOverlay;
+      return;
     }
     // "?" toggles the pan/zoom shortcuts cheat-sheet (discoverability - see showShortcuts'
     // declaration). e.key already reflects Shift (browsers report the produced character),
@@ -3394,7 +3399,7 @@
        only while it's toggled on. -->
   {#if benchOverlay}
     <div class="bench-overlay">
-      <div class="bench-title">§20 LIVE METRICS <span class="bench-hint">[B] to close</span></div>
+      <div class="bench-title">§20 LIVE METRICS <span class="bench-hint">Ctrl+Alt+Shift+B to close</span></div>
       <div class="bench-row">
         <span>pan frame</span>
         <span class={panFrameMs <= 33 ? "ok" : "warn"}>

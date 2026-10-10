@@ -11,6 +11,7 @@
    *   takeoffStore — TakeoffStore (active scale for display)
    *   docId       — for the exportMarkupList IPC call
    */
+  import { exportDoneMessage } from "$lib/doc-op-flow";
   import type { MarkupStore } from "$lib/markup-store.svelte";
   import type { TakeoffStore } from "$lib/takeoff-store.svelte";
   import type { Markup } from "$lib/ipc";
@@ -62,16 +63,21 @@
   const scaleLabel = $derived(scale ? `${scale.label} (${scale.unit})` : "No scale set");
 
   let exportError = $state<string | null>(null);
+  let exportMessage = $state<string | null>(null);
 
   async function handleExport(format: ExportFormat) {
     exportError = null;
+    exportMessage = null;
     const ext = format === "Xlsx" ? "xlsx" : "csv";
     const dest = await saveDialog({
       filters: [{ name: format === "Xlsx" ? "Excel" : "CSV", extensions: [ext] }],
     });
     if (!dest) return;
     try {
+      // The backend exports its own copy of the list; drain pending edits first.
+      await store.flush();
       await exportMarkupList(docId, dest, format);
+      exportMessage = exportDoneMessage(dest, store.markups.length);
     } catch (e) {
       exportError = `Export failed: ${e instanceof Error ? e.message : String(e)}`;
     }
@@ -81,13 +87,17 @@
 <div class="measurement-panel">
   <div class="panel-actions">
     <span class="scale-badge" title="Active scale">{scaleLabel}</span>
-    <button class="btn-export" onclick={() => handleExport("Xlsx")} disabled={measurements.length === 0}>
+    <button class="btn-export" onclick={() => handleExport("Xlsx")} disabled={store.markups.length === 0}>
       Export XLSX
     </button>
-    <button class="btn-export" onclick={() => handleExport("Csv")} disabled={measurements.length === 0}>
+    <button class="btn-export" onclick={() => handleExport("Csv")} disabled={store.markups.length === 0}>
       Export CSV
     </button>
   </div>
+
+  {#if exportMessage}
+    <div class="export-ok" role="status">{exportMessage}</div>
+  {/if}
 
   {#if exportError}
     <div class="export-error">{exportError}</div>
@@ -232,6 +242,11 @@
     cursor: not-allowed;
   }
 
+  .export-ok {
+    padding: var(--space-1) var(--space-3);
+    font-size: var(--font-size-sm);
+    color: var(--color-text-secondary);
+  }
   .export-error {
     color: var(--color-error, #e02424);
     font-size: var(--font-size-sm);
