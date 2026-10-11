@@ -21,7 +21,10 @@ detect_target() {
   local os arch
   os="$(uname -s)"; arch="$(uname -m)"
   case "$os" in
-    Darwin) [ "$arch" = "arm64" ] && echo "mac-arm64" || echo "unknown" ;;  # Apple Silicon only
+    Darwin)
+      if [ "$arch" = "arm64" ]; then echo "mac-arm64"
+      else echo "ERROR: Intel Macs are not supported (Apple Silicon only)." >&2; exit 2
+      fi ;;
     Linux)  echo "linux-x64" ;;
     MINGW*|MSYS*|CYGWIN*) echo "win-x64" ;;
     *) echo "unknown" ;;

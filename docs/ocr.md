@@ -49,8 +49,8 @@ yet):
 
 - **macOS (dev machines):** Homebrew's `tesseract` + `leptonica` formulae
   install `eng.traineddata` under
-  `/opt/homebrew/share/tessdata/` (Apple Silicon) or the Intel-prefix
-  equivalent. `OcrEngineHandle::load(None)` finds it via Tesseract's
+  `/opt/homebrew/share/tessdata/` (Apple Silicon only).
+  `OcrEngineHandle::load(None)` finds it via Tesseract's
   compiled-in default search relative to the linked library.
 - **Linux CI** (`.forgejo/workflows/ci.yml`'s `ocr` job, runs directly on the
   `rust-1.89` runner label — CI-hardening migration 2026-09-13 moved this

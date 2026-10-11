@@ -1,7 +1,7 @@
 # /sendit --release — cross-platform build, prerequisites
 
 The release flag is intentionally inert. It produces the shippable artifacts — **macOS
-universal + Windows x64 installers** — and that requires infrastructure redline does not have
+(Apple Silicon) + Windows x64 installers** — and that requires infrastructure redline does not have
 yet. This file is the checklist for wiring it in. Update it as items land; flip the flag on
 in `agent-prompt.md` Step 0 only when all of 1–5 are true.
 
