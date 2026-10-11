@@ -43,7 +43,7 @@ A cross-platform (Windows + macOS) desktop application for AEC PDF **markup, tak
 - **OCR:** Tesseract (Apache-2.0) via `leptess` (rust binding)
 - **Full-text search:** Tantivy (MIT) — folder/library index
 - **Document-surgery backend:** trait-based, swappable — free baseline for v1; MuPDF (commercial) or Apryse Advanced pluggable later
-- **Targets:** Windows x64, macOS (universal)
+- **Targets:** Windows x64, macOS Apple Silicon only (Intel dropped, decision:boujy4d42i8w7zovifts)
 
 ## 4. Architecture
 

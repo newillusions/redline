@@ -42,7 +42,7 @@ Do NOT try to cross-compile Windows bundles on the Mac mini.
 ```
 version bump (scripts/sync-version.cjs across the 3 files) → commit
   → git tag v<X.Y.Z> → push tag to Forgejo
-  → Forgejo Actions: build macOS universal + Windows x64, bundle PDFium, sign
+  → Forgejo Actions: build macOS Apple Silicon + Windows x64, bundle PDFium, sign
   → poll run via Forgejo API (/ci-status pattern) until success/failure
   → verify release assets present (macOS .dmg/.app.tar.gz + sig, Windows .msi/.exe + sig)
   → KB observation → report

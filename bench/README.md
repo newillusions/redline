@@ -110,10 +110,6 @@ cp /tmp/pdfium-mac-arm64/lib/libpdfium.dylib src-tauri/resources/
 export PDFIUM_DYNAMIC_LIB_PATH="$(pwd)/src-tauri/resources/libpdfium.dylib"
 ```
 
-### macOS (Intel)
-
-Same as above but use `pdfium-mac-x64.tgz`.
-
 ### Windows x64
 
 Download `pdfium-win-x64.tgz`, extract `pdfium.dll`, place in `src-tauri/resources/`.

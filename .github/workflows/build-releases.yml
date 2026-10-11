@@ -55,7 +55,7 @@ env:
 
 jobs:
   build-macos:
-    name: Build macOS (Apple Silicon + Intel)
+    name: Build macOS (Apple Silicon)
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -399,13 +399,8 @@ jobs:
         if: steps.ocr_mode.outputs.proof_leg != 'true'
         id: archive
         run: |
-          if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
-            echo "NAME=Redline_${{ steps.version.outputs.VERSION }}_aarch64" >> $GITHUB_OUTPUT
-            echo "ARCH=aarch64" >> $GITHUB_OUTPUT
-          else
-            echo "NAME=Redline_${{ steps.version.outputs.VERSION }}_x64" >> $GITHUB_OUTPUT
-            echo "ARCH=x64" >> $GITHUB_OUTPUT
-          fi
+          echo "NAME=Redline_${{ steps.version.outputs.VERSION }}_aarch64" >> $GITHUB_OUTPUT
+          echo "ARCH=aarch64" >> $GITHUB_OUTPUT
 
       - name: Find artifacts
         if: steps.ocr_mode.outputs.proof_leg != 'true'
@@ -424,11 +419,7 @@ jobs:
         run: |
           if [ -f "${{ steps.find_artifacts.outputs.SIG_PATH }}" ]; then
             SIG=$(cat "${{ steps.find_artifacts.outputs.SIG_PATH }}")
-            if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
-              echo "sig_aarch64=$SIG" >> $GITHUB_OUTPUT
-            else
-              echo "sig_x86_64=$SIG" >> $GITHUB_OUTPUT
-            fi
+            echo "sig_aarch64=$SIG" >> $GITHUB_OUTPUT
           fi
 
       - name: Create checksum

@@ -44,8 +44,6 @@ npm install
 ```bash
 # macOS Apple Silicon:
 scripts/fetch-pdfium.sh mac-arm64
-# macOS Intel:
-scripts/fetch-pdfium.sh mac-x64
 # Windows x64 (Git Bash / WSL shell):
 scripts/fetch-pdfium.sh win-x64
 ```

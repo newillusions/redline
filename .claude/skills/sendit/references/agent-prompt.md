@@ -28,7 +28,7 @@ In DRY_RUN: print every command with `[DRY-RUN]` prefix instead of executing. Re
 
 **If RELEASE is true:** stop immediately with this message and exit 0:
 ```
-/sendit --release is not active yet. The cross-platform build pipeline (macOS universal +
+/sendit --release is not active yet. The cross-platform build pipeline (macOS Apple Silicon +
 Windows x64) requires Forgejo Actions runners, per-OS PDFium bundling, code signing, a
 Windows-verified bundle, and the definitive §20 verdict. See
 .claude/skills/sendit/references/release-todo.md. Run /sendit without --release to land a branch.
@@ -328,7 +328,7 @@ else
   echo "  ✓ Merged: PR #${PR_NUMBER} squashed into main, branches cleaned"
 fi
 echo ""
-echo "  Release builds (macOS universal + Windows x64) are NOT part of this run."
+echo "  Release builds (macOS Apple Silicon + Windows x64) are NOT part of this run."
 echo "  They activate under /sendit --release once CI + signing exist — see"
 echo "  .claude/skills/sendit/references/release-todo.md"
 [ "$DRY_RUN" = "true" ] && echo "" && echo "  ↑ DRY-RUN — nothing changed."

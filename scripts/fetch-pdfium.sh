@@ -6,7 +6,6 @@
 # Usage:
 #   scripts/fetch-pdfium.sh            # auto-detect host platform
 #   scripts/fetch-pdfium.sh mac-arm64  # force a specific target
-#   scripts/fetch-pdfium.sh mac-x64
 #   scripts/fetch-pdfium.sh win-x64    # downloads pdfium.dll (run on/for Windows builds)
 #   scripts/fetch-pdfium.sh linux-x64
 #
@@ -22,7 +21,7 @@ detect_target() {
   local os arch
   os="$(uname -s)"; arch="$(uname -m)"
   case "$os" in
-    Darwin) [ "$arch" = "arm64" ] && echo "mac-arm64" || echo "mac-x64" ;;
+    Darwin) [ "$arch" = "arm64" ] && echo "mac-arm64" || echo "unknown" ;;  # Apple Silicon only
     Linux)  echo "linux-x64" ;;
     MINGW*|MSYS*|CYGWIN*) echo "win-x64" ;;
     *) echo "unknown" ;;
@@ -31,10 +30,10 @@ detect_target() {
 
 TARGET="${1:-$(detect_target)}"
 case "$TARGET" in
-  mac-arm64|mac-x64) LIBNAME="libpdfium.dylib"; LIBSUBPATH="lib/libpdfium.dylib" ;;
+  mac-arm64)         LIBNAME="libpdfium.dylib"; LIBSUBPATH="lib/libpdfium.dylib" ;;
   linux-x64)         LIBNAME="libpdfium.so";    LIBSUBPATH="lib/libpdfium.so" ;;
   win-x64)           LIBNAME="pdfium.dll";      LIBSUBPATH="bin/pdfium.dll" ;;
-  *) echo "Unknown target: $TARGET (expected mac-arm64|mac-x64|linux-x64|win-x64)"; exit 2 ;;
+  *) echo "Unknown target: $TARGET (expected mac-arm64|linux-x64|win-x64)"; exit 2 ;;
 esac
 
 ASSET="pdfium-${TARGET}.tgz"
@@ -63,7 +62,7 @@ fi
 cp "$TMP/$LIBSUBPATH" "$DEST/$LIBNAME"
 
 # Strip macOS quarantine so the dylib loads without Gatekeeper prompts.
-if [ "$TARGET" = "mac-arm64" ] || [ "$TARGET" = "mac-x64" ]; then
+if [ "$TARGET" = "mac-arm64" ]; then
   xattr -d com.apple.quarantine "$DEST/$LIBNAME" 2>/dev/null || true
 fi
 

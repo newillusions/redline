@@ -1,6 +1,6 @@
 ---
 name: sendit
-description: Use when ready to ship a redline change — runs quality-gate → commit → push → PR → review → squash-merge autonomously in the background, Forgejo-only. The core flow lands a feature branch on main. The cross-platform release build (macOS universal + Windows x64) is a separate --release extension that is NOT active yet (no CI runners). Run /sendit --dry-run first to preview.
+description: Use when ready to ship a redline change — runs quality-gate → commit → push → PR → review → squash-merge autonomously in the background, Forgejo-only. The core flow lands a feature branch on main. The cross-platform release build (macOS Apple Silicon + Windows x64) is a separate --release extension that is NOT active yet (no CI runners). Run /sendit --dry-run first to preview.
 ---
 
 # /sendit — Redline Ship It Pipeline
@@ -15,7 +15,7 @@ using `$FORGEJO_ADMIN_TOKEN` from `~/.claude/.credentials.env` — never the `gh
 
 ## Scope: what this does NOT do yet
 
-The **cross-platform release build** (macOS universal + Windows x64 bundles, signing,
+The **cross-platform release build** (macOS Apple Silicon + Windows x64 bundles, signing,
 release assets) is modeled on e-fees's tag→CI pipeline but is **not wired in**. It activates
 under a future `--release` flag once ALL of these exist (see `references/release-todo.md`):
 
