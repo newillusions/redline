@@ -1,8 +1,11 @@
 //! lopdf-level read/write of redline markups in a PDF's page /Annots arrays.
 //!
 //! Managed-annotation policy: an annotation is *managed* (owned/replaced by redline on
-//! save) iff it carries an /RLType key OR its /NM matches a markup id in the store.
-//! Foreign annotations (links, popups, widgets, third-party markups) are preserved
+//! save) iff it carries an /RLType key, carries the /RLPreserved marker, or is the exact
+//! annotation (object id, or page position for an inline dictionary, AND /NM) a markup of
+//! the store was imported from. An unedited foreign markup is written back from its
+//! sanitized original dictionary (original /AP, /BE, /IT, /Measure, ...); an edited one is
+//! rebuilt from the model. Other foreign annotations (links, popups, widgets) are preserved
 //! untouched. Import filter: only markup-like subtypes become `Markup`s on read.
 
 use anyhow::{bail, Context, Result};
@@ -319,13 +322,21 @@ fn nm_key(d: &Dictionary) -> Option<String> {
 /// Where an imported markup came from, for [`SourceRef`] matching on save: the annotation's
 /// object id and `/NM` as they are in the loaded file. `None` when it has neither (nothing
 /// to match by).
-fn source_ref_of(oid: Option<ObjectId>, d: &Dictionary) -> Option<SourceRef> {
+fn source_ref_of(oid: Option<ObjectId>, d: &Dictionary, loc: AnnotLoc) -> Option<SourceRef> {
     let nm = nm_key(d);
-    (oid.is_some() || nm.is_some()).then_some(SourceRef { oid, nm })
+    // An inline dictionary has no object id: its position in the page's /Annots tells two
+    // inline annotations that share a /NM apart.
+    let loc = if oid.is_none() { Some(loc) } else { None };
+    (oid.is_some() || nm.is_some()).then_some(SourceRef { oid, nm, loc })
 }
 
+/// Where an annotation sits: (1-based page number, index in the page's resolved /Annots as
+/// [`page_annots`] returns it).
+type AnnotLoc = (u32, usize);
+
 /// True if redline owns this annotation (replace-on-save): it is redline-authored (carries
-/// `/RLType`), or it is the exact annotation (object id AND `/NM`) a markup of the store
+/// `/RLType`), or it is an unedited foreign markup redline wrote back (carries the
+/// `/RLPreserved` marker), or it is the exact annotation (object id AND `/NM`) a markup of the store
 /// was imported from. A `/NM` alone never makes an annotation ours - names are not unique
 /// across a PDF, and a non-imported annotation (a FileAttachment, a reply to one) sharing an
 /// imported markup's name must survive every save.
@@ -338,9 +349,18 @@ fn source_ref_of(oid: Option<ObjectId>, d: &Dictionary) -> Option<SourceRef> {
 fn is_managed(
     oid: Option<ObjectId>,
     d: &Dictionary,
+    loc: AnnotLoc,
     sources: &std::collections::HashSet<SourceRef>,
 ) -> bool {
-    d.has(b"RLType") || source_ref_of(oid, d).is_some_and(|r| sources.contains(&r))
+    // The marker counts only on a subtype redline imports: a Link or a form Widget carrying
+    // it is not ours.
+    let preserved = d.has(crate::markup::foreign::PRESERVED_MARKER.as_bytes())
+        && subtype(d).is_some_and(|st| {
+            MARKUP_SUBTYPES.contains(&st.as_str()) || TEXT_MARKUP_SUBTYPES.contains(&st.as_str())
+        });
+    d.has(b"RLType")
+        || preserved
+        || source_ref_of(oid, d, loc).is_some_and(|r| sources.contains(&r))
 }
 
 /// Splice a `StampAsset::BluebeamFormXObject` graph into `doc` as real indirect objects,
@@ -467,15 +487,17 @@ fn owned_annotation_ids(
     pages: &std::collections::BTreeMap<u32, ObjectId>,
     sources: &std::collections::HashSet<SourceRef>,
 ) -> Result<std::collections::HashSet<ObjectId>> {
-    let mut all: Vec<(Option<ObjectId>, Dictionary)> = Vec::new();
-    for page_id in pages.values() {
-        all.extend(page_annots(doc, *page_id)?);
+    let mut all: Vec<(Option<ObjectId>, Dictionary, AnnotLoc)> = Vec::new();
+    for (page_no, page_id) in pages {
+        for (i, (oid, d)) in page_annots(doc, *page_id)?.into_iter().enumerate() {
+            all.push((oid, d, (*page_no, i)));
+        }
     }
     // Worklist over an irt -> replies index: linear, whatever the chain length or shape
     // (a cycle or self-reference is never reachable from a managed markup, so is never owned).
     let mut answers: std::collections::HashMap<ObjectId, Vec<ObjectId>> =
         std::collections::HashMap::new();
-    for (oid, d) in &all {
+    for (oid, d, _) in &all {
         if let (Some(oid), Some(parent)) = (oid, irt_ref(d)) {
             if crate::markup::replies::is_reply_or_state(d) {
                 answers.entry(parent).or_default().push(*oid);
@@ -484,7 +506,7 @@ fn owned_annotation_ids(
     }
     let mut owned: std::collections::HashSet<ObjectId> = all
         .iter()
-        .filter_map(|(oid, d)| oid.filter(|_| is_managed(*oid, d, sources)))
+        .filter_map(|(oid, d, loc)| oid.filter(|_| is_managed(*oid, d, *loc, sources)))
         .collect();
     let mut work: Vec<ObjectId> = owned.iter().copied().collect();
     while let Some(parent) = work.pop() {
@@ -582,6 +604,104 @@ fn write_workflow_annots(
     out
 }
 
+/// Build `m`'s Normal appearance stream as an indirect object (plus the image / Form
+/// XObjects it needs) and return its id. PDF requires a stream to be an indirect object (it
+/// cannot be embedded inline in a dictionary), so the caller points `/AP /N` at the id.
+///
+/// A PNG-backed Stamp's appearance additionally references an Image XObject (also
+/// stream-typed, also requiring its own indirect object - PDF spec 7.3.8).
+/// `appearance::build_ap_stream` stays Document-free/pure and returns any such auxiliary
+/// images unresolved; THIS is where `&mut Document` is held, so it resolves them (soft-mask
+/// first, since the color image's own dict points at it) before finishing the Form stream via
+/// `finish_ap_stream`.
+fn add_appearance(doc: &mut Document, m: &Markup) -> ObjectId {
+    let mut built = appearance::build_ap_stream(m);
+    let mut xobject_refs = Dictionary::new();
+    for aux in std::mem::take(&mut built.image_xobjects) {
+        let mut color = aux.image;
+        if let Some(smask) = aux.smask {
+            let smask_id = doc.add_object(Object::Stream(smask));
+            color.dict.set("SMask", Object::Reference(smask_id));
+        }
+        let image_id = doc.add_object(Object::Stream(color));
+        xobject_refs.set(aux.name, Object::Reference(image_id));
+    }
+    // A `.btx`-imported Bluebeam stamp's Form XObject graph (`StampAsset::
+    // BluebeamFormXObject`, `toolchest::btx` module doc "Stamp artwork"): splice every
+    // node in as a real indirect object (see `splice_bb_form_xobject`), then point
+    // this resource name at whichever node is the root.
+    if let Some(form) = built.form_xobject.take() {
+        if let Some(root_oid) = splice_bb_form_xobject(doc, &form.root_id, &form.objects) {
+            xobject_refs.set(form.name, Object::Reference(root_oid));
+        }
+    }
+    doc.add_object(Object::Stream(appearance::finish_ap_stream(
+        built,
+        xobject_refs,
+    )))
+}
+
+/// True if `o` is an `/AP` value that resolves in `doc` to what an appearance must be: a
+/// dictionary (direct or indirect) whose `/N` is a reference to a STREAM, or a direct state
+/// dictionary whose every entry is a reference to a stream. A reference that no longer
+/// resolves, or resolves to something else (the file changed under us), is not usable.
+fn ap_usable(doc: &Document, o: &Object) -> bool {
+    let is_stream = |o: &Object| match o {
+        Object::Reference(r) => doc.get_object(*r).is_ok_and(|t| matches!(t, Object::Stream(_))),
+        _ => false,
+    };
+    let dict = match o {
+        Object::Dictionary(d) => Some(d),
+        Object::Reference(r) => doc.get_dictionary(*r).ok(),
+        _ => None,
+    };
+    dict.is_some_and(|d| match d.get(b"N") {
+        Ok(n @ Object::Reference(_)) => is_stream(n),
+        Ok(Object::Dictionary(states)) => !states.is_empty() && states.iter().all(|(_, v)| is_stream(v)),
+        _ => false,
+    })
+}
+
+/// `doc`'s object `r`, for [`crate::markup::foreign::sanitized_original`] to inline indirect
+/// references (borrowed: nothing is copied until it passes the sanitiser's budget).
+fn resolve_object(doc: &Document, r: ObjectId) -> Option<&Object> {
+    doc.get_object(r).ok()
+}
+
+/// The dictionary to write for `m` instead of a rebuilt one, when `m` is an unedited foreign
+/// markup: its original, re-sanitized here (the write boundary) and marked so the next save
+/// still manages the rewritten object. `None` = rebuild from the model.
+fn preserved_original(doc: &Document, m: &Markup, page_id: ObjectId) -> Option<Dictionary> {
+    if !m.is_unedited() {
+        return None;
+    }
+    let mut d = crate::markup::foreign::sanitized_original(
+        m.source_dict.as_ref()?,
+        |o| ap_usable(doc, o),
+        &|r| resolve_object(doc, r),
+        // A stored original has no inlinable references left: nothing for a budget to count.
+        &mut crate::markup::foreign::Shared::default(),
+    )?;
+    // The remaining references must still be what they were: the page it sits on, and an
+    // optional-content group that exists. Anything else is gone or not ours: rebuild.
+    if d.has(b"P") {
+        d.set("P", Object::Reference(page_id));
+    }
+    if let Ok(Object::Reference(r)) = d.get(b"OC") {
+        if doc.get_object(*r).is_err() {
+            d.remove(b"OC");
+        }
+    }
+    d.set(
+        crate::markup::foreign::PRESERVED_MARKER,
+        Object::Boolean(true),
+    );
+    if !d.has(b"NM") {
+        d.set("NM", Object::string_literal(m.nm_for_pdf()));
+    }
+    Some(d)
+}
+
 /// Write the full markup set into the document: strip managed annotations from every
 /// page, keep foreign ones, then append the current set as fresh indirect objects.
 #[cfg(test)]
@@ -629,7 +749,7 @@ pub(crate) fn write_markups_removing(
     // Phase 1: collect surviving foreign entries per page.
     let mut kept: std::collections::BTreeMap<ObjectId, Vec<Object>> =
         std::collections::BTreeMap::new();
-    for page_id in pages.values() {
+    for (page_no, page_id) in &pages {
         let annots = page_annots(doc, *page_id)?;
         // Object ids of the foreign annotations a /Popup may legitimately parent to: kept
         // (not redline-managed) and not themselves popups. A redline-owned markup is
@@ -638,16 +758,17 @@ pub(crate) fn write_markups_removing(
         // dropped - otherwise it shows as a phantom comment note in Bluebeam (G9 defect 4).
         let valid_popup_parents: std::collections::HashSet<ObjectId> = annots
             .iter()
-            .filter(|(oid, d)| {
+            .enumerate()
+            .filter(|(i, (oid, d))| {
                 oid.is_some_and(|o| !owned.contains(&o))
-                    && !is_managed(*oid, d, &ids)
+                    && !is_managed(*oid, d, (*page_no, *i), &ids)
                     && subtype(d).as_deref() != Some("Popup")
             })
-            .filter_map(|(oid, _)| *oid)
+            .filter_map(|(_, (oid, _))| *oid)
             .collect();
         let mut keep = Vec::new();
-        for (oid, dict) in annots {
-            if is_managed(oid, &dict, &ids) || oid.is_some_and(|o| owned.contains(&o)) {
+        for (i, (oid, dict)) in annots.into_iter().enumerate() {
+            if is_managed(oid, &dict, (*page_no, i), &ids) || oid.is_some_and(|o| owned.contains(&o)) {
                 continue;
             }
             if oid.is_none()
@@ -718,35 +839,22 @@ pub(crate) fn write_markups_removing(
         // auxiliary images unresolved; THIS is the one place that holds `&mut Document`,
         // so it resolves them (soft-mask first, since the color image's own dict points
         // at it) before finishing the Form stream via `finish_ap_stream`.
-        let mut built = appearance::build_ap_stream(m);
-        let mut xobject_refs = Dictionary::new();
-        for aux in std::mem::take(&mut built.image_xobjects) {
-            let mut color = aux.image;
-            if let Some(smask) = aux.smask {
-                let smask_id = doc.add_object(Object::Stream(smask));
-                color.dict.set("SMask", Object::Reference(smask_id));
-            }
-            let image_id = doc.add_object(Object::Stream(color));
-            xobject_refs.set(aux.name, Object::Reference(image_id));
+        //
+        // An UNEDITED foreign markup is written back from its (sanitized) original dictionary
+        // - original /AP, /BE, /IT, /Measure, /LE, ... untouched - instead of being rebuilt
+        // from the model, which can only express what the model knows.
+        let preserved = preserved_original(doc, m, page_id);
+        let mut dict = match preserved {
+            Some(orig) => orig,
+            None => m.to_annotation_dict(),
+        };
+        if !dict.has(b"AP") {
+            let ap_id = add_appearance(doc, m);
+            dict.set(
+                "AP",
+                Object::Dictionary(dictionary! { "N" => Object::Reference(ap_id) }),
+            );
         }
-        // A `.btx`-imported Bluebeam stamp's Form XObject graph (`StampAsset::
-        // BluebeamFormXObject`, `toolchest::btx` module doc "Stamp artwork"): splice every
-        // node in as a real indirect object (see `splice_bb_form_xobject`), then point
-        // this resource name at whichever node is the root.
-        if let Some(form) = built.form_xobject.take() {
-            if let Some(root_oid) = splice_bb_form_xobject(doc, &form.root_id, &form.objects) {
-                xobject_refs.set(form.name, Object::Reference(root_oid));
-            }
-        }
-        let ap_id = doc.add_object(Object::Stream(appearance::finish_ap_stream(
-            built,
-            xobject_refs,
-        )));
-        let mut dict = m.to_annotation_dict();
-        dict.set(
-            "AP",
-            Object::Dictionary(dictionary! { "N" => Object::Reference(ap_id) }),
-        );
         let parent_rect = rect_of(&dict);
         let aid = doc.add_object(Object::Dictionary(dict));
         // The source markup's own pop-up: its original was dropped with the original markup
@@ -817,12 +925,13 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
         oid: Option<ObjectId>,
         dict: Dictionary,
         page_no_1based: u32,
+        idx: usize,
     }
     let pages = doc.get_pages(); // 1-based page no -> page ObjectId; queried once, reused below
     let mut collected: Vec<Collected> = Vec::new();
     let mut raw_replies: Vec<(Option<ObjectId>, Dictionary)> = Vec::new();
     for (&page_no_1based, &page_id) in &pages {
-        for (oid, dict) in page_annots(doc, page_id)? {
+        for (idx, (oid, dict)) in page_annots(doc, page_id)?.into_iter().enumerate() {
             let Some(st) = subtype(&dict) else { continue };
             if !MARKUP_SUBTYPES.contains(&st.as_str())
                 && !TEXT_MARKUP_SUBTYPES.contains(&st.as_str())
@@ -839,7 +948,7 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
             if st == "Text" && dict.has(b"StateModel") {
                 continue;
             }
-            collected.push(Collected { oid, dict, page_no_1based });
+            collected.push(Collected { oid, dict, page_no_1based, idx });
         }
     }
 
@@ -907,6 +1016,8 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
     }
 
     let markup_oids: Vec<Option<ObjectId>> = collected.iter().map(|c| c.oid).collect();
+    // One inlining budget for the whole document read (see `foreign::Shared`).
+    let mut shared = crate::markup::foreign::Shared::default();
     let mut out = Vec::new();
     let mut page_space = PageSpaceCache::new(doc);
     for (i, c) in collected.into_iter().enumerate() {
@@ -917,7 +1028,17 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
         {
             let mut m = Markup::from_annotation_dict(&dict);
             m.page = page_no_1based - 1;
-            m.source_ref = source_ref_of(c.oid, &dict);
+            m.source_ref = source_ref_of(c.oid, &dict, (page_no_1based, c.idx));
+            // A foreign annotation keeps its (sanitized) original so an unedited one is
+            // written back as it was; a redline-authored one is always rebuilt.
+            if !dict.has(b"RLType") {
+                m.source_dict = crate::markup::foreign::sanitized_original(
+                    &dict,
+                    |o| ap_usable(doc, o),
+                    &|r| resolve_object(doc, r),
+                    &mut shared,
+                );
+            }
             m.source_popup = crate::markup::replies::popup_in(doc, &dict);
             // `/IRT`+`/RT /Group` (standards-based, externally visible) takes priority
             // over a bare `/RLGroup` fallback (a prior redline-only save with no group
@@ -988,6 +1109,11 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
     }
     crate::markup::replies::attach(&mut out, &markup_oids, &raw_replies);
     crate::takeoff::count::cap_group_sizes(&mut out);
+    // The model as read is the baseline "unedited" is measured against (after replies and
+    // group sizes, which are part of the model).
+    for m in out.iter_mut().filter(|m| m.source_dict.is_some()) {
+        m.source_fp = m.edit_fingerprint();
+    }
     Ok(out)
 }
 

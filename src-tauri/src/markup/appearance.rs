@@ -23,7 +23,7 @@
 //! carries its own `fill_opacity` distinct from the overall opacity.
 //!
 //! # Known simplifications (named, not silently dropped - see PR description)
-//! - Cloud draws a plain closed polygon, not the scalloped revision-cloud arcs.
+//! - Cloud scallops are one cubic Bezier per chord (chord = 10 pt x `/BE /I`), not Acrobat's exact arc profile.
 //! - Stamp/StampDynamic with a `StampAsset::PngBase64` asset draws a REAL Image XObject
 //!   (see `decode_png_stamp_image` + `StampImageXObject`) - this is the v0.3.1 fix.
 //! - Stamp/StampDynamic with a `StampAsset::BluebeamFormXObject` asset (a `.btx`-imported
@@ -342,6 +342,10 @@ pub(crate) fn ap_bbox(m: &Markup) -> [f64; 4] {
             pad = pad.max(font_pt).max(CALLOUT_BOX.0.max(CALLOUT_BOX.1) + 8.0);
         }
         MarkupType::Arrow => pad = pad.max(m.appearance.line_weight.max(0.0) * 4.0 + 8.0),
+        // Scallops bulge up to about half a chord outside the polygon edge.
+        MarkupType::Cloud => {
+            pad = pad.max(cloud_chord(cloud_intensity(m)) * 0.5 + m.appearance.line_weight.max(0.0) + 2.0)
+        }
         _ => {}
     }
     [x0 - pad, y0 - pad, x1 + pad, y1 + pad]
@@ -747,31 +751,196 @@ fn draw_text_block(
     out.push_str("ET\n");
 }
 
-/// One callout leader: shaft from the box end to the target, filled arrowhead at the target.
-fn draw_callout_leader(out: &mut String, leader: &[PdfPoint], a: &Appearance) {
-    let (Some(&target), Some(&anchor)) = (leader.first(), leader.last()) else {
+/// One callout leader: shaft from the box end to the target, then the `/LE` ending at the
+/// target (`ending`: `None` = no ending).
+fn draw_callout_leader(out: &mut String, leader: &[PdfPoint], a: &Appearance, ending: Option<&str>) {
+    let Some(&anchor) = leader.last() else {
         return;
     };
     if leader.len() < 2 {
         return;
     }
-    let reversed: Vec<PdfPoint> = leader.iter().rev().copied().collect();
-    if let Some((_base, head)) = arrow_head(&reversed, a.line_weight) {
-        moveto(out, anchor);
-        for p in leader.iter().rev().skip(1) {
-            lineto(out, *p);
-        }
-        out.push_str("S\n");
-        fill_color(out, &a.color);
-        moveto(out, head[0]);
-        lineto(out, head[1]);
-        lineto(out, head[2]);
-        out.push_str("h\nf\n");
-    } else {
-        moveto(out, anchor);
-        lineto(out, target);
-        out.push_str("S\n");
+    moveto(out, anchor);
+    for p in leader.iter().rev().skip(1) {
+        lineto(out, *p);
     }
+    out.push_str("S\n");
+    let Some(ending) = ending else { return };
+    let reversed: Vec<PdfPoint> = leader.iter().rev().copied().collect();
+    let Some((base, head)) = arrow_head(&reversed, a.line_weight) else {
+        return;
+    };
+    let [tip, left, right] = head;
+    let r = ((tip.x - base.x).hypot(tip.y - base.y)) / 2.5;
+    let (ux, uy) = ((tip.x - base.x) / (2.5 * r), (tip.y - base.y) / (2.5 * r));
+    match ending {
+        "ClosedArrow" => {
+            fill_color(out, &a.color);
+            moveto(out, tip);
+            lineto(out, left);
+            lineto(out, right);
+            out.push_str("h\nf\n");
+        }
+        "OpenArrow" => {
+            moveto(out, left);
+            lineto(out, tip);
+            lineto(out, right);
+            out.push_str("S\n");
+        }
+        "RClosedArrow" | "ROpenArrow" => {
+            // Reversed: the point is at the base, the wide side at the target.
+            let (l, rt) = (
+                PdfPoint { x: left.x + (tip.x - base.x), y: left.y + (tip.y - base.y) },
+                PdfPoint { x: right.x + (tip.x - base.x), y: right.y + (tip.y - base.y) },
+            );
+            if ending == "RClosedArrow" {
+                fill_color(out, &a.color);
+                moveto(out, base);
+                lineto(out, l);
+                lineto(out, rt);
+                out.push_str("h\nf\n");
+            } else {
+                moveto(out, l);
+                lineto(out, base);
+                lineto(out, rt);
+                out.push_str("S\n");
+            }
+        }
+        "Circle" => {
+            ellipse_path(out, tip.x, tip.y, r, r);
+            out.push_str("S\n");
+        }
+        "Square" | "Diamond" => {
+            let (nx, ny) = (-uy, ux);
+            let pts: Vec<PdfPoint> = if ending == "Square" {
+                vec![
+                    PdfPoint { x: tip.x + r * (ux + nx), y: tip.y + r * (uy + ny) },
+                    PdfPoint { x: tip.x + r * (ux - nx), y: tip.y + r * (uy - ny) },
+                    PdfPoint { x: tip.x - r * (ux + nx), y: tip.y - r * (uy + ny) },
+                    PdfPoint { x: tip.x - r * (ux - nx), y: tip.y - r * (uy - ny) },
+                ]
+            } else {
+                vec![
+                    PdfPoint { x: tip.x + r * ux, y: tip.y + r * uy },
+                    PdfPoint { x: tip.x + r * nx, y: tip.y + r * ny },
+                    PdfPoint { x: tip.x - r * ux, y: tip.y - r * uy },
+                    PdfPoint { x: tip.x - r * nx, y: tip.y - r * ny },
+                ]
+            };
+            path_from_points(out, &pts);
+            out.push_str("\ns\n");
+        }
+        "Butt" | "Slash" => {
+            let (nx, ny) = (-uy, ux);
+            let (a0, a1) = if ending == "Butt" {
+                (
+                    PdfPoint { x: tip.x + r * nx, y: tip.y + r * ny },
+                    PdfPoint { x: tip.x - r * nx, y: tip.y - r * ny },
+                )
+            } else {
+                (
+                    PdfPoint { x: tip.x + r * (nx + ux), y: tip.y + r * (ny + uy) },
+                    PdfPoint { x: tip.x - r * (nx + ux), y: tip.y - r * (ny + uy) },
+                )
+            };
+            moveto(out, a0);
+            lineto(out, a1);
+            out.push_str("S\n");
+        }
+        // An ending this app does not know: the shaft alone, no invented shape.
+        _ => {}
+    }
+}
+
+/// Revision-cloud intensity (`/BE /I`, 0..2) of `m`: the value a foreign cloud was read with,
+/// else the standard 2. Non-finite values read as 2.
+pub(crate) fn cloud_intensity(m: &Markup) -> f64 {
+    m.source_intensity
+        .filter(|i| i.is_finite())
+        .map_or(2.0, |i| i.clamp(0.0, 2.0))
+}
+
+/// Length of one scallop chord, PDF points, for an intensity.
+fn cloud_chord(intensity: f64) -> f64 {
+    (intensity * 10.0).max(5.0)
+}
+
+const CLOUD_MAX_ARCS_PER_EDGE: usize = 1_000;
+const CLOUD_MAX_ARCS_TOTAL: usize = 20_000;
+
+/// Closed path of outward-bulging Bezier scallops along the polygon `pts` (no paint op).
+/// Returns false, writing nothing, when the polygon cannot be scalloped (fewer than 3
+/// distinct finite points, intensity 0, or too many arcs): the caller draws it straight.
+fn cloud_path(out: &mut String, pts: &[PdfPoint], intensity: f64) -> bool {
+    if intensity <= 0.0 || pts.len() < 3 || pts.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+        return false;
+    }
+    let chord = cloud_chord(intensity);
+    let n = pts.len();
+    let area2: f64 = (0..n)
+        .map(|i| {
+            let (p, q) = (pts[i], pts[(i + 1) % n]);
+            p.x * q.y - q.x * p.y
+        })
+        .sum();
+    if !area2.is_finite() || area2 == 0.0 {
+        return false;
+    }
+    // Right-hand normal of an edge points outward for a counter-clockwise polygon.
+    let side = if area2 > 0.0 { 1.0 } else { -1.0 };
+    let mut arcs = 0usize;
+    let mut edges = Vec::with_capacity(n);
+    for i in 0..n {
+        let (p, q) = (pts[i], pts[(i + 1) % n]);
+        let len = (q.x - p.x).hypot(q.y - p.y);
+        if len < 1e-6 {
+            continue;
+        }
+        let k = ((len / chord).ceil() as usize).max(1);
+        if !len.is_finite() || k > CLOUD_MAX_ARCS_PER_EDGE {
+            return false;
+        }
+        arcs += k;
+        if arcs > CLOUD_MAX_ARCS_TOTAL {
+            return false;
+        }
+        edges.push((p, q, len, k));
+    }
+    if edges.len() < 3 {
+        return false;
+    }
+    moveto(out, edges[0].0);
+    for (p, q, len, k) in edges {
+        let (dx, dy) = ((q.x - p.x) / len, (q.y - p.y) / len);
+        let (nx, ny) = (dy * side, -dx * side);
+        let step = len / k as f64;
+        // Control offset 4/3 of the bulge height gives a bulge of `height` at mid-chord.
+        let ctrl = step * 0.45 * 4.0 / 3.0;
+        for j in 0..k {
+            let a = PdfPoint {
+                x: p.x + dx * step * j as f64,
+                y: p.y + dy * step * j as f64,
+            };
+            let b = if j + 1 == k {
+                q
+            } else {
+                PdfPoint {
+                    x: p.x + dx * step * (j + 1) as f64,
+                    y: p.y + dy * step * (j + 1) as f64,
+                }
+            };
+            out.push_str(&format!(
+                "{} {} {} {} {} {} c\n",
+                num(a.x + nx * ctrl),
+                num(a.y + ny * ctrl),
+                num(b.x + nx * ctrl),
+                num(b.y + ny * ctrl),
+                num(b.x),
+                num(b.y)
+            ));
+        }
+    }
+    true
 }
 
 /// Box border + optional fill for Text/Callout. Stroke (border) opacity and fill opacity
@@ -1080,7 +1249,14 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>, Option<Stamp
             if let Some(fill) = &a.fill {
                 fill_color(&mut out, fill);
             }
-            path_from_points(&mut out, pts);
+            // A cloud is scalloped (curved arcs, so Acrobat shows a cloud, not a polygon);
+            // anything that cannot be scalloped, and every other type, is a straight path.
+            let scalloped = m.markup_type == MarkupType::Cloud
+                && pts.len() >= 3
+                && cloud_path(&mut out, pts, cloud_intensity(m));
+            if !scalloped {
+                path_from_points(&mut out, pts);
+            }
             out.push('\n');
             out.push_str(paint_op(has_fill, a.line_weight > 0.0, true));
             out.push_str("\nQ\n");
@@ -1122,8 +1298,9 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>, Option<Stamp
             out.push_str(&format!("q\n/{leader_gs} gs\n"));
             stroke_preamble(&mut out, a);
             // Each leader points AT its target (index 0) and ends on the text box (last point).
+            let ending = super::callout::line_ending(m);
             for leader in super::callout::all_leaders(m) {
-                draw_callout_leader(&mut out, &leader, a);
+                draw_callout_leader(&mut out, &leader, a, ending.drawn_name());
             }
             out.push_str("Q\n");
             let rect = super::callout::text_box(m);
@@ -1453,6 +1630,10 @@ mod tests {
             source_rect: None,
             source_ref: None,
             source_popup: None,
+            source_dict: None,
+            source_fp: None,
+            source_intensity: None,
+            source_le: None,
             callout: None,
         }
     }
@@ -1816,21 +1997,73 @@ mod tests {
     }
 
     #[test]
-    fn cloud_appearance_is_a_simple_closed_polygon() {
-        // Named simplification: Cloud draws a plain closed polygon here, not the
-        // scalloped revision-cloud arcs the SVG overlay renders.
+    fn cloud_appearance_is_scalloped_with_bezier_arcs() {
+        let g = MarkupGeometry::Polyline(vec![
+            PdfPoint { x: 0.0, y: 0.0 },
+            PdfPoint { x: 100.0, y: 0.0 },
+            PdfPoint { x: 100.0, y: 60.0 },
+            PdfPoint { x: 0.0, y: 60.0 },
+        ]);
+        let m = base_markup(MarkupType::Cloud, g);
+        let c = content_str(&m);
+        // Intensity 2 -> 20pt chords: 5 + 3 + 5 + 3 arcs.
+        assert_eq!(c.matches(" c\n").count(), 16, "{c}");
+        assert!(!c.contains(" l\n"), "a cloud has no straight edges: {c}");
+        // The scallops bulge outward, so the BBox must clear the polygon.
+        let bb = ap_bbox(&m);
+        assert!(bb[0] < -10.0 && bb[2] > 110.0 && bb[1] < -10.0 && bb[3] > 70.0, "{bb:?}");
+    }
+
+    #[test]
+    fn cloud_scallops_bulge_outward_for_either_winding() {
+        let ccw = vec![
+            PdfPoint { x: 0.0, y: 0.0 },
+            PdfPoint { x: 40.0, y: 0.0 },
+            PdfPoint { x: 40.0, y: 40.0 },
+            PdfPoint { x: 0.0, y: 40.0 },
+        ];
+        let mut cw = ccw.clone();
+        cw.reverse();
+        for pts in [ccw, cw] {
+            let mut out = String::new();
+            assert!(cloud_path(&mut out, &pts, 2.0));
+            // The bottom edge (y = 0) arcs must dip below it, never rise into the polygon.
+            let lowest = out
+                .lines()
+                .filter(|l| l.ends_with(" c"))
+                .flat_map(|l| l.split_whitespace().take(6).map(|t| t.parse::<f64>().unwrap()).collect::<Vec<_>>())
+                .fold(f64::MAX, f64::min);
+            assert!(lowest < -1.0, "no outward bulge below the polygon: {out}");
+        }
+    }
+
+    #[test]
+    fn cloud_with_zero_intensity_or_hostile_points_is_drawn_straight() {
         let g = MarkupGeometry::Polyline(vec![
             PdfPoint { x: 0.0, y: 0.0 },
             PdfPoint { x: 40.0, y: 0.0 },
             PdfPoint { x: 40.0, y: 40.0 },
         ]);
-        let m = base_markup(MarkupType::Cloud, g);
+        let mut m = base_markup(MarkupType::Cloud, g);
+        m.source_intensity = Some(0.0);
         let c = content_str(&m);
-        assert!(
-            !c.contains(" c\n"),
-            "simplified cloud must not use bezier arcs"
-        );
-        assert!(c.contains(" m\n") && c.contains(" l\n"));
+        assert!(!c.contains(" c\n") && c.contains(" l\n"), "{c}");
+        // Absurdly long edge: more arcs than the cap, so a straight polygon, not a huge stream.
+        let mut out = String::new();
+        let far = [
+            PdfPoint { x: 0.0, y: 0.0 },
+            PdfPoint { x: 1e9, y: 0.0 },
+            PdfPoint { x: 1e9, y: 1e9 },
+        ];
+        assert!(!cloud_path(&mut out, &far, 2.0) && out.is_empty());
+        let nan = [
+            PdfPoint { x: f64::NAN, y: 0.0 },
+            PdfPoint { x: 1.0, y: 0.0 },
+            PdfPoint { x: 1.0, y: 1.0 },
+        ];
+        assert!(!cloud_path(&mut out, &nan, 2.0) && out.is_empty());
+        m.source_intensity = Some(f64::NAN);
+        assert_eq!(cloud_intensity(&m), 2.0);
     }
 
     // --- Open polyline --------------------------------------------------------------------

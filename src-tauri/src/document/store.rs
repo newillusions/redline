@@ -47,6 +47,26 @@ pub struct DocEntry {
     /// markups this store held, never input. An undo (`add` of the same id) takes them back
     /// out. Cleared with `tombstones`.
     pub removed_sources: std::collections::HashSet<crate::markup::SourceRef>,
+    /// Modified time and size of the file as redline last opened or wrote it. A save compares
+    /// it to the file now: annotation matching uses object ids from the loaded file, so a
+    /// file another program rewrote since would be saved over with stale ids (duplicating or
+    /// stripping annotations). `None` when the file could not be stat'ed.
+    pub disk_stamp: Option<DiskStamp>,
+}
+
+/// Modified time + size of a file on disk.
+pub type DiskStamp = (SystemTime, u64);
+
+/// Shown when a write finds the file changed under redline. Save As is NOT offered: it
+/// reads the same changed file, whose object numbers no longer match what redline loaded.
+pub const ERR_DISK_CHANGED: &str = "The PDF was changed on disk by another program after redline \
+opened it, so nothing was written (writing now could duplicate or remove annotations). \
+Close and reopen the document to reload it; markup changes made since then are not saved, so \
+note anything you need first.";
+
+fn disk_stamp_of(path: &std::path::Path) -> Option<DiskStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 /// One open document as reported by [`MarkupStore::list_open`] - the data
@@ -106,6 +126,7 @@ impl MarkupStore {
         self.docs.lock().unwrap().insert(
             doc_id.to_string(),
             DocEntry {
+                disk_stamp: disk_stamp_of(&path),
                 path,
                 password,
                 markups: Vec::new(),
@@ -199,8 +220,43 @@ impl MarkupStore {
         let e = g
             .get_mut(doc_id)
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+        e.disk_stamp = disk_stamp_of(&path);
         e.path = path;
         Ok(())
+    }
+
+    /// After a successful write of the file: forget every reference to object positions of the
+    /// file as it was before the write. Inline (direct-dictionary) annotations are matched by
+    /// their position in the page's `/Annots`, which the write reordered, and a deleted
+    /// markup's removal is done; keeping either would let the next save match a different
+    /// annotation that now sits at that position. Written objects are managed by their own
+    /// `/RLType` or `/RLPreserved` marker from here on.
+    pub fn rebaseline_after_write(&self, doc_id: &str) {
+        if let Some(e) = self.docs.lock().unwrap().get_mut(doc_id) {
+            let drop_inline = |m: &mut Markup| {
+                if m.source_ref.as_ref().is_some_and(|r| r.oid.is_none()) {
+                    m.source_ref = None;
+                }
+            };
+            e.markups.iter_mut().for_each(drop_inline);
+            e.tombstones.values_mut().for_each(drop_inline);
+            e.removed_sources.clear();
+        }
+    }
+
+    /// Err([`ERR_DISK_CHANGED`]) if the file registered for `doc_id` is no longer the one
+    /// redline opened or last wrote (modified time or size differ). Fails open (Ok) when
+    /// either stamp is unknown: the check exists to stop a stale-id save, not to block one
+    /// on a stat error.
+    pub fn check_disk_unchanged(&self, doc_id: &str) -> Result<(), String> {
+        let g = self.docs.lock().unwrap();
+        let e = g
+            .get(doc_id)
+            .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+        match (e.disk_stamp, disk_stamp_of(&e.path)) {
+            (Some(before), Some(now)) if before != now => Err(ERR_DISK_CHANGED.to_string()),
+            _ => Ok(()),
+        }
     }
 
     /// True if the PDF's existing annotations have been loaded into the store.
@@ -367,6 +423,13 @@ impl MarkupStore {
     /// Drop the cached entry for `path` (call after a save changes the file).
     pub fn invalidate_cache(&self, path: &PathBuf) {
         self.cache.lock().unwrap().invalidate(path);
+        // Every caller has just written `path` itself, so it is again the file redline knows.
+        let stamp = disk_stamp_of(path);
+        for e in self.docs.lock().unwrap().values_mut() {
+            if e.path == *path {
+                e.disk_stamp = stamp;
+            }
+        }
     }
 }
 
@@ -891,5 +954,51 @@ mod tests {
         assert_eq!(s.list_open().len(), 1);
         s.remove("d1");
         assert!(s.list_open().is_empty());
+    }
+
+    // --- save refuses a file changed under redline ------------------------------------
+
+    #[test]
+    fn writes_are_refused_once_the_file_changed_on_disk_and_allowed_again_after_our_own_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pdf");
+        std::fs::write(&p, b"%PDF-1.5 original").unwrap();
+        let s = MarkupStore::default();
+        s.register("d1", p.clone(), None);
+        assert_eq!(s.check_disk_unchanged("d1"), Ok(()), "unchanged since open");
+
+        // Another program rewrites it (different size, so the check holds on coarse mtimes).
+        std::fs::write(&p, b"%PDF-1.5 rewritten by another program").unwrap();
+        let err = s.check_disk_unchanged("d1").unwrap_err();
+        assert_eq!(err, ERR_DISK_CHANGED);
+        assert!(err.contains("reopen") && !err.contains("Save As"), "{err}");
+
+        // redline's own write (every caller of invalidate_cache) makes it the known file again.
+        s.invalidate_cache(&p);
+        assert_eq!(s.check_disk_unchanged("d1"), Ok(()));
+    }
+
+    #[test]
+    fn same_size_rewrite_is_caught_by_mtime_and_save_as_adopts_the_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.pdf"), dir.path().join("b.pdf"));
+        std::fs::write(&a, b"AAAA").unwrap();
+        let s = MarkupStore::default();
+        s.register("d1", a.clone(), None);
+        let f = std::fs::OpenOptions::new().write(true).open(&a).unwrap();
+        f.set_modified(SystemTime::now() + std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!(s.check_disk_unchanged("d1"), Err(ERR_DISK_CHANGED.to_string()));
+
+        std::fs::write(&b, b"BBBB").unwrap();
+        s.set_path("d1", b).unwrap();
+        assert_eq!(s.check_disk_unchanged("d1"), Ok(()), "Save As re-baselines on the new file");
+    }
+
+    #[test]
+    fn disk_check_fails_open_for_an_unreadable_path_and_errors_for_an_unknown_doc() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/nonexistent/none.pdf"), None);
+        assert_eq!(s.check_disk_unchanged("d1"), Ok(()));
+        assert!(s.check_disk_unchanged("nope").is_err());
     }
 }

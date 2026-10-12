@@ -1319,7 +1319,8 @@ pub(crate) mod tests {
             .iter()
             .map(|(_, d)| d)
             .find(|d| {
-                text_of(d, b"Contents").as_deref() == Some("Circuit note") && d.has(b"RLType")
+                text_of(d, b"Contents").as_deref() == Some("Circuit note")
+                    && (d.has(b"RLType") || d.has(b"RLPreserved"))
             })
             .unwrap();
         for k in [&b"BSIColumnData"[..], b"BBMeasure", b"NumCounts"] {

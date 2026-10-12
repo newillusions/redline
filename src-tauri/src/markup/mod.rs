@@ -635,6 +635,25 @@ pub struct Markup {
     /// serialised.
     #[serde(skip)]
     pub source_popup: Option<PopupProps>,
+    /// The sanitized original annotation dictionary of a FOREIGN (no `/RLType`) markup, kept
+    /// so a save that finds the markup unedited ([`Markup::is_unedited`]) writes it back
+    /// instead of rebuilding it from the model. Set only by the PDF reader (already stripped
+    /// of action keys and bounded, see [`foreign::sanitized_original`]); never serialised.
+    #[serde(skip)]
+    pub source_dict: Option<lopdf::Dictionary>,
+    /// [`Markup::edit_fingerprint`] of the model as the reader produced it; the markup is
+    /// "edited since load" once the current fingerprint differs. Set only by the PDF reader.
+    #[serde(skip)]
+    pub source_fp: Option<u64>,
+    /// A foreign cloud's original `/BE /I` (intensity), written back when the cloud is
+    /// rebuilt. Set only by the PDF reader; never serialised.
+    #[serde(skip)]
+    pub source_intensity: Option<f64>,
+    /// A foreign callout's original `/LE` (line ending), written back and drawn when the
+    /// callout is rebuilt. `None` = a callout redline authored (closed arrow). Set only by
+    /// the PDF reader; never serialised.
+    #[serde(skip)]
+    pub source_le: Option<callout::LineEnding>,
     /// Text box, extra leaders and auto-size of a [`MarkupType::Callout`] (see
     /// [`callout`]). `None` = the legacy fixed box at the leader's anchor.
     /// `#[serde(default)]` keeps pre-this-field JSON deserialising to `None`.
@@ -648,6 +667,10 @@ pub struct Markup {
 pub struct SourceRef {
     pub oid: Option<lopdf::ObjectId>,
     pub nm: Option<String>,
+    /// Where an INLINE (direct-dict, no object id) annotation sat: `(1-based page number,
+    /// index in the page's resolved /Annots)`. Two inline annotations sharing a `/NM` are
+    /// otherwise indistinguishable. `None` whenever `oid` is `Some`.
+    pub loc: Option<(u32, usize)>,
 }
 
 /// Default `/F` annotation flags for a markup redline creates itself: `4` (Print, bit 3
@@ -703,6 +726,10 @@ impl Markup {
             source_rect: None,
             source_ref: None,
             source_popup: None,
+            source_dict: None,
+            source_fp: None,
+            source_intensity: None,
+            source_le: None,
             callout: None,
         }
     }
@@ -720,6 +747,9 @@ impl Markup {
             || self.source_rect.is_some()
             || self.source_ref.is_some()
             || self.source_popup.is_some()
+            || self.source_dict.is_some()
+            || self.source_intensity.is_some()
+            || self.source_le.is_some()
             || self
                 .workflow
                 .thread
@@ -742,6 +772,10 @@ impl Markup {
         self.source_rect = None;
         self.source_ref = None;
         self.source_popup = None;
+        self.source_dict = None;
+        self.source_fp = None;
+        self.source_intensity = None;
+        self.source_le = None;
         for r in &mut self.workflow.thread {
             r.nm = None;
             r.extras = None;
@@ -761,6 +795,10 @@ impl Markup {
         self.source_rect = existing.source_rect;
         self.source_ref = existing.source_ref.clone();
         self.source_popup = existing.source_popup.clone();
+        self.source_dict = existing.source_dict.clone();
+        self.source_fp = existing.source_fp;
+        self.source_intensity = existing.source_intensity;
+        self.source_le = existing.source_le.clone();
         let replies: std::collections::HashMap<Uuid, &Reply> =
             existing.workflow.thread.iter().map(|r| (r.id, r)).collect();
         for r in &mut self.workflow.thread {
@@ -781,6 +819,27 @@ impl Markup {
                 c.extras = old.extras.clone();
             }
         }
+    }
+
+    /// Fingerprint of everything the model serialises (reader-owned `#[serde(skip)]` fields
+    /// excluded), so two equal fingerprints mean no user-visible field changed.
+    ///
+    /// `None` when the model cannot be serialised: such a markup is never "unedited".
+    pub fn edit_fingerprint(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_vec(self).ok()?.hash(&mut h);
+        Some(h.finish())
+    }
+
+    /// True while this foreign markup is exactly as the reader produced it: a save then
+    /// writes its original dictionary back rather than rebuilding it. False for anything
+    /// authored by redline, anything edited since load, and anything the reader could not
+    /// keep an original for.
+    pub fn is_unedited(&self) -> bool {
+        self.source_dict.is_some()
+            && self.source_fp.is_some()
+            && self.source_fp == self.edit_fingerprint()
     }
 
     /// The `/NM` to write: the original source name if there was one, else the id.
@@ -897,6 +956,9 @@ pub fn check_not_locked(existing: &Markup) -> Result<(), MarkupLockError> {
 
 #[cfg(test)]
 mod interop_integrity_tests;
+
+#[cfg(test)]
+mod preserve_tests;
 
 #[cfg(test)]
 mod tests {

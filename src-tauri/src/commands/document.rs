@@ -310,6 +310,22 @@ pub async fn save_document_as(
     save_impl(state, doc_id, Some(PathBuf::from(new_path))).await
 }
 
+/// Refuse any write that would use the loaded markups' object ids (save, Save As, every page
+/// op, extract) once the file on disk is no longer the one redline loaded them from. Skipped
+/// for a document that was not loaded (its markups are read fresh from the current file).
+/// A refusal never touches the baseline: only a verified write re-baselines it.
+fn ensure_source_unchanged(
+    store: &crate::document::store::MarkupStore,
+    doc_id: &str,
+    was_loaded: bool,
+) -> Result<(), String> {
+    if was_loaded {
+        store.check_disk_unchanged(doc_id)
+    } else {
+        Ok(())
+    }
+}
+
 /// Shared save flow entry: acquires the per-doc save-in-flight guard, then runs
 /// the actual save. The guard is released on EVERY exit path - `save_inner`
 /// returns its Result here and `end_save` runs unconditionally before returning.
@@ -345,7 +361,8 @@ async fn save_inner(
     // Load-before-save guard: never strip annotations that were never imported.
     // is_managed treats every /RLType annot as ours, so saving an un-loaded doc
     // would replace pre-existing redline annotations with only the new ones.
-    if !state.markups.is_loaded(doc_id) {
+    let was_loaded = state.markups.is_loaded(doc_id);
+    if !was_loaded {
         let p = src.clone();
         let pw = password.clone();
         let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
@@ -356,6 +373,11 @@ async fn save_inner(
     }
     let markups = state.markups.list(doc_id)?;
     let removed = state.markups.removed_sources(doc_id);
+
+    // Annotation matching and preserved originals use the loaded file's object ids: refuse
+    // any write (in place or Save As, which reads the same source) once another program has
+    // rewritten the file since. Only a reload is safe.
+    ensure_source_unchanged(&state.markups, doc_id, was_loaded)?;
 
     // 1. Stage the complete rewritten file next to the destination. Encrypted source
     //    documents are refused inside save_with_markups (see its doc comment) - lopdf
@@ -403,6 +425,7 @@ async fn save_inner(
     // The current markup state is now on disk - clear dirty (MCP server design, Phase
     // 2a `close_document`/`list_open_documents`; see `DocEntry::dirty`'s doc comment).
     state.markups.clear_dirty(doc_id);
+    state.markups.rebaseline_after_write(doc_id);
     Ok(())
 }
 
@@ -500,7 +523,8 @@ pub(crate) async fn apply_page_edit(
 
     // Load-before-op: ensure the markup store is seeded so save doesn't drop existing
     // redline annotations that haven't been loaded into memory yet.
-    if !state.markups.is_loaded(doc_id) {
+    let was_loaded = state.markups.is_loaded(doc_id);
+    if !was_loaded {
         let p = src.clone();
         let pw = password.clone();
         let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
@@ -509,6 +533,9 @@ pub(crate) async fn apply_page_edit(
             .map_err(|e| format!("{e:#}"))?;
         state.markups.seed_loaded(doc_id, loaded)?;
     }
+    // The write below re-baselines the disk stamp (`invalidate_cache`), so verify it first:
+    // a page op over a file another program changed would write stale object ids.
+    ensure_source_unchanged(&state.markups, doc_id, was_loaded)?;
     let markups = state.markups.list(doc_id)?;
     let removed = state.markups.removed_sources(doc_id);
 
@@ -538,6 +565,7 @@ pub(crate) async fn apply_page_edit(
     // `op` runs) - clear dirty here too, not just in save_inner (MCP server design,
     // Phase 2a; see DocEntry::dirty's doc comment).
     state.markups.clear_dirty(doc_id);
+    state.markups.rebaseline_after_write(doc_id);
     Ok(())
 }
 
@@ -677,7 +705,8 @@ pub async fn extract_pages(
     }
 
     let password = state.markups.password(&doc_id);
-    if !state.markups.is_loaded(&doc_id) {
+    let was_loaded = state.markups.is_loaded(&doc_id);
+    if !was_loaded {
         let p = src.clone();
         let pw = password.clone();
         let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
@@ -686,6 +715,7 @@ pub async fn extract_pages(
             .map_err(|e| format!("{e:#}"))?;
         state.markups.seed_loaded(&doc_id, loaded)?;
     }
+    ensure_source_unchanged(&state.markups, &doc_id, was_loaded)?;
     let markups = state.markups.list(&doc_id)?;
     let removed = state.markups.removed_sources(&doc_id);
 
@@ -1051,5 +1081,26 @@ mod tests {
         let err = extract_pages_to_new_file(&src, &dest, &[], &Default::default(), &[5]);
         assert!(err.is_err(), "an out-of-range page index must be refused");
         assert!(!dest.exists());
+    }
+
+    #[test]
+    fn a_changed_source_refuses_every_write_and_a_refusal_keeps_the_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pdf");
+        std::fs::write(&p, b"%PDF original").unwrap();
+        let store = crate::document::store::MarkupStore::default();
+        store.register("d", p.clone(), None);
+        assert_eq!(ensure_source_unchanged(&store, "d", true), Ok(()));
+        std::fs::write(&p, b"%PDF rewritten by another program").unwrap();
+        // Save, Save As, page ops and extract all go through this one check; repeating it
+        // never re-baselines, so a refused attempt cannot make the next one pass.
+        for _ in 0..3 {
+            assert_eq!(
+                ensure_source_unchanged(&store, "d", true),
+                Err(crate::document::store::ERR_DISK_CHANGED.to_string())
+            );
+        }
+        // A document whose markups were never loaded reads them fresh: nothing stale.
+        assert_eq!(ensure_source_unchanged(&store, "d", false), Ok(()));
     }
 }

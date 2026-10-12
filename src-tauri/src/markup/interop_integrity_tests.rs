@@ -277,7 +277,7 @@ fn removed_sources_only_ever_come_from_markups_the_store_held() {
 
     // A very large removal set is plain data: no panic, nothing else touched.
     let big: HashSet<SourceRef> = (0..100_000)
-        .map(|i| SourceRef { oid: Some((i + 10_000, 0)), nm: Some(format!("NAME{i:012}")) })
+        .map(|i| SourceRef { oid: Some((i + 10_000, 0)), nm: Some(format!("NAME{i:012}")), loc: None })
         .collect();
     write_markups_removing(&mut doc, &[], &big).unwrap();
     assert_eq!(count_of(&doc, "Link"), 1);
@@ -785,6 +785,10 @@ fn text_markups_in_either_quadpoints_order_load_and_save_to_the_same_geometry() 
                     8,
                 );
                 assert_eq!(line, vec![BL, BR]);
+                // An edit makes redline rebuild the markup (an unedited one is written back
+                // as it was, whatever its quad order - see the unedited tests).
+                let mut ms = ms;
+                ms[0].contents = Some(format!("edited {cycle}"));
                 write_markups(&mut doc, &ms).unwrap();
                 doc = reload(&mut doc);
                 assert_eq!(annots(&doc).len(), 1, "{st} {label} cycle {cycle}");

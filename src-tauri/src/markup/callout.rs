@@ -31,6 +31,53 @@ pub const MAX_BOX_SIDE: f64 = 20_000.0;
 /// Text-box size of a callout with no props, PDF points (mirrors `markup-render.ts`).
 pub const LEGACY_BOX: (f64, f64) = (144.0, 18.0);
 
+/// The `/LE` (line ending) of a callout's leader: a foreign callout's value is read, kept and
+/// written back; a callout redline authors gets a closed arrow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineEnding {
+    /// No `/LE` key (the standard default is no ending).
+    Absent,
+    /// A name such as `OpenArrow`, `None`, `Circle` (short, `[A-Za-z0-9]` only).
+    Named(String),
+}
+
+const MAX_LE_NAME: usize = 32;
+
+impl LineEnding {
+    /// What redline draws and writes for a callout it authored.
+    pub fn closed_arrow() -> LineEnding {
+        LineEnding::Named("ClosedArrow".into())
+    }
+
+    /// The annotation's `/LE`. A value that is not a short plain name (an array, an
+    /// oversized or odd-looking name) reads as [`LineEnding::Absent`].
+    pub fn read(d: &Dictionary) -> LineEnding {
+        match d.get(b"LE").ok().and_then(|o| o.as_name().ok()) {
+            Some(n)
+                if !n.is_empty()
+                    && n.len() <= MAX_LE_NAME
+                    && n.iter().all(|b| b.is_ascii_alphanumeric()) =>
+            {
+                LineEnding::Named(String::from_utf8_lossy(n).into_owned())
+            }
+            _ => LineEnding::Absent,
+        }
+    }
+
+    /// The name to draw by, `None` for no ending (absent or `/None`).
+    pub fn drawn_name(&self) -> Option<&str> {
+        match self {
+            LineEnding::Named(n) if n != "None" => Some(n.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// The ending to draw and write for `m`: the one it was read with, else a closed arrow.
+pub fn line_ending(m: &Markup) -> LineEnding {
+    m.source_le.clone().unwrap_or_else(LineEnding::closed_arrow)
+}
+
 /// Text box + extra leaders + auto-size of a [`MarkupType::Callout`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CalloutProps {
@@ -194,7 +241,9 @@ pub fn write_keys(d: &mut Dictionary, m: &Markup, rect: [f64; 4]) {
         return;
     }
     d.set("IT", Object::Name(b"FreeTextCallout".to_vec()));
-    d.set("LE", Object::Name(b"ClosedArrow".to_vec()));
+    if let LineEnding::Named(n) = line_ending(m) {
+        d.set("LE", Object::Name(n.into_bytes()));
+    }
     let Some(p) = props(m) else { return };
     let (b0, b1) = (p.box_min, p.box_max);
     // /RD: left, top, right, bottom offsets from /Rect to the text box.

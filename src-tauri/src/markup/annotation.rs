@@ -581,7 +581,12 @@ impl Markup {
                     }
                 } else if matches!(t, MarkupType::Callout) {
                     // Callout leader line: tip first, 2 or 3 points (ISO 32000-1 12.5.6.6).
-                    d.set("CL", flatten(&super::callout::primary_leader(self)));
+                    // /CL is 4 or 6 numbers (ISO 32000-1 12.5.6.6): with fewer than two finite
+                    // leader points there is no valid value, so the key is left out.
+                    let leader = super::callout::primary_leader(self);
+                    if leader.len() >= 2 {
+                        d.set("CL", flatten(&leader));
+                    }
                 } else {
                     d.set("Vertices", flatten(pts));
                 }
@@ -757,7 +762,9 @@ impl Markup {
         if matches!(t, MarkupType::Cloud) {
             let mut be = Dictionary::new();
             be.set("S", name("C")); // Cloudy border style
-            be.set("I", real(2.0)); // intensity (0..2); 2 = standard revision-cloud amplitude
+            // intensity (0..2); 2 = standard revision-cloud amplitude. A foreign cloud keeps
+            // the intensity it was read with.
+            be.set("I", real(super::appearance::cloud_intensity(self)));
             d.set("BE", Object::Dictionary(be));
             d.set("IT", name("PolygonCloud"));
         }
@@ -1229,6 +1236,15 @@ impl Markup {
             source_rect,
             source_ref: None,
             source_popup: None,
+            source_dict: None,
+            source_fp: None,
+            source_intensity: (markup_type == MarkupType::Cloud)
+                .then(|| d.get(b"BE").ok().and_then(|o| o.as_dict().ok()))
+                .flatten()
+                .and_then(|be| get_real(be, b"I"))
+                .filter(|i| i.is_finite()),
+            source_le: (markup_type == MarkupType::Callout)
+                .then(|| super::callout::LineEnding::read(d)),
             callout,
         }
     }

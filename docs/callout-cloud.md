@@ -66,7 +66,7 @@ A callout is a text box plus one or more leaders (arrows) from the box to things
 |---|---|---|
 | Annotation | `/Subtype /FreeText`, `/IT /FreeTextCallout` | standard (ISO 32000-1 12.5.6.6) |
 | Primary leader | `/CL` with 4 numbers (tip, attach) or 6 numbers (tip, knee, attach) | tip first, as the standard defines it |
-| Line ending | `/LE /ClosedArrow` | matches the arrowhead drawn |
+| Line ending | `/LE /ClosedArrow` (a foreign callout keeps its own `/LE`, drawn to match) | matches the ending drawn |
 | Text box | `/Rect` minus `/RD` (left, top, right, bottom insets) | standard; other viewers read the box from it |
 | Text box, exact | `/RLCalloutBox [x0 y0 x1 y1]` | private; the f32 `/Rect` minus `/RD` is not exact, so redline reads this first |
 | Extra leaders | `/RLCalloutLeaders [[x y x y (x y)] ...]` | private; **also drawn into `/AP`**, so every viewer shows them |
@@ -104,8 +104,9 @@ callouts no longer have that mismatch. Dragging only a tip or knee does not add 
 | Esc cancels an unfinished shape | I | redline convention | yes (existing) |
 
 PDF: `/Subtype /Polygon`, `/Vertices`, `/BE << /S /C /I 2 >>` (cloudy border, intensity 2), `/IT /PolygonCloud`
-(existing). Intensity is fixed at 2; a foreign `/BE /I` is not kept (**follow-up**). The saved appearance is a
-plain polygon; redline's own viewer draws the scallops.
+(existing). A foreign cloud keeps its `/BE /I` (new clouds use 2). The saved appearance is a scalloped Bezier path
+(chord 10 pt x intensity; intensity 0 or an unscalloppable polygon is drawn straight), so Acrobat shows a
+cloud. An unedited foreign cloud is written back from its original dictionary, `/AP` included.
 
 Bounded work: the screen scallop count is capped at 4000 (a larger cloud gets proportionally larger
 scallops), at most 2000 vertices are walked, and non-finite vertices or radius give no path.
@@ -130,7 +131,7 @@ Cloud+ is a follow-up.
 ## 4. Interop and safety rules kept
 
 - Foreign annotations keep identity (`source_ref`, `source_nm`); reader-owned fields never come from IPC.
-- Only allow-listed foreign keys are carried; `/IT`, `/LE`, `/RD` are written from the model.
+- An edited foreign markup carries only allow-listed foreign keys; `/IT`, `/LE`, `/RD` are written from the model. An unedited one is written back from its sanitized original dictionary (action keys stripped, bounded).
 - Load/save is idempotent over 3 cycles with Revu-style 16-char `/NM` (test below).
 - Untrusted geometry is bounded: non-finite or oversized box -> legacy box; at most 16 extra leaders,
   3 points per leader; a 200-point `/CL` is reduced to 3; 5000 leaders in a PDF are read as 16;
@@ -156,7 +157,6 @@ Frontend: `src/lib/callout.test.ts` (geometry, knee, leaders, box, auto-size, cl
 - "+" / "-" cursors while Shift is held over a knee / tip.
 - Alt+Z autosize command and an "Autosize" application preference.
 - Direct Shift+drag of the Cloud+ text box without ungrouping.
-- Keep a foreign `/BE /I` cloud intensity, and a per-cloud intensity control.
+- A per-cloud intensity control (a foreign `/BE /I` is already kept).
 - Find out how Revu stores several leaders and Cloud+ (needs a Revu-made sample file) and align.
 - Keyboard shortcut for Callout (letter unknown).
-- Redline-drawn cloud scallops in the saved appearance (today a plain polygon).

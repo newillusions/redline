@@ -303,6 +303,257 @@ fn from_value(v: &PdfValue) -> Object {
     }
 }
 
+/// Marker redline writes on a foreign markup it wrote back unchanged ([`sanitized_original`]),
+/// so the next save still knows the (rewritten) object is the one it manages.
+pub const PRESERVED_MARKER: &str = "RLPreserved";
+
+/// Most nodes (values), and string/name bytes, an original annotation dictionary may hold to
+/// be carried; a hostile or absurd one is not kept and the markup is rebuilt from the model.
+const MAX_ORIGINAL_NODES: usize = 200_000;
+const MAX_ORIGINAL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ORIGINAL_DEPTH: usize = 16;
+
+/// Top-level keys of an original dictionary that are never carried: every action- or
+/// navigation-bearing key, plus the links redline rebuilds (`/Popup`, `/IRT`, `/RT`, `/Parent`)
+/// and its own marker. `/AP` (checked by the caller), `/P` (the page) and `/F` (the
+/// annotation flags, a plain integer at this level) are kept.
+fn top_level_dropped(k: &[u8]) -> bool {
+    let Ok(k) = std::str::from_utf8(k) else { return true };
+    k == "RT"
+        || k == PRESERVED_MARKER
+        || (ACTION_KEYS.contains(&k) && !matches!(k, "AP" | "P" | "F"))
+}
+
+/// Largest single string or name carried in an original dictionary.
+const MAX_ORIGINAL_STRING: usize = 1024 * 1024;
+/// Budget for content INLINED from indirect references, counted after expansion and shared by
+/// the whole annotation (fan-out of many references to one big object is charged each time).
+const MAX_INLINED_NODES: usize = 20_000;
+const MAX_INLINED_BYTES: usize = 1024 * 1024;
+/// The same budget for a whole document read: every annotation's inlined content counts, so a
+/// crafted file cannot cost more than this on open however many annotations share objects.
+/// Once spent, further foreign markups are rebuilt from the model instead of preserved.
+const MAX_DOC_INLINED_NODES: usize = 200_000;
+const MAX_DOC_INLINED_BYTES: usize = 8 * 1024 * 1024;
+/// An object whose expansion cost more than this many nodes is inlined once per document; a
+/// second reach (from another annotation, or again in the same one) refuses to preserve that
+/// markup rather than copying it again. Small shared objects (a /Measure) may repeat.
+const SHARED_INLINE_MAX: usize = 500;
+
+/// Document-wide state for [`sanitized_original`], shared across every annotation of one read.
+#[derive(Default)]
+pub struct Shared {
+    inlined_nodes: usize,
+    inlined_bytes: usize,
+    /// Expansion cost (nodes) of each object inlined so far.
+    costs: std::collections::HashMap<lopdf::ObjectId, usize>,
+}
+
+impl Shared {
+    fn exhausted(&self) -> bool {
+        self.inlined_nodes > MAX_DOC_INLINED_NODES || self.inlined_bytes > MAX_DOC_INLINED_BYTES
+    }
+}
+
+type Resolver<'a> = &'a dyn Fn(lopdf::ObjectId) -> Option<&'a Object>;
+
+/// Why a value could not be carried.
+enum Fail {
+    /// The dictionary itself is too large or deep: rebuild the whole markup from the model.
+    Whole,
+    /// The inlining budget is spent: drop this key, keep the rest.
+    Key,
+}
+
+/// Running totals for one annotation (plus the document-wide [`Shared`]).
+struct Budget<'s> {
+    shared: &'s mut Shared,
+    nodes: usize,
+    bytes: usize,
+    inlined_nodes: usize,
+    inlined_bytes: usize,
+    /// Reference targets currently being expanded (cycle detection).
+    active: Vec<lopdf::ObjectId>,
+    cycle_logged: bool,
+}
+
+impl Budget<'_> {
+    fn charge(&mut self, bytes: usize) -> Result<(), Fail> {
+        self.nodes += 1;
+        self.bytes += bytes;
+        if !self.active.is_empty() {
+            self.inlined_nodes += 1;
+            self.inlined_bytes += bytes;
+            self.shared.inlined_nodes += 1;
+            self.shared.inlined_bytes += bytes;
+            if self.shared.exhausted() {
+                return Err(Fail::Whole);
+            }
+            if self.inlined_nodes > MAX_INLINED_NODES || self.inlined_bytes > MAX_INLINED_BYTES {
+                return Err(Fail::Key);
+            }
+        }
+        if self.nodes > MAX_ORIGINAL_NODES || self.bytes > MAX_ORIGINAL_BYTES {
+            return Err(Fail::Whole);
+        }
+        Ok(())
+    }
+}
+
+/// Strip action keys and action dictionaries from a value, INLINING indirect references (an
+/// object id from the file as opened can dangle or point elsewhere after redline rewrites
+/// the page's objects, and a referenced action object would otherwise stay in the file).
+/// `None` = drop this value (a stream, an action dictionary, an unresolvable or cyclic
+/// reference). Recursion is bounded by [`MAX_ORIGINAL_DEPTH`] and every node and byte is
+/// charged to `st` before it is copied, so a hostile graph cannot cost more than the budget.
+fn clean_original(
+    o: &Object,
+    resolve: Resolver,
+    depth: usize,
+    st: &mut Budget,
+) -> Result<Option<Object>, Fail> {
+    if depth > MAX_ORIGINAL_DEPTH {
+        return Err(Fail::Whole);
+    }
+    st.charge(0)?;
+    Ok(Some(match o {
+        Object::Stream(_) => return Ok(None),
+        Object::Reference(r) => {
+            if st.active.contains(r) {
+                if !st.cycle_logged {
+                    log::warn!("foreign annotation: reference cycle at {r:?}; dropping the reference");
+                    st.cycle_logged = true;
+                }
+                return Ok(None);
+            }
+            let Some(target) = resolve(*r) else {
+                return Ok(None);
+            };
+            // A big object already inlined once is not copied again, nor is anything once the
+            // document-wide budget is spent: the markup is rebuilt from the model.
+            if st.shared.exhausted() || st.shared.costs.get(r).is_some_and(|c| *c > SHARED_INLINE_MAX) {
+                return Err(Fail::Whole);
+            }
+            let before = st.nodes;
+            st.active.push(*r);
+            let out = clean_original(target, resolve, depth + 1, st);
+            st.active.pop();
+            if out.is_ok() {
+                st.shared.costs.insert(*r, st.nodes - before);
+            }
+            return out;
+        }
+        Object::String(b, f) => {
+            if b.len() > MAX_ORIGINAL_STRING {
+                return Err(Fail::Whole);
+            }
+            st.charge(b.len())?;
+            Object::String(b.clone(), *f)
+        }
+        Object::Name(n) => {
+            if n.len() > MAX_ORIGINAL_STRING {
+                return Err(Fail::Whole);
+            }
+            st.charge(n.len())?;
+            Object::Name(n.clone())
+        }
+        Object::Array(a) => {
+            let mut out = Vec::with_capacity(a.len().min(1024));
+            for e in a {
+                if let Some(v) = clean_original(e, resolve, depth + 1, st)? {
+                    out.push(v);
+                }
+            }
+            Object::Array(out)
+        }
+        Object::Dictionary(d) => {
+            let is_action = matches!(
+                d.get(b"S").ok().and_then(|s| s.as_name().ok()).and_then(|n| std::str::from_utf8(n).ok()),
+                Some(t) if ACTION_TYPES.contains(&t)
+            );
+            if is_action {
+                return Ok(None);
+            }
+            let mut out = Dictionary::new();
+            for (k, v) in d.iter() {
+                let dropped = std::str::from_utf8(k).map_or(true, |k| k != "P" && ACTION_KEYS.contains(&k));
+                if dropped {
+                    continue;
+                }
+                st.charge(k.len())?;
+                if let Some(v) = clean_original(v, resolve, depth + 1, st)? {
+                    out.set(k.clone(), v);
+                }
+            }
+            Object::Dictionary(out)
+        }
+        other => other.clone(),
+    }))
+}
+
+/// The original dictionary of a foreign annotation as safe to write back unchanged: every
+/// key kept except action/navigation keys (`/A /AA /JS /OpenAction /URI /Launch ...`, top
+/// level and nested), the links redline rebuilds and its marker; action dictionaries nested
+/// anywhere (also behind an indirect reference) are dropped. Indirect references are
+/// INLINED through `resolve` (streams and unresolvable ones dropped), except `/AP` (kept as
+/// the file's own reference when `ap_ok` accepts it), `/P` (the page) and `/OC` (optional
+/// content group), which stay references. `None` when the dictionary is too large or deep to
+/// carry (the caller then rebuilds the markup from its model as before).
+pub fn sanitized_original(
+    d: &Dictionary,
+    ap_ok: impl Fn(&Object) -> bool,
+    resolve: Resolver,
+    shared: &mut Shared,
+) -> Option<Dictionary> {
+    let mut st = Budget {
+        shared,
+        nodes: 0,
+        bytes: 0,
+        inlined_nodes: 0,
+        inlined_bytes: 0,
+        active: Vec::new(),
+        cycle_logged: false,
+    };
+    let mut out = Dictionary::new();
+    for (k, v) in d.iter() {
+        if top_level_dropped(k) {
+            continue;
+        }
+        match k.as_slice() {
+            b"AP" => {
+                if ap_ok(v) {
+                    out.set(k.clone(), v.clone());
+                }
+                continue;
+            }
+            b"P" | b"OC" => {
+                if matches!(v, Object::Reference(_)) {
+                    out.set(k.clone(), v.clone());
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        if st.charge(k.len()).is_err() {
+            return None;
+        }
+        match clean_original(v, resolve, 0, &mut st) {
+            Ok(Some(v)) => out.set(k.clone(), v),
+            Ok(None) => {}
+            // The inlining budget is spent: leave this key out, keep the rest.
+            Err(Fail::Key) => {
+                st.active.clear();
+                log::warn!("foreign annotation: /{} dropped (inlined content over budget)", String::from_utf8_lossy(k));
+            }
+            Err(Fail::Whole) => {
+                log::warn!("foreign annotation: original dictionary too large to carry; rebuilding");
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Collect the allowlisted, valid keys of an annotation dictionary, in key order. Anything
 /// else (other keys are simply not ours; invalid values of ours are logged) is skipped.
 pub fn capture(d: &Dictionary) -> Vec<ForeignKey> {
