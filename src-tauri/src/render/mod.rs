@@ -2408,6 +2408,172 @@ pub(crate) mod tests {
         );
     }
 
+    /// Text mark-up + sticky Note, painted by an independent strict reader (PDFium's own
+    /// annotation pipeline, `render_annotations(true)`, which honours `/AP`). Proves the
+    /// exported appearance streams land where the authored geometry says: an Underline on
+    /// the quad's bottom edge, a StrikeOut at mid-height, a Squiggly hugging the baseline
+    /// (never above the quad's top), a Note's icon box centred on its point. NOT a
+    /// Bluebeam/Acrobat render - those regenerate from the dictionary keys (see
+    /// docs/text-markup-tools.md for the owner's cross-viewer command).
+    #[test]
+    fn strict_reader_paints_text_markup_and_note_at_the_authored_geometry() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+        use crate::geometry::PdfPoint;
+        use crate::markup::{Appearance, Markup, MarkupGeometry, MarkupType, UserRef};
+
+        let user = || UserRef {
+            user_id: uuid::Uuid::new_v4(),
+            display_name: "Test".into(),
+        };
+        let appearance = |color: &str| Appearance {
+            color: color.to_string(),
+            line_weight: 2.0,
+            ..Appearance::default()
+        };
+        // One text line per markup, stacked 100pt apart so they cannot overlap.
+        let quad_at = |top: f64| {
+            MarkupGeometry::Quads(vec![[
+                PdfPoint { x: 72.0, y: top },
+                PdfPoint { x: 272.0, y: top },
+                PdfPoint {
+                    x: 72.0,
+                    y: top - 12.0,
+                },
+                PdfPoint {
+                    x: 272.0,
+                    y: top - 12.0,
+                },
+            ]])
+        };
+        let markups = vec![
+            Markup::new(
+                MarkupType::Underline,
+                0,
+                quad_at(712.0),
+                appearance("#ff0000"),
+                user(),
+            ),
+            Markup::new(
+                MarkupType::StrikeOut,
+                0,
+                quad_at(612.0),
+                appearance("#00aa00"),
+                user(),
+            ),
+            Markup::new(
+                MarkupType::Squiggly,
+                0,
+                quad_at(512.0),
+                appearance("#0000ff"),
+                user(),
+            ),
+            Markup::new(
+                MarkupType::Note,
+                0,
+                MarkupGeometry::Point(PdfPoint { x: 400.0, y: 300.0 }),
+                appearance("#ffd400"),
+                user(),
+            ),
+        ];
+        let (mut doc, _page_id) = crate::document::annots::tests::one_page_doc();
+        crate::document::annots::write_markups(&mut doc, &markups).expect("write_markups");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("textmarkup.pdf");
+        doc.save(&path).expect("save fixture");
+
+        let bindings = Pdfium::bind_to_library(
+            std::env::var("PDFIUM_DYNAMIC_LIB_PATH").expect("checked above"),
+        )
+        .expect("bind pdfium");
+        let pdfium = Pdfium::new(bindings);
+        let document = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load fixture");
+        let page = document.pages().get(0).expect("page 0");
+        let bitmap = page
+            .render_with_config(
+                &PdfRenderConfig::new()
+                    .scale_page_by_factor(1.0)
+                    .render_annotations(true),
+            )
+            .expect("render with annotations");
+        let img = bitmap.as_image().into_rgba8();
+
+        // Device y (down) of PDF y (up) on the 792pt page, 1pt = 1px.
+        let dy = |pdf_y: f64| (792.0 - pdf_y).round() as i64;
+        // Pixel-space bounding box of pixels satisfying `is` (None when nothing painted).
+        let bbox = |is: &dyn Fn(&image::Rgba<u8>) -> bool| {
+            let (mut x0, mut y0, mut x1, mut y1, mut any) = (i64::MAX, i64::MAX, 0i64, 0i64, false);
+            for (x, y, p) in img.enumerate_pixels() {
+                if is(p) {
+                    any = true;
+                    x0 = x0.min(x as i64);
+                    y0 = y0.min(y as i64);
+                    x1 = x1.max(x as i64);
+                    y1 = y1.max(y as i64);
+                }
+            }
+            any.then_some((x0, y0, x1, y1))
+        };
+        let near = |c: [u8; 3]| {
+            move |p: &image::Rgba<u8>| {
+                p.0[3] > 0
+                    && (p.0[0] as i32 - c[0] as i32).abs() < 70
+                    && (p.0[1] as i32 - c[1] as i32).abs() < 70
+                    && (p.0[2] as i32 - c[2] as i32).abs() < 70
+            }
+        };
+
+        // Underline: a horizontal rule on the quad's bottom edge (PDF y=700), x 72..272.
+        let (x0, y0, x1, y1) = bbox(&near([255, 0, 0])).expect("underline painted");
+        assert!(
+            (x0 - 72).abs() <= 3 && (x1 - 272).abs() <= 3,
+            "underline x-extent {x0}..{x1}"
+        );
+        assert!(
+            y0 >= dy(700.0) - 3 && y1 <= dy(700.0) + 3,
+            "underline sits on the bottom edge y={}: rows {y0}..{y1}",
+            dy(700.0)
+        );
+
+        // StrikeOut: mid-height of its quad (PDF y=606).
+        let (_, y0, _, y1) = bbox(&near([0, 170, 0])).expect("strike-out painted");
+        assert!(
+            y0 >= dy(606.0) - 3 && y1 <= dy(606.0) + 3,
+            "strike-out at mid-height y={}: rows {y0}..{y1}",
+            dy(606.0)
+        );
+
+        // Squiggly: below the quad's top edge, hugging the baseline (PDF y=500..503).
+        let (x0, y0, x1, y1) = bbox(&near([0, 0, 255])).expect("squiggly painted");
+        assert!(
+            (x0 - 72).abs() <= 3 && (x1 - 272).abs() <= 3,
+            "squiggly x-extent {x0}..{x1}"
+        );
+        assert!(
+            y0 >= dy(500.0 + 6.0) && y1 <= dy(500.0) + 3,
+            "squiggly stays on the baseline band: rows {y0}..{y1}"
+        );
+        assert!(
+            y1 - y0 >= 2,
+            "squiggly has vertical amplitude, not a flat rule: rows {y0}..{y1}"
+        );
+
+        // Note: yellow icon box centred on (400,300), 20x20.
+        let (x0, y0, x1, y1) = bbox(&near([255, 212, 0])).expect("note icon painted");
+        assert!(
+            (x0 - 391).abs() <= 3 && (x1 - 409).abs() <= 3,
+            "note icon x-extent {x0}..{x1}"
+        );
+        assert!(
+            (y0 - dy(309.0)).abs() <= 3 && (y1 - dy(291.0)).abs() <= 3,
+            "note icon y-extent {y0}..{y1}"
+        );
+    }
+
     /// Second cross-viewer interop regression, independent renderer, ROTATED page this
     /// time: a strict reader (PDFium's OWN full rendering pipeline - `render_with_config`
     /// with no custom matrix, so `/Rotate` is applied automatically exactly like a real

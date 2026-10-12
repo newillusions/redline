@@ -710,3 +710,17 @@ describe("existingSearchHighlightIds", () => {
     expect(existingSearchHighlightIds([offsetBy2pt], 0, rect)).toEqual([]);
   });
 });
+
+describe("sticky Note bounds + hit-testing", () => {
+  const note = { ...mkMarkup("n1", { Point: { x: 100, y: 200 } }), markup_type: "Note" as const };
+
+  it("bounds are the 20pt icon box centred on the point", () => {
+    expect(boundsOf(note)).toEqual({ minX: 90, minY: 190, maxX: 110, maxY: 210 });
+  });
+
+  it("a click anywhere on the icon box hits, just outside misses", () => {
+    expect(hitTest([note], { x: 108, y: 208 }, 1)).toBe("n1");
+    expect(hitTest([note], { x: 92, y: 192 }, 1)).toBe("n1");
+    expect(hitTest([note], { x: 120, y: 200 }, 1)).toBeNull();
+  });
+});

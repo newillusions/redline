@@ -43,10 +43,10 @@ REDLINE_CROSSVIEWER_OUT=/tmp/redline-crossviewer \
   cargo test --lib -- --ignored --nocapture emit_crossviewer_corpus emit_bb_corpus_roundtrip
 ```
 
-That yields 24 PDFs: one per `MarkupType` (20), an all-types page on a real project plan
+That yields 28 PDFs: one per `MarkupType` (24), an all-types page on a real project plan
 backdrop, the synthetic blank backdrop, and redline-resaved round-trips of the two genuine
 Bluebeam reference files. The two round-trips and the real backdrop require
-`bench/corpus/bb-ref/` (gitignored, machine-local); without it you get 22 and the emitters
+`bench/corpus/bb-ref/` (gitignored, machine-local); without it you get 26 and the emitters
 say so rather than failing silently.
 
 ## Running it

@@ -77,6 +77,8 @@
     isMultiClickTool, isInkTool, polylineGeometry, inkGeometry,
     isMultiClickComplete, type MultiClickTool,
     isTextTool, textBoxGeometry, calloutGeometry, DEFAULT_TEXT_FONT,
+    isTextMarkupTool, textMarkupAppearance, noteAppearance, DEFAULT_NOTE_PROPS,
+    type TextMarkupTool,
     translateToolGeometry, extractPromptedLabels, toolPlacementDelta, shiftGeometry,
   } from "$lib/markup-tools";
   import { patchGroup } from "$lib/markup-properties";
@@ -273,6 +275,9 @@
   /** Char index last fetched from the backend - avoids re-calling IPC on every
    *  pixel of pointer movement when the hit-tested char index hasn't changed. */
   let textSelLastFocusChar: number | null = null;
+  /** Monotonic id of the latest `getTextSelection` request - a response whose id is no longer
+   *  the latest is dropped, so an out-of-order reply can't overwrite the final range. */
+  let textSelSeq = 0;
   /** True while a text-selection drag is in progress (pointer down -> up). */
   let textSelDragging = $state(false);
   /** The current (committed-on-release, but visible live during drag) text selection.
@@ -378,7 +383,12 @@
     isDrawTool(t) || isMultiClickTool(t) || isInkTool(t) || isTextTool(t) ||
     t === "calibrate" || t === "MeasurementLength" || t === "MeasurementRadius" ||
     CLOSED_MEASUREMENT_TOOLS.has(t) || t === "MeasurementCount" || t === "MeasurementAngle" ||
-    t === "placeTool";
+    t === "placeTool" || t === "Note";
+
+  /** True for the I-beam Select Text tool and the three text mark-up tools (Underline /
+   *  StrikeOut / Squiggly): all share one drag-over-text gesture (hit-test chars, live
+   *  selection polygons); they differ only in what happens on release. */
+  const isTextSelTool = (t = store.activeTool): boolean => t === "selectText" || isTextMarkupTool(t);
 
   /** True when the select tool is active. */
   const isSelectTool = (t = store.activeTool): boolean => t === "select";
@@ -386,7 +396,7 @@
   /** Overlay captures pointer events for create tools, select tool, or the I-beam
    *  text-selection tool (not a create/select tool in the drawn-shape sense, but
    *  still needs pointer capture for its own drag gesture). */
-  const overlayActive = $derived(isCreateTool() || isSelectTool() || store.activeTool === "selectText");
+  const overlayActive = $derived(isCreateTool() || isSelectTool() || isTextSelTool());
 
   /** Cursor for the markup-overlay SVG. undefined for every tool except the
    *  I-beam text-selection tool - CSS's `.markup-overlay.capture { cursor:
@@ -395,7 +405,7 @@
    *  while dragging or hovering over selectable text, the plain arrow
    *  otherwise (see cursorForTextTool's doc comment in $lib/text-select). */
   const overlayCursor: "text" | "default" | undefined = $derived(
-    store.activeTool === "selectText" ? cursorForTextTool(textSelDragging || textHoverOnText) : undefined,
+    isTextSelTool() ? cursorForTextTool(textSelDragging || textHoverOnText) : undefined,
   );
 
   // --- Vector snap (spec §5, v1) ---
@@ -676,7 +686,7 @@
    * tool has not been used yet this "session" on the page.
    */
   const textSelBar = $derived.by((): { x: number; y: number; mode: "selection" | "empty"; charCount: number } | null => {
-    if (store.activeTool !== "selectText" || textSelDragging || !textSelAttempted) return null;
+    if (!isTextSelTool() || textSelDragging || !textSelAttempted) return null;
     if (textSelection && textSelection.page === pageIndex && textSelection.text.length > 0) {
       const bbox = screenBoundsOfQuads(textSelection.quads);
       const pos = clampBarPos((bbox?.x ?? containerWidth / 2) + 8, (bbox?.y ?? containerHeight / 2) + 8);
@@ -1248,6 +1258,20 @@
       store.activeTool = "select";
       return;
     }
+    // Revu single-key mark-up tool shortcuts (support.bluebeam.com/revu/resources/keyboard-
+    // shortcuts.html): U Underline, D Strikethrough, Shift+U Squiggly, N Note. No Cmd/Ctrl/Alt.
+    if (!e.metaKey && !e.ctrlKey && !e.altKey) {
+      // Decide by Shift, not by the character's case: with Caps Lock on, a plain U arrives
+      // as "U" (and Shift+U as "u"), and a plain U must still pick Underline.
+      const k = e.key.toLowerCase();
+      const tool: ToolKind | null =
+        k === "u" ? (e.shiftKey ? "Squiggly" : "Underline") : k === "d" ? "StrikeOut" : k === "n" ? "Note" : null;
+      if (tool) {
+        e.preventDefault();
+        store.activeTool = tool;
+        return;
+      }
+    }
     // Delete / Backspace: remove the active vertex of a single multipoint markup if one is
     // engaged; otherwise remove the whole selection (one undo frame).
     if ((e.key === "Delete" || e.key === "Backspace") && store.selectedIds.size > 0) {
@@ -1639,11 +1663,13 @@
     textSelLastFocusChar = focus;
     if (!docInfo) return;
     const { start, end } = selectionRange(anchor, focus);
+    const seq = ++textSelSeq;
     try {
       const sel = await getTextSelection(docInfo.doc_id, page, start, end);
       // Stale-response guard: a newer drag (different anchor/page) may have started
-      // while this request was in flight.
-      if (textSelAnchorChar !== anchor || textSelPage !== page) return;
+      // while this request was in flight, or a later range request may already have
+      // landed (responses can resolve out of order; the last REQUEST must win).
+      if (textSelAnchorChar !== anchor || textSelPage !== page || seq !== textSelSeq) return;
       textSelection = { page, start, end, quads: sel.quads, text: sel.text };
     } catch (err) {
       console.error("getTextSelection failed:", err);
@@ -1672,7 +1698,7 @@
     textHoverPending = false;
     // Stale-response guard: the tool may have changed, or a drag may have started,
     // while this hover query was in flight.
-    if (store.activeTool !== "selectText" || textSelDragging) return;
+    if (!isTextSelTool() || textSelDragging) return;
     textHoverOnText = char !== null;
   }
 
@@ -1712,6 +1738,65 @@
     store.create(m);
     clearTextSelection();
     if (anchor) showTextSelToast("Highlight created", anchor);
+  }
+
+  /**
+   * Release of a text mark-up drag (Underline / StrikeOut / Squiggly): settle the final
+   * range from the release point (the last drag-move request may still be in flight), then
+   * create one markup whose geometry is one quad per selected text line. Nothing is created
+   * when there is no text under the drag (a scanned/image-only region): `textSelAttempted`
+   * stays true with no selection, so the action bar shows the same "No text selected" hint
+   * the I-beam tool gives. The tool stays active for the next selection.
+   */
+  async function finishTextMarkupDrag(tool: TextMarkupTool, p: { x: number; y: number } | null): Promise<void> {
+    const page = textSelPage;
+    const anchor = textSelAnchorChar;
+    if (page !== null && anchor !== null && p) {
+      const focus = await resolveCharAt(p, page);
+      if (focus !== null) await refreshTextSelection(anchor, focus, page);
+    }
+    if (store.activeTool !== tool || textSelDragging) return; // tool switched / new drag began
+    if (!textSelection || !identity || textSelection.quads.length === 0) return;
+    const barAnchor = textSelBar ? { x: textSelBar.x, y: textSelBar.y } : null;
+    store.create(buildMarkup({
+      markupType: tool,
+      page: textSelection.page,
+      geometry: { Quads: textSelection.quads },
+      appearance: textMarkupAppearance(store.draftAppearance),
+      identity,
+      now: new Date().toISOString(),
+      id: crypto.randomUUID(),
+    }));
+    clearTextSelection();
+    if (barAnchor) showTextSelToast(`${tool === "StrikeOut" ? "Strikethrough" : tool} created`, barAnchor);
+  }
+
+  /** Place a sticky Note at `p` (PDF space) and open its pop-up (the inline editor) so the
+   *  comment can be typed straight away. The icon is created immediately - closing the
+   *  pop-up with no text leaves an empty Note, as Revu does. */
+  function placeNote(p: { x: number; y: number }): void {
+    if (!identity || !containerEl) return;
+    const m = buildMarkup({
+      markupType: "Note",
+      page: pageIndex,
+      geometry: { Point: p },
+      appearance: noteAppearance(store.draftAppearance),
+      identity,
+      now: new Date().toISOString(),
+      id: crypto.randomUUID(),
+      note: DEFAULT_NOTE_PROPS,
+    });
+    store.create(m);
+    openNoteEditor(m);
+  }
+
+  /** Open the inline pop-up editor for an existing Note, anchored just right of its icon. */
+  function openNoteEditor(m: Markup): void {
+    if (!("Point" in m.geometry)) return;
+    const pt = m.geometry.Point;
+    const screen = pdfUserSpaceToScreen(pt.x + 10, pt.y + 10, viewState);
+    editorText = m.contents ?? "";
+    editor = { screenX: screen.x, screenY: screen.y, anchorPdf: pt, leaderPdf: null, editingId: m.id };
   }
 
   /** Copy the active text selection's extracted text to the clipboard (Ctrl/Cmd+C
@@ -1886,7 +1971,7 @@
     }
     // Clear any in-progress/active text selection when switching AWAY from the
     // I-beam tool (staying on it, or just arriving at it, must NOT clear).
-    if (tool !== "selectText") {
+    if (!isTextSelTool(tool)) {
       clearTextSelection();
       textHoverOnText = false;
       textHoverLastPoint = null;
@@ -2087,8 +2172,8 @@
       return;
     }
 
-    // --- TEXT SELECTION (I-beam) tool branch: drag selects real PDF text. ---
-    if (tool === "selectText") {
+    // --- TEXT SELECTION (I-beam / text mark-up) tool branch: drag selects real PDF text. ---
+    if (isTextSelTool(tool)) {
       if (!docInfo) return;
       const p = localPdf(e);
       if (!p) return;
@@ -2133,7 +2218,7 @@
     }
 
     // --- MEASUREMENT COUNT / ANGLE tool branches (click-based, handled via onOverlayClick) ---
-    if (tool === "MeasurementCount" || tool === "MeasurementAngle") return;
+    if (tool === "MeasurementCount" || tool === "MeasurementAngle" || tool === "Note") return;
 
     // --- CREATE tool branch ---
     if (!isCreateTool(tool) || !identity) return;
@@ -2155,8 +2240,8 @@
   function onOverlayPointerMove(e: PointerEvent) {
     const tool = store.activeTool;
 
-    // --- TEXT SELECTION (I-beam) tool: extend the range to the current point. ---
-    if (tool === "selectText") {
+    // --- TEXT SELECTION (I-beam / text mark-up) tool: extend the range to the current point. ---
+    if (isTextSelTool(tool)) {
       if (!textSelDragging) {
         // Not dragging: this is a hover move - update the cursor (owner feedback:
         // "have some kind of icon change when we're over selectable text").
@@ -2261,7 +2346,7 @@
     //     live (rendered + copyable) until Escape, a tool switch, or Enter commits
     //     it as a Highlight - mirrors how a native text selection persists after
     //     mouseup until the user does something else. ---
-    if (tool === "selectText") {
+    if (isTextSelTool(tool)) {
       textSelDragging = false;
       // Record the release point (container-relative) and mark this attempt as
       // finished - textSelBar (reactive) picks up from here, showing the result
@@ -2270,6 +2355,9 @@
       const r = containerEl?.getBoundingClientRect();
       textSelReleaseScreen = { x: r ? e.clientX - r.left : e.clientX, y: r ? e.clientY - r.top : e.clientY };
       textSelAttempted = true;
+      // Text mark-up tools create on release (Revu: "Release the mouse button. The selected
+      // text will be underlined."); the I-beam tool keeps its selection for Copy/Enter.
+      if (isTextMarkupTool(tool)) void finishTextMarkupDrag(tool, localPdf(e));
       return;
     }
 
@@ -2729,6 +2817,14 @@
       return;
     }
 
+    // Note tool: a single click places a sticky Note and opens its pop-up.
+    if (tool === "Note" && identity) {
+      const p = localPdfFromMouse(e);
+      if (!p) return;
+      placeNote(p);
+      return;
+    }
+
     // Text/Callout tool: open the inline editor on click.
     if (isTextTool(tool) && identity) {
       const p = localPdfFromMouse(e);
@@ -2786,6 +2882,11 @@
       const hit = hitTest(pageMarkups, p, SELECT_GRAB_PX / zoom);
       if (!hit) return;
       const m = store.getById(hit);
+      if (m && m.markup_type === "Note") {
+        // Revu: "Double-click the Note icon to bring up the pop-up window."
+        openNoteEditor(m);
+        return;
+      }
       if (!m || (m.markup_type !== "Text" && m.markup_type !== "Callout")) return;
       // pdfUserSpaceToScreen already returns container-relative px - the same coordinate
       // space the SVG overlay renders in and the .text-editor's `left/top` CSS consumes
@@ -2975,6 +3076,26 @@
             fill={s.fill} fill-opacity={s.fillOpacity}
             pointer-events="none"
           />
+        {/each}
+      {:else if s.kind === "textmarkup"}
+        <!-- Underline / StrikeOut / Squiggly: one stroked polyline per text-line quad. -->
+        {#each s.lines as pts, i (i)}
+          <polyline points={pts} fill="none"
+            stroke={s.stroke} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
+            stroke-linecap="round" stroke-linejoin="round"
+            pointer-events="none"
+          />
+        {/each}
+      {:else if s.kind === "note"}
+        <!-- Sticky Note icon: coloured box + three text lines (PDF /Text annotation). -->
+        <rect x={s.x} y={s.y} width={s.size} height={s.size}
+          stroke={s.stroke} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
+          fill={s.fill} fill-opacity={s.fillOpacity}
+          pointer-events="none" />
+        {#each s.lines as l, i (i)}
+          <line x1={l.x1} y1={l.y1} x2={l.x2} y2={l.y2}
+            stroke={s.stroke} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
+            pointer-events="none" />
         {/each}
       {:else if s.kind === "ellipse"}
         <ellipse
@@ -3274,7 +3395,13 @@
       onblur={commitEditor}
       onkeydown={(e) => {
         if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); commitEditor(); }
-        if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancelEditor(); }
+        if (e.key === "Escape") {
+          e.preventDefault(); e.stopPropagation();
+          // A Note's pop-up keeps what was typed when hidden with Esc (Revu); a Text/Callout
+          // box being created or edited discards it, as before.
+          if (editor?.editingId && store.getById(editor.editingId)?.markup_type === "Note") commitEditor();
+          else cancelEditor();
+        }
       }}
       autofocus
       rows={3}
@@ -3385,6 +3512,8 @@
         <div class="shortcuts-row"><span>⌘/Ctrl + 9</span><span>Fit height</span></div>
         <div class="shortcuts-row"><span>⌘/Ctrl + 8</span><span>Actual size (100%)</span></div>
         <div class="shortcuts-row"><span>T</span><span>Show/hide the zoom toolbar</span></div>
+        <div class="shortcuts-row"><span>U / Shift+U / D</span><span>Underline / Squiggly / Strikethrough</span></div>
+        <div class="shortcuts-row"><span>N</span><span>Sticky Note</span></div>
         <div class="shortcuts-hint">Esc or click outside to close</div>
       </div>
     </div>

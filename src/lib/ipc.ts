@@ -168,6 +168,12 @@ export type MarkupType =
   | "Ink"
   | "Stamp"
   | "StampDynamic"
+  // Text mark-up (PDF /Underline /StrikeOut /Squiggly + /QuadPoints) and the sticky Note
+  // (PDF /Text annotation) - see docs/text-markup-tools.md.
+  | "Underline"
+  | "StrikeOut"
+  | "Squiggly"
+  | "Note"
   | "MeasurementLength"
   | "MeasurementPerimeter"
   | "MeasurementArea"
@@ -290,6 +296,13 @@ export interface CountSet {
   symbol: CountSymbol;
 }
 
+/** Sticky-Note properties (mirrors Rust `NoteProps`): the PDF `/Text` annotation's icon
+ *  `/Name` and its `/Open` pop-up state. Present only on `Note` markups. */
+export interface NoteProps {
+  icon: string;
+  open: boolean;
+}
+
 export interface Markup {
   id: string;
   markup_type: MarkupType;
@@ -320,6 +333,8 @@ export interface Markup {
    * value as unlocked (matches the backend's unlocked default, `4`/Print-only).
    */
   annot_flags?: number;
+  /** Icon + open state (Note only; mirrors Rust `Markup.note`). Absent/null otherwise. */
+  note?: NoteProps | null;
   /**
    * Bluebeam-private annotation keys the backend carries verbatim (`/BSIColumnData`, ...).
    * Opaque to the frontend - never edit; spread-copy the markup and it survives.

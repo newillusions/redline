@@ -219,6 +219,12 @@ pub(crate) const MARKUP_SUBTYPES: &[&str] = &[
     "Stamp",
 ];
 
+/// Text mark-up subtypes (ISO 32000-1 12.5.6.10) that `read_markups` imports as
+/// `Underline` / `StrikeOut` / `Squiggly` markups. Deliberately NOT in [`MARKUP_SUBTYPES`]:
+/// that list also gates the `.btx` importer, and a Tool Chest tool for a text-anchored
+/// annotation has no quad-less drawing template, so `.btx` keeps skipping these.
+pub(crate) const TEXT_MARKUP_SUBTYPES: &[&str] = &["Underline", "StrikeOut", "Squiggly"];
+
 pub(crate) fn subtype(d: &Dictionary) -> Option<String> {
     d.get(b"Subtype")
         .ok()?
@@ -763,12 +769,19 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
     for (&page_no_1based, &page_id) in &pages {
         for (oid, dict) in page_annots(doc, page_id)? {
             let Some(st) = subtype(&dict) else { continue };
-            if !MARKUP_SUBTYPES.contains(&st.as_str()) {
+            if !MARKUP_SUBTYPES.contains(&st.as_str())
+                && !TEXT_MARKUP_SUBTYPES.contains(&st.as_str())
+            {
                 continue;
             }
             // A reply / review-state /Text answers a markup; it is not a markup itself.
             if crate::markup::replies::is_reply_or_state(&dict) {
                 raw_replies.push((oid, dict));
+                continue;
+            }
+            // A /Text carrying /StateModel is a review-state record even when it lacks the
+            // /IRT that would parent it: never a standalone sticky Note. Left untouched.
+            if st == "Text" && dict.has(b"StateModel") {
                 continue;
             }
             collected.push(Collected { oid, dict, page_no_1based });
@@ -1986,7 +1999,7 @@ pub(crate) mod tests {
             }
         }
 
-        /// One Markup per `MarkupType` variant (20 total), each with non-default values
+        /// One Markup per `MarkupType` variant (24 total), each with non-default values
         /// in every field that type applies to. `stamp_asset` is deliberately left unset
         /// on the Stamp/StampDynamic fixtures - it is a documented, already-tested
         /// exception (see the field's doc comment in markup/mod.rs and
@@ -2136,6 +2149,22 @@ pub(crate) mod tests {
             let mut mang = matrix_markup(MarkupType::MeasurementAngle, poly3(), creator.clone());
             mang.measurement = Some(measurement(None, None));
             out.push(mang);
+
+            // Text mark-up: one fixture per type, sharing the two-line quad set.
+            for t in [
+                MarkupType::Underline,
+                MarkupType::StrikeOut,
+                MarkupType::Squiggly,
+            ] {
+                out.push(matrix_markup(t, quads(), creator.clone()));
+            }
+            // Sticky Note with a non-default icon and the pop-up open.
+            let mut note = matrix_markup(MarkupType::Note, point(), creator.clone());
+            note.note = Some(crate::markup::NoteProps {
+                icon: "Comment".into(),
+                open: true,
+            });
+            out.push(note);
 
             let mut mr = matrix_markup(MarkupType::MeasurementRadius, line2(), creator.clone());
             mr.measurement = Some(measurement(None, None));
@@ -2289,6 +2318,7 @@ pub(crate) mod tests {
 
             assert_eq!(got.measurement, orig.measurement, "{ctx}: measurement");
             assert_eq!(got.count_set, orig.count_set, "{ctx}: count_set");
+            assert_eq!(got.note, orig.note, "{ctx}: note icon/open");
         }
 
         #[test]
@@ -2296,8 +2326,8 @@ pub(crate) mod tests {
             let originals = full_fixture_set();
             assert_eq!(
                 originals.len(),
-                20,
-                "fixture set must cover all 20 MarkupType variants"
+                24,
+                "fixture set must cover all 24 MarkupType variants"
             );
 
             // First write -> real Document -> read back.
@@ -2345,7 +2375,7 @@ pub(crate) mod tests {
             }
         }
 
-        /// Emits ONE PDF per `MarkupType` (20 files) plus one "all-types" PDF placing
+        /// Emits ONE PDF per `MarkupType` (24 files) plus one "all-types" PDF placing
         /// every fixture from `full_fixture_set()` together on a real project-like
         /// backdrop, for the cross-viewer verification pass (pdfium/mutool/poppler/
         /// Chromium/Bluebeam/Acrobat). Every fixture already carries non-default
@@ -2369,8 +2399,8 @@ pub(crate) mod tests {
             let fixtures = full_fixture_set();
             assert_eq!(
                 fixtures.len(),
-                20,
-                "fixture set must cover all 20 MarkupType variants"
+                24,
+                "fixture set must cover all 24 MarkupType variants"
             );
 
             // Synthetic blank-page backdrop, reused for every single-type file.
@@ -2615,7 +2645,7 @@ pub(crate) mod tests {
             /// text, and change several style properties - at minimum what the mission
             /// asks for. Every fixture from `full_fixture_set()` has `contents`/`subject`
             /// set and a non-default `full_appearance()`, so every branch below fires for
-            /// every one of the 20 types.
+            /// every one of the 24 types.
             fn mutate_markup(m: &mut Markup) {
                 m.geometry = translate(&m.geometry, 18.0, -11.0);
                 if !matches!(m.geometry, MarkupGeometry::Point(_)) {
@@ -2668,7 +2698,7 @@ pub(crate) mod tests {
                 write_backdrop(&backdrop);
 
                 let fixtures = full_fixture_set();
-                assert_eq!(fixtures.len(), 20);
+                assert_eq!(fixtures.len(), 24);
 
                 for orig in fixtures {
                     let type_name = format!("{:?}", orig.markup_type);
@@ -2711,7 +2741,7 @@ pub(crate) mod tests {
                 }
             }
 
-            /// All 20 fixtures on one page (a real project-like backdrop of overlapping
+            /// All 24 fixtures on one page (a real project-like backdrop of overlapping
             /// markups), mutating only a SUBSET across gen1->gen2 - the untouched majority
             /// must be byte-for-byte fidelity-stable, not merely "still present". This is
             /// the classic rewrite-the-whole-`/Annots`-array failure mode: editing one
@@ -2724,19 +2754,19 @@ pub(crate) mod tests {
                 write_backdrop(&backdrop);
 
                 let originals = full_fixture_set();
-                assert_eq!(originals.len(), 20);
+                assert_eq!(originals.len(), 24);
 
                 let file1 = dir.path().join("combined-gen1.pdf");
                 save_with_markups(&backdrop, &file1, &originals).unwrap();
                 let reread1 = load_markups_from(&file1, None).unwrap();
-                assert_eq!(reread1.len(), 20);
+                assert_eq!(reread1.len(), 24);
                 for orig in &originals {
                     let got = reread1.iter().find(|m| m.id() == orig.id()).unwrap();
                     assert_markup_fidelity(orig, got);
                 }
-                assert_structural_invariants(&file1, 20, "combined gen1");
+                assert_structural_invariants(&file1, 24, "combined gen1");
 
-                // Mutate every 4th markup (5 of 20, incl. one member of the Rectangle/
+                // Mutate every 4th markup (6 of 24, incl. one member of the Rectangle/
                 // Ellipse group while its sibling stays untouched); the rest carry
                 // through UNCHANGED.
                 let mut gen2_set = reread1.clone();
@@ -2747,12 +2777,12 @@ pub(crate) mod tests {
                         mutated_ids.insert(m.id());
                     }
                 }
-                assert_eq!(mutated_ids.len(), 5, "sanity: exactly 5 markups mutated");
+                assert_eq!(mutated_ids.len(), 6, "sanity: exactly 6 markups mutated");
 
                 let file2 = dir.path().join("combined-gen2.pdf");
                 save_with_markups(&file1, &file2, &gen2_set).unwrap();
                 let reread2 = load_markups_from(&file2, None).unwrap();
-                assert_eq!(reread2.len(), 20);
+                assert_eq!(reread2.len(), 24);
                 for expected in &gen2_set {
                     let got = reread2.iter().find(|m| m.id() == expected.id()).unwrap();
                     assert_markup_fidelity(expected, got);
@@ -2766,19 +2796,19 @@ pub(crate) mod tests {
                     let got = reread2.iter().find(|m| m.id() == orig1.id()).unwrap();
                     assert_markup_fidelity(orig1, got);
                 }
-                assert_structural_invariants(&file2, 20, "combined gen2");
+                assert_structural_invariants(&file2, 24, "combined gen2");
 
                 // Generation 3: idempotent re-save, no further edits - every markup
                 // (mutated AND untouched) must be a fixed point of generation 2.
                 let file3 = dir.path().join("combined-gen3.pdf");
                 save_with_markups(&file2, &file3, &reread2).unwrap();
                 let reread3 = load_markups_from(&file3, None).unwrap();
-                assert_eq!(reread3.len(), 20);
+                assert_eq!(reread3.len(), 24);
                 for m2 in &reread2 {
                     let got = reread3.iter().find(|m| m.id() == m2.id()).unwrap();
                     assert_markup_fidelity(m2, got);
                 }
-                assert_structural_invariants(&file3, 20, "combined gen3");
+                assert_structural_invariants(&file3, 24, "combined gen3");
             }
 
             /// Extends `orphaned_popup_on_a_managed_markup_is_dropped_foreign_popup_kept`
@@ -3536,5 +3566,347 @@ pub(crate) mod tests {
         assert_eq!(read2.len(), 2);
         assert!(read2[0].group_id.is_some());
         assert_eq!(read2[0].group_id, read2[1].group_id, "cycle 2: still grouped after re-save");
+    }
+    // --- Text mark-up (Underline / StrikeOut / Squiggly) + sticky Note ----------------
+
+    fn text_quads() -> MarkupGeometry {
+        MarkupGeometry::Quads(vec![
+            [
+                PdfPoint { x: 72.0, y: 712.0 },
+                PdfPoint { x: 300.0, y: 712.0 },
+                PdfPoint { x: 72.0, y: 700.0 },
+                PdfPoint { x: 300.0, y: 700.0 },
+            ],
+            [
+                PdfPoint { x: 72.0, y: 698.0 },
+                PdfPoint { x: 150.0, y: 698.0 },
+                PdfPoint { x: 72.0, y: 686.0 },
+                PdfPoint { x: 150.0, y: 686.0 },
+            ],
+        ])
+    }
+
+    fn new_markup(t: MarkupType, g: MarkupGeometry) -> Markup {
+        let mut m = Markup::new(
+            t,
+            0,
+            g,
+            Appearance::default(),
+            UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: "Alice".into(),
+            },
+        );
+        m.contents = Some("reword".into());
+        m
+    }
+
+    #[test]
+    fn text_markup_and_note_survive_write_read_write_read_with_appearance_streams() {
+        let mut note = new_markup(
+            MarkupType::Note,
+            MarkupGeometry::Point(PdfPoint { x: 200.0, y: 300.0 }),
+        );
+        note.note = Some(crate::markup::NoteProps {
+            icon: "Help".into(),
+            open: true,
+        });
+        let markups = vec![
+            new_markup(MarkupType::Underline, text_quads()),
+            new_markup(MarkupType::StrikeOut, text_quads()),
+            new_markup(MarkupType::Squiggly, text_quads()),
+            note,
+        ];
+        let (mut doc, page_id) = one_page_doc();
+        write_markups(&mut doc, &markups).unwrap();
+
+        let read1 = read_markups(&doc).unwrap();
+        assert_eq!(read1.len(), 4);
+        for orig in &markups {
+            let got = read1
+                .iter()
+                .find(|m| m.id() == orig.id())
+                .expect("id preserved");
+            assert_eq!(got.markup_type, orig.markup_type);
+            assert_eq!(got.geometry, orig.geometry);
+            assert_eq!(got.contents, orig.contents);
+            assert_eq!(got.note, orig.note);
+        }
+
+        // Every one has a non-empty /AP /N and the standard subtype + key set.
+        for (subtype, has_quads) in [
+            ("Underline", true),
+            ("StrikeOut", true),
+            ("Squiggly", true),
+            ("Text", false),
+        ] {
+            let annots = page_annots(&doc, page_id).unwrap();
+            let (_, d) = annots
+                .iter()
+                .find(|(_, d)| subtype_of(d).as_deref() == Some(subtype))
+                .unwrap_or_else(|| panic!("{subtype} annotation written"));
+            assert_eq!(d.has(b"QuadPoints"), has_quads, "{subtype}");
+            assert!(
+                d.has(b"Contents") && d.has(b"C") && d.has(b"CA"),
+                "{subtype} standard keys"
+            );
+            assert!(
+                !resolve_ap_n_stream(&doc, d).content.is_empty(),
+                "{subtype} /AP"
+            );
+        }
+
+        // Second save/read cycle is stable (no duplication, nothing lost).
+        write_markups(&mut doc, &read1).unwrap();
+        let read2 = read_markups(&doc).unwrap();
+        assert_eq!(read2.len(), 4);
+        assert_eq!(
+            page_annots(&doc, page_id).unwrap().len(),
+            4,
+            "no duplicate annotations"
+        );
+        for m in &read1 {
+            let again = read2.iter().find(|x| x.id() == m.id()).unwrap();
+            assert_eq!(again.markup_type, m.markup_type);
+            assert_eq!(again.note, m.note);
+        }
+    }
+
+    fn subtype_of(d: &Dictionary) -> Option<String> {
+        subtype(d)
+    }
+
+    #[test]
+    fn foreign_text_markup_and_sticky_note_load_and_resave_without_losing_keys() {
+        let (mut doc, page_id) = one_page_doc();
+        let underline = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Underline",
+            // A UUID /NM (a producer that names annotations with GUIDs) so the re-save
+            // replaces the original; a non-UUID /NM is a pre-existing duplication gap
+            // that affects every imported foreign subtype alike (see the PR description).
+            "NM" => Object::string_literal("5d0f6f5e-6f0b-4a43-9a0e-3f0a2b1c0001"),
+            "T" => Object::string_literal("Reviewer"),
+            "Subj" => Object::string_literal("Underline"),
+            "Contents" => Object::string_literal("wording"),
+            "C" => vec![0.into(), 0.5.into(), 0.into()],
+            "CA" => 0.75,
+            "F" => 4,
+            "Rect" => vec![72.into(), 700.into(), 300.into(), 712.into()],
+            "QuadPoints" => vec![72.into(), 712.into(), 300.into(), 712.into(), 72.into(), 700.into(), 300.into(), 700.into()],
+        }));
+        let sticky = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Text",
+            "NM" => Object::string_literal("5d0f6f5e-6f0b-4a43-9a0e-3f0a2b1c0002"),
+            "T" => Object::string_literal("Reviewer"),
+            "Name" => "Comment",
+            "Open" => true,
+            "Contents" => Object::string_literal("please check"),
+            "C" => vec![1.into(), 1.into(), 0.into()],
+            "F" => 28,
+            "Rect" => vec![40.into(), 50.into(), 60.into(), 70.into()],
+        }));
+        doc.get_dictionary_mut(page_id).unwrap().set(
+            "Annots",
+            Object::Array(vec![underline.into(), sticky.into()]),
+        );
+
+        let loaded = read_markups(&doc).unwrap();
+        assert_eq!(loaded.len(), 2, "both foreign annotations import");
+        assert!(loaded
+            .iter()
+            .any(|m| m.markup_type == MarkupType::Underline));
+        assert!(loaded.iter().any(|m| m.markup_type == MarkupType::Note));
+
+        // Re-save exactly what the store holds: the originals are replaced, not duplicated,
+        // and the re-written dictionaries keep the keys a viewer reads.
+        write_markups(&mut doc, &loaded).unwrap();
+        let annots = page_annots(&doc, page_id).unwrap();
+        assert_eq!(
+            annots.len(),
+            2,
+            "foreign originals must be replaced, not duplicated"
+        );
+        let (_, u) = annots
+            .iter()
+            .find(|(_, d)| subtype_of(d).as_deref() == Some("Underline"))
+            .unwrap();
+        for key in [
+            &b"QuadPoints"[..],
+            b"C",
+            b"CA",
+            b"Contents",
+            b"T",
+            b"Subj",
+            b"F",
+            b"Rect",
+            b"AP",
+        ] {
+            assert!(
+                u.has(key),
+                "Underline lost /{}",
+                String::from_utf8_lossy(key)
+            );
+        }
+        let (_, t) = annots
+            .iter()
+            .find(|(_, d)| subtype_of(d).as_deref() == Some("Text"))
+            .unwrap();
+        for key in [
+            &b"Name"[..],
+            b"Open",
+            b"C",
+            b"Contents",
+            b"T",
+            b"Rect",
+            b"AP",
+        ] {
+            assert!(
+                t.has(key),
+                "Text note lost /{}",
+                String::from_utf8_lossy(key)
+            );
+        }
+        assert_eq!(t.get(b"Name").unwrap().as_name().unwrap(), b"Comment");
+    }
+
+    // --- Round-1 review (B1 / N1): non-UUID /NM stability and reply/state handling -----------
+
+    /// A Bluebeam-style foreign annotation: 16-char /NM, the shape every Revu file uses.
+    fn bluebeam_annot(subtype: &str, nm: &str) -> lopdf::Dictionary {
+        let mut d = dictionary! {
+            "Type" => "Annot", "Subtype" => Object::Name(subtype.as_bytes().to_vec()),
+            "NM" => Object::string_literal(nm),
+            "T" => Object::string_literal("Reviewer"),
+            "Contents" => Object::string_literal("note text"),
+            "C" => vec![1.into(), 0.into(), 0.into()],
+            "F" => 4,
+            "Rect" => vec![72.into(), 700.into(), 300.into(), 712.into()],
+        };
+        if subtype != "Text" {
+            d.set(
+                "QuadPoints",
+                vec![
+                    72.into(),
+                    712.into(),
+                    300.into(),
+                    712.into(),
+                    72.into(),
+                    700.into(),
+                    300.into(),
+                    700.into(),
+                ],
+            );
+        } else {
+            d.set("Name", Object::Name(b"Comment".to_vec()));
+        }
+        d
+    }
+
+    #[test]
+    fn bluebeam_16_char_nm_text_markups_and_sticky_note_stay_at_one_annotation_over_three_cycles() {
+        for (subtype, nm) in [
+            ("Underline", "BBUNDERLINE00001"),
+            ("StrikeOut", "BBSTRIKEOUT00001"),
+            ("Squiggly", "BBSQUIGGLY0000001"),
+            ("Text", "BBSTICKYNOTE0001"),
+        ] {
+            let (mut doc, page_id) = one_page_doc();
+            let a = doc.add_object(Object::Dictionary(bluebeam_annot(subtype, nm)));
+            doc.get_dictionary_mut(page_id)
+                .unwrap()
+                .set("Annots", Object::Array(vec![a.into()]));
+
+            for cycle in 1..=3 {
+                let loaded = read_markups(&doc).unwrap();
+                assert_eq!(loaded.len(), 1, "{subtype} cycle {cycle}: loaded");
+                assert_eq!(
+                    loaded[0].source_nm.as_deref(),
+                    Some(nm),
+                    "{subtype}: source /NM kept"
+                );
+                write_markups(&mut doc, &loaded).unwrap();
+                let annots = page_annots(&doc, page_id).unwrap();
+                assert_eq!(
+                    annots.len(),
+                    1,
+                    "{subtype} cycle {cycle}: page /Annots count"
+                );
+                let (_, d) = &annots[0];
+                assert_eq!(
+                    get_string_for_test(d, b"NM").as_deref(),
+                    Some(nm),
+                    "{subtype} cycle {cycle}: /NM unchanged"
+                );
+                let want = if subtype == "Text" { "Text" } else { subtype };
+                assert_eq!(subtype_of(d).as_deref(), Some(want));
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_text_reply_or_state_is_not_imported_as_a_standalone_note() {
+        let (mut doc, page_id) = one_page_doc();
+        let parent = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Square",
+            "NM" => Object::string_literal("BBSQUARE00000001"),
+            "Rect" => vec![0.into(), 0.into(), 50.into(), 50.into()], "F" => 4,
+        }));
+        // A comment reply: /Text + /IRT, no /RT.
+        let reply = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Text",
+            "NM" => Object::string_literal("BBREPLY000000001"),
+            "IRT" => Object::Reference(parent), "Contents" => Object::string_literal("agreed"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "F" => 28,
+        }));
+        // A review state: /Text + /IRT + /StateModel /State.
+        let state = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Text",
+            "NM" => Object::string_literal("BBSTATE000000001"),
+            "IRT" => Object::Reference(parent),
+            "StateModel" => Object::string_literal("Review"), "State" => Object::string_literal("Accepted"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "F" => 28,
+        }));
+        // A state record with NO /IRT (malformed): still a state, never a sticky.
+        let orphan_state = doc.add_object(Object::Dictionary(dictionary! {
+            "Type" => "Annot", "Subtype" => "Text",
+            "NM" => Object::string_literal("BBSTATEORPHAN001"),
+            "StateModel" => Object::string_literal("Marked"), "State" => Object::string_literal("Marked"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "F" => 28,
+        }));
+        doc.get_dictionary_mut(page_id).unwrap().set(
+            "Annots",
+            Object::Array(vec![
+                parent.into(),
+                reply.into(),
+                state.into(),
+                orphan_state.into(),
+            ]),
+        );
+
+        let loaded = read_markups(&doc).unwrap();
+        assert!(
+            loaded.iter().all(|m| m.markup_type != MarkupType::Note),
+            "reply / state /Text annotations must never become standalone Notes: {:?}",
+            loaded.iter().map(|m| m.markup_type).collect::<Vec<_>>()
+        );
+        assert_eq!(loaded.len(), 1, "only the Square is a markup");
+
+        // And they survive a save (owned replies are rewritten, the orphan state is untouched).
+        write_markups(&mut doc, &loaded).unwrap();
+        let after = page_annots(&doc, page_id).unwrap();
+        assert!(
+            after
+                .iter()
+                .any(|(_, d)| get_string_for_test(d, b"NM").as_deref() == Some("BBSTATEORPHAN001")),
+            "the malformed state record is preserved untouched"
+        );
+        assert!(
+            after
+                .iter()
+                .all(|(_, d)| subtype_of(d).as_deref() != Some("Text")
+                    || d.has(b"IRT")
+                    || d.has(b"StateModel")),
+            "every /Text left in the file is still a reply or state, none became a standalone note"
+        );
     }
 }

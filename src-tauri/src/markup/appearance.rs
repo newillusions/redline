@@ -262,6 +262,11 @@ pub(crate) fn interop_rect(m: &Markup) -> Option<[f64; 4]> {
             let pad = COUNT_MARKER_RADIUS + 4.0;
             Some([p.x - pad, p.y - pad, p.x + pad, p.y + pad])
         }
+        // Sticky Note: the icon box (/Rect of the /Text annotation) centred on the point.
+        (MarkupType::Note, MarkupGeometry::Point(p)) if p.x.is_finite() && p.y.is_finite() => {
+            let h = NOTE_ICON_PT / 2.0;
+            Some([p.x - h, p.y - h, p.x + h, p.y + h])
+        }
         _ => None,
     }
 }
@@ -329,6 +334,99 @@ pub(crate) fn ap_bbox(m: &Markup) -> [f64; 4] {
 // ---------------------------------------------------------------------------
 // Content stream + resources
 // ---------------------------------------------------------------------------
+
+/// Side of the square sticky-Note icon box in PDF points (Acrobat's default `/Text` icon
+/// is 20x20 - inferred, not read from a Bluebeam file; mirrors `NOTE_ICON_PT` in
+/// `src/lib/markup-render.ts`).
+pub(crate) const NOTE_ICON_PT: f64 = 20.0;
+
+/// Most quads (text lines) one text mark-up annotation may carry. A real selection is a few
+/// dozen lines; anything past this is a hostile or corrupt `/QuadPoints` and is truncated
+/// (annotation.rs applies the same cap when reading a PDF, this one covers markups that
+/// arrive another way). Mirrored as `MAX_TEXT_MARKUP_QUADS` in `src/lib/markup-render.ts`.
+pub(crate) const MAX_TEXT_MARKUP_QUADS: usize = 2_000;
+
+/// Total squiggle vertices one annotation may generate across ALL its quads. Each quad gets
+/// `max(2, budget / quad_count)` segments; a longer baseline gets a coarser wave instead of
+/// more vertices. Mirrored in `src/lib/markup-render.ts`.
+pub(crate) const MAX_SQUIGGLE_VERTICES_TOTAL: usize = 50_000;
+
+/// Segments allowed per quad's squiggle when the annotation has `quad_count` quads.
+pub(crate) fn squiggle_segments_per_quad(quad_count: usize) -> usize {
+    (MAX_SQUIGGLE_VERTICES_TOTAL / quad_count.clamp(1, MAX_TEXT_MARKUP_QUADS)).max(2)
+}
+
+fn quad_is_finite(q: &[PdfPoint; 4]) -> bool {
+    q.iter().all(|p| p.x.is_finite() && p.y.is_finite())
+}
+
+/// The line segments a text mark-up (Underline / StrikeOut / Squiggly) paints for one text-line
+/// quad, as polyline vertices in PDF user space. `quad` is the storage order
+/// TL, TR, BL, BR (see `geometry::Quad`). Underline: the quad's bottom edge. StrikeOut: the
+/// line through the mid-height. Squiggly: a zig-zag along the bottom edge. `weight` is the
+/// stroke width in points (drives the squiggle's amplitude and wavelength; clamped to
+/// 0.5..=100 and non-finite treated as 1). `max_segments` caps the squiggle's zig-zag count
+/// (a longer baseline gets a coarser wave, never more vertices).
+///
+/// Hostile input: a quad with any non-finite coordinate yields NO vertices (the caller skips
+/// it); a baseline whose length overflows to infinity degrades to a straight edge. Mirrored in
+/// `src/lib/markup-render.ts` (`textMarkupPolyline`); keep the two in step.
+pub(crate) fn text_markup_polyline(
+    kind: MarkupType,
+    quad: &[PdfPoint; 4],
+    weight: f64,
+    max_segments: usize,
+) -> Vec<PdfPoint> {
+    if !quad_is_finite(quad) {
+        return Vec::new();
+    }
+    let (tl, tr, bl, br) = (quad[0], quad[1], quad[2], quad[3]);
+    match kind {
+        MarkupType::StrikeOut => vec![
+            PdfPoint {
+                x: (tl.x + bl.x) / 2.0,
+                y: (tl.y + bl.y) / 2.0,
+            },
+            PdfPoint {
+                x: (tr.x + br.x) / 2.0,
+                y: (tr.y + br.y) / 2.0,
+            },
+        ],
+        MarkupType::Squiggly => {
+            let w = if weight.is_finite() {
+                weight.clamp(0.5, 100.0)
+            } else {
+                1.0
+            };
+            let step = (w * 2.0).max(2.0);
+            let amp = w.max(0.75);
+            let (dx, dy) = (br.x - bl.x, br.y - bl.y);
+            let len = dx.hypot(dy);
+            if !len.is_finite() || len < 1e-6 {
+                return vec![bl, br];
+            }
+            let (ux, uy) = (dx / len, dy / len);
+            // Normal pointing up-page for an upright quad (perpendicular to the baseline).
+            let (nx, ny) = (-uy, ux);
+            // Segment count, capped BEFORE the float->usize cast so a huge baseline cannot
+            // saturate into an enormous allocation.
+            let n = (len / step).ceil().min(max_segments.max(2) as f64).max(1.0) as usize;
+            let step = len / n as f64;
+            (0..=n)
+                .map(|i| {
+                    let t = (i as f64 * step).min(len);
+                    let off = if i % 2 == 0 { 0.0 } else { amp };
+                    PdfPoint {
+                        x: bl.x + ux * t + nx * off,
+                        y: bl.y + uy * t + ny * off,
+                    }
+                })
+                .collect()
+        }
+        // Underline (and any other caller): the bottom edge.
+        _ => vec![bl, br],
+    }
+}
 
 /// Resource-dictionary accumulator so each shape only declares what it uses.
 struct Resources {
@@ -1069,6 +1167,61 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>, Option<Stamp
             ));
         }
 
+        // --- Text mark-up: Underline / StrikeOut / Squiggly (one stroke per text-line quad) --
+        (
+            MarkupType::Underline | MarkupType::StrikeOut | MarkupType::Squiggly,
+            MarkupGeometry::Quads(quads),
+        ) if !quads.is_empty() => {
+            // Opacity lives on the annotation-level /CA (see to_annotation_dict): a strict
+            // viewer regenerates the stroke from /C + /CA + /QuadPoints, and an /AP-honouring
+            // one applies /CA as a group alpha over this form - so the form paints opaque.
+            let [r, g, b] = hex_to_rgb(&a.color);
+            out.push_str(&format!(
+                "q\n{} {} {} RG\n{} w\n1 J\n",
+                num(r),
+                num(g),
+                num(b),
+                num(a.line_weight.max(0.0))
+            ));
+            let seg_cap = squiggle_segments_per_quad(quads.len());
+            for q in quads.iter().take(MAX_TEXT_MARKUP_QUADS) {
+                let pts = text_markup_polyline(m.markup_type, q, a.line_weight, seg_cap);
+                if pts.is_empty() {
+                    continue; // non-finite quad: skipped, never written as "NaN"
+                }
+                path_from_points(&mut out, &pts);
+                out.push_str("S\n");
+            }
+            out.push_str("Q\n");
+        }
+
+        // --- Sticky Note: a small page-with-lines icon in the markup colour -----------------
+        (MarkupType::Note, MarkupGeometry::Point(p)) if p.x.is_finite() && p.y.is_finite() => {
+            let h = NOTE_ICON_PT / 2.0;
+            let (x0, y0) = (p.x - h, p.y - h);
+            out.push_str("q\n");
+            fill_color(&mut out, &a.color);
+            out.push_str(&format!(
+                "0 0 0 RG\n0.75 w\n{} {} {} {} re\nB\n",
+                num(x0 + 1.0),
+                num(y0 + 1.0),
+                num(NOTE_ICON_PT - 2.0),
+                num(NOTE_ICON_PT - 2.0)
+            ));
+            // Three text lines inside the icon.
+            for i in 0..3 {
+                let y = y0 + 6.0 + (i as f64) * 4.0;
+                out.push_str(&format!(
+                    "{} {} m\n{} {} l\nS\n",
+                    num(x0 + 4.0),
+                    num(y),
+                    num(x0 + NOTE_ICON_PT - 4.0),
+                    num(y)
+                ));
+            }
+            out.push_str("Q\n");
+        }
+
         // --- Ink: one moveto/lineto subpath per stroke, single stroke paint -------------
         (MarkupType::Ink, MarkupGeometry::Ink(strokes)) if !strokes.is_empty() => {
             let gs_name = res.add_gstate(line_gstate(a));
@@ -1260,6 +1413,7 @@ mod tests {
             rich_text: None,
             optional_content: None,
             raw_da: None,
+            note: None,
             foreign_keys: Vec::new(),
             source_nm: None,
         }
@@ -1299,6 +1453,230 @@ mod tests {
             "/BBox must be non-degenerate, got {vals:?}"
         );
         assert!(d.has(b"Resources"), "/AP /N must carry /Resources");
+    }
+
+    // --- Text mark-up (Underline / StrikeOut / Squiggly) + Note ------------------------------
+
+    fn line_quad() -> [PdfPoint; 4] {
+        // TL, TR, BL, BR
+        [
+            PdfPoint { x: 72.0, y: 712.0 },
+            PdfPoint { x: 172.0, y: 712.0 },
+            PdfPoint { x: 72.0, y: 700.0 },
+            PdfPoint { x: 172.0, y: 700.0 },
+        ]
+    }
+
+    #[test]
+    fn underline_strikeout_use_bottom_edge_and_mid_height() {
+        let q = line_quad();
+        let u = text_markup_polyline(MarkupType::Underline, &q, 1.0, 400);
+        assert_eq!(u, vec![q[2], q[3]], "underline = bottom edge");
+        let st = text_markup_polyline(MarkupType::StrikeOut, &q, 1.0, 400);
+        assert_eq!(
+            st,
+            vec![
+                PdfPoint { x: 72.0, y: 706.0 },
+                PdfPoint { x: 172.0, y: 706.0 }
+            ],
+            "strike-out = line through mid-height"
+        );
+    }
+
+    #[test]
+    fn squiggly_zigzags_along_the_baseline_between_its_endpoints() {
+        let q = line_quad();
+        let pts = text_markup_polyline(MarkupType::Squiggly, &q, 1.0, 400);
+        assert!(
+            pts.len() > 10,
+            "a 100pt baseline needs many zig-zag vertices, got {}",
+            pts.len()
+        );
+        assert_eq!(pts.first().unwrap(), &q[2]);
+        assert!(
+            (pts.last().unwrap().x - 172.0).abs() < 1e-9,
+            "ends at the baseline end"
+        );
+        // Alternating offset above the baseline: even vertices on it, odd ones raised.
+        assert!((pts[0].y - 700.0).abs() < 1e-9);
+        assert!(pts[1].y > 700.0);
+        assert!((pts[2].y - 700.0).abs() < 1e-9);
+        assert!(
+            pts.iter().all(|p| p.y >= 700.0 && p.y <= 702.0),
+            "stays within the quad's lower band"
+        );
+    }
+
+    // --- Hostile geometry (untrusted /QuadPoints must not hang, allocate unboundedly or panic) ---
+
+    #[test]
+    fn squiggle_vertex_count_is_capped_however_long_the_baseline() {
+        for len in [1.0e4, 1.0e9, 1.0e30, 1.0e300] {
+            let q = [
+                PdfPoint { x: 0.0, y: 12.0 },
+                PdfPoint { x: len, y: 12.0 },
+                PdfPoint { x: 0.0, y: 0.0 },
+                PdfPoint { x: len, y: 0.0 },
+            ];
+            let pts = text_markup_polyline(MarkupType::Squiggly, &q, 1.0, 400);
+            assert!(pts.len() <= 401, "len {len}: {} vertices", pts.len());
+            assert!(pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()));
+        }
+    }
+
+    #[test]
+    fn squiggle_baseline_that_overflows_to_infinity_degrades_to_a_straight_edge() {
+        let q = [
+            PdfPoint {
+                x: -1.7e308,
+                y: 12.0,
+            },
+            PdfPoint {
+                x: 1.7e308,
+                y: 12.0,
+            },
+            PdfPoint {
+                x: -1.7e308,
+                y: 0.0,
+            },
+            PdfPoint { x: 1.7e308, y: 0.0 },
+        ];
+        assert_eq!(
+            text_markup_polyline(MarkupType::Squiggly, &q, 1.0, 400).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn non_finite_quad_yields_no_vertices_for_every_kind() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let q = [
+                PdfPoint { x: 0.0, y: 12.0 },
+                PdfPoint { x: bad, y: 12.0 },
+                PdfPoint { x: 0.0, y: 0.0 },
+                PdfPoint { x: 10.0, y: 0.0 },
+            ];
+            for k in [
+                MarkupType::Underline,
+                MarkupType::StrikeOut,
+                MarkupType::Squiggly,
+            ] {
+                assert!(
+                    text_markup_polyline(k, &q, 1.0, 400).is_empty(),
+                    "{k:?} with {bad}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_finite_or_absurd_weight_cannot_blow_up_the_squiggle() {
+        let q = line_quad();
+        for w in [f64::NAN, f64::INFINITY, -5.0, 1.0e300] {
+            let pts = text_markup_polyline(MarkupType::Squiggly, &q, w, 400);
+            assert!(!pts.is_empty() && pts.len() <= 401);
+            assert!(
+                pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()),
+                "weight {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn appearance_with_a_huge_quad_count_is_truncated_and_stays_bounded() {
+        let many: Vec<[PdfPoint; 4]> = (0..100_000).map(|_| line_quad()).collect();
+        for t in [
+            MarkupType::Underline,
+            MarkupType::StrikeOut,
+            MarkupType::Squiggly,
+        ] {
+            let m = base_markup(t, MarkupGeometry::Quads(many.clone()));
+            let c = content_str(&m);
+            let strokes = c.matches("S\n").count();
+            assert_eq!(strokes, MAX_TEXT_MARKUP_QUADS, "{t:?}: strokes capped");
+            // total generated lines stay within a few MB however many quads arrive
+            assert!(c.len() < 8_000_000, "{t:?}: stream {} bytes", c.len());
+        }
+    }
+
+    #[test]
+    fn appearance_skips_non_finite_quads_and_never_writes_nan_or_inf() {
+        let mut bad = line_quad();
+        bad[1].x = f64::NAN;
+        let mut inf = line_quad();
+        inf[3].y = f64::INFINITY;
+        let m = base_markup(
+            MarkupType::Squiggly,
+            MarkupGeometry::Quads(vec![bad, line_quad(), inf]),
+        );
+        let c = content_str(&m);
+        assert_eq!(
+            c.matches("S\n").count(),
+            1,
+            "only the finite quad is stroked: {c}"
+        );
+        assert!(
+            !c.contains("NaN") && !c.to_lowercase().contains("inf"),
+            "{c}"
+        );
+    }
+
+    #[test]
+    fn note_with_a_non_finite_point_draws_nothing_and_gets_no_nan_rect() {
+        let m = base_markup(
+            MarkupType::Note,
+            MarkupGeometry::Point(PdfPoint {
+                x: f64::NAN,
+                y: 5.0,
+            }),
+        );
+        assert!(!content_str(&m).contains("NaN"));
+        assert!(interop_rect(&m).is_none());
+    }
+
+    #[test]
+    fn text_markup_appearance_strokes_one_path_per_quad_and_paints_opaque() {
+        let quads = vec![line_quad(), line_quad()];
+        for t in [
+            MarkupType::Underline,
+            MarkupType::StrikeOut,
+            MarkupType::Squiggly,
+        ] {
+            let m = base_markup(t, MarkupGeometry::Quads(quads.clone()));
+            let d = stream_dict_checks(&m);
+            assert_valid_form_dict(&d);
+            let c = content_str(&m);
+            assert_eq!(
+                c.matches("S\n").count(),
+                2,
+                "{t:?}: one stroke per quad: {c}"
+            );
+            assert!(
+                c.contains(" RG\n") && c.contains(" w\n"),
+                "{t:?}: colour + width: {c}"
+            );
+            assert!(
+                !c.contains(" gs\n"),
+                "{t:?}: opacity is carried by /CA, not an ExtGState: {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn note_appearance_draws_a_filled_icon_centred_on_the_point() {
+        let m = base_markup(
+            MarkupType::Note,
+            MarkupGeometry::Point(PdfPoint { x: 100.0, y: 200.0 }),
+        );
+        let c = content_str(&m);
+        assert!(c.contains(" re\nB\n"), "icon box is filled + stroked: {c}");
+        assert_eq!(c.matches("S\n").count(), 3, "three text lines: {c}");
+        let bbox = ap_bbox(&m);
+        assert_eq!(
+            bbox,
+            [90.0, 190.0, 110.0, 210.0],
+            "/Rect == icon box centred on the point"
+        );
     }
 
     // --- Rectangle / Square ---------------------------------------------------------

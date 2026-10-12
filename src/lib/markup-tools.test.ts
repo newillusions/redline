@@ -419,3 +419,46 @@ describe("shiftGeometry", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Text mark-up + Note helpers
+// ---------------------------------------------------------------------------
+import {
+  isTextMarkupTool, textMarkupAppearance, noteAppearance, NOTE_DEFAULT_COLOR,
+  TEXT_MARKUP_DEFAULT_WEIGHT, DEFAULT_NOTE_PROPS,
+} from "./markup-tools";
+
+describe("text mark-up + Note helpers", () => {
+  const draft = { color: "#e02424", line_weight: 2, opacity: 0.8, fill: "#00ff00", line_style: "Dashed" as const, font: { family: "Helvetica", size_pt: 12 } };
+
+  it("isTextMarkupTool is true for exactly Underline / StrikeOut / Squiggly", () => {
+    expect(["Underline", "StrikeOut", "Squiggly"].every((t) => isTextMarkupTool(t as never))).toBe(true);
+    expect(["Highlight", "selectText", "Note", "Text"].some((t) => isTextMarkupTool(t as never))).toBe(false);
+  });
+
+  it("textMarkupAppearance keeps colour + opacity, forces the thin rule weight, drops the font", () => {
+    const a = textMarkupAppearance(draft);
+    expect(a.color).toBe("#e02424");
+    expect(a.opacity).toBe(0.8);
+    expect(a.line_weight).toBe(TEXT_MARKUP_DEFAULT_WEIGHT);
+    expect(a.font).toBeNull();
+  });
+
+  it("noteAppearance is the yellow sticky colour at the draft opacity, with no fill", () => {
+    const a = noteAppearance(draft);
+    expect(a.color).toBe(NOTE_DEFAULT_COLOR);
+    expect(a.opacity).toBe(0.8);
+    expect(a.fill).toBeNull();
+  });
+
+  it("buildMarkup carries a Note's icon + open state (copied, not shared) and null otherwise", () => {
+    const base = {
+      page: 0, geometry: { Point: { x: 1, y: 2 } }, appearance: draft,
+      identity: { user_id: "u", display_name: "U" }, now: "2026-10-12T00:00:00Z", id: "i",
+    };
+    const n = buildMarkup({ ...base, markupType: "Note", note: DEFAULT_NOTE_PROPS });
+    expect(n.note).toEqual({ icon: "Note", open: false });
+    expect(n.note).not.toBe(DEFAULT_NOTE_PROPS);
+    expect(buildMarkup({ ...base, markupType: "Rectangle" }).note).toBeNull();
+  });
+});

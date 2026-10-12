@@ -14,6 +14,7 @@ import type {
   CountSet,
   StampAsset,
   DynamicField,
+  NoteProps,
 } from "./ipc";
 import type { ToolKind } from "./markup-store.svelte";
 
@@ -95,6 +96,35 @@ export const TEXT_TOOLS: ReadonlySet<TextTool> = new Set<TextTool>(["Text", "Cal
 export function isTextTool(t: ToolKind): t is TextTool {
   return (TEXT_TOOLS as ReadonlySet<string>).has(t);
 }
+
+/** Text-anchored mark-up tools (drag over text; the markup is created on release). */
+export type TextMarkupTool = Extract<MarkupType, "Underline" | "StrikeOut" | "Squiggly">;
+export const TEXT_MARKUP_TOOLS: ReadonlySet<TextMarkupTool> =
+  new Set<TextMarkupTool>(["Underline", "StrikeOut", "Squiggly"]);
+export function isTextMarkupTool(t: ToolKind): t is TextMarkupTool {
+  return (TEXT_MARKUP_TOOLS as ReadonlySet<string>).has(t);
+}
+
+/** Stroke weight (pt) a new Underline / StrikeOut / Squiggly gets - the shared draft
+ *  weight (2pt) is a shape-outline default and far too heavy for a text rule. Editable
+ *  afterwards in the Properties panel. */
+export const TEXT_MARKUP_DEFAULT_WEIGHT = 1;
+
+/** Appearance for a new text mark-up: the draft colour/opacity, with the text-rule weight. */
+export function textMarkupAppearance(draft: Appearance): Appearance {
+  return { ...draft, font: null, line_weight: TEXT_MARKUP_DEFAULT_WEIGHT };
+}
+
+/** Sticky-note colour (Revu's default Note is yellow; the draft colour is a shape red). */
+export const NOTE_DEFAULT_COLOR = "#ffd400";
+
+/** Appearance for a new sticky Note: yellow icon at the draft opacity. */
+export function noteAppearance(draft: Appearance): Appearance {
+  return { ...draft, font: null, color: NOTE_DEFAULT_COLOR, fill: null };
+}
+
+/** Icon + open state a freshly placed Note starts with. */
+export const DEFAULT_NOTE_PROPS: NoteProps = { icon: "Note", open: false };
 
 /** Default font for new text/callout markups (G7 adds the picker). */
 export const DEFAULT_TEXT_FONT = { family: "Helvetica", size_pt: 12 } as const;
@@ -228,6 +258,8 @@ export function buildMarkup(opts: {
    *  `docs/design/2026-08-11-grouped-markups.md` §4). `null`/omitted for an
    *  ordinary ungrouped markup, matching every prior call site. */
   groupId?: string | null;
+  /** Icon + open state (Note only). */
+  note?: NoteProps | null;
 }): Markup {
   return {
     id: opts.id,
@@ -258,6 +290,7 @@ export function buildMarkup(opts: {
     measurement: null,
     count_set: opts.countSet ? { ...opts.countSet } : null,
     stamp_asset: opts.stampAsset ?? null,
+    note: opts.note ? { ...opts.note } : null,
   };
 }
 

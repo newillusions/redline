@@ -7,6 +7,8 @@
     patchAppearance,
     patchFields,
     patchStatus,
+    patchNoteIcon,
+    NOTE_ICONS,
     commonValue,
     FONT_FAMILIES,
     FONT_SIZES,
@@ -37,6 +39,19 @@
     mode === "draft"
       ? store.activeTool === "Text" || store.activeTool === "Callout"
       : selected.length > 0 && selected.every((m) => m.markup_type === "Text" || m.markup_type === "Callout"),
+  );
+
+  // Text mark-up (Underline / StrikeOut / Squiggly) and the sticky Note have no fill, line
+  // style or box: showing those controls would offer settings that do nothing. Colour,
+  // weight (rule thickness), opacity, subject, status and author stay.
+  const isRuleOrNote = (t: string) => t === "Underline" || t === "StrikeOut" || t === "Squiggly" || t === "Note";
+  const hideShapeControls = $derived(
+    mode === "draft"
+      ? isRuleOrNote(store.activeTool)
+      : selected.length > 0 && selected.every((m) => isRuleOrNote(m.markup_type)),
+  );
+  const isNoteContext = $derived(
+    mode === "draft" ? store.activeTool === "Note" : selected.length > 0 && selected.every((m) => m.markup_type === "Note"),
   );
 
   // ---------------------------------------------------------------------------
@@ -71,6 +86,20 @@
       after: patchFields(m, patch, by(m.audit.modified_by), now),
     }));
     store.applyBatch(pairs);
+  }
+
+  function commitNoteIcon(icon: string) {
+    const now = new Date().toISOString();
+    const pairs = selected.map((m) => ({ before: m, after: patchNoteIcon(m, icon, by(m.audit.modified_by), now) }));
+    store.applyBatch(pairs);
+  }
+
+  function noteIconValue(): string {
+    return commonValue(selected, (m) => m.note?.icon ?? "Note") ?? "";
+  }
+
+  function authorValue(): string {
+    return commonValue(selected, (m) => m.audit.created_by.display_name) ?? "";
   }
 
   function commitStatusPatch(status: MarkupWorkflow["status"]) {
@@ -374,6 +403,7 @@
          fill settings. Box outline (a distinct, FreeText-only concept) lives in its own
          section below, gated to Text/Callout so it never shows for shapes that have no
          box of their own. -->
+    {#if !hideShapeControls}
     <div class="prop-subgroup">
       <p class="prop-subgroup-title muted">Fill</p>
 
@@ -421,6 +451,8 @@
       </div>
     </div>
 
+    {/if}
+
     <!-- Text box border (Text/Callout FreeText box border colour - semantically distinct
          from both the fill above and the glyph/line colour: it is the rectangle drawn
          around a Text or Callout note. Only shown for those types so it is never mistaken
@@ -443,6 +475,7 @@
     {/if}
 
     <!-- Line style -->
+    {#if !hideShapeControls}
     <div class="prop-row">
       <label for="prop-line-style" class="prop-label">Line style</label>
       <select
@@ -460,6 +493,7 @@
         <option value="Dotted">Dotted</option>
       </select>
     </div>
+    {/if}
   </section>
 
   <!-- Font group (shown in both draft and selection mode) -->
@@ -533,6 +567,31 @@
           placeholder={subjectValue() === "" && selected.length > 1 ? "Mixed" : ""}
         />
       </div>
+
+      <div class="prop-row">
+        <span class="prop-label">Author</span>
+        <span class="prop-value muted" data-field="author">{authorValue() || "Mixed"}</span>
+      </div>
+
+      {#if isNoteContext}
+        <div class="prop-row">
+          <label for="prop-note-icon" class="prop-label">Icon</label>
+          <select
+            id="prop-note-icon"
+            data-field="note_icon"
+            value={noteIconValue()}
+            onchange={(e) => commitNoteIcon((e.target as HTMLSelectElement).value)}
+            class="prop-select"
+          >
+            {#if !noteIconValue()}
+              <option value="" disabled selected>Mixed</option>
+            {/if}
+            {#each NOTE_ICONS as icon (icon)}
+              <option value={icon}>{icon}</option>
+            {/each}
+          </select>
+        </div>
+      {/if}
 
       <div class="prop-row">
         <label for="prop-layer" class="prop-label">Layer</label>

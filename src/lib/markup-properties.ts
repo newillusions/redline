@@ -140,6 +140,20 @@ export function patchDeleteReply(m: Markup, replyId: string, by: UserRef, now: s
   return bumpAudit({ ...m, workflow: { ...m.workflow, thread, status_history } }, by, now);
 }
 
+/** The standard PDF `/Text` icon names (ISO 32000-1 12.5.6.4), in menu order. */
+export const NOTE_ICONS: readonly string[] = [
+  "Note", "Comment", "Key", "Help", "NewParagraph", "Paragraph", "Insert",
+];
+
+/**
+ * Return a clone of a Note markup with its icon (`/Name`) set to `icon` and the audit trail
+ * bumped. Non-Note markups are returned unchanged (same reference). Pure.
+ */
+export function patchNoteIcon(m: Markup, icon: string, by: UserRef, now: string): Markup {
+  if (m.markup_type !== "Note") return m;
+  return bumpAudit({ ...m, note: { open: m.note?.open ?? false, icon } }, by, now);
+}
+
 /**
  * Return the shared projected value across all `markups` when every element
  * projects the same value under strict equality (===), or `undefined` when the

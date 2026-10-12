@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { markupToSvg, cloudPath, selectionChrome, countSymbolRender, quadToScreenPolygon, type SvgShape } from "./markup-render";
+import { markupToSvg, cloudPath, selectionChrome, countSymbolRender, quadToScreenPolygon, textMarkupPolyline, MAX_TEXT_MARKUP_QUADS, squiggleSegmentsPerQuad, type SvgShape } from "./markup-render";
 import type { Markup, MarkupType, Appearance, MarkupGeometry, CountSet } from "./ipc";
 import type { ViewportState } from "./viewport";
 import { pdfUserSpaceToScreen } from "./viewport";
@@ -554,5 +554,133 @@ describe("markupToSvg stamp artwork (2026-08-08 fix)", () => {
       stamp_asset: { Svg: "<svg/>" },
     };
     expect(markupToSvg(m, VS).kind).toBe("rect");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Text mark-up (Underline / StrikeOut / Squiggly) + sticky Note
+// ---------------------------------------------------------------------------
+
+const LINE_QUAD: [{ x: number; y: number }, { x: number; y: number }, { x: number; y: number }, { x: number; y: number }] =
+  [{ x: 10, y: 50 }, { x: 60, y: 50 }, { x: 10, y: 38 }, { x: 60, y: 38 }];
+
+describe("textMarkupPolyline (parity with Rust appearance::text_markup_polyline)", () => {
+  it("Underline is the quad's bottom edge", () => {
+    expect(textMarkupPolyline("Underline", LINE_QUAD, 1)).toEqual([LINE_QUAD[2], LINE_QUAD[3]]);
+  });
+  it("StrikeOut is the line through mid-height", () => {
+    expect(textMarkupPolyline("StrikeOut", LINE_QUAD, 1)).toEqual([{ x: 10, y: 44 }, { x: 60, y: 44 }]);
+  });
+  it("Squiggly zig-zags along the baseline: even vertices on it, odd ones raised by the amplitude", () => {
+    const pts = textMarkupPolyline("Squiggly", LINE_QUAD, 1);
+    expect(pts.length).toBeGreaterThan(10);
+    expect(pts[0]).toEqual(LINE_QUAD[2]);
+    expect(pts[pts.length - 1].x).toBeCloseTo(60);
+    expect(pts[0].y).toBeCloseTo(38);
+    expect(pts[1].y).toBeCloseTo(39); // amp = max(weight, 0.75) = 1 at weight 1
+    expect(pts[2].y).toBeCloseTo(38);
+    expect(pts.every((p) => p.y >= 38 && p.y <= 39)).toBe(true);
+  });
+});
+
+describe("markupToSvg text mark-up + Note", () => {
+  const quads = { Quads: [LINE_QUAD, [{ x: 10, y: 30 }, { x: 30, y: 30 }, { x: 10, y: 18 }, { x: 30, y: 18 }] as typeof LINE_QUAD] };
+
+  for (const t of ["Underline", "StrikeOut", "Squiggly"] as const) {
+    it(`${t}: a stroke-only 'textmarkup' shape, one polyline per quad, opacity on the stroke`, () => {
+      const s = markupToSvg(mk(quads, t, { opacity: 0.5, line_weight: 1.5 }), VS);
+      expect(s.kind).toBe("textmarkup");
+      if (s.kind !== "textmarkup") throw new Error("kind");
+      expect(s.lines).toHaveLength(2);
+      expect(s.fill).toBe("none");
+      expect(s.stroke).toBe("#ff0000");
+      expect(s.strokeOpacity).toBe(0.5);
+      expect(s.strokeWidth).toBeCloseTo(3); // 1.5pt * zoom 2
+    });
+  }
+
+  it("Underline polyline is mapped through the viewport (y-flipped, zoom-scaled)", () => {
+    const s = markupToSvg(mk({ Quads: [LINE_QUAD] }, "Underline"), VS);
+    if (s.kind !== "textmarkup") throw new Error("kind");
+    // bottom edge (10,38)-(60,38) at zoom 2, page height 100 -> screen y = (100-38)*2 = 124
+    expect(s.lines[0]).toBe("20,124 120,124");
+  });
+
+  it("Note: an icon box centred on the point, three text lines, opacity on the whole icon", () => {
+    const s = markupToSvg(mk({ Point: { x: 50, y: 50 } }, "Note", { color: "#ffd400", opacity: 0.6 }), VS);
+    expect(s.kind).toBe("note");
+    if (s.kind !== "note") throw new Error("kind");
+    const c = pdfUserSpaceToScreen(50, 50, VS);
+    expect(s.size).toBeCloseTo(40); // 20pt * zoom 2
+    expect(s.x + s.size / 2).toBeCloseTo(c.x);
+    expect(s.y + s.size / 2).toBeCloseTo(c.y);
+    expect(s.lines).toHaveLength(3);
+    expect(s.fill).toBe("#ffd400");
+    expect(s.fillOpacity).toBe(0.6);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hostile geometry (untrusted /QuadPoints): bounded work, no NaN in the output
+// ---------------------------------------------------------------------------
+
+describe("text mark-up hostile geometry", () => {
+  const quadOfLength = (len: number): typeof LINE_QUAD =>
+    [{ x: 0, y: 12 }, { x: len, y: 12 }, { x: 0, y: 0 }, { x: len, y: 0 }];
+
+  it("squiggle vertex count is capped however long the baseline (no runaway loop)", () => {
+    for (const len of [1e4, 1e9, 1e30, 1e300]) {
+      const pts = textMarkupPolyline("Squiggly", quadOfLength(len), 1, 400);
+      expect(pts.length, `len ${len}`).toBeLessThanOrEqual(401);
+      expect(pts.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y))).toBe(true);
+    }
+  });
+
+  it("a baseline that overflows to Infinity degrades to a straight edge", () => {
+    const q: typeof LINE_QUAD = [{ x: -1.7e308, y: 12 }, { x: 1.7e308, y: 12 }, { x: -1.7e308, y: 0 }, { x: 1.7e308, y: 0 }];
+    expect(textMarkupPolyline("Squiggly", q, 1, 400)).toHaveLength(2);
+  });
+
+  it("non-finite quads yield no vertices for every kind", () => {
+    for (const bad of [NaN, Infinity, -Infinity]) {
+      const q: typeof LINE_QUAD = [{ x: 0, y: 12 }, { x: bad, y: 12 }, { x: 0, y: 0 }, { x: 10, y: 0 }];
+      for (const k of ["Underline", "StrikeOut", "Squiggly"] as const) {
+        expect(textMarkupPolyline(k, q, 1, 400), `${k} ${bad}`).toEqual([]);
+      }
+    }
+  });
+
+  it("non-finite / absurd weights cannot blow up the squiggle", () => {
+    for (const w of [NaN, Infinity, -5, 1e300]) {
+      const pts = textMarkupPolyline("Squiggly", LINE_QUAD, w, 400);
+      expect(pts.length).toBeGreaterThan(1);
+      expect(pts.length).toBeLessThanOrEqual(401);
+      expect(pts.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y))).toBe(true);
+    }
+  });
+
+  it("per-quad squiggle budget shrinks as the quad count grows, with a floor of 2", () => {
+    expect(squiggleSegmentsPerQuad(1)).toBe(50_000);
+    expect(squiggleSegmentsPerQuad(100)).toBe(500);
+    expect(squiggleSegmentsPerQuad(MAX_TEXT_MARKUP_QUADS)).toBe(25);
+    expect(squiggleSegmentsPerQuad(10_000_000)).toBe(25);
+  });
+
+  for (const t of ["Underline", "StrikeOut", "Squiggly"] as const) {
+    it(`${t}: a markup with 100000 quads renders at most ${MAX_TEXT_MARKUP_QUADS} polylines`, () => {
+      const many = Array.from({ length: 100_000 }, () => LINE_QUAD);
+      const s = markupToSvg(mk({ Quads: many }, t), VS);
+      if (s.kind !== "textmarkup") throw new Error("kind");
+      expect(s.lines).toHaveLength(MAX_TEXT_MARKUP_QUADS);
+    });
+  }
+
+  it("non-finite quads are skipped and never reach the SVG strings", () => {
+    const bad: typeof LINE_QUAD = [{ x: NaN, y: 1 }, { x: 5, y: 1 }, { x: 0, y: 0 }, { x: 5, y: 0 }];
+    const inf: typeof LINE_QUAD = [{ x: 0, y: 1 }, { x: 5, y: 1 }, { x: 0, y: 0 }, { x: Infinity, y: 0 }];
+    const s = markupToSvg(mk({ Quads: [bad, LINE_QUAD, inf] }, "Squiggly"), VS);
+    if (s.kind !== "textmarkup") throw new Error("kind");
+    expect(s.lines).toHaveLength(1);
+    expect(s.lines.join(" ")).not.toMatch(/NaN|Infinity/);
   });
 });

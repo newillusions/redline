@@ -39,6 +39,12 @@ pub enum MarkupType {
     Ink,
     Stamp,
     StampDynamic,
+    // Text mark-up (PDF /Underline, /StrikeOut, /Squiggly with /QuadPoints) and the
+    // sticky Note (PDF /Text annotation). See docs/text-markup-tools.md.
+    Underline,
+    StrikeOut,
+    Squiggly,
+    Note,
     // Measurement types (spec §7)
     MeasurementLength,
     MeasurementPerimeter,
@@ -50,6 +56,15 @@ pub enum MarkupType {
 }
 
 impl MarkupType {
+    /// The three text-anchored mark-up types that share one geometry (`Quads`, one per
+    /// text line) and one appearance model: a stroke along (or through) each quad.
+    pub fn is_text_markup(self) -> bool {
+        matches!(
+            self,
+            MarkupType::Underline | MarkupType::StrikeOut | MarkupType::Squiggly
+        )
+    }
+
     /// Whether this type carries a [`Measurement`] payload (spec §7).
     pub fn is_measurement(self) -> bool {
         matches!(
@@ -391,6 +406,28 @@ pub struct Measurement {
     pub custom_columns: BTreeMap<String, String>,
 }
 
+/// Properties specific to a sticky [`MarkupType::Note`] (a standard PDF `/Text`
+/// annotation, ISO 32000-1 12.5.6.4): the icon name (`/Name`) and whether its pop-up is
+/// open (`/Open`). Foreign icon names are kept verbatim so a re-save never rewrites a
+/// Bluebeam/Acrobat icon choice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteProps {
+    /// `/Name` icon: Comment, Key, Note, Help, NewParagraph, Paragraph, Insert (or any
+    /// foreign name).
+    pub icon: String,
+    /// `/Open`: the pop-up window is shown when the document opens.
+    pub open: bool,
+}
+
+impl Default for NoteProps {
+    fn default() -> Self {
+        Self {
+            icon: "Note".to_string(),
+            open: false,
+        }
+    }
+}
+
 /// The common markup envelope (spec §6). Every markup — annotation or measurement — is
 /// one of these. `id` is the stable sync/merge anchor and maps to the PDF `/NM`
 /// annotation name on save; it is assigned at creation and never changes.
@@ -472,6 +509,10 @@ pub struct Markup {
     /// has a font. `#[serde(default)]` keeps pre-this-field JSON deserialising to `None`.
     #[serde(default)]
     pub raw_da: Option<String>,
+    /// Icon + open state, present only for [`MarkupType::Note`]. `#[serde(default)]` keeps
+    /// pre-this-field JSON deserialising to `None`.
+    #[serde(default)]
+    pub note: Option<NoteProps>,
     /// Bluebeam-private annotation keys redline does not interpret (`/BSI*` such as
     /// `/BSIColumnData`, `/BBMeasure`, `/GroupNesting`, `/NumCounts`, ...), carried
     /// verbatim so a Revu-authored markup keeps its custom-column data and count metadata
@@ -531,6 +572,7 @@ impl Markup {
             rich_text: None,
             optional_content: None,
             raw_da: None,
+            note: None,
             foreign_keys: Vec::new(),
             source_nm: None,
         }

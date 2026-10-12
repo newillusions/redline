@@ -112,4 +112,23 @@ describe("ToolPalette", () => {
     await user.click(btn);
     expect(store.activeTool).toBe("select");
   });
+
+  it("text mark-up tools sit after Select Text and activate; Note sits after Callout", async () => {
+    const user = userEvent.setup();
+    const { container } = render(ToolPalette, { props: { store } });
+    const titles = Array.from(container.querySelectorAll("button.tool-btn")).map((b) => b.getAttribute("title") ?? "");
+    const idx = (prefix: string) => titles.findIndex((t) => t.startsWith(prefix));
+    expect(idx("Underline text (U)")).toBe(idx("Select Text") + 1);
+    expect(idx("Strikethrough text (D)")).toBe(idx("Select Text") + 2);
+    expect(idx("Squiggly underline (Shift+U)")).toBe(idx("Select Text") + 3);
+    expect(idx("Sticky Note (N)")).toBe(idx("Callout") + 1);
+
+    for (const [prefix, tool] of [
+      ["Underline text (U)", "Underline"], ["Strikethrough text (D)", "StrikeOut"],
+      ["Squiggly underline (Shift+U)", "Squiggly"], ["Sticky Note (N)", "Note"],
+    ] as const) {
+      await user.click(screen.getByTitle(new RegExp("^" + prefix.replace(/[()+]/g, "\\$&"))));
+      expect(store.activeTool).toBe(tool);
+    }
+  });
 });

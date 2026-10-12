@@ -26,12 +26,18 @@
       title: "Select Text (drag to select; Enter highlights, Ctrl/Cmd+C copies)",
       iconClass: "icon-ibeam",
     },
+    // Text mark-up (PDF /Underline /StrikeOut /Squiggly): drag over text, created on
+    // release. Shortcuts follow Revu's: U, D, Shift+U (docs/text-markup-tools.md).
+    { kind: "Underline", label: "U", title: "Underline text (U) - drag over text", iconClass: "icon-underline" },
+    { kind: "StrikeOut", label: "S", title: "Strikethrough text (D) - drag over text", iconClass: "icon-strike" },
+    { kind: "Squiggly", label: "U", title: "Squiggly underline (Shift+U) - drag over text", iconClass: "icon-squiggly" },
     { kind: "Polyline", label: "⋁", title: "Polyline" },
     { kind: "Polygon", label: "⬠", title: "Polygon" },
     { kind: "Cloud", label: "☁", title: "Cloud" },
     { kind: "Ink", label: "✎", title: "Ink (Freehand)" },
     { kind: "Text", label: "A", title: "Text" },
     { kind: "Callout", label: "💬", title: "Callout" },
+    { kind: "Note", label: "🗒", title: "Sticky Note (N) - click to place, type the comment" },
     { kind: "calibrate", label: "⚖", title: "Calibrate Scale (two-click)" },
     { kind: "MeasurementLength", label: "↔", title: "Measure Length" },
     { kind: "MeasurementArea", label: "⬛", title: "Measure Area" },
@@ -48,6 +54,9 @@
       class="tool-btn"
       class:active={store.activeTool === t.kind}
       class:icon-ibeam={t.iconClass === "icon-ibeam"}
+      class:icon-underline={t.iconClass === "icon-underline"}
+      class:icon-strike={t.iconClass === "icon-strike"}
+      class:icon-squiggly={t.iconClass === "icon-squiggly"}
       title={t.title}
       aria-pressed={store.activeTool === t.kind}
       onclick={() => (store.activeTool = t.kind)}
@@ -75,5 +84,10 @@
      serifs) - the app's default sans-serif font renders a bare "I" as a single
      stroke, easy to miss entirely (owner feedback, v0.3.22). font-family here is
      a shape choice, not a colour/token override. */
+  /* Text mark-up glyphs: the letter itself carries the decoration, so the button reads as
+     what the tool draws (underline / strike-through / wavy underline). */
+  .tool-btn.icon-underline { text-decoration: underline; font-weight: 700; }
+  .tool-btn.icon-strike { text-decoration: line-through; font-weight: 700; }
+  .tool-btn.icon-squiggly { text-decoration: underline wavy; font-weight: 700; }
   .tool-btn.icon-ibeam { font-family: Georgia, "Times New Roman", serif; font-weight: 700; }
 </style>

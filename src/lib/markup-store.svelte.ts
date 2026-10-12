@@ -70,6 +70,8 @@ export interface MarkupIpc {
 export type ToolKind =
   | "hand" | "select" | "Rectangle" | "Ellipse" | "Line" | "Arrow" | "Highlight"
   | "Polyline" | "Polygon" | "Cloud" | "Ink" | "Text" | "Callout"
+  // Text mark-up (drag over text, created on release) and the sticky Note (click to place).
+  | "Underline" | "StrikeOut" | "Squiggly" | "Note"
   // I-beam text-selection tool: drag to select real PDF text (not a drawn shape).
   // Enter (with an active selection) creates a text-anchored Highlight; Ctrl/Cmd+C
   // copies the selected text. See Viewport.svelte onOverlayPointerDown/Move/Up.

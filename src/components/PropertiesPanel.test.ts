@@ -647,3 +647,67 @@ describe("multi-selection (2 markups)", () => {
     expect(getByText(/2 markup\(s\) selected/i)).toBeTruthy();
   });
 });
+
+// ---------------------------------------------------------------------------
+describe("text mark-up + sticky Note properties", () => {
+  const quadGeom = {
+    Quads: [[{ x: 0, y: 12 }, { x: 80, y: 12 }, { x: 0, y: 0 }, { x: 80, y: 0 }] as [
+      { x: number; y: number }, { x: number; y: number }, { x: number; y: number }, { x: number; y: number },
+    ]],
+  };
+
+  it("an Underline exposes colour, weight, opacity, subject, status and author - and no fill / line style", async () => {
+    const store = makeStore();
+    store.seed([makeMarkup("u1", { markupType: "Underline", geometry: quadGeom })]);
+    store.selectedIds = new Set(["u1"]);
+    const { container } = await mountPanel(store);
+    for (const f of ["color", "line_weight", "opacity", "subject", "status"]) {
+      expect(container.querySelector(`[data-field='${f}']`), f).toBeTruthy();
+    }
+    expect(container.querySelector("[data-field='author']")?.textContent).toBe("Author");
+    expect(container.querySelector("[data-field='fill_color']")).toBeNull();
+    expect(container.querySelector("[data-field='line_style']")).toBeNull();
+    expect(container.querySelector("[data-field='note_icon']")).toBeNull();
+  });
+
+  it("the draft panel hides fill / line style while a text mark-up tool is armed", async () => {
+    const store = makeStore();
+    store.activeTool = "Squiggly";
+    const { container } = await mountPanel(store);
+    expect(container.querySelector("[data-field='fill_color']")).toBeNull();
+    expect(container.querySelector("[data-field='color']")).toBeTruthy();
+  });
+
+  it("a Note offers the standard icon names; choosing one rewrites /Name through the store (one undo frame)", async () => {
+    const store = makeStore();
+    store.seed([makeMarkup("n1", {
+      markupType: "Note", geometry: { Point: { x: 5, y: 5 } }, note: { icon: "Note", open: false },
+    })]);
+    store.selectedIds = new Set(["n1"]);
+    const { container } = await mountPanel(store);
+    const sel = container.querySelector("select[data-field='note_icon']") as HTMLSelectElement;
+    expect(sel).toBeTruthy();
+    expect(Array.from(sel.options).map((o) => o.value)).toEqual(
+      ["Note", "Comment", "Key", "Help", "NewParagraph", "Paragraph", "Insert"],
+    );
+    expect(container.querySelector("[data-field='fill_color']")).toBeNull();
+
+    sel.value = "Comment";
+    fireEvent.change(sel);
+    await tick();
+    expect(store.markups[0].note).toEqual({ icon: "Comment", open: false });
+    expect(store.markups[0].audit.revision).toBe(1);
+    store.undo();
+    await tick();
+    expect(store.markups[0].note).toEqual({ icon: "Note", open: false });
+  });
+
+  it("shapes keep their fill and line-style controls (no regression)", async () => {
+    const store = makeStore();
+    store.seed([makeMarkup("r1")]);
+    store.selectedIds = new Set(["r1"]);
+    const { container } = await mountPanel(store);
+    expect(container.querySelector("[data-field='fill_color']")).toBeTruthy();
+    expect(container.querySelector("[data-field='line_style']")).toBeTruthy();
+  });
+});

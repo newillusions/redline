@@ -7,7 +7,7 @@
  */
 import type { CountSymbol, Markup, MarkupType, PdfPoint } from "./ipc";
 import { pdfUserSpaceToScreen, type ViewportState } from "./viewport";
-import { type Bounds, type HandleId, HANDLE_IDS, handleAnchors } from "./markup-select";
+import { type Bounds, type HandleId, HANDLE_IDS, handleAnchors, NOTE_ICON_PT } from "./markup-select";
 
 interface SvgStyle {
   id: string;
@@ -53,6 +53,21 @@ export type SvgShape =
       kind: "quads";
       /** One SVG polygon points-string per quad (one per underlying text line). */
       polygons: string[];
+    })
+  | (SvgStyle & {
+      /** Underline / StrikeOut / Squiggly: one stroked polyline per text-line quad
+       *  (SVG `points` strings, screen space). No fill. */
+      kind: "textmarkup";
+      lines: string[];
+    })
+  | (SvgStyle & {
+      /** Sticky Note icon: a square box centred on the anchor, with three text lines. */
+      kind: "note";
+      x: number;
+      y: number;
+      size: number;
+      /** Three text-line segments inside the icon, screen space. */
+      lines: { x1: number; y1: number; x2: number; y2: number }[];
     })
   | (SvgStyle & { kind: "ellipse"; cx: number; cy: number; rx: number; ry: number })
   | (SvgStyle & { kind: "polygon"; points: string })
@@ -270,6 +285,68 @@ export function quadToScreenPolygon(
   return screen.map((s) => `${+s.x.toFixed(3)},${+s.y.toFixed(3)}`).join(" ");
 }
 
+/** Most quads (text lines) a text mark-up renders; the rest are ignored. Mirrors Rust
+ *  `appearance::MAX_TEXT_MARKUP_QUADS` - hostile `/QuadPoints` must not drive unbounded work. */
+export const MAX_TEXT_MARKUP_QUADS = 2000;
+/** Total squiggle vertices across one markup's quads; mirrors Rust
+ *  `appearance::MAX_SQUIGGLE_VERTICES_TOTAL`. */
+export const MAX_SQUIGGLE_VERTICES_TOTAL = 50_000;
+
+/** Squiggle segments allowed per quad when the markup has `quadCount` quads. */
+export function squiggleSegmentsPerQuad(quadCount: number): number {
+  const n = Math.min(Math.max(quadCount, 1), MAX_TEXT_MARKUP_QUADS);
+  return Math.max(Math.floor(MAX_SQUIGGLE_VERTICES_TOTAL / n), 2);
+}
+
+const quadIsFinite = (q: readonly PdfPoint[]): boolean =>
+  q.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+
+/**
+ * The polyline a text mark-up paints for one text-line quad, in PDF user space. `quad` is
+ * the storage order TL, TR, BL, BR. Underline: the bottom edge. StrikeOut: the line through
+ * mid-height. Squiggly: a zig-zag along the bottom edge, at most `maxSegments` long (a longer
+ * baseline gets a coarser wave, never more vertices). A quad with a non-finite coordinate
+ * yields `[]` (callers skip it); a non-finite weight is treated as 1 and weights clamp to
+ * 0.5..100. Mirrors Rust `appearance::text_markup_polyline` (the exported PDF appearance) -
+ * keep the two in step.
+ */
+export function textMarkupPolyline(
+  kind: MarkupType,
+  quad: readonly [PdfPoint, PdfPoint, PdfPoint, PdfPoint],
+  weight: number,
+  maxSegments: number = 400,
+): PdfPoint[] {
+  if (!quadIsFinite(quad)) return [];
+  const [tl, tr, bl, br] = quad;
+  if (kind === "StrikeOut") {
+    return [
+      { x: (tl.x + bl.x) / 2, y: (tl.y + bl.y) / 2 },
+      { x: (tr.x + br.x) / 2, y: (tr.y + br.y) / 2 },
+    ];
+  }
+  if (kind === "Squiggly") {
+    const w = Number.isFinite(weight) ? Math.min(Math.max(weight, 0.5), 100) : 1;
+    const step0 = Math.max(w * 2, 2);
+    const amp = Math.max(w, 0.75);
+    const dx = br.x - bl.x, dy = br.y - bl.y;
+    const len = Math.hypot(dx, dy);
+    if (!Number.isFinite(len) || len < 1e-6) return [bl, br];
+    const ux = dx / len, uy = dy / len;
+    const nx = -uy, ny = ux;
+    // Capped BEFORE the loop so a huge baseline cannot make it run (and allocate) forever.
+    const n = Math.max(Math.min(Math.ceil(len / step0), Math.max(maxSegments, 2)), 1);
+    const step = len / n;
+    const out: PdfPoint[] = [];
+    for (let i = 0; i <= n; i++) {
+      const t = Math.min(i * step, len);
+      const off = i % 2 === 0 ? 0 : amp;
+      out.push({ x: bl.x + ux * t + nx * off, y: bl.y + uy * t + ny * off });
+    }
+    return out;
+  }
+  return [bl, br]; // Underline
+}
+
 function pointsStr(pts: { x: number; y: number }[], v: ViewportState): string {
   return pts
     .map((p) => {
@@ -479,6 +556,34 @@ export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
       x: anchor.x, y: anchor.y,
       width: CALLOUT_BOX_PT.width * v.zoom, height: CALLOUT_BOX_PT.height * v.zoom,
       text: m.contents ?? "", fontPx, outline,
+    };
+  }
+
+  // Text mark-up: a stroke along (Underline / Squiggly) or through (StrikeOut) every text-line
+  // quad. Stroke only - no fill; opacity is the stroke opacity.
+  if ("Quads" in g && (m.markup_type === "Underline" || m.markup_type === "StrikeOut" || m.markup_type === "Squiggly")) {
+    return {
+      ...style, kind: "textmarkup", fill: "none", dashArray: undefined,
+      lines: g.Quads.slice(0, MAX_TEXT_MARKUP_QUADS)
+        .map((q) => textMarkupPolyline(m.markup_type, q, m.appearance.line_weight, squiggleSegmentsPerQuad(g.Quads.length)))
+        .filter((pts) => pts.length > 0)
+        .map((pts) => pointsStr(pts, v)),
+    };
+  }
+
+  // Sticky Note: icon box centred on the anchor point (PDF /Text annotation).
+  if ("Point" in g && m.markup_type === "Note" && Number.isFinite(g.Point.x) && Number.isFinite(g.Point.y)) {
+    const c = pdfUserSpaceToScreen(g.Point.x, g.Point.y, v);
+    const size = NOTE_ICON_PT * v.zoom;
+    const x = c.x - size / 2, y = c.y - size / 2;
+    // Three text lines, evenly spaced in the lower 3/5 of the box (mirrors appearance.rs).
+    const lines = [0, 1, 2].map((i) => {
+      const ly = y + size * (1 - (6 + i * 4) / NOTE_ICON_PT);
+      return { x1: x + size * 0.2, y1: ly, x2: x + size * 0.8, y2: ly };
+    });
+    return {
+      ...style, kind: "note", x, y, size, lines, stroke: "#000000", strokeWidth: 0.75,
+      fill: m.appearance.color, fillOpacity: m.appearance.opacity,
     };
   }
 

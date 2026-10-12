@@ -23,7 +23,8 @@ use lopdf::{Dictionary, Object};
 
 use super::{
     Appearance, Audit, CountSet, CountSymbol, FontSpec, LineStyle, Markup, MarkupGeometry,
-    MarkupStatus, MarkupType, Measurement, OptionalContent, Origin, Reply, UserRef, Workflow,
+    MarkupStatus, MarkupType, Measurement, NoteProps, OptionalContent, Origin, Reply, UserRef,
+    Workflow,
 };
 use crate::geometry::{PdfPoint, Quad};
 
@@ -164,6 +165,12 @@ fn pdf_subtype(t: MarkupType) -> &'static str {
         | MarkupType::MeasurementRadius => "Line",
         MarkupType::Polyline | MarkupType::MeasurementAngle => "PolyLine",
         MarkupType::Highlight => "Highlight",
+        MarkupType::Underline => "Underline",
+        MarkupType::StrikeOut => "StrikeOut",
+        MarkupType::Squiggly => "Squiggly",
+        // A sticky note is the standard PDF /Text annotation (NOT /FreeText, which is
+        // MarkupType::Text) - ISO 32000-1 12.5.6.4.
+        MarkupType::Note => "Text",
         MarkupType::Ink => "Ink",
         MarkupType::Stamp | MarkupType::StampDynamic => "Stamp",
     }
@@ -305,9 +312,13 @@ fn points_from_reals(r: &[f64]) -> Vec<PdfPoint> {
 
 /// Reconstruct `Quad`s from a flat `/QuadPoints` real array (8 values per quad,
 /// x1 y1 x2 y2 x3 y3 x4 y4 - the TL/TR/BL/BR order documented on [`Quad`]).
-/// A trailing partial group (malformed annotation) is dropped via `chunks_exact`.
+/// A trailing partial group (malformed annotation) is dropped via `chunks_exact`; a quad with a
+/// non-finite coordinate is dropped, and at most `MAX_TEXT_MARKUP_QUADS` quads are kept (hostile
+/// `/QuadPoints` must not drive unbounded rendering work).
 fn quads_from_reals(r: &[f64]) -> Vec<Quad> {
     r.chunks_exact(8)
+        .filter(|c| c.iter().all(|v| v.is_finite()))
+        .take(super::appearance::MAX_TEXT_MARKUP_QUADS)
         .map(|c| {
             [
                 PdfPoint { x: c[0], y: c[1] },
@@ -626,6 +637,11 @@ impl Markup {
             "CA",
             real(if matches!(t, MarkupType::Highlight) {
                 self.appearance.opacity * HIGHLIGHT_WASH_ALPHA
+            } else if t.is_text_markup() || matches!(t, MarkupType::Note) {
+                // Text mark-up and Note: a strict viewer regenerates the stroke / icon from
+                // /C + /CA, so /CA carries the real opacity; the /AP paints fully opaque
+                // (appearance.rs) so an /AP-honouring viewer applies it exactly once.
+                self.appearance.opacity
             } else {
                 1.0
             }),
@@ -738,6 +754,11 @@ impl Markup {
                 Object::string_literal(self.appearance.color.clone()),
             );
         }
+        if matches!(t, MarkupType::Note) {
+            let note = self.note.clone().unwrap_or_default();
+            d.set("Name", name(&note.icon));
+            d.set("Open", Object::Boolean(note.open));
+        }
         d.set("RLGeom", name(geom_tag(&self.geometry)));
         d.set("RLPage", Object::Integer(self.page as i64));
         d.set(
@@ -835,6 +856,10 @@ impl Markup {
                 }),
                 Some("PolyLine") => Some(MarkupType::Polyline),
                 Some("Highlight") => Some(MarkupType::Highlight),
+                Some("Underline") => Some(MarkupType::Underline),
+                Some("StrikeOut") => Some(MarkupType::StrikeOut),
+                Some("Squiggly") => Some(MarkupType::Squiggly),
+                Some("Text") => Some(MarkupType::Note),
                 Some("Ink") => Some(MarkupType::Ink),
                 Some("FreeText") => Some(if d.has(b"CL") {
                     MarkupType::Callout
@@ -1003,11 +1028,29 @@ impl Markup {
                 symbol: count_symbol_from_tag(&get_name(d, b"RLCountSymbol").unwrap_or_default()),
             });
 
+        let mut geometry = geometry_from_dict(d);
+        // A foreign /Text (sticky note) carries only a /Rect (the icon box), which the
+        // foreign fallback reads as `Rect`; a Note's geometry is the icon CENTRE.
+        if markup_type == MarkupType::Note {
+            if let MarkupGeometry::Rect { min, max } = geometry {
+                let (cx, cy) = ((min.x + max.x) / 2.0, (min.y + max.y) / 2.0);
+                geometry = MarkupGeometry::Point(if cx.is_finite() && cy.is_finite() {
+                    PdfPoint { x: cx, y: cy }
+                } else {
+                    PdfPoint { x: 0.0, y: 0.0 } // overflowed /Rect: park at the origin
+                });
+            }
+        }
+        let note = (markup_type == MarkupType::Note).then(|| NoteProps {
+            icon: get_name(d, b"Name").unwrap_or_else(|| "Note".to_string()),
+            open: matches!(d.get(b"Open").ok(), Some(Object::Boolean(true))),
+        });
+
         Markup {
             id,
             markup_type,
             page: get_int(d, b"RLPage").unwrap_or(0) as u32,
-            geometry: geometry_from_dict(d),
+            geometry,
             appearance: Appearance {
                 color,
                 line_weight,
@@ -1067,6 +1110,7 @@ impl Markup {
                 _ => None,
             }),
             raw_da,
+            note,
             foreign_keys: super::foreign::capture(d),
             source_nm,
         }
@@ -1505,6 +1549,221 @@ mod tests {
             }
             other => panic!("expected Quads from foreign /QuadPoints, got {other:?}"),
         }
+    }
+
+    // --- Text mark-up (Underline / StrikeOut / Squiggly) + sticky Note ----------------
+
+    #[test]
+    fn text_markup_types_emit_standard_subtype_quadpoints_and_round_trip() {
+        for (t, subtype) in [
+            (MarkupType::Underline, "Underline"),
+            (MarkupType::StrikeOut, "StrikeOut"),
+            (MarkupType::Squiggly, "Squiggly"),
+        ] {
+            let quads = sample_quads();
+            let m = fixture(MarkupGeometry::Quads(quads), t);
+            let d = m.to_annotation_dict();
+            assert_eq!(get_name(&d, b"Subtype").as_deref(), Some(subtype));
+            let qp = get_reals(&d, b"QuadPoints").expect("/QuadPoints");
+            assert_eq!(qp.len(), 16, "{subtype}: 2 quads x 8 floats");
+            assert_eq!(qp[0], 72.0);
+            assert_eq!(qp[1], 712.0);
+            // /C is the stroke colour; /CA carries the real opacity (strict viewers
+            // regenerate the line from /C + /CA + /QuadPoints).
+            assert_eq!(get_reals(&d, b"C").expect("/C").len(), 3);
+            let ca = get_real(&d, b"CA").expect("/CA");
+            assert!(
+                (ca - 0.8).abs() < 1e-6,
+                "{subtype}: /CA must equal opacity 0.8, got {ca}"
+            );
+            assert_eq!(get_name(&d, b"RLGeom").as_deref(), Some("quads"));
+            assert_roundtrip(&m);
+        }
+    }
+
+    #[test]
+    fn foreign_text_markup_subtypes_import_with_their_own_type_and_quads() {
+        for (subtype, expected) in [
+            ("Underline", MarkupType::Underline),
+            ("StrikeOut", MarkupType::StrikeOut),
+            ("Squiggly", MarkupType::Squiggly),
+        ] {
+            // Shape of an Acrobat/Bluebeam-authored text mark-up: no /RL* keys at all.
+            let mut d = Dictionary::new();
+            d.set("Type", name("Annot"));
+            d.set("Subtype", name(subtype));
+            d.set("NM", Object::string_literal("BBABCDEF01234567"));
+            d.set("T", Object::string_literal("Reviewer"));
+            d.set("Subj", Object::string_literal("Underline"));
+            d.set("Contents", Object::string_literal("fix this wording"));
+            d.set("C", Object::Array(vec![real(1.0), real(0.0), real(0.0)]));
+            d.set("CA", real(0.5));
+            d.set(
+                "Rect",
+                Object::Array(vec![real(72.0), real(700.0), real(500.0), real(712.0)]),
+            );
+            d.set(
+                "QuadPoints",
+                Object::Array(
+                    [72.0, 712.0, 500.0, 712.0, 72.0, 700.0, 500.0, 700.0]
+                        .iter()
+                        .map(|v| real(*v))
+                        .collect(),
+                ),
+            );
+            let m = Markup::from_annotation_dict(&d);
+            assert_eq!(m.markup_type, expected, "{subtype}");
+            assert!(matches!(m.geometry, MarkupGeometry::Quads(ref q) if q.len() == 1));
+            assert_eq!(m.appearance.color, "#ff0000");
+            assert!(
+                (m.appearance.opacity - 0.5).abs() < 1e-6,
+                "foreign /CA becomes opacity"
+            );
+            assert_eq!(m.contents.as_deref(), Some("fix this wording"));
+            assert_eq!(m.subject.as_deref(), Some("Underline"));
+            assert_eq!(m.audit.created_by.display_name, "Reviewer");
+        }
+    }
+
+    #[test]
+    fn note_emits_standard_text_annotation_with_name_open_and_icon_rect() {
+        let mut m = fixture(
+            MarkupGeometry::Point(PdfPoint { x: 100.0, y: 200.0 }),
+            MarkupType::Note,
+        );
+        m.note = Some(super::NoteProps {
+            icon: "Comment".into(),
+            open: true,
+        });
+        let d = m.to_annotation_dict();
+        assert_eq!(
+            get_name(&d, b"Subtype").as_deref(),
+            Some("Text"),
+            "sticky = /Text, not /FreeText"
+        );
+        assert_eq!(get_name(&d, b"Name").as_deref(), Some("Comment"));
+        assert!(matches!(d.get(b"Open").ok(), Some(Object::Boolean(true))));
+        assert_eq!(
+            get_string(&d, b"Contents").as_deref(),
+            Some("verify fire rating")
+        );
+        assert_eq!(
+            get_reals(&d, b"Rect").expect("/Rect"),
+            vec![90.0, 190.0, 110.0, 210.0]
+        );
+        let back = Markup::from_annotation_dict(&d);
+        assert_eq!(back.markup_type, MarkupType::Note);
+        assert_eq!(back.note, m.note, "icon + open state round-trip");
+        assert_geom_eq(&back.geometry, &m.geometry);
+        assert_roundtrip(&m);
+    }
+
+    #[test]
+    fn foreign_text_annotation_imports_as_note_not_freetext() {
+        // An Acrobat-style sticky: /Subtype /Text with an icon box /Rect and no /RL* keys.
+        let mut d = Dictionary::new();
+        d.set("Type", name("Annot"));
+        d.set("Subtype", name("Text"));
+        d.set("Name", name("Key"));
+        d.set("Open", Object::Boolean(true));
+        d.set("Contents", Object::string_literal("see markup"));
+        d.set("C", Object::Array(vec![real(1.0), real(1.0), real(0.0)]));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(40.0), real(50.0), real(58.0), real(70.0)]),
+        );
+        let m = Markup::from_annotation_dict(&d);
+        assert_eq!(m.markup_type, MarkupType::Note);
+        assert_eq!(
+            m.note,
+            Some(super::NoteProps {
+                icon: "Key".into(),
+                open: true
+            })
+        );
+        assert_eq!(m.contents.as_deref(), Some("see markup"));
+        assert_eq!(m.appearance.color, "#ffff00");
+        let MarkupGeometry::Point(p) = m.geometry else {
+            panic!("Note geometry is the icon centre")
+        };
+        assert_pt_eq(p, PdfPoint { x: 49.0, y: 60.0 });
+        // Re-save keeps the icon name and stays a /Text annotation.
+        let out = m.to_annotation_dict();
+        assert_eq!(get_name(&out, b"Subtype").as_deref(), Some("Text"));
+        assert_eq!(get_name(&out, b"Name").as_deref(), Some("Key"));
+    }
+
+    // --- Hostile /QuadPoints and /Rect (denial-of-service hardening) ---------------------
+
+    fn quadpoints_dict(subtype: &str, vals: Vec<f32>) -> Dictionary {
+        let mut d = Dictionary::new();
+        d.set("Type", name("Annot"));
+        d.set("Subtype", name(subtype));
+        d.set(
+            "Rect",
+            Object::Array(vec![real(0.0), real(0.0), real(10.0), real(10.0)]),
+        );
+        d.set(
+            "QuadPoints",
+            Object::Array(vals.into_iter().map(Object::Real).collect()),
+        );
+        d
+    }
+
+    fn quads_of(m: &Markup) -> usize {
+        match &m.geometry {
+            MarkupGeometry::Quads(q) => q.len(),
+            other => panic!("expected Quads, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn odd_length_and_non_multiple_of_eight_quadpoints_never_panic_and_keep_whole_quads_only() {
+        for n in [0usize, 1, 7, 8, 9, 15, 16, 17, 23] {
+            let m = Markup::from_annotation_dict(&quadpoints_dict("Underline", vec![1.0; n]));
+            assert_eq!(quads_of(&m), n / 8, "{n} values");
+        }
+    }
+
+    #[test]
+    fn non_finite_quadpoints_are_dropped_per_quad() {
+        let mut vals = vec![1.0f32; 8];
+        vals.extend([f32::NAN, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+        vals.extend([1.0, 1.0, f32::INFINITY, 1.0, 1.0, 1.0, 1.0, 1.0]);
+        vals.extend(vec![2.0f32; 8]);
+        let m = Markup::from_annotation_dict(&quadpoints_dict("Squiggly", vals));
+        assert_eq!(quads_of(&m), 2, "only the two all-finite quads survive");
+    }
+
+    #[test]
+    fn enormous_quad_counts_are_truncated_at_the_documented_cap() {
+        let cap = super::super::appearance::MAX_TEXT_MARKUP_QUADS;
+        let vals = vec![3.0f32; 8 * (cap + 5_000)];
+        for st in ["Underline", "StrikeOut", "Squiggly", "Highlight"] {
+            let m = Markup::from_annotation_dict(&quadpoints_dict(st, vals.clone()));
+            assert_eq!(quads_of(&m), cap, "{st}");
+        }
+    }
+
+    #[test]
+    fn foreign_note_with_an_overflowing_rect_is_parked_at_the_origin_not_nan() {
+        let mut d = Dictionary::new();
+        d.set("Type", name("Annot"));
+        d.set("Subtype", name("Text"));
+        d.set(
+            "Rect",
+            Object::Array(vec![
+                Object::Real(f32::MAX),
+                Object::Real(0.0),
+                Object::Real(f32::INFINITY),
+                Object::Real(10.0),
+            ]),
+        );
+        let m = Markup::from_annotation_dict(&d);
+        let MarkupGeometry::Point(p) = m.geometry else {
+            panic!("point")
+        };
+        assert!(p.x.is_finite() && p.y.is_finite());
     }
 
     // --- G7.2: base14_da_name unit tests -------------------------------------------

@@ -66,9 +66,17 @@ export function expandSelectionToGroups(markups: Markup[], ids: Set<string>): Se
 // boundsOf
 // ---------------------------------------------------------------------------
 
+/** Side (PDF pt) of a sticky Note's square icon box, centred on its `Point` geometry.
+ *  Mirrors Rust `appearance::NOTE_ICON_PT`. */
+export const NOTE_ICON_PT = 20;
+
 /** Compute the AABB for any markup geometry (in PDF user space). */
 export function boundsOf(m: Markup): Bounds {
   const g = m.geometry;
+  if (m.markup_type === "Note" && "Point" in g) {
+    const h = NOTE_ICON_PT / 2;
+    return { minX: g.Point.x - h, minY: g.Point.y - h, maxX: g.Point.x + h, maxY: g.Point.y + h };
+  }
   if ("Rect" in g) {
     return {
       minX: Math.min(g.Rect.min.x, g.Rect.max.x),
@@ -243,7 +251,12 @@ function _hits(m: Markup, p: PdfPoint, tol: number): boolean {
     return false;
   }
   // Point (count markers): bounding-box (Chebyshev) test so every pixel inside
-  // the rendered symbol footprint registers as a hit regardless of shape.
+  // the rendered symbol footprint registers as a hit regardless of shape. A sticky Note's
+  // footprint is its whole icon box.
+  if (m.markup_type === "Note") {
+    const h = NOTE_ICON_PT / 2 + tol;
+    return Math.abs(p.x - g.Point.x) <= h && Math.abs(p.y - g.Point.y) <= h;
+  }
   return Math.abs(p.x - g.Point.x) <= tol && Math.abs(p.y - g.Point.y) <= tol;
 }
 
