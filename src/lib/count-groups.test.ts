@@ -78,6 +78,14 @@ describe("resumeRun", () => {
     const r = resumeRun([item("a", "G")], "a", by, NOW);
     expect("run" in r && r.pairs).toEqual([]);
   });
+  it("refuses a LOCKED legacy ungrouped item (no stamp possible, would split the count)", () => {
+    expect("error" in resumeRun([item("a", null, { annot_flags: 0x80 })], "a", by, NOW)).toBe(true);
+    expect("error" in resumeRun([item("a", null, { annot_flags: 0x200 })], "a", by, NOW)).toBe(true);
+  });
+  it("a locked but already grouped item still resumes (nothing to stamp)", () => {
+    const r = resumeRun([item("a", "G", { annot_flags: 0x80 })], "a", by, NOW);
+    expect("run" in r && r.pairs).toEqual([]);
+  });
   it("refuses non-count and unknown ids", () => {
     expect("error" in resumeRun([item("r", null, { markup_type: "Rectangle" })], "r")).toBe(true);
     expect("error" in resumeRun([], "zz")).toBe(true);

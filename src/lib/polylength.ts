@@ -161,6 +161,19 @@ export function recomputeAll(
   return out;
 }
 
+/**
+ * Open-time normalisation: the measurements as `recomputeAll` would leave them, but with
+ * each markup's audit untouched (nobody edited anything). Used to seed the store so the
+ * panels show the same numbers the exports compute (Rust recomputes with the same rule on
+ * every export). Returns `markups` itself when nothing changes.
+ */
+export function normaliseMeasurements(markups: Markup[], scales: ScaleRecord[]): Markup[] {
+  const pairs = recomputeAll(markups, scales, { user_id: "", display_name: "" }, "");
+  if (pairs.length === 0) return markups;
+  const after = new Map(pairs.map((p) => [p.before.id, { ...p.after, audit: p.before.audit }]));
+  return markups.map((m) => after.get(m.id) ?? m);
+}
+
 export type EditResult = { ok: true; markup: Markup } | { ok: false; error: string };
 
 /** Set (or with amount 0, clear) the rise/drop on one segment, then recompute under `scale`. */

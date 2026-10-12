@@ -3610,6 +3610,41 @@ describe("Viewport callout + cloud (docs/callout-cloud.md)", () => {
     expect(store.markups).toHaveLength(0);
   });
 
+  async function cloudPlusEditor() {
+    const { container, overlay } = await mountViewport(store);
+    store.activeTool = "CloudPlus";
+    await tick();
+    ptr(overlay, "pointerdown", 50, 50);
+    ptr(overlay, "pointermove", 100, 100);
+    ptr(overlay, "pointerup", 100, 100);
+    await new Promise((r) => setTimeout(r, 320));
+    fireEvent.click(overlay, { clientX: 150, clientY: 60 });
+    await tick();
+    const textarea = container.querySelector("textarea.text-editor") as HTMLTextAreaElement;
+    expect(textarea).not.toBeNull();
+    return { textarea };
+  }
+
+  it("K3b: Cloud+ with the callout text left empty keeps the cloud as a plain Cloud, one undo step", async () => {
+    const { textarea } = await cloudPlusEditor();
+    fireEvent.blur(textarea);
+    await tick();
+    expect(store.markups.map((m) => m.markup_type)).toEqual(["Cloud"]);
+    expect(store.markups[0].group_id).toBeNull();
+    store.undo();
+    expect(store.markups).toHaveLength(0);
+  });
+
+  it("K3c: Escape in the Cloud+ callout editor discards the text but keeps the cloud", async () => {
+    const { textarea } = await cloudPlusEditor();
+    textarea.value = "typed";
+    fireEvent.input(textarea);
+    fireEvent.keyDown(textarea, { key: "Escape" });
+    await tick();
+    expect(store.markups.map((m) => m.markup_type)).toEqual(["Cloud"]);
+    expect(store.markups[0].contents ?? null).toBeNull();
+  });
+
   it("H1: Y selects Cloud, K selects Cloud+", async () => {
     await mountViewport(store);
     fireEvent.keyDown(window, { key: "y" });

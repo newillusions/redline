@@ -17,8 +17,9 @@ import type { CountSet, Markup } from "$lib/ipc";
 // COUNT_SYMBOLS is a runtime value consumed by CountSetPicker, so it must be present.
 vi.mock("$lib/ipc", () => ({
   exportMarkupList: vi.fn(async () => {}),
-  isMarkupLocked: () => false,
-  isMarkupContentsLocked: () => false,
+  isMarkupLocked: (m: { annot_flags?: number }) => ((m.annot_flags ?? 0) & 0x80) !== 0,
+  isMarkupContentsLocked: (m: { annot_flags?: number }) => ((m.annot_flags ?? 0) & 0x200) !== 0,
+  getUserIdentity: vi.fn(async () => ({ user_id: "actor", display_name: "Actor" })),
   COUNT_SYMBOLS: ["Circle", "Square", "Triangle", "Diamond", "Cross", "Star", "Hexagon"],
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -191,5 +192,24 @@ describe("MeasurementPanel", () => {
     expect(store.getById("legacy")!.count_group).toBe("legacy");
     expect(store.countRun?.groupId).toBe("legacy");
     expect(store.activeTool).toBe("MeasurementCount");
+  });
+
+  it("Resume stamps the ACTING user as modified_by, not the original author (R2-1)", async () => {
+    store.seed([makeMeasurementMarkup("legacy", "MeasurementCount", 1, "ea", null, 1)]);
+    render(MeasurementPanel, { props: { store, takeoffStore, docId: "d1" } });
+    await tick();
+    await tick();
+    await fireEvent.click(document.querySelector('[data-action="resume-count"]')!);
+    expect(store.getById("legacy")!.audit.modified_by.user_id).toBe("actor");
+  });
+
+  it("Resume on a locked legacy count is refused with a message and arms no run (R2-2)", async () => {
+    store.seed([{ ...makeMeasurementMarkup("legacy", "MeasurementCount", 1, "ea", null, 1), annot_flags: 0x80 }]);
+    render(MeasurementPanel, { props: { store, takeoffStore, docId: "d1" } });
+    await tick();
+    await fireEvent.click(document.querySelector('[data-action="resume-count"]')!);
+    expect(store.countRun).toBeNull();
+    expect(store.getById("legacy")!.count_group ?? null).toBeNull();
+    expect(screen.getByText(/locked, so it cannot be resumed/)).toBeTruthy();
   });
 });

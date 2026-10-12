@@ -37,7 +37,8 @@
   import VersionPanel from "./components/VersionPanel.svelte";
   import ToolbarMenu from "./components/ToolbarMenu.svelte";
   import type { ToolbarMenuItem } from "./components/ToolbarMenu.svelte";
-  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, snapshotVersion, exportMarkupList, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity, getPageCount } from "$lib/ipc";
+  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, snapshotVersion, exportMarkupList, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity, getPageCount, type ScaleRecord } from "$lib/ipc";
+  import { normaliseMeasurements } from "$lib/polylength";
   import type { IndexStatus, OcrProgressEvent } from "$lib/ipc";
   import { listen } from "@tauri-apps/api/event";
   import { loadSettings, saveSettings } from "$lib/settings";
@@ -666,12 +667,17 @@
       }
 
       // Load markups and scales asynchronously (non-blocking).
-      loadMarkups(doc.doc_id)
-        .then((m) => { store.seed(m); })
+      // Scales are non-critical (a failure leaves the stored values as they are). Both
+      // load before seeding so measurements can be normalised once under the document's
+      // scales: computed-only - no undo frame, document stays clean - so the panels show
+      // the numbers the exports compute.
+      const scalesP = listScales(doc.doc_id).catch(() => [] as ScaleRecord[]);
+      Promise.all([loadMarkups(doc.doc_id), scalesP])
+        .then(([m, scales]) => {
+          ts.seedScales(scales);
+          store.seed(normaliseMeasurements(m, scales));
+        })
         .catch((e) => { openError = `Load markups failed: ${e}`; });
-      listScales(doc.doc_id)
-        .then((scales) => { ts.seedScales(scales); })
-        .catch(() => {}); // scales are non-critical
 
       // Auto-OCR-on-open (Phase 2c-ii, opt-in via Settings - default off). Best-effort,
       // non-blocking: a failed settings load or detection must never slow or break

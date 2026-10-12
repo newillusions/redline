@@ -6,7 +6,7 @@
  * pairs for `MarkupStore.applyBatch` (ONE undo step). No DOM, no Svelte, no clocks beyond
  * the injected `now`.
  */
-import type { Markup, UserRef } from "./ipc";
+import { isMarkupContentsLocked, isMarkupLocked, type Markup, type UserRef } from "./ipc";
 import { bumpAudit } from "./markup-tools";
 
 /** Most items one count may hold (mirrors Rust `MAX_COUNT_GROUP_ITEMS`). */
@@ -100,6 +100,8 @@ export type OpResult = { ok: true; pairs: Pair[]; run?: CountRun } | { ok: false
  * its own count; resuming it STAMPS its id as `count_group` on that item (returned in
  * `pairs`, apply with `applyBatch`) so every view agrees it is one row with one total.
  * `by` defaults to the item's last modifier (a mechanical regroup, not a new author).
+ * A LOCKED ungrouped item is refused: the stamp cannot be written, and arming the run
+ * anyway would split the count into 1 + N rows across views. Unlock it first.
  */
 export function resumeRun(
   markups: Markup[],
@@ -113,6 +115,9 @@ export function resumeRun(
   if (!g) return { error: "Count not found." };
   if (g.ids.length >= MAX_COUNT_GROUP_ITEMS) {
     return { error: `This count is full (${MAX_COUNT_GROUP_ITEMS} items).` };
+  }
+  if (!m.count_group && (isMarkupLocked(m) || isMarkupContentsLocked(m))) {
+    return { error: "This count is locked, so it cannot be resumed. Unlock it first." };
   }
   const pairs: Pair[] = m.count_group
     ? []

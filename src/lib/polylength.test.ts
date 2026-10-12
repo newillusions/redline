@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { Markup, ScaleRecord, UserRef } from "./ipc";
 import {
-  convertLength, riseDropTotal, polylengthPayload, recomputeMeasurement, recomputeAll,
+  convertLength, riseDropTotal, polylengthPayload, recomputeMeasurement, recomputeAll, normaliseMeasurements,
   setSegmentRiseDrop, splitPolylengthAt, effectiveScale, segmentLengths, scaleFor, isKnownLengthUnit,
 } from "./polylength";
 
@@ -89,6 +89,22 @@ describe("totals under calibration", () => {
     const m = polylen(scale("a", 0.001));
     expect(recomputeMeasurement(m, scale("x", NaN))).toBe(m);
     expect(recomputeMeasurement(m, scale("x", 0))).toBe(m);
+  });
+});
+
+describe("normaliseMeasurements (open-time, computed-only)", () => {
+  it("legacy measurement with a dangling scale_ref shows the recomputed value, audit untouched", () => {
+    const legacy = polylen(scale("gone", 0.001)); // 3 m under a scale that no longer exists
+    const out = normaliseMeasurements([legacy], [scale("new", 0.002)]);
+    expect(out[0].measurement!.computed_quantity).toBeCloseTo(6, 9);
+    expect(out[0].measurement!.scale_ref).toBe("new");
+    expect(out[0].audit).toEqual(legacy.audit);
+  });
+  it("returns the same array when nothing changes (no needless store churn)", () => {
+    const s = scale("a", 0.001);
+    const ms = [polylen(s)];
+    expect(normaliseMeasurements(ms, [s])).toBe(ms);
+    expect(normaliseMeasurements(ms, [])).toBe(ms);
   });
 });
 

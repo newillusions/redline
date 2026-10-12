@@ -1990,6 +1990,16 @@
       return;
     }
 
+    if (!text && cloudVerts) {
+      // Cloud+ with no callout text (empty, or cancelled): the drawn cloud stays as a
+      // plain Cloud, one undo step. Only the callout is dropped.
+      cancelEditor();
+      store.create(buildMarkup({
+        markupType: "Cloud", page: pageIndex, geometry: polylineGeometry(cloudVerts),
+        appearance: store.draftAppearance, identity, now: new Date().toISOString(), id: crypto.randomUUID(),
+      }));
+      return;
+    }
     if (!text) { cancelEditor(); return; }
     const appearance = { ...store.draftAppearance, font: store.draftAppearance.font ?? DEFAULT_TEXT_FONT };
     let markupType: "Text" | "Callout";
@@ -3662,6 +3672,7 @@
           // A Note's pop-up keeps what was typed when hidden with Esc (Revu); a Text/Callout
           // box being created or edited discards it, as before.
           if (editor?.editingId && store.getById(editor.editingId)?.markup_type === "Note") commitEditor();
+          else if (editor?.cloudVerts && !editor.editingId) { editorText = ""; commitEditor(); } // Cloud+ : keep the cloud
           else cancelEditor();
         }
       }}

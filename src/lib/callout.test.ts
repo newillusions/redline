@@ -7,7 +7,7 @@ import type { Markup, PdfPoint } from "./ipc";
 import {
   MAX_EXTRA_LEADERS, addLeader, allLeaders, attachPoint, calloutBox, defaultKnee, fitBoxSize,
   leaderHandles, moveBox, nearestOnPolygon, newCallout, rectCloudVertices, refitBox,
-  removeLeader, resizeBox, setAutosize, setLeaderPoint, snapToBoxEdge, translateCallout,
+  removeLeader, resizeBox, primaryLeader, extraLeaders, setAutosize, setLeaderPoint, snapToBoxEdge, translateCallout,
 } from "./callout";
 import { applyCalloutEdit, hitCallout, translateMarkup } from "./callout-edit";
 import { MAX_CLOUD_BUMPS, cloudPath } from "./markup-render";
@@ -54,6 +54,23 @@ describe("legacy callouts (no props)", () => {
     const moved = moveBox(m, 10, 0);
     expect(moved.callout!.box_min).toEqual({ x: 60, y: 42 });
     expect(poly(moved)[1]).toEqual({ x: 60, y: 60 });
+  });
+});
+
+describe("leader cap (3 points, like Rust compress)", () => {
+  const five = [0, 1, 2, 3, 4].map((i) => ({ x: i, y: i * 2 }));
+  it("primary leader of >3 points is reduced to first, middle, last", () => {
+    const m = callout({ geometry: { Polyline: five } });
+    expect(primaryLeader(m)).toEqual([five[0], five[2], five[4]]);
+    expect(allLeaders(m)[0]).toHaveLength(3);
+  });
+  it("extra leaders are capped too; non-finite points are dropped first", () => {
+    const m = callout();
+    m.callout = { ...m.callout!, extra_leaders: [[...five, { x: NaN, y: 0 }]] };
+    expect(extraLeaders(m)).toEqual([[five[0], five[2], five[4]]]);
+  });
+  it("leaves 2- and 3-point leaders alone", () => {
+    expect(primaryLeader(callout())).toEqual(poly(callout()));
   });
 });
 

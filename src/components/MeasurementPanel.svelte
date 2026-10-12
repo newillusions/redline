@@ -14,8 +14,9 @@
   import { exportDoneMessage } from "$lib/doc-op-flow";
   import type { MarkupStore } from "$lib/markup-store.svelte";
   import type { TakeoffStore } from "$lib/takeoff-store.svelte";
-  import type { Markup } from "$lib/ipc";
-  import { exportMarkupList, type ExportFormat } from "$lib/ipc";
+  import type { Markup, UserRef } from "$lib/ipc";
+  import { exportMarkupList, getUserIdentity, type ExportFormat } from "$lib/ipc";
+  import { onMount } from "svelte";
   import { countSubtotalsByPage } from "$lib/measurement-tools";
   import { countGroups as groupCounts, groupKey, resumeRun } from "$lib/count-groups";
   import { countSymbolRender, COUNT_MARKER_RADIUS } from "$lib/markup-render";
@@ -58,13 +59,21 @@
 
   let countMessage = $state<string | null>(null);
 
+  // The acting user, so a Resume stamp records them (not the original author) as modifier.
+  let identity = $state<UserRef | null>(null);
+  onMount(() => {
+    getUserIdentity()
+      .then((u) => { identity = u; })
+      .catch(() => {});
+  });
+
   function selectCount(ids: string[]) {
     store.selectedIds = new Set(ids);
     store.activeTool = "select";
   }
 
   function resumeCount(itemId: string) {
-    const r = resumeRun(store.markups, itemId);
+    const r = resumeRun(store.markups, itemId, identity ?? undefined);
     if ("error" in r) {
       countMessage = r.error;
       return;

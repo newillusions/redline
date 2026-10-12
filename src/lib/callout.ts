@@ -31,9 +31,16 @@ const LINE_HEIGHT_EM = 1.2;
 const finite = (p: PdfPoint): boolean => Number.isFinite(p.x) && Number.isFinite(p.y);
 const copy = (p: PdfPoint): PdfPoint => ({ x: p.x, y: p.y });
 
-/** The primary leader (the Polyline geometry), finite points only. */
+/** A leader reduced to at most MAX_LEADER_POINTS finite points (first, middle, last) -
+ *  mirrors Rust `callout::compress`, so the preview matches what is saved. */
+function compress(pts: PdfPoint[]): PdfPoint[] {
+  const p = pts.filter(finite);
+  return p.length <= MAX_LEADER_POINTS ? p : [p[0], p[Math.floor(p.length / 2)], p[p.length - 1]];
+}
+
+/** The primary leader (the Polyline geometry), finite points only, capped at 3 points. */
 export function primaryLeader(m: Markup): PdfPoint[] {
-  return "Polyline" in m.geometry ? m.geometry.Polyline.filter(finite) : [];
+  return "Polyline" in m.geometry ? compress(m.geometry.Polyline) : [];
 }
 
 /** Extra leaders (valid ones only: >= 2 finite points, capped). */
@@ -41,6 +48,7 @@ export function extraLeaders(m: Markup): PdfPoint[][] {
   return (m.callout?.extra_leaders ?? [])
     .map((l) => l.filter(finite))
     .filter((l) => l.length >= 2)
+    .map(compress)
     .slice(0, MAX_EXTRA_LEADERS);
 }
 
