@@ -432,11 +432,128 @@ pub(crate) fn build_isolated_form_xobject_pdf(
     Ok(buf)
 }
 
+/// Object ids of the annotations redline owns on save: managed markups plus every
+/// reply / state annotation that (transitively) answers one. Replies to something redline
+/// does not manage (a Link, a foreign sticky note) are not owned and stay untouched.
+fn owned_annotation_ids(
+    doc: &Document,
+    pages: &std::collections::BTreeMap<u32, ObjectId>,
+    ids: &std::collections::HashSet<String>,
+) -> Result<std::collections::HashSet<ObjectId>> {
+    let mut all: Vec<(Option<ObjectId>, Dictionary)> = Vec::new();
+    for page_id in pages.values() {
+        all.extend(page_annots(doc, *page_id)?);
+    }
+    // Worklist over an irt -> replies index: linear, whatever the chain length or shape
+    // (a cycle or self-reference is never reachable from a managed markup, so is never owned).
+    let mut answers: std::collections::HashMap<ObjectId, Vec<ObjectId>> =
+        std::collections::HashMap::new();
+    for (oid, d) in &all {
+        if let (Some(oid), Some(parent)) = (oid, irt_ref(d)) {
+            if crate::markup::replies::is_reply_or_state(d) {
+                answers.entry(parent).or_default().push(*oid);
+            }
+        }
+    }
+    let mut owned: std::collections::HashSet<ObjectId> = all
+        .iter()
+        .filter_map(|(oid, d)| oid.filter(|_| is_managed(d, ids)))
+        .collect();
+    let mut work: Vec<ObjectId> = owned.iter().copied().collect();
+    while let Some(parent) = work.pop() {
+        for child in answers.get(&parent).into_iter().flatten() {
+            if owned.insert(*child) {
+                work.push(*child);
+            }
+        }
+    }
+    Ok(owned)
+}
+
+fn rect_of(d: &Dictionary) -> Option<[f32; 4]> {
+    let a = d.get(b"Rect").ok()?.as_array().ok()?;
+    let v: Vec<f32> = a.iter().filter_map(|o| o.as_float().ok()).collect();
+    <[f32; 4]>::try_from(v).ok()
+}
+
+/// Write `m`'s replies and status history as standard `/Text` + `/IRT` annotations
+/// (see `markup::replies`). Returns the new annotation ids to append to the page.
+fn write_workflow_annots(
+    doc: &mut Document,
+    m: &Markup,
+    parent: ObjectId,
+    page: ObjectId,
+    parent_rect: Option<[f32; 4]>,
+    empty_ap: &mut Option<ObjectId>,
+) -> Vec<ObjectId> {
+    use crate::markup::replies;
+    let history = replies::history_to_write(m);
+    if m.workflow.thread.is_empty() && history.is_empty() {
+        return Vec::new();
+    }
+    let ap = *empty_ap
+        .get_or_insert_with(|| doc.add_object(Object::Stream(replies::empty_ap_stream())));
+    let rect = replies::note_rect(parent_rect);
+    let mut out = Vec::new();
+    let mut oid_of: std::collections::HashMap<uuid::Uuid, ObjectId> =
+        std::collections::HashMap::new();
+    for r in replies::thread_in_write_order(&m.workflow.thread) {
+        let target = r
+            .in_reply_to
+            .and_then(|p| oid_of.get(&p).copied())
+            .unwrap_or(parent);
+        let anchor = replies::NoteAnchor { parent: target, page, rect, ap };
+        let oid = doc.add_object(Object::Dictionary(replies::reply_dict(r, &anchor)));
+        oid_of.insert(r.id, oid);
+        out.push(oid);
+    }
+    // States: one set on the markup itself, or on a reply / another state, goes back under
+    // exactly that target. A state whose target no longer exists (its reply was deleted) is
+    // DROPPED, never re-anchored on the markup, where it would silently become the markup's
+    // status. Linear: states waiting on a not-yet-written state are queued by target id.
+    let mut waiting: std::collections::HashMap<uuid::Uuid, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut queue: Vec<(usize, ObjectId)> = Vec::new();
+    for (i, c) in history.iter().enumerate() {
+        match c.on_reply {
+            None => queue.push((i, parent)),
+            Some(t) => match oid_of.get(&t) {
+                Some(&oid) => queue.push((i, oid)),
+                None => waiting.entry(t).or_default().push(i),
+            },
+        }
+    }
+    let mut written = 0usize;
+    while let Some((i, target)) = queue.pop() {
+        let c = &history[i];
+        let anchor = replies::NoteAnchor { parent: target, page, rect, ap };
+        let oid = doc.add_object(Object::Dictionary(replies::state_dict(c, &anchor)));
+        out.push(oid);
+        written += 1;
+        if let Some(kids) = waiting.remove(&c.id) {
+            queue.extend(kids.into_iter().map(|k| (k, oid)));
+        }
+    }
+    if written < history.len() {
+        log::warn!(
+            "replies: dropped {} status entr(ies) set on a reply that no longer exists",
+            history.len() - written
+        );
+    }
+    out
+}
+
 /// Write the full markup set into the document: strip managed annotations from every
 /// page, keep foreign ones, then append the current set as fresh indirect objects.
 pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()> {
-    let ids: std::collections::HashSet<String> =
-        markups.iter().map(|m| m.id().to_string()).collect();
+    // Managed = redline-owned. Keyed by both the id and the original foreign /NM, so a
+    // Revu-authored markup (16-char /NM) is replaced on save rather than kept next to its
+    // rewritten copy.
+    let ids: std::collections::HashSet<String> = markups
+        .iter()
+        .flat_map(|m| [Some(m.id().to_string()), m.source_nm.clone()])
+        .flatten()
+        .collect();
     let pages = doc.get_pages(); // 1-based page no -> page ObjectId
 
     // Resolve every target page's (rotation, true_width, true_height, origin_x, origin_y)
@@ -451,6 +568,11 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
         let (w0, h0, ox, oy) = true_media_box(doc, *page_id)?;
         page_space.insert(*page_id, (rotation, w0, h0, ox, oy));
     }
+
+    // Replies / state annotations answering a managed markup are owned: stripped here and
+    // re-emitted from the model in phase 2 (their parents get fresh object ids).
+    let owned = owned_annotation_ids(doc, &pages, &ids)?;
+    let mut empty_ap: Option<ObjectId> = None;
 
     // Phase 1: collect surviving foreign entries per page.
     let mut kept: std::collections::BTreeMap<ObjectId, Vec<Object>> =
@@ -471,8 +593,14 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
             .collect();
         let mut keep = Vec::new();
         for (oid, dict) in annots {
-            if is_managed(&dict, &ids) {
+            if is_managed(&dict, &ids) || oid.is_some_and(|o| owned.contains(&o)) {
                 continue;
+            }
+            if oid.is_none()
+                && crate::markup::replies::is_reply_or_state(&dict)
+                && irt_ref(&dict).is_some_and(|p| owned.contains(&p))
+            {
+                continue; // inline reply to a managed markup
             }
             if subtype(&dict).as_deref() == Some("Popup")
                 && !parent_ref(&dict).is_some_and(|p| valid_popup_parents.contains(&p))
@@ -565,9 +693,15 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
             "AP",
             Object::Dictionary(dictionary! { "N" => Object::Reference(ap_id) }),
         );
+        let parent_rect = rect_of(&dict);
         let aid = doc.add_object(Object::Dictionary(dict));
         if let Some(gid) = m.group_id {
             group_members.entry(gid).or_default().push(aid);
+        }
+        let workflow_annots =
+            write_workflow_annots(doc, m, aid, page_id, parent_rect, &mut empty_ap);
+        if let Some(entries) = kept.get_mut(&page_id) {
+            entries.extend(workflow_annots.into_iter().map(Object::Reference));
         }
         // Invariant: phase 1 inserted an entry for every page id in `pages`, and
         // `page_id` came from `pages`, so the lookup cannot miss.
@@ -625,10 +759,16 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
     }
     let pages = doc.get_pages(); // 1-based page no -> page ObjectId; queried once, reused below
     let mut collected: Vec<Collected> = Vec::new();
+    let mut raw_replies: Vec<(Option<ObjectId>, Dictionary)> = Vec::new();
     for (&page_no_1based, &page_id) in &pages {
         for (oid, dict) in page_annots(doc, page_id)? {
             let Some(st) = subtype(&dict) else { continue };
             if !MARKUP_SUBTYPES.contains(&st.as_str()) {
+                continue;
+            }
+            // A reply / review-state /Text answers a markup; it is not a markup itself.
+            if crate::markup::replies::is_reply_or_state(&dict) {
+                raw_replies.push((oid, dict));
                 continue;
             }
             collected.push(Collected { oid, dict, page_no_1based });
@@ -698,6 +838,7 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
         group_ids.entry(root).or_insert(existing);
     }
 
+    let markup_oids: Vec<Option<ObjectId>> = collected.iter().map(|c| c.oid).collect();
     let mut out = Vec::new();
     let mut page_space = PageSpaceCache::new(doc);
     for (i, c) in collected.into_iter().enumerate() {
@@ -756,6 +897,17 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
             out.push(m);
         }
     }
+    // Two source annotations sharing one /NM would derive the same id; keep ids unique.
+    let mut seen_ids = std::collections::HashSet::new();
+    for m in out.iter_mut() {
+        let mut n = 0u32;
+        while !seen_ids.insert(m.id()) {
+            n += 1;
+            let base = m.source_nm.clone().unwrap_or_else(|| m.id().to_string());
+            m.reassign_id(crate::markup::derive_uuid(&format!("nm:{base}:dup{n}")));
+        }
+    }
+    crate::markup::replies::attach(&mut out, &markup_oids, &raw_replies);
     Ok(out)
 }
 
@@ -1995,6 +2147,8 @@ pub(crate) mod tests {
                 author: user("Commenter"),
                 at: fixed_ts(120),
                 contents: "please confirm radius".into(),
+                in_reply_to: None,
+                nm: None,
             });
             out.push(mr);
 

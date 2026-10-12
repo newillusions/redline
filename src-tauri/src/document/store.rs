@@ -34,6 +34,12 @@ pub struct DocEntry {
     /// and - via `commands::docops` - flatten/optimize/redact), since all of those
     /// flush the current markup state to disk exactly like a save does.
     pub dirty: bool,
+    /// Markups deleted this session that carried reader-owned names (`source_nm`, reply and
+    /// state `nm`), keyed by markup id, so an undo (which re-sends the deleted markup as an
+    /// add) gets back exactly the names the PDF reader produced for it - and only those:
+    /// `add` never trusts names from its input. Holds only markups this store held, i.e.
+    /// reader output for this document. Cleared when the document is closed or reloaded.
+    pub tombstones: std::collections::HashMap<Uuid, Markup>,
 }
 
 /// One open document as reported by [`MarkupStore::list_open`] - the data
@@ -99,6 +105,7 @@ impl MarkupStore {
                 loaded: false,
                 saving: false,
                 dirty: false,
+                tombstones: Default::default(),
             },
         );
     }
@@ -199,13 +206,20 @@ impl MarkupStore {
     }
 
     /// Add one markup. Errors on unknown doc or duplicate id.
-    pub fn add(&self, doc_id: &str, m: Markup) -> Result<(), String> {
+    pub fn add(&self, doc_id: &str, mut m: Markup) -> Result<(), String> {
         let mut g = self.docs.lock().unwrap();
         let e = g
             .get_mut(doc_id)
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
         if e.markups.iter().any(|x| x.id() == m.id()) {
             return Err(format!("duplicate markup id {}", m.id()));
+        }
+        // Reader-owned names never come from the input (see `Markup::clear_reader_owned`).
+        // The one exception is an undo of a delete: the same id returns to the store and gets
+        // back the names this store itself held for it, from the tombstone - not the input's.
+        match e.tombstones.remove(&m.id()) {
+            Some(deleted) => m.adopt_reader_owned_from(&deleted),
+            None => m.clear_reader_owned(),
         }
         e.markups.push(m);
         e.dirty = true;
@@ -220,7 +234,7 @@ impl MarkupStore {
     /// This is a verbatim swap, not a `Markup::touch()`. The frontend store is the
     /// in-session source of truth and bumps audit fields (revision / modified_*) before
     /// sending the updated markup (spec §6; decision:vic6slsasg6njkf7haka).
-    pub fn update(&self, doc_id: &str, m: Markup) -> Result<(), String> {
+    pub fn update(&self, doc_id: &str, mut m: Markup) -> Result<(), String> {
         let mut g = self.docs.lock().unwrap();
         let e = g
             .get_mut(doc_id)
@@ -231,6 +245,8 @@ impl MarkupStore {
             .find(|x| x.id() == m.id())
             .ok_or_else(|| format!("unknown markup id {}", m.id()))?;
         crate::markup::check_not_locked(slot).map_err(|e| e.to_string())?;
+        // Keep the stored markup's reader-owned names; ignore any the caller sent.
+        m.adopt_reader_owned_from(slot);
         *slot = m;
         e.dirty = true;
         Ok(())
@@ -250,6 +266,9 @@ impl MarkupStore {
             .find(|x| x.id() == id)
             .ok_or_else(|| format!("unknown markup id {id}"))?;
         crate::markup::check_not_locked(existing).map_err(|e| e.to_string())?;
+        if existing.has_reader_owned() {
+            e.tombstones.insert(id, existing.clone());
+        }
         e.markups.retain(|x| x.id() != id);
         e.dirty = true;
         Ok(())
@@ -271,6 +290,7 @@ impl MarkupStore {
             .collect();
         merged.append(&mut e.markups);
         e.markups = merged;
+        e.tombstones.clear();
         e.loaded = true;
         Ok(e.markups.clone())
     }

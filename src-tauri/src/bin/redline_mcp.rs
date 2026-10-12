@@ -458,7 +458,7 @@ fn tool_defs() -> Value {
                     "markup_id": {"type": "string"},
                     "contents": {"type": "string"},
                     "appearance": {"type": "object"},
-                    "workflow_status": {"type": "string", "enum": ["None", "Accepted", "Rejected", "Completed"]}
+                    "workflow_status": {"type": "string", "enum": ["None", "Accepted", "Rejected", "Completed", "Cancelled"]}
                 },
                 "required": ["doc_id", "markup_id"]
             }

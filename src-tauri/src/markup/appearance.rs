@@ -1251,6 +1251,7 @@ mod tests {
                 status: MarkupStatus::None,
                 assignee: None,
                 thread: Vec::new(),
+                status_history: Vec::new(),
             },
             measurement: None,
             count_set: None,
@@ -1259,6 +1260,8 @@ mod tests {
             rich_text: None,
             optional_content: None,
             raw_da: None,
+            foreign_keys: Vec::new(),
+            source_nm: None,
         }
     }
 

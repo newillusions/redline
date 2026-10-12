@@ -175,6 +175,7 @@ fn status_tag(s: MarkupStatus) -> &'static str {
         MarkupStatus::Accepted => "Accepted",
         MarkupStatus::Rejected => "Rejected",
         MarkupStatus::Completed => "Completed",
+        MarkupStatus::Cancelled => "Cancelled",
     }
 }
 
@@ -183,6 +184,7 @@ fn status_from_tag(s: &str) -> MarkupStatus {
         "Accepted" => MarkupStatus::Accepted,
         "Rejected" => MarkupStatus::Rejected,
         "Completed" => MarkupStatus::Completed,
+        "Cancelled" | "Canceled" => MarkupStatus::Cancelled,
         _ => MarkupStatus::None,
     }
 }
@@ -259,11 +261,11 @@ fn rgb_to_hex(c: &[f64]) -> String {
 
 // --- dates (PDF "D:YYYYMMDDHHmmSSZ", second resolution) ------------------------
 
-fn to_pdf_date(dt: &DateTime<Utc>) -> String {
+pub(super) fn to_pdf_date(dt: &DateTime<Utc>) -> String {
     dt.format("D:%Y%m%d%H%M%SZ").to_string()
 }
 
-fn from_pdf_date(s: &str) -> Option<DateTime<Utc>> {
+pub(super) fn from_pdf_date(s: &str) -> Option<DateTime<Utc>> {
     let core = s.trim_start_matches("D:").get(0..14)?;
     NaiveDateTime::parse_from_str(core, "%Y%m%d%H%M%S")
         .ok()
@@ -520,7 +522,7 @@ impl Markup {
         }
 
         // Identity + text (spec §6 embed map).
-        d.set("NM", Object::string_literal(self.id().to_string()));
+        d.set("NM", Object::string_literal(self.nm_for_pdf()));
         d.set(
             "T",
             Object::string_literal(self.audit.created_by.display_name.clone()),
@@ -796,18 +798,21 @@ impl Markup {
             }
         }
 
-        // Reserved workflow fields not carried by /RLStatus: assignee + comment thread
-        // (spec §6 decision f). No v1 UI surfaces these yet, but they are real fields on
-        // every Markup and must round-trip rather than silently reset to empty on reopen.
-        // Omitted when both are at their empty defaults so a plain markup's dict is
-        // unchanged from before this field existed.
-        if self.workflow.assignee.is_some() || !self.workflow.thread.is_empty() {
-            if let Ok(json) =
-                serde_json::to_string(&(&self.workflow.assignee, &self.workflow.thread))
+        // Assignee has no standard PDF/Revu representation, so it stays in the private
+        // /RLWorkflowExtra JSON. The reply thread no longer lives here: it is written as
+        // standard /IRT reply annotations by `document::annots::write_markups` (see
+        // `markup::replies`). The tuple shape (assignee, thread) is kept, with an empty
+        // thread, so an older redline still parses the key. Omitted when there is no
+        // assignee.
+        if self.workflow.assignee.is_some() {
+            if let Ok(json) = serde_json::to_string(&(&self.workflow.assignee, Vec::<Reply>::new()))
             {
                 d.set("RLWorkflowExtra", Object::string_literal(json));
             }
         }
+
+        // Bluebeam-private keys we do not interpret, copied through verbatim.
+        super::foreign::apply(&mut d, &self.foreign_keys);
         d
     }
 
@@ -841,9 +846,16 @@ impl Markup {
             })
             .unwrap_or(MarkupType::Text);
 
-        let id = get_string(d, b"NM")
-            .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+        // A canonical UUID /NM is the id. Any other /NM (Revu writes 16-char names) gets a
+        // stable id derived from it and is kept as `source_nm`, so reading the same file
+        // twice yields the same ids and a save writes the original /NM back unchanged.
+        let nm = get_string(d, b"NM").filter(|s| !s.is_empty());
+        let id = nm
+            .as_deref()
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .or_else(|| nm.as_deref().map(|s| super::derive_uuid(&format!("nm:{s}"))))
             .unwrap_or_else(uuid::Uuid::new_v4);
+        let source_nm = nm.filter(|s| *s != id.to_string());
 
         let created_name = get_string(d, b"T").unwrap_or_default();
         let created_uid = get_string(d, b"RLUserId")
@@ -1034,6 +1046,7 @@ impl Markup {
                     status: status_from_tag(&get_name(d, b"RLStatus").unwrap_or_default()),
                     assignee,
                     thread,
+                    status_history: Vec::new(),
                 }
             },
             measurement: get_string(d, b"RLMeasure")
@@ -1054,6 +1067,8 @@ impl Markup {
                 _ => None,
             }),
             raw_da,
+            foreign_keys: super::foreign::capture(d),
+            source_nm,
         }
     }
 }

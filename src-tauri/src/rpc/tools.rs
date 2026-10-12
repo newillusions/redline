@@ -31,6 +31,12 @@ pub struct MarkupSummary {
     pub locked: bool,
     pub locked_contents: bool,
     pub workflow_status: MarkupStatus,
+    /// Markups List read model for the review workflow (replies are standard `/IRT`
+    /// annotations; see `markup::replies`): number of replies, and who/when set the
+    /// current status (the latest Review-model state annotation), when one is recorded.
+    pub reply_count: usize,
+    pub status_changed_by: Option<String>,
+    pub status_changed_at: Option<String>,
     pub count_set_name: Option<String>,
 }
 
@@ -59,6 +65,12 @@ fn summarize(m: &Markup) -> MarkupSummary {
         locked: m.is_locked(),
         locked_contents: m.is_contents_locked(),
         workflow_status: m.workflow.status,
+        reply_count: m.workflow.reply_count(),
+        status_changed_by: m
+            .workflow
+            .latest_review_change()
+            .map(|c| c.author.display_name.clone()),
+        status_changed_at: m.workflow.latest_review_change().map(|c| c.at.to_rfc3339()),
         count_set_name: m.count_set.as_ref().map(|cs| cs.name.clone()),
     }
 }

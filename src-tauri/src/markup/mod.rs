@@ -19,6 +19,8 @@ use uuid::Uuid;
 use crate::geometry::{PdfPoint, Quad};
 
 mod annotation;
+pub mod foreign;
+pub(crate) mod replies;
 pub(crate) mod appearance;
 
 /// v1 markup types (spec §12 decision a — locked).
@@ -90,6 +92,9 @@ pub enum MarkupStatus {
     Accepted,
     Rejected,
     Completed,
+    /// ISO 32000-1 Review state `Cancelled` (Revu's "Cancelled"; some tools spell it
+    /// "Canceled" - both are read, `Cancelled` is written).
+    Cancelled,
 }
 
 /// Distinct count-marker shapes (takeoff Count sets). A small, fixed palette so a user
@@ -252,6 +257,87 @@ pub struct Reply {
     pub author: UserRef,
     pub at: DateTime<Utc>,
     pub contents: String,
+    /// The reply this one answers (a nested reply, `/IRT` -> another reply). `None` =
+    /// a direct reply to the markup itself. `#[serde(default)]` keeps pre-this-field
+    /// JSON (and legacy `/RLWorkflowExtra` threads) deserialising to `None`.
+    #[serde(default)]
+    pub in_reply_to: Option<Uuid>,
+    /// The annotation's original `/NM` when it is not just this `id` (a Revu-style 16-char
+    /// name): written back unchanged because Revu matches annotations by `/NM`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nm: Option<String>,
+}
+
+/// One entry of a markup's status history: a standard PDF state annotation (a hidden
+/// `/Text` reply carrying `/StateModel` + `/State`, ISO 32000-1 §12.5.6.4). `model` is
+/// `"Review"` for the standard review states (`state` = Accepted/Rejected/Cancelled/
+/// Completed/None), `"Marked"` (Marked/Unmarked), or any custom model a viewer wrote
+/// (Revu's "Migration", user-defined models) - non-Review entries are preserved
+/// verbatim but never drive [`Workflow::status`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StatusChange {
+    pub id: Uuid,
+    pub author: UserRef,
+    pub at: DateTime<Utc>,
+    pub model: String,
+    pub state: String,
+    /// The reply this state is set on (its `/IRT` is a reply, not the markup). Such an
+    /// entry is kept and written back to the same reply, and never drives the markup's
+    /// status. `None` = a status of the markup itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_reply: Option<Uuid>,
+    /// Original `/NM` when it is not just this `id` (see [`Reply::nm`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nm: Option<String>,
+}
+
+/// The `/StateModel` name of the standard review model.
+pub const REVIEW_MODEL: &str = "Review";
+
+impl MarkupStatus {
+    /// The ISO 32000-1 `/State` string for this status in the Review model.
+    pub fn review_state(self) -> &'static str {
+        match self {
+            MarkupStatus::None => "None",
+            MarkupStatus::Accepted => "Accepted",
+            MarkupStatus::Rejected => "Rejected",
+            MarkupStatus::Completed => "Completed",
+            MarkupStatus::Cancelled => "Cancelled",
+        }
+    }
+
+    /// Parse a Review-model `/State`. Accepts the "Canceled" spelling some tools write.
+    /// `None` for anything that is not a Review state.
+    pub fn from_review_state(s: &str) -> Option<Self> {
+        match s {
+            "None" => Some(MarkupStatus::None),
+            "Accepted" => Some(MarkupStatus::Accepted),
+            "Rejected" => Some(MarkupStatus::Rejected),
+            "Completed" => Some(MarkupStatus::Completed),
+            "Cancelled" | "Canceled" => Some(MarkupStatus::Cancelled),
+            _ => Option::None,
+        }
+    }
+}
+
+/// Deterministic UUID from a seed string (two FNV-1a 64 passes), used for ids that must be
+/// stable across saves without a stored value: a reply/state annotation lacking a UUID
+/// `/NM`, or a status entry synthesised at write time. Not cryptographic.
+pub fn derive_uuid(seed: &str) -> Uuid {
+    fn fnv(seed: &str, basis: u64) -> u64 {
+        let mut h = basis;
+        for b in seed.bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+    let hi = fnv(seed, 0xcbf2_9ce4_8422_2325);
+    let lo = fnv(seed, 0x8422_2325_cbf2_9ce4 ^ hi.rotate_left(17));
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&hi.to_be_bytes());
+    bytes[8..].copy_from_slice(&lo.to_be_bytes());
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
 }
 
 /// Reserved review-workflow fields (spec §6 decision f). Present from day one but
@@ -260,7 +346,33 @@ pub struct Reply {
 pub struct Workflow {
     pub status: MarkupStatus,
     pub assignee: Option<UserRef>,
+    /// Replies, oldest first. Persisted as standard `/Text` + `/IRT` + `/RT /R`
+    /// annotations (visible to Revu and Acrobat); legacy `/RLWorkflowExtra` threads are
+    /// read and migrated on the next save.
     pub thread: Vec<Reply>,
+    /// Every state annotation read from / to be written to the PDF, oldest first (all
+    /// models). `status` mirrors the latest Review-model entry.
+    #[serde(default)]
+    pub status_history: Vec<StatusChange>,
+}
+
+impl Workflow {
+    /// Number of replies in the thread (all nesting levels) - for a Markups List column.
+    pub fn reply_count(&self) -> usize {
+        self.thread.len()
+    }
+
+    /// The most recent Review-model status entry (who/when set the current status).
+    pub fn latest_review_change(&self) -> Option<&StatusChange> {
+        self.status_history
+            .iter()
+            .rev()
+            .find(|c| {
+                c.on_reply.is_none()
+                    && c.model == REVIEW_MODEL
+                    && MarkupStatus::from_review_state(&c.state).is_some()
+            })
+    }
 }
 
 /// Measurement payload for measurement markups (spec §6/§7).
@@ -360,6 +472,17 @@ pub struct Markup {
     /// has a font. `#[serde(default)]` keeps pre-this-field JSON deserialising to `None`.
     #[serde(default)]
     pub raw_da: Option<String>,
+    /// Bluebeam-private annotation keys redline does not interpret (`/BSI*` such as
+    /// `/BSIColumnData`, `/BBMeasure`, `/GroupNesting`, `/NumCounts`, ...), carried
+    /// verbatim so a Revu-authored markup keeps its custom-column data and count metadata
+    /// across a redline save. See [`foreign`]. `#[serde(default)]` for older JSON.
+    #[serde(default)]
+    pub foreign_keys: Vec<foreign::ForeignKey>,
+    /// The source annotation's `/NM` when it is not a canonical UUID (Revu writes 16-char
+    /// names). `id` is then derived deterministically from it, and the original is written
+    /// back unchanged so Revu keeps matching the markup and a load+save cycle is idempotent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_nm: Option<String>,
 }
 
 /// Default `/F` annotation flags for a markup redline creates itself: `4` (Print, bit 3
@@ -408,7 +531,67 @@ impl Markup {
             rich_text: None,
             optional_content: None,
             raw_da: None,
+            foreign_keys: Vec::new(),
+            source_nm: None,
         }
+    }
+
+    /// Replace the id. Only for the PDF import path, to keep ids unique when two source
+    /// annotations share one `/NM`; everywhere else the id is immutable.
+    pub(crate) fn reassign_id(&mut self, id: Uuid) {
+        self.id = id;
+    }
+
+    /// True if this markup carries any reader-owned name (`source_nm`, reply or state `nm`).
+    pub fn has_reader_owned(&self) -> bool {
+        self.source_nm.is_some()
+            || self.workflow.thread.iter().any(|r| r.nm.is_some())
+            || self.workflow.status_history.iter().any(|c| c.nm.is_some())
+    }
+
+    /// Drop every reader-owned field (`source_nm`, reply and state `nm`). Called on a markup
+    /// that arrives from outside (GUI IPC, MCP) and has no counterpart in the store: those
+    /// fields are only ever set by the PDF reader, and a crafted value equal to a foreign
+    /// annotation's `/NM` would make a save delete that annotation.
+    pub fn clear_reader_owned(&mut self) {
+        self.source_nm = None;
+        for r in &mut self.workflow.thread {
+            r.nm = None;
+        }
+        for c in &mut self.workflow.status_history {
+            c.nm = None;
+        }
+    }
+
+    /// For an update arriving from outside: ignore the inbound reader-owned fields and keep
+    /// those of the stored markup `existing` (matched by reply / state id), so editing an
+    /// existing markup preserves its original names but input can never introduce one.
+    pub fn adopt_reader_owned_from(&mut self, existing: &Markup) {
+        self.clear_reader_owned();
+        self.source_nm = existing.source_nm.clone();
+        let reply_nm: std::collections::HashMap<Uuid, &String> = existing
+            .workflow
+            .thread
+            .iter()
+            .filter_map(|r| r.nm.as_ref().map(|n| (r.id, n)))
+            .collect();
+        for r in &mut self.workflow.thread {
+            r.nm = reply_nm.get(&r.id).map(|n| (*n).clone());
+        }
+        let state_nm: std::collections::HashMap<Uuid, &String> = existing
+            .workflow
+            .status_history
+            .iter()
+            .filter_map(|c| c.nm.as_ref().map(|n| (c.id, n)))
+            .collect();
+        for c in &mut self.workflow.status_history {
+            c.nm = state_nm.get(&c.id).map(|n| (*n).clone());
+        }
+    }
+
+    /// The `/NM` to write: the original source name if there was one, else the id.
+    pub fn nm_for_pdf(&self) -> String {
+        self.source_nm.clone().unwrap_or_else(|| self.id.to_string())
     }
 
     /// The stable, immutable id (read-only — there is deliberately no setter).

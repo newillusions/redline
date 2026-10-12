@@ -12,6 +12,8 @@
     FONT_SIZES,
   } from "$lib/markup-properties";
   import type { MarkupWorkflow } from "$lib/ipc";
+  import { patchAddReply, patchDeleteReply } from "$lib/markup-properties";
+  import { reviewSummary } from "$lib/markup-review";
 
   const { store }: { store: MarkupStore } = $props();
 
@@ -254,6 +256,46 @@
   function onLayerInput(e: Event) {
     const v = (e.target as HTMLInputElement).value;
     commitFieldPatch({ layer: v || null });
+  }
+
+  // Reply thread + status history (single selection). Replies persist as standard PDF
+  // /IRT annotations, so Bluebeam Revu and Acrobat show them.
+  const single = $derived(selected.length === 1 ? selected[0] : null);
+  const review = $derived(single ? reviewSummary(single) : null);
+  let replyDraft = $state("");
+  let replyTo = $state<string | null>(null);
+
+  function fmtWhen(iso: string): string {
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+  }
+
+  function submitReply() {
+    if (!single) return;
+    const after = patchAddReply(
+      single,
+      replyDraft,
+      by(single.audit.modified_by),
+      new Date().toISOString(),
+      replyTo,
+    );
+    if (after === single) return;
+    store.applyBatch([{ before: single, after }]);
+    replyDraft = "";
+    replyTo = null;
+  }
+
+  function removeReply(id: string) {
+    if (!single) return;
+    const after = patchDeleteReply(single, id, by(single.audit.modified_by), new Date().toISOString());
+    if (after !== single) store.applyBatch([{ before: single, after }]);
+  }
+
+  function onReplyKey(e: KeyboardEvent) {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      submitReply();
+    }
   }
 
   function onStatusChange(e: Event) {
@@ -533,8 +575,65 @@
           <option value="Accepted">Accepted</option>
           <option value="Rejected">Rejected</option>
           <option value="Completed">Completed</option>
+          <option value="Cancelled">Cancelled</option>
         </select>
       </div>
+
+      {#if review && single}
+        {#if review.statusBy && review.statusAt}
+          <p class="status-meta muted" data-field="status-meta">
+            Set by {review.statusBy}, {fmtWhen(review.statusAt)}
+          </p>
+        {/if}
+
+        <h4 class="prop-subtitle">Replies ({review.replyCount})</h4>
+        <ul class="reply-thread" data-field="reply-thread">
+          {#each review.thread as row (row.reply.id)}
+            <li class="reply" style:margin-left="{row.depth * 12}px" data-reply-id={row.reply.id}>
+              <div class="reply-head">
+                <span class="reply-author">{row.reply.author.display_name || "Unknown"}</span>
+                <span class="muted">{fmtWhen(row.reply.at)}</span>
+              </div>
+              <div class="reply-body">{row.reply.contents}</div>
+              <div class="reply-actions">
+                <button type="button" class="link-btn" onclick={() => (replyTo = row.reply.id)}>Reply</button>
+                <button type="button" class="link-btn" onclick={() => removeReply(row.reply.id)}>Delete</button>
+              </div>
+            </li>
+          {/each}
+        </ul>
+        {#if replyTo}
+          <p class="muted reply-target">
+            Replying to a reply
+            <button type="button" class="link-btn" onclick={() => (replyTo = null)}>cancel</button>
+          </p>
+        {/if}
+        <textarea
+          class="prop-textarea"
+          data-field="reply-input"
+          rows="2"
+          placeholder="Reply (Ctrl+Enter to send)"
+          bind:value={replyDraft}
+          onkeydown={onReplyKey}
+        ></textarea>
+        <button type="button" class="prop-button" data-action="send-reply" onclick={submitReply} disabled={!replyDraft.trim()}>
+          Reply
+        </button>
+
+        {#if (single.workflow.status_history ?? []).length > 0}
+          <h4 class="prop-subtitle">Status history</h4>
+          <ul class="status-history" data-field="status-history">
+            {#each [...(single.workflow.status_history ?? [])].reverse() as c (c.id)}
+              <li>
+                <span class="reply-author">{c.state}</span>
+                {#if c.model !== "Review"}<span class="muted">({c.model})</span>{/if}
+                {#if c.on_reply}<span class="muted">(on a reply)</span>{/if}
+                <span class="muted">{c.author.display_name || "Unknown"}, {fmtWhen(c.at)}</span>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      {/if}
     </section>
   {/if}
 </div>
@@ -679,6 +778,53 @@
     border-radius: var(--radius-sm);
     color: var(--color-text);
     font-size: var(--font-size-sm);
+  }
+
+  .prop-subtitle {
+    margin: var(--space-2) 0 var(--space-1) 0;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+  }
+  .status-meta {
+    margin: 0;
+    font-size: var(--font-size-sm);
+  }
+  .reply-thread,
+  .status-history {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: var(--font-size-sm);
+  }
+  .reply-head {
+    display: flex;
+    gap: var(--space-2);
+    justify-content: space-between;
+  }
+  .reply-author {
+    font-weight: 600;
+  }
+  .reply-body {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .reply-actions {
+    display: flex;
+    gap: var(--space-2);
+  }
+  .link-btn {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--color-primary);
+    cursor: pointer;
+    font-size: var(--font-size-sm);
+  }
+  .prop-button {
+    align-self: flex-end;
   }
 
   .prop-select {

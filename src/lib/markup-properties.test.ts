@@ -10,6 +10,8 @@ import {
   patchFields,
   patchGroup,
   patchStatus,
+  patchAddReply,
+  patchDeleteReply,
   commonValue,
 } from "./markup-properties";
 import type { Appearance, UserRef, Markup } from "./ipc";
@@ -299,11 +301,11 @@ describe("patchStatus", () => {
 
   it("leaves assignee and thread untouched", () => {
     const withAssignee = mkMarkup("s2", {
-      workflow: { status: "None", assignee: OTHER, thread: ["note"] },
+      workflow: { status: "None", assignee: OTHER, thread: [{ id: "r0", author: OTHER, at: NOW, contents: "note" }] },
     });
     const result = patchStatus(withAssignee, "Rejected", USER, LATER);
     expect(result.workflow.assignee).toEqual(OTHER);
-    expect(result.workflow.thread).toEqual(["note"]);
+    expect(result.workflow.thread).toEqual(withAssignee.workflow.thread);
   });
 
   it("does not mutate the input markup", () => {
@@ -372,5 +374,80 @@ describe("commonValue", () => {
   it("returns shared value for three identical projections", () => {
     const m4 = mkMarkup("c4", { appearance: { ...AP, color: "#ff0000" } });
     expect(commonValue([m1, m2, m4], (m) => m.appearance.color)).toBe("#ff0000");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// status history + replies (standard /IRT reply annotations on the Rust side)
+// ---------------------------------------------------------------------------
+describe("patchStatus history", () => {
+  it("appends a Review-model history entry for a change", () => {
+    const r = patchStatus(mkMarkup("h1"), "Accepted", OTHER, LATER, "id-1");
+    expect(r.workflow.status_history).toEqual([
+      { id: "id-1", author: OTHER, at: LATER, model: "Review", state: "Accepted" },
+    ]);
+  });
+
+  it("keeps earlier history and appends in order", () => {
+    const a = patchStatus(mkMarkup("h2"), "Accepted", USER, NOW, "a");
+    const b = patchStatus(a, "Completed", OTHER, LATER, "b");
+    expect(b.workflow.status_history?.map((c) => c.state)).toEqual(["Accepted", "Completed"]);
+  });
+
+  it("records nothing when the status is unchanged", () => {
+    const m = mkMarkup("h3", { workflow: { status: "Rejected", assignee: null, thread: [] } });
+    expect(patchStatus(m, "Rejected", OTHER, LATER).workflow.status_history).toBeUndefined();
+  });
+
+  it("can set Cancelled (the fifth Review state)", () => {
+    expect(patchStatus(mkMarkup("h4"), "Cancelled", USER, NOW, "c").workflow.status).toBe("Cancelled");
+  });
+});
+
+describe("patchAddReply / patchDeleteReply", () => {
+  it("appends a trimmed reply and bumps audit", () => {
+    const r = patchAddReply(mkMarkup("r1"), "  Agreed  ", OTHER, LATER, null, "rep-1");
+    expect(r.workflow.thread).toEqual([
+      { id: "rep-1", author: OTHER, at: LATER, contents: "Agreed", in_reply_to: null },
+    ]);
+    expect(r.audit.revision).toBe(BASE_AUDIT.revision + 1);
+  });
+
+  it("ignores blank text", () => {
+    const m = mkMarkup("r2");
+    expect(patchAddReply(m, "   ", OTHER, LATER)).toBe(m);
+  });
+
+  it("deleting a reply also deletes the replies nested under it", () => {
+    let m = patchAddReply(mkMarkup("r3"), "one", USER, NOW, null, "a");
+    m = patchAddReply(m, "two", OTHER, NOW, "a", "b");
+    m = patchAddReply(m, "three", USER, NOW, "b", "c");
+    m = patchAddReply(m, "sibling", USER, NOW, null, "d");
+    const r = patchDeleteReply(m, "a", USER, LATER);
+    expect(r.workflow.thread.map((x) => x.id)).toEqual(["d"]);
+  });
+
+  it("deleting a reply also removes the states set on it (and on those states)", () => {
+    let m = patchAddReply(mkMarkup("r5"), "one", USER, NOW, null, "a");
+    m = patchAddReply(m, "keep", USER, NOW, null, "k");
+    m = {
+      ...m,
+      workflow: {
+        ...m.workflow,
+        status_history: [
+          { id: "s0", author: USER, at: NOW, model: "Review", state: "Accepted" },
+          { id: "s1", author: USER, at: NOW, model: "Review", state: "Rejected", on_reply: "a" },
+          { id: "s2", author: USER, at: NOW, model: "Review", state: "Completed", on_reply: "s1" },
+        ],
+      },
+    };
+    const r = patchDeleteReply(m, "a", USER, LATER);
+    expect(r.workflow.thread.map((x) => x.id)).toEqual(["k"]);
+    expect(r.workflow.status_history?.map((c) => c.id)).toEqual(["s0"]);
+  });
+
+  it("unknown id is a no-op", () => {
+    const m = mkMarkup("r4");
+    expect(patchDeleteReply(m, "nope", USER, LATER)).toBe(m);
   });
 });

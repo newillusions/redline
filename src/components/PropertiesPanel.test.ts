@@ -489,6 +489,52 @@ describe("single selection mode", () => {
     await tick();
     expect(store.markups[0].workflow.status).toBe("None");
   });
+
+  it("status select offers Cancelled and records a history entry", async () => {
+    const store = makeStore();
+    store.seed([makeMarkup("m1")]);
+    store.selectedIds = new Set(["m1"]);
+    const { container } = await mountPanel(store);
+    const statusSelect = container.querySelector("select[data-field='status']") as HTMLSelectElement;
+    expect([...statusSelect.options].map((o) => o.value)).toContain("Cancelled");
+
+    fireEvent.change(statusSelect, { target: { value: "Cancelled" } });
+    await tick();
+
+    expect(store.markups[0].workflow.status).toBe("Cancelled");
+    expect(store.markups[0].workflow.status_history?.map((c) => c.state)).toEqual(["Cancelled"]);
+    expect(container.querySelector("[data-field='status-history']")?.textContent).toContain("Cancelled");
+  });
+
+  it("shows the reply thread of the selected markup and adds a reply", async () => {
+    const store = makeStore();
+    const m = makeMarkup("m1");
+    m.workflow.thread = [
+      { id: "r1", author: { user_id: "u", display_name: "Architect" }, at: "2026-10-01T09:10:00Z", contents: "Agreed" },
+    ];
+    store.seed([m]);
+    store.selectedIds = new Set(["m1"]);
+    const { container } = await mountPanel(store);
+
+    expect(container.querySelector("[data-field='reply-thread']")?.textContent).toContain("Agreed");
+
+    const input = container.querySelector("textarea[data-field='reply-input']") as HTMLTextAreaElement;
+    await fireEvent.input(input, { target: { value: "Thanks, revising" } });
+    await fireEvent.click(container.querySelector("button[data-action='send-reply']") as HTMLButtonElement);
+    await tick();
+
+    const thread = store.markups[0].workflow.thread;
+    expect(thread.map((r) => r.contents)).toEqual(["Agreed", "Thanks, revising"]);
+    expect(store.canUndo).toBe(true);
+  });
+
+  it("hides the thread for a multi-selection", async () => {
+    const store = makeStore();
+    store.seed([makeMarkup("m1"), makeMarkup("m2")]);
+    store.selectedIds = new Set(["m1", "m2"]);
+    const { container } = await mountPanel(store);
+    expect(container.querySelector("[data-field='reply-thread']")).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -221,10 +221,44 @@ export interface MarkupAudit {
   origin: "Desktop" | "FieldApp";
 }
 
+export type MarkupStatus = "None" | "Accepted" | "Rejected" | "Completed" | "Cancelled";
+
+/**
+ * A reply in a markup's thread (mirrors Rust `Reply`). Persisted as a standard PDF
+ * `/Text` annotation with `/IRT` + `/RT /R`, so Bluebeam Revu and Acrobat show it.
+ */
+export interface MarkupReply {
+  id: string;
+  author: UserRef;
+  at: string; // RFC3339
+  contents: string;
+  /** The reply this one answers; null/absent = a direct reply to the markup. */
+  in_reply_to?: string | null;
+  /** Original `/NM` of a foreign annotation; opaque, written back unchanged. */
+  nm?: string | null;
+}
+
+/**
+ * One status-history entry (mirrors Rust `StatusChange`): a PDF state annotation
+ * (`/StateModel` + `/State`). `model` is "Review" for the standard states.
+ */
+export interface StatusChange {
+  id: string;
+  author: UserRef;
+  at: string; // RFC3339
+  model: string;
+  state: string;
+  /** Set when the state is on a reply rather than the markup; such entries never drive status. */
+  on_reply?: string | null;
+  nm?: string | null;
+}
+
 export interface MarkupWorkflow {
-  status: "None" | "Accepted" | "Rejected" | "Completed";
+  status: MarkupStatus;
   assignee: UserRef | null;
-  thread: unknown[];
+  thread: MarkupReply[];
+  /** Oldest first, all models. Absent on payloads from before this field existed. */
+  status_history?: StatusChange[];
 }
 
 /** Distinct count-marker shapes for takeoff Count sets (mirrors Rust `CountSymbol`). */
@@ -286,6 +320,13 @@ export interface Markup {
    * value as unlocked (matches the backend's unlocked default, `4`/Print-only).
    */
   annot_flags?: number;
+  /**
+   * Bluebeam-private annotation keys the backend carries verbatim (`/BSIColumnData`, ...).
+   * Opaque to the frontend - never edit; spread-copy the markup and it survives.
+   */
+  foreign_keys?: unknown[];
+  /** Original non-UUID `/NM` (Revu); opaque, written back unchanged. */
+  source_nm?: string | null;
 }
 
 /** ISO 32000-1 Table 165 bit 8, `Locked` (decimal `128`/`0x80`) - mirrors Rust
