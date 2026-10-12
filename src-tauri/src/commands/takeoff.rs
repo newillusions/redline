@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use tauri::State;
 
+use crate::commands::markup_list::neutralise_formula;
 use crate::markup::Markup;
 use crate::sidecar::{load_meta, save_meta};
 use crate::takeoff::{ScaleMethod, ScaleRecord, ScaleTarget};
@@ -230,13 +231,15 @@ fn export_csv(
             &(i + 1).to_string(),
             &format!("{:?}", m.markup_type),
             &(m.page + 1).to_string(),
-            m.subject.as_deref().unwrap_or(""),
-            &m.audit.created_by.display_name,
+            // Text that came from the PDF is neutralised against spreadsheet formula
+            // injection; app-formatted cells (page, date, quantity) stay as they are.
+            &neutralise_formula(m.subject.as_deref().unwrap_or("")),
+            &neutralise_formula(&m.audit.created_by.display_name),
             &m.audit.created_at.format("%Y-%m-%d %H:%M").to_string(),
-            m.contents.as_deref().unwrap_or(""),
-            m.layer.as_deref().unwrap_or(""),
+            &neutralise_formula(m.contents.as_deref().unwrap_or("")),
+            &neutralise_formula(m.layer.as_deref().unwrap_or("")),
             &qty,
-            &unit,
+            &neutralise_formula(&unit),
             &format!("{:?}", m.workflow.status),
         ])?;
     }
@@ -293,6 +296,35 @@ mod tests {
             out.metadata().unwrap().len() > 1000,
             "xlsx should be non-trivial size"
         );
+    }
+
+    #[test]
+    fn csv_export_neutralises_hostile_text_but_keeps_negative_quantity() {
+        use crate::markup::Measurement;
+        use std::collections::BTreeMap;
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("hostile.csv");
+        let mut m = sample_markup(crate::markup::MarkupType::MeasurementLength);
+        m.contents = Some("=HYPERLINK(\"http://x\",\"y\")".into());
+        m.subject = Some("+cmd".into());
+        m.layer = Some("@SUM(A1)".into());
+        m.measurement = Some(Measurement {
+            scale_ref: None,
+            raw_measure: 1.0,
+            unit: "-1+1".into(),
+            computed_quantity: -5.0,
+            depth: None,
+            count_value: None,
+            custom_columns: BTreeMap::new(),
+        });
+        export_csv(&[m], &out).unwrap();
+        let mut rdr = csv::Reader::from_path(&out).unwrap();
+        let rec = rdr.records().next().unwrap().unwrap();
+        assert_eq!(&rec[3], "'+cmd");
+        assert_eq!(&rec[6], "'=HYPERLINK(\"http://x\",\"y\")");
+        assert_eq!(&rec[7], "'@SUM(A1)");
+        assert_eq!(&rec[8], "-5.00");
+        assert_eq!(&rec[9], "'-1+1");
     }
 
     #[test]

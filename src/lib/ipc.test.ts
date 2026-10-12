@@ -27,6 +27,14 @@ describe("ipc invoke argument keys (Tauri v2 camelCase)", () => {
     expect(mockInvoke).toHaveBeenCalledWith("get_page_size", { docId: "d1", pageIndex: 3 });
   });
 
+  it("export_markups_view → docId / path / format / ids / columns", async () => {
+    mockInvoke.mockResolvedValue(2 as never);
+    await expect(ipc.exportMarkupsView("d1", "/tmp/x.csv", "Csv", ["a", "b"], ["page", "comment"])).resolves.toBe(2);
+    expect(mockInvoke).toHaveBeenCalledWith("export_markups_view", {
+      docId: "d1", path: "/tmp/x.csv", format: "Csv", ids: ["a", "b"], columns: ["page", "comment"],
+    });
+  });
+
   it("get_page_count → docId", async () => {
     await ipc.getPageCount("d1");
     expect(mockInvoke).toHaveBeenCalledWith("get_page_count", { docId: "d1" });

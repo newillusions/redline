@@ -473,6 +473,20 @@ export async function exportMarkupList(
   return invoke<void>("export_markup_list", { docId: doc_id, path, format });
 }
 
+/**
+ * Export the Markups List view: `ids` in the order shown (after filter + sort) and the
+ * visible column `columns` keys (see `markups-list.ts`). Returns the rows written.
+ */
+export async function exportMarkupsView(
+  doc_id: string,
+  path: string,
+  format: ExportFormat,
+  ids: string[],
+  columns: string[]
+): Promise<number> {
+  return invoke<number>("export_markups_view", { docId: doc_id, path, format, ids, columns });
+}
+
 // ---------------------------------------------------------------------------
 // Page operation commands (M4 S1)
 // ---------------------------------------------------------------------------

@@ -386,6 +386,7 @@ pub fn run() {
             commands::takeoff::list_scales,
             commands::takeoff::delete_scale,
             commands::takeoff::export_markup_list,
+            commands::markup_list::export_markups_view,
             // Takeoff commands (M4 S1 — preset picker + /Measure write)
             commands::takeoff::list_applicable_scales,
             commands::takeoff::write_page_measure,

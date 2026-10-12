@@ -28,6 +28,7 @@
   import ToolPalette from "./components/ToolPalette.svelte";
   import PropertiesPanel from "./components/PropertiesPanel.svelte";
   import MeasurementPanel from "./components/MeasurementPanel.svelte";
+  import MarkupsListPanel from "./components/MarkupsListPanel.svelte";
   import ComparePanel from "./components/ComparePanel.svelte";
   import TabBar from "./components/TabBar.svelte";
   import SavePromptDialog from "./components/SavePromptDialog.svelte";
@@ -599,6 +600,8 @@
   let leftCollapsed  = $state(false);
   let rightCollapsed = $state(false);
   let bottomCollapsed = $state(true);
+  /** Which view the bottom panel shows: the Markups List or the takeoff Quantities. */
+  let bottomTab = $state<"markups" | "quantities">("markups");
 
   // Settings dialog visibility
   let settingsOpen = $state(false);
@@ -1285,7 +1288,7 @@
     },
     { id: "left", label: "Toggle left sidebar", separator: true, onselect: () => (leftCollapsed = !leftCollapsed) },
     { id: "right", label: "Toggle right sidebar", onselect: () => (rightCollapsed = !rightCollapsed) },
-    { id: "bottom", label: "Toggle quantities panel", onselect: () => (bottomCollapsed = !bottomCollapsed) },
+    { id: "bottom", label: "Toggle markups list / quantities panel", onselect: () => (bottomCollapsed = !bottomCollapsed) },
     { id: "settings", label: "Settings", separator: true, onselect: () => (settingsOpen = true) },
     { id: "about", label: "About Redline", onselect: () => (aboutOpen = true) },
   ]);
@@ -1499,8 +1502,8 @@
             class="btn-toolbar btn-icon"
             class:btn-icon-active={!bottomCollapsed}
             onclick={() => (bottomCollapsed = !bottomCollapsed)}
-            title="Toggle quantities panel (takeoff measurements)"
-            aria-label="Toggle quantities panel"
+            title="Toggle markups list / quantities panel"
+            aria-label="Toggle markups list / quantities panel"
             aria-pressed={!bottomCollapsed}
           >
             <svg class="sidebar-icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
@@ -1794,25 +1797,44 @@
     {/if}
   </div>
 
-  <!-- Bottom panel — Markups / Measurement quantities (spec §17) -->
+  <!-- Bottom panel - Markups List / Measurement quantities (spec §17) -->
   {#if !bottomCollapsed}
-    <div class="bottom-panel">
-      <Accordion
-        title="Quantities"
-        storageKey="bottom-panel"
-        bodyClass="panel-body panel-body-flush"
-        testId="accordion-bottom-panel"
-      >
-        {#if activeTab}
-          <MeasurementPanel
-            store={activeTab.store}
-            takeoffStore={activeTab.takeoffStore}
-            docId={activeTab.docId}
-          />
+    <div class="bottom-panel" class:bottom-panel-tall={bottomTab === "markups"}>
+      <div class="bottom-tabs" role="tablist" aria-label="Bottom panel">
+        <button role="tab" class="bottom-tab" aria-selected={bottomTab === "markups"}
+          class:active={bottomTab === "markups"} onclick={() => (bottomTab = "markups")}>Markups</button>
+        <button role="tab" class="bottom-tab" aria-selected={bottomTab === "quantities"}
+          class:active={bottomTab === "quantities"} onclick={() => (bottomTab = "quantities")}>Quantities</button>
+      </div>
+      <div class="bottom-body" data-testid="bottom-panel-body">
+        {#if !activeTab}
+          <p class="panel-hint muted">Open a PDF to see {bottomTab === "markups" ? "its mark-ups" : "quantities"}.</p>
+        {:else if bottomTab === "markups"}
+          {#key activeTab.docId}
+            <MarkupsListPanel
+              store={activeTab.store}
+              docId={activeTab.docId}
+              onjump={(t) => {
+                searchJumpNonce += 1;
+                viewportJumpRequest = { page: t.page, rect: t.rect, nonce: searchJumpNonce };
+              }}
+            />
+          {/key}
         {:else}
-          <p class="panel-hint muted">Open a PDF to see quantities.</p>
+          <Accordion
+            title="Quantities"
+            storageKey="bottom-panel"
+            bodyClass="panel-body panel-body-flush"
+            testId="accordion-bottom-panel"
+          >
+            <MeasurementPanel
+              store={activeTab.store}
+              takeoffStore={activeTab.takeoffStore}
+              docId={activeTab.docId}
+            />
+          </Accordion>
         {/if}
-      </Accordion>
+      </div>
     </div>
   {/if}
 
@@ -2171,6 +2193,40 @@
   .empty-state p { font-size: var(--font-size-lg); margin: 0; }
 
   /* --- Bottom panel --- */
+  .bottom-panel.bottom-panel-tall {
+    height: 300px;
+  }
+
+  .bottom-tabs {
+    display: flex;
+    gap: var(--space-1);
+    padding: 0 var(--space-2);
+    background: var(--color-bg-toolbar);
+    border-bottom: 1px solid var(--color-border);
+    flex-shrink: 0;
+  }
+
+  .bottom-tab {
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--color-text-secondary);
+    padding: var(--space-1) var(--space-3);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+  }
+
+  .bottom-tab.active {
+    color: var(--color-text);
+    border-bottom-color: var(--color-primary);
+  }
+
+  .bottom-body {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+  }
+
   .bottom-panel {
     height: var(--bottom-panel-height);
     border-top: 1px solid var(--color-border);
