@@ -6,12 +6,13 @@
 //! file next to the original (never auto-opened; manual cleanup; an open-time
 //! sweep is a future nicety).
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use lopdf::Document;
 
-use super::annots::{read_markups, write_markups};
+use super::annots::{read_markups, write_markups_removing};
 use crate::markup::Markup;
 
 /// Read the markup set from a PDF on disk.
@@ -57,6 +58,17 @@ pub fn load_markups_from(path: &Path, password: Option<&str>) -> Result<Vec<Mark
 /// (see render::open_document / load_markups_from); editing and saving markups
 /// back into an encrypted PDF is a known, named gap, not implemented here.
 pub fn save_with_markups(src: &Path, dest: &Path, markups: &[Markup]) -> Result<()> {
+    save_with_markups_removing(src, dest, markups, &HashSet::new())
+}
+
+/// [`save_with_markups`] that also removes the annotations named in `removed` (markups the
+/// user deleted that a foreign viewer authored: see `annots::write_markups_removing`).
+pub fn save_with_markups_removing(
+    src: &Path,
+    dest: &Path,
+    markups: &[Markup],
+    removed: &HashSet<String>,
+) -> Result<()> {
     let mut doc = Document::load(src).with_context(|| format!("load {}", src.display()))?;
     if doc.is_encrypted() {
         anyhow::bail!(
@@ -64,7 +76,7 @@ pub fn save_with_markups(src: &Path, dest: &Path, markups: &[Markup]) -> Result<
              would strip the file's password protection. Your changes were not saved."
         );
     }
-    write_markups(&mut doc, markups)?;
+    write_markups_removing(&mut doc, markups, removed)?;
 
     let dir = dest.parent().context("dest has no parent dir")?;
     let tmp = dir.join(format!(
@@ -136,6 +148,7 @@ pub fn save_decrypted_copy(src: &Path, dest: &Path, password: &str) -> Result<()
 mod tests {
     use super::*;
     use crate::document::annots::tests::{encrypted_one_page_doc, one_page_doc, redline_markup};
+    use crate::document::annots::write_markups;
 
     #[test]
     fn save_with_markups_writes_dest_and_reloads() {

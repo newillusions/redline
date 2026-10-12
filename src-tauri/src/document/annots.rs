@@ -512,6 +512,12 @@ fn write_workflow_annots(
         let oid = doc.add_object(Object::Dictionary(replies::reply_dict(r, &anchor)));
         oid_of.insert(r.id, oid);
         out.push(oid);
+        out.extend(
+            r.extras
+                .as_ref()
+                .and_then(|x| x.popup.as_ref())
+                .and_then(|p| replies::add_popup(doc, oid, page, p)),
+        );
     }
     // States: one set on the markup itself, or on a reply / another state, goes back under
     // exactly that target. A state whose target no longer exists (its reply was deleted) is
@@ -535,6 +541,12 @@ fn write_workflow_annots(
         let anchor = replies::NoteAnchor { parent: target, page, rect, ap };
         let oid = doc.add_object(Object::Dictionary(replies::state_dict(c, &anchor)));
         out.push(oid);
+        out.extend(
+            c.extras
+                .as_ref()
+                .and_then(|x| x.popup.as_ref())
+                .and_then(|p| replies::add_popup(doc, oid, page, p)),
+        );
         written += 1;
         if let Some(kids) = waiting.remove(&c.id) {
             queue.extend(kids.into_iter().map(|k| (k, oid)));
@@ -551,15 +563,31 @@ fn write_workflow_annots(
 
 /// Write the full markup set into the document: strip managed annotations from every
 /// page, keep foreign ones, then append the current set as fresh indirect objects.
+#[cfg(test)]
 pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()> {
+    write_markups_removing(doc, markups, &std::collections::HashSet::new())
+}
+
+/// [`write_markups`] plus the names (`/NM` values) of markups the user deleted since they
+/// were loaded from this file (`MarkupStore::removed_names`). Those are still in the PDF and
+/// carry no `/RLType` if a foreign viewer authored them, so without this they would be kept
+/// as "foreign" and the delete would silently not reach the saved file. They are treated as
+/// redline-owned for this save, so they and everything answering them (replies, states) are
+/// stripped and, being absent from `markups`, not re-emitted.
+pub(crate) fn write_markups_removing(
+    doc: &mut Document,
+    markups: &[Markup],
+    removed: &std::collections::HashSet<String>,
+) -> Result<()> {
     // Managed = redline-owned. Keyed by both the id and the original foreign /NM, so a
     // Revu-authored markup (16-char /NM) is replaced on save rather than kept next to its
     // rewritten copy.
-    let ids: std::collections::HashSet<String> = markups
+    let mut ids: std::collections::HashSet<String> = markups
         .iter()
         .flat_map(|m| [Some(m.id().to_string()), m.source_nm.clone()])
         .flatten()
         .collect();
+    ids.extend(removed.iter().cloned());
     let pages = doc.get_pages(); // 1-based page no -> page ObjectId
 
     // Resolve every target page's (rotation, true_width, true_height, origin_x, origin_y)
@@ -593,7 +621,9 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
         let valid_popup_parents: std::collections::HashSet<ObjectId> = annots
             .iter()
             .filter(|(oid, d)| {
-                oid.is_some() && !is_managed(d, &ids) && subtype(d).as_deref() != Some("Popup")
+                oid.is_some_and(|o| !owned.contains(&o))
+                    && !is_managed(d, &ids)
+                    && subtype(d).as_deref() != Some("Popup")
             })
             .filter_map(|(oid, _)| *oid)
             .collect();
@@ -776,7 +806,7 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
             }
             // A reply / review-state /Text answers a markup; it is not a markup itself.
             if crate::markup::replies::is_reply_or_state(&dict) {
-                raw_replies.push((oid, dict));
+                raw_replies.push((oid, crate::markup::replies::with_resolved_popup(doc, dict)));
                 continue;
             }
             // A /Text carrying /StateModel is a review-state record even when it lacks the
@@ -899,6 +929,15 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
                 m.geometry = map_geometry(&m.geometry, |p| {
                     true_to_display(p, rotation, w0, h0, ox, oy)
                 });
+            }
+            // A foreign text-line quad may be in ISO polygon order rather than Acrobat/Revu's
+            // Z order: bring it to the storage order here, in the frame where text is upright.
+            if !dict.has(b"RLType") {
+                if let crate::markup::MarkupGeometry::Quads(quads) = &mut m.geometry {
+                    for q in quads.iter_mut() {
+                        *q = crate::markup::annotation::canonical_quad(q);
+                    }
+                }
             }
             if matches!(
                 m.markup_type,
@@ -2178,6 +2217,7 @@ pub(crate) mod tests {
                 contents: "please confirm radius".into(),
                 in_reply_to: None,
                 nm: None,
+                extras: None,
             });
             out.push(mr);
 

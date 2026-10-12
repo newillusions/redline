@@ -52,6 +52,23 @@ pub const ALLOWED: &[(&str, Shape)] = &[
     ("SlopeType", Shape::Data),
 ];
 
+/// Extra keys carried on a reply / state annotation only (never on a markup, whose own
+/// writer already emits `/Subj` and `/C`): the author's subject, colour and rich-text body.
+/// `/Popup` is not here: it is a reference, rebuilt by the writer (`markup::replies`).
+pub const REPLY_EXTRA: &[(&str, Shape)] = &[
+    ("Subj", Shape::Data),
+    ("C", Shape::Data),
+    ("RC", Shape::Data),
+];
+
+/// Which annotation the keys belong to: decides the allowlist ([`ALLOWED`] alone for a
+/// markup; plus [`REPLY_EXTRA`] for a reply or state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Markup,
+    Reply,
+}
+
 /// Keys that can trigger an action, script or navigation. Never written at the top level
 /// and never accepted as a dictionary key anywhere inside an allowed value.
 const ACTION_KEYS: &[&str] = &[
@@ -138,12 +155,18 @@ pub struct ForeignKey {
     pub value: PdfValue,
 }
 
-/// The expected shape for an allowlisted key name.
-pub fn shape_of(name: &str) -> Option<Shape> {
-    ALLOWED.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
+/// The expected shape for a key name allowlisted in `scope`.
+pub fn shape_in(scope: Scope, name: &str) -> Option<Shape> {
+    let find = |list: &[(&str, Shape)]| list.iter().find(|(n, _)| *n == name).map(|(_, s)| *s);
+    find(ALLOWED).or_else(|| (scope == Scope::Reply).then(|| find(REPLY_EXTRA)).flatten())
 }
 
-/// True for the key names redline preserves verbatim.
+/// The expected shape for a markup-scope allowlisted key name.
+pub fn shape_of(name: &str) -> Option<Shape> {
+    shape_in(Scope::Markup, name)
+}
+
+/// True for the key names redline preserves verbatim on a markup.
 pub fn is_preserved_key(name: &str) -> bool {
     shape_of(name).is_some()
 }
@@ -194,10 +217,15 @@ fn check_plain(v: &PdfValue, depth: usize, nodes: &mut usize) -> Result<(), &'st
 /// Validate one key/value for carrying: allowlisted name, expected shape, plain bounded
 /// data. `Err` carries the reason (for the log line).
 pub fn validate(k: &ForeignKey) -> Result<(), &'static str> {
+    validate_in(Scope::Markup, k)
+}
+
+/// [`validate`] against the allowlist of `scope`.
+pub fn validate_in(scope: Scope, k: &ForeignKey) -> Result<(), &'static str> {
     if ACTION_KEYS.contains(&k.name.as_str()) {
         return Err("action-bearing key");
     }
-    let Some(shape) = shape_of(&k.name) else {
+    let Some(shape) = shape_in(scope, &k.name) else {
         return Err("key not on the allowlist");
     };
     match (shape, &k.value) {
@@ -278,10 +306,15 @@ fn from_value(v: &PdfValue) -> Object {
 /// Collect the allowlisted, valid keys of an annotation dictionary, in key order. Anything
 /// else (other keys are simply not ours; invalid values of ours are logged) is skipped.
 pub fn capture(d: &Dictionary) -> Vec<ForeignKey> {
+    capture_in(Scope::Markup, d)
+}
+
+/// [`capture`] against the allowlist of `scope`.
+pub fn capture_in(scope: Scope, d: &Dictionary) -> Vec<ForeignKey> {
     let mut out: Vec<ForeignKey> = Vec::new();
     for (k, v) in d.iter() {
         let name = String::from_utf8_lossy(k).into_owned();
-        if !is_preserved_key(&name) {
+        if shape_in(scope, &name).is_none() {
             continue;
         }
         let Some(value) = to_value(v, 0) else {
@@ -289,7 +322,7 @@ pub fn capture(d: &Dictionary) -> Vec<ForeignKey> {
             continue;
         };
         let key = ForeignKey { name, value };
-        match validate(&key) {
+        match validate_in(scope, &key) {
             Ok(()) => out.push(key),
             Err(why) => log::warn!("foreign key /{}: dropped on read ({why})", key.name),
         }
@@ -302,8 +335,13 @@ pub fn capture(d: &Dictionary) -> Vec<ForeignKey> {
 /// untrusted JSON, so only allowlisted, well-shaped keys are emitted, and never over a key
 /// redline already set.
 pub fn apply(d: &mut Dictionary, keys: &[ForeignKey]) {
+    apply_in(Scope::Markup, d, keys);
+}
+
+/// [`apply`] against the allowlist of `scope`.
+pub fn apply_in(scope: Scope, d: &mut Dictionary, keys: &[ForeignKey]) {
     for k in keys {
-        if let Err(why) = validate(k) {
+        if let Err(why) = validate_in(scope, k) {
             log::warn!("foreign key /{}: not written ({why})", k.name);
             continue;
         }

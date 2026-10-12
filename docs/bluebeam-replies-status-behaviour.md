@@ -209,13 +209,59 @@ The PDF and the `Markup` JSON (frontend, MCP) are untrusted:
   allowed values; names and nested keys must be `[A-Za-z0-9_.+-]` (max 64), depth max 8, max
   4096 nodes, strings max 64 KiB. Page `/BSISpaces` is not an annotation key and is not carried.
 
+## 6c. Data integrity of a reviewed PDF (as of 2026-10-12)
+
+- **Deleting a foreign markup.** `MarkupStore::delete` records the deleted markup's id and
+  original `/NM` in `removed_names`; the save paths (`save_with_markups_removing`,
+  `apply_edit_and_save`, `extract_pages_to_new_file`) pass them to `write_markups_removing`,
+  which treats those names as redline-owned for that save. The original, its replies and its
+  states are stripped (replies are owned through `/IRT`) and, being absent from the model, not
+  re-emitted. Undo (`add` of the same id) takes the names back out. The set holds only names of
+  markups the store held, never input. Cleared on reload. Tests:
+  `deleting_a_revu_markup_removes_the_original_its_replies_and_states_on_save`,
+  `undoing_the_delete_restores_the_markup_once_with_its_original_names`,
+  `deleting_an_acrobat_uuid_nm_markup_removes_it_and_its_reply_too`,
+  `removed_names_only_ever_come_from_markups_the_store_held`.
+- **Reply and state keys.** `Reply.extras` / `StatusChange.extras` (`SourceExtras`) carry
+  `/Subj`, `/C`, `/RC`, the Bluebeam private keys of `foreign::ALLOWED` (allowlist
+  `foreign::Scope::Reply` = `ALLOWED` + `REPLY_EXTRA`) and the pop-up (`/Rect`, `/Open`, `/F`).
+  Same trust model as section 6b: read-time capture and write-time re-validation, reader-owned
+  (cleared on add, kept by id on update, restored by the tombstone). **`/RC` rule: it is
+  written back only while the reply's `/Contents` still equals what was read; after an edit the
+  stale `/RC` is dropped (not regenerated), so a viewer shows the new `/Contents`.** The pop-up
+  is a fresh `/Popup` annotation parented to the rewritten reply; the old one is dropped with the
+  old reply (it used to be kept, dangling). Tests:
+  `an_unedited_reply_keeps_subj_c_rc_popup_and_bluebeam_keys_over_three_cycles`,
+  `an_edited_reply_keeps_subj_c_and_private_keys_but_drops_the_stale_rich_text`,
+  `hostile_reply_keys_are_dropped_on_read_and_refused_on_write`.
+- **Duplicate reply `/NM`.** Entries sharing an id get new ids derived from the `/NM`, kind,
+  author, time and a rank among identical entries, so the ids do not depend on file order.
+  Each keeps its source `/NM`, so the file is written back with the duplicates it had and a
+  reload derives the same ids. Tests: `replies_and_states_sharing_one_nm_keep_distinct_stable_identities`,
+  `thousands_of_replies_sharing_one_nm_resolve_in_bounded_time_without_loss`.
+- **Foreign sticky note `/Rect`.** `Markup.source_rect` keeps a note's `/Rect` when it is not the
+  standard 20 x 20 icon box; it is written back while the note is still centred on it (moved
+  notes get the normal box). A box smaller than the icon shrinks the icon to fit. Reader-owned,
+  finite and at most 1000 pt a side. Tests: `an_unmoved_foreign_sticky_note_keeps_its_rect_over_three_cycles`
+  (also on rotated pages), `a_moved_foreign_sticky_note_gets_a_normal_icon_box_at_its_new_place`,
+  `a_small_foreign_note_box_is_kept_and_the_icon_shrinks_to_fit_it`, `a_hostile_source_rect_is_ignored`.
+- **`/QuadPoints` order.** The model stores TL, TR, BL, BR. A foreign quad that is a strictly
+  convex polygon in index order (ISO counter-clockwise from any corner, or clockwise) is
+  re-ordered by its bottom edge, found geometrically (lowest midpoint y) in the displayed frame
+  (after the page-rotation transform); the Acrobat / Revu bow-tie order and degenerate quads are
+  kept as they are. Redline always writes the Acrobat / Revu order. Tests:
+  `acrobat_z_order_is_left_alone_and_polygon_orders_are_reordered_from_any_corner`,
+  `degenerate_and_hostile_quads_are_returned_unchanged_and_never_panic`,
+  `text_markups_in_either_quadpoints_order_load_and_save_to_the_same_geometry`,
+  `quadpoints_order_is_resolved_in_the_displayed_frame_on_rotated_pages`.
+  Not covered: a `.btx` import reads `/QuadPoints` without this step.
+
 ## 7. Known limits
 
-- Deleting a foreign (Revu-authored) markup in redline does not remove its original
-  annotation from the PDF, because only redline-owned annotations are replaced on save
-  (pre-existing; follow-up).
-- Replies are rebuilt from the model: reply-only keys (`/RC`, `/Subj`, `/C`, `/Popup`, private
-  keys on the reply) are not carried (follow-up).
+- A deleted foreign markup is removed on save (section 6c), but only the annotations redline
+  loaded: a foreign annotation of an unsupported subtype is never touched.
+- Reply keys beyond the allowlist of section 6c (`/CA`, `/ExData`, other private keys) are not
+  carried. The pop-up is rebuilt with `/Rect`, `/Open` and `/F` only.
 - Contents of non-reply markups is still written as raw UTF-8 (pre-existing); only replies
   and states use UTF-16BE for non-ASCII.
 - Revu's Migration/custom model state names are unknown; they are preserved but not

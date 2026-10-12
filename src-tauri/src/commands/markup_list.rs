@@ -465,6 +465,7 @@ mod tests {
             contents: "=reply".into(),
             in_reply_to: None,
             nm: None,
+            extras: None,
         });
         let ids = vec![m.id().to_string()];
         let dir = tempdir().unwrap();
@@ -605,6 +606,7 @@ mod tests {
             contents: "r".into(),
             in_reply_to: None,
             nm: None,
+            extras: None,
         });
         m.workflow.status = MarkupStatus::Accepted;
         m.workflow.status_history.push(StatusChange {
@@ -615,6 +617,7 @@ mod tests {
             state: "Accepted".into(),
             on_reply: None,
             nm: None,
+            extras: None,
         });
         let mut cc = BTreeMap::new();
         cc.insert("cost_code".to_string(), "E-100".to_string());

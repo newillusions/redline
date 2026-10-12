@@ -330,6 +330,61 @@ fn quads_from_reals(r: &[f64]) -> Vec<Quad> {
         .collect()
 }
 
+/// A sticky note's `/Rect` when it is a finite, non-empty box other than the standard icon
+/// box redline writes for a note it made (`NOTE_ICON_PT` square): that one is regenerated from
+/// the point anyway, so only a foreign box needs carrying.
+fn non_standard_note_rect(d: &Dictionary) -> Option<[f64; 4]> {
+    let r = get_reals(d, b"Rect")?;
+    let [x0, y0, x1, y1] = <[f64; 4]>::try_from(r).ok()?;
+    if ![x0, y0, x1, y1].iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let (w, h) = ((x1 - x0).abs(), (y1 - y0).abs());
+    let std_side = super::appearance::NOTE_ICON_PT;
+    if w == 0.0 || h == 0.0 || ((w - std_side).abs() < 1e-3 && (h - std_side).abs() < 1e-3) {
+        return None;
+    }
+    Some([x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)])
+}
+
+/// Put one text-line quad into the storage order TL, TR, BL, BR (see [`Quad`]).
+///
+/// `/QuadPoints` has two orders in the wild. Acrobat and Revu write the "Z" order TL, TR, BL,
+/// BR, which as a polygon p0 -> p1 -> p2 -> p3 is a bow-tie. ISO 32000-1's text describes
+/// counter-clockwise order and some writers follow it (starting at any corner, some clockwise):
+/// a convex polygon. A strictly convex polygon in index order is therefore a polygon-order quad
+/// and is re-ordered by finding its bottom edge geometrically (the edge with the lowest
+/// midpoint y), not by index; anything else (the Z order, or a degenerate quad) is kept as is.
+/// Call it in the frame where text is upright (the display frame), not on raw page space of a
+/// rotated page.
+pub(crate) fn canonical_quad(q: &Quad) -> Quad {
+    let turn = |a: PdfPoint, b: PdfPoint, c: PdfPoint| (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+    let t = [
+        turn(q[0], q[1], q[2]),
+        turn(q[1], q[2], q[3]),
+        turn(q[2], q[3], q[0]),
+        turn(q[3], q[0], q[1]),
+    ];
+    let convex = t.iter().all(|v| *v > 0.0) || t.iter().all(|v| *v < 0.0);
+    if !convex {
+        return *q;
+    }
+    // The polygon's edges are (q[i], q[i+1]); the bottom one has the lowest midpoint y.
+    let Some(i) = (0..4).min_by(|&a, &b| {
+        let mid = |i: usize| q[i].y + q[(i + 1) % 4].y;
+        mid(a).total_cmp(&mid(b))
+    }) else {
+        return *q;
+    };
+    let (a, b, c, d) = (q[i], q[(i + 1) % 4], q[(i + 2) % 4], q[(i + 3) % 4]);
+    // Cycle a-b-c-d: d is next to a, c next to b.
+    if a.x <= b.x {
+        [d, c, a, b]
+    } else {
+        [c, d, b, a]
+    }
+}
+
 /// Reconstruct geometry, preferring the exact `/RL*` shape keys (lossless for redline
 /// annotations) and falling back to standard keys for foreign annotations.
 fn geometry_from_dict(d: &Dictionary) -> MarkupGeometry {
@@ -1030,7 +1085,9 @@ impl Markup {
 
         let mut geometry = geometry_from_dict(d);
         // A foreign /Text (sticky note) carries only a /Rect (the icon box), which the
-        // foreign fallback reads as `Rect`; a Note's geometry is the icon CENTRE.
+        // foreign fallback reads as `Rect`; a Note's geometry is the icon CENTRE. The box
+        // itself is kept (`source_rect`) so an unmoved note is written back with it.
+        let mut source_rect = None;
         if markup_type == MarkupType::Note {
             if let MarkupGeometry::Rect { min, max } = geometry {
                 let (cx, cy) = ((min.x + max.x) / 2.0, (min.y + max.y) / 2.0);
@@ -1040,6 +1097,9 @@ impl Markup {
                     PdfPoint { x: 0.0, y: 0.0 } // overflowed /Rect: park at the origin
                 });
             }
+            // Also for a note redline already saved with that box (its /Rect is what it
+            // wrote, so the next load sees the same box and the next save keeps it).
+            source_rect = non_standard_note_rect(d);
         }
         let note = (markup_type == MarkupType::Note).then(|| NoteProps {
             icon: get_name(d, b"Name").unwrap_or_else(|| "Note".to_string()),
@@ -1113,6 +1173,7 @@ impl Markup {
             note,
             foreign_keys: super::foreign::capture(d),
             source_nm,
+            source_rect,
         }
     }
 }

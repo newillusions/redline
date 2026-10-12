@@ -6,7 +6,7 @@ use tauri::{Manager, State};
 
 use crate::document::known_passwords;
 use crate::document::page_ops;
-use crate::document::save::{load_markups_from, save_decrypted_copy, save_with_markups};
+use crate::document::save::{load_markups_from, save_decrypted_copy, save_with_markups_removing};
 use crate::document::{new_doc_id, DocumentInfo, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD};
 use crate::markup::Markup;
 use crate::render::OpenOutcome;
@@ -353,6 +353,7 @@ async fn save_inner(
         state.markups.seed_loaded(doc_id, loaded)?;
     }
     let markups = state.markups.list(doc_id)?;
+    let removed = state.markups.removed_names(doc_id);
 
     // 1. Stage the complete rewritten file next to the destination. Encrypted source
     //    documents are refused inside save_with_markups (see its doc comment) - lopdf
@@ -362,7 +363,9 @@ async fn save_inner(
     {
         let src = src.clone();
         let staged = staged.clone();
-        tokio::task::spawn_blocking(move || save_with_markups(&src, &staged, &markups))
+        tokio::task::spawn_blocking(move || {
+            save_with_markups_removing(&src, &staged, &markups, &removed)
+        })
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| format!("{e:#}"))?;
@@ -438,6 +441,7 @@ async fn save_inner(
 fn apply_edit_and_save(
     src: &std::path::Path,
     markups: &[Markup],
+    removed: &std::collections::HashSet<String>,
     op: impl FnOnce(&mut lopdf::Document) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let mut doc =
@@ -453,7 +457,7 @@ fn apply_edit_and_save(
     }
     // Bring annotations up to the CURRENT markup state first, then apply the edit -
     // see the doc comment above for why this order matters.
-    crate::document::annots::write_markups(&mut doc, markups)?;
+    crate::document::annots::write_markups_removing(&mut doc, markups, removed)?;
     op(&mut doc)?;
     // Atomic write: temp + rename.
     let dir = src.parent().context("no parent dir")?;
@@ -504,10 +508,11 @@ pub(crate) async fn apply_page_edit(
         state.markups.seed_loaded(doc_id, loaded)?;
     }
     let markups = state.markups.list(doc_id)?;
+    let removed = state.markups.removed_names(doc_id);
 
     // Apply the op + save in a blocking task.
     let src2 = src.clone();
-    tokio::task::spawn_blocking(move || apply_edit_and_save(&src2, &markups, op))
+    tokio::task::spawn_blocking(move || apply_edit_and_save(&src2, &markups, &removed, op))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("{e:#}"))?;
@@ -609,6 +614,7 @@ fn extract_pages_to_new_file(
     src: &std::path::Path,
     dest: &std::path::Path,
     markups: &[Markup],
+    removed: &std::collections::HashSet<String>,
     page_indices: &[u32],
 ) -> anyhow::Result<()> {
     let mut doc =
@@ -622,7 +628,7 @@ fn extract_pages_to_new_file(
     // Bring annotations up to the CURRENT markup state first (matches every other page
     // op - see apply_edit_and_save's doc comment), so extracted pages carry whatever's
     // actually on screen, not a stale on-disk snapshot.
-    crate::document::annots::write_markups(&mut doc, markups)?;
+    crate::document::annots::write_markups_removing(&mut doc, markups, removed)?;
     crate::document::page_ops::extract_pages(&mut doc, page_indices)?;
 
     let dir = dest.parent().context("no parent dir for destination path")?;
@@ -679,9 +685,10 @@ pub async fn extract_pages(
         state.markups.seed_loaded(&doc_id, loaded)?;
     }
     let markups = state.markups.list(&doc_id)?;
+    let removed = state.markups.removed_names(&doc_id);
 
     tokio::task::spawn_blocking(move || {
-        extract_pages_to_new_file(&src, &dest, &markups, &page_indices)
+        extract_pages_to_new_file(&src, &dest, &markups, &removed, &page_indices)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -723,7 +730,7 @@ mod tests {
         doc.save(&path).unwrap();
 
         let m = redline_markup(0);
-        apply_edit_and_save(&path, std::slice::from_ref(&m), |doc| {
+        apply_edit_and_save(&path, std::slice::from_ref(&m), &Default::default(), |doc| {
             flatten_annotations(doc)?;
             Ok(())
         })
@@ -769,7 +776,7 @@ mod tests {
             panic!("expected polyline geometry from redline_markup fixture");
         }
 
-        apply_edit_and_save(&path, std::slice::from_ref(&m), |doc| {
+        apply_edit_and_save(&path, std::slice::from_ref(&m), &Default::default(), |doc| {
             flatten_annotations(doc)?;
             Ok(())
         })
@@ -806,7 +813,7 @@ mod tests {
         // (Stream::compress() only compresses when it saves >= 19 bytes - see
         // docops::tests::compressible_stream_content for the same constraint).
         let m = long_ink_markup(0);
-        apply_edit_and_save(&path, std::slice::from_ref(&m), |doc| optimize_in_place(doc, 2))
+        apply_edit_and_save(&path, std::slice::from_ref(&m), &Default::default(), |doc| optimize_in_place(doc, 2))
             .unwrap();
 
         let reopened = lopdf::Document::load(&path).unwrap();
@@ -890,7 +897,7 @@ mod tests {
         let markups = vec![rect, highlight, ink, text, count];
         let expected = markups.len();
 
-        apply_edit_and_save(&path, &markups, |doc| {
+        apply_edit_and_save(&path, &markups, &Default::default(), |doc| {
             let n = flatten_annotations(doc)?;
             assert_eq!(
                 n, expected,
@@ -929,7 +936,7 @@ mod tests {
         doc.save(&path).unwrap();
 
         let m = redline_markup(0);
-        apply_edit_and_save(&path, std::slice::from_ref(&m), |doc| {
+        apply_edit_and_save(&path, std::slice::from_ref(&m), &Default::default(), |doc| {
             page_ops::rotate_page(doc, 0, 90)
         })
         .unwrap();
@@ -950,7 +957,7 @@ mod tests {
         let mut doc = encrypted_one_page_doc("redline-pw", "owner-pw");
         doc.save(&path).unwrap();
 
-        let err = apply_edit_and_save(&path, &[], |doc| optimize_in_place(doc, 1));
+        let err = apply_edit_and_save(&path, &[], &Default::default(), |doc| optimize_in_place(doc, 1));
         assert!(err.is_err(), "encrypted PDFs must be refused, not silently de-protected");
     }
 
@@ -968,7 +975,7 @@ mod tests {
         doc.save(&src).unwrap();
         let src_bytes_before = std::fs::read(&src).unwrap();
 
-        extract_pages_to_new_file(&src, &dest, &[], &[1, 3]).unwrap();
+        extract_pages_to_new_file(&src, &dest, &[], &Default::default(), &[1, 3]).unwrap();
 
         assert!(dest.exists(), "destination file must be created");
         let src_bytes_after = std::fs::read(&src).unwrap();
@@ -991,7 +998,7 @@ mod tests {
         doc.save(&src).unwrap();
 
         let m = redline_markup(1); // markup lives on page index 1
-        extract_pages_to_new_file(&src, &dest, std::slice::from_ref(&m), &[1]).unwrap();
+        extract_pages_to_new_file(&src, &dest, std::slice::from_ref(&m), &Default::default(), &[1]).unwrap();
 
         let extracted = lopdf::Document::load(&dest).unwrap();
         let markups = crate::document::annots::read_markups(&extracted).unwrap();
@@ -1008,7 +1015,7 @@ mod tests {
         doc.save(&src).unwrap();
 
         let m = redline_markup(2); // markup lives on page index 2 - NOT extracted below
-        extract_pages_to_new_file(&src, &dest, std::slice::from_ref(&m), &[0, 1]).unwrap();
+        extract_pages_to_new_file(&src, &dest, std::slice::from_ref(&m), &Default::default(), &[0, 1]).unwrap();
 
         let extracted = lopdf::Document::load(&dest).unwrap();
         assert_eq!(extracted.get_pages().len(), 2);
@@ -1025,7 +1032,7 @@ mod tests {
         let mut doc = encrypted_one_page_doc("redline-pw", "owner-pw");
         doc.save(&src).unwrap();
 
-        let err = extract_pages_to_new_file(&src, &dest, &[], &[0]);
+        let err = extract_pages_to_new_file(&src, &dest, &[], &Default::default(), &[0]);
         assert!(err.is_err(), "encrypted PDFs must be refused, not silently de-protected");
         assert!(!dest.exists(), "no partial destination file on refusal");
     }
@@ -1039,7 +1046,7 @@ mod tests {
         let (mut doc, _) = n_page_doc(2);
         doc.save(&src).unwrap();
 
-        let err = extract_pages_to_new_file(&src, &dest, &[], &[5]);
+        let err = extract_pages_to_new_file(&src, &dest, &[], &Default::default(), &[5]);
         assert!(err.is_err(), "an out-of-range page index must be refused");
         assert!(!dest.exists());
     }

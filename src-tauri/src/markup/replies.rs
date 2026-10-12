@@ -17,7 +17,11 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use super::annotation::to_pdf_date;
-use super::{derive_uuid, Markup, MarkupStatus, Reply, StatusChange, UserRef, REVIEW_MODEL};
+use super::foreign::{self, ForeignKey, Scope};
+use super::{
+    derive_uuid, Markup, MarkupStatus, PopupProps, Reply, SourceExtras, StatusChange, UserRef,
+    REVIEW_MODEL,
+};
 
 /// `/F` for a reply: Print + NoZoom + NoRotate (28), the flags Acrobat writes for reply
 /// notes (inferred from memory of Acrobat output; not re-verified against a fresh file).
@@ -157,6 +161,141 @@ enum Entry {
     State(StatusChange),
 }
 
+impl Entry {
+    fn id(&self) -> Uuid {
+        match self {
+            Entry::Reply(r) => r.id,
+            Entry::State(s) => s.id,
+        }
+    }
+
+    /// (kind, author, time, text): what tells two entries sharing one `/NM` apart.
+    fn fingerprint(&self) -> (u8, &str, DateTime<Utc>, &str) {
+        match self {
+            Entry::Reply(r) => (0, &r.author.display_name, r.at, &r.contents),
+            Entry::State(s) => (1, &s.author.display_name, s.at, &s.state),
+        }
+    }
+
+    fn reassign(&mut self, id: Uuid, original_nm: String) {
+        let (slot_id, slot_nm) = match self {
+            Entry::Reply(r) => (&mut r.id, &mut r.nm),
+            Entry::State(s) => (&mut s.id, &mut s.nm),
+        };
+        *slot_id = id;
+        *slot_nm = Some(original_nm);
+    }
+}
+
+/// Give every entry a distinct id. Source files do repeat `/NM` values (a tool that copies
+/// an annotation, a merge), and ids derive from the `/NM`: two entries would share an id,
+/// so a write would address both replies' children and states through one `oid_of` slot and
+/// lose track of which is which. Entries that share an id get a new id derived from the
+/// `/NM` plus (kind, author, time) and a rank among entries identical in those, so the result
+/// does not depend on file order: the same entries get the same ids on every load, whatever
+/// order a save wrote them in. Each keeps its original `/NM` (written back unchanged: this
+/// is another party's data), so a reload sees the same duplicates and derives the same ids.
+fn dedupe_ids(parsed: &mut [(Option<ObjectId>, ObjectId, Entry)]) {
+    let mut by_id: HashMap<Uuid, Vec<usize>> = HashMap::new();
+    for (i, (_, _, e)) in parsed.iter().enumerate() {
+        by_id.entry(e.id()).or_default().push(i);
+    }
+    let mut taken: HashSet<Uuid> = by_id.keys().copied().collect();
+    let mut groups: Vec<(Uuid, Vec<usize>)> =
+        by_id.into_iter().filter(|(_, v)| v.len() > 1).collect();
+    groups.sort_by_key(|(id, _)| *id);
+    for (base, mut idxs) in groups {
+        idxs.sort_by(|&a, &b| parsed[a].2.fingerprint().cmp(&parsed[b].2.fingerprint()));
+        let mut rank: HashMap<(u8, String, DateTime<Utc>), u32> = HashMap::new();
+        for i in idxs {
+            let (kind, author, at, _) = parsed[i].2.fingerprint();
+            let slot = rank.entry((kind, author.to_string(), at)).or_insert(0);
+            let mut n = *slot;
+            *slot += 1;
+            let original_nm = match &parsed[i].2 {
+                Entry::Reply(r) => r.nm.clone(),
+                Entry::State(s) => s.nm.clone(),
+            }
+            .unwrap_or_else(|| base.to_string());
+            let id = loop {
+                let candidate = derive_uuid(&format!(
+                    "nm:{original_nm}:dup:{kind}:{author}:{}:{n}",
+                    at.timestamp_micros()
+                ));
+                if taken.insert(candidate) {
+                    break candidate;
+                }
+                n += 1;
+            };
+            parsed[i].2.reassign(id, original_nm);
+        }
+    }
+}
+
+/// The pop-up of a reply as the reader resolved it (a direct `/Popup` dictionary holding
+/// only `Rect`, `Open`, `F`; see [`with_resolved_popup`]).
+fn popup_of(d: &Dictionary) -> Option<PopupProps> {
+    let p = d.get(b"Popup").ok()?.as_dict().ok()?;
+    let a = p.get(b"Rect").ok()?.as_array().ok()?;
+    let v: Vec<f32> = a.iter().filter_map(|o| o.as_float().ok()).collect();
+    let rect = <[f32; 4]>::try_from(v).ok().filter(|r| r.iter().all(|c| c.is_finite()))?;
+    Some(PopupProps {
+        rect,
+        open: matches!(p.get(b"Open").ok(), Some(Object::Boolean(true))),
+        flags: p.get(b"F").ok().and_then(|o| o.as_i64().ok()),
+    })
+}
+
+/// Replace a reply's `/Popup` reference by a small direct dictionary of the pop-up
+/// annotation's `Rect`, `Open` and `F`, so [`parse`] (which sees one annotation at a time) can
+/// carry it. A missing, dangling or non-popup target leaves no `/Popup`. Works on the
+/// reader's in-memory copy only.
+pub(crate) fn with_resolved_popup(doc: &lopdf::Document, mut d: Dictionary) -> Dictionary {
+    let Some(Object::Reference(r)) = d.get(b"Popup").ok().cloned() else {
+        return d;
+    };
+    d.remove(b"Popup");
+    if let Ok(pd) = doc.get_dictionary(r) {
+        if name_of(pd, b"Subtype").as_deref() == Some("Popup") {
+            let mut small = Dictionary::new();
+            for key in [&b"Rect"[..], b"Open", b"F"] {
+                if let Ok(v) = pd.get(key) {
+                    small.set(key.to_vec(), v.clone());
+                }
+            }
+            d.set("Popup", Object::Dictionary(small));
+        }
+    }
+    d
+}
+
+/// What `d` carries beyond the modelled fields (see [`SourceExtras`]); `None` when nothing.
+fn capture_extras(d: &Dictionary, contents: &str) -> Option<SourceExtras> {
+    let keys = foreign::capture_in(Scope::Reply, d);
+    let popup = popup_of(d);
+    if keys.is_empty() && popup.is_none() {
+        return None;
+    }
+    Some(SourceExtras {
+        keys,
+        popup,
+        contents_at_read: contents.to_string(),
+    })
+}
+
+/// Write the carried keys back onto a rewritten reply / state. `written` is the `/Contents`
+/// being written: a stale `/RC` (the text was edited since it was read) is dropped.
+fn apply_extras(d: &mut Dictionary, x: &SourceExtras, written: &str) {
+    let keep_rc = x.contents_at_read == written;
+    let keys: Vec<ForeignKey> = x
+        .keys
+        .iter()
+        .filter(|k| keep_rc || k.name != "RC")
+        .cloned()
+        .collect();
+    foreign::apply_in(Scope::Reply, d, &keys);
+}
+
 fn parse(oid: Option<ObjectId>, d: &Dictionary) -> Option<(ObjectId, Entry)> {
     let parent = irt(d)?;
     let nm = text_of(d, b"NM");
@@ -180,6 +319,8 @@ fn parse(oid: Option<ObjectId>, d: &Dictionary) -> Option<(ObjectId, Entry)> {
         .unwrap_or(UNDATED);
     // Keep the original /NM when the id is not simply it, so a save writes it back.
     let nm = nm.filter(|s| *s != id.to_string());
+    let contents = text_of(d, b"Contents").unwrap_or_default();
+    let extras = capture_extras(d, &contents);
     let entry = if let Some(model) = text_or_name(d, b"StateModel") {
         Entry::State(StatusChange {
             id,
@@ -189,15 +330,17 @@ fn parse(oid: Option<ObjectId>, d: &Dictionary) -> Option<(ObjectId, Entry)> {
             state: text_or_name(d, b"State").unwrap_or_else(|| "None".to_string()),
             on_reply: None, // set by `attach` once the /IRT target is known
             nm,
+            extras,
         })
     } else {
         Entry::Reply(Reply {
             id,
             author,
             at,
-            contents: text_of(d, b"Contents").unwrap_or_default(),
+            contents,
             in_reply_to: None,
             nm,
+            extras,
         })
     };
     Some((parent, entry))
@@ -228,19 +371,17 @@ pub(crate) fn attach(
         .enumerate()
         .filter_map(|(i, o)| o.map(|o| (o, i)))
         .collect();
-    let parsed: Vec<(Option<ObjectId>, ObjectId, Entry)> = raw
+    let mut parsed: Vec<(Option<ObjectId>, ObjectId, Entry)> = raw
         .iter()
         .filter_map(|(oid, d)| parse(*oid, d).map(|(p, e)| (*oid, p, e)))
         .collect();
+    dedupe_ids(&mut parsed);
     let by_entry_oid: HashMap<ObjectId, usize> = parsed
         .iter()
         .enumerate()
         .filter_map(|(i, (oid, _, _))| oid.map(|o| (o, i)))
         .collect();
-    let entry_id = |e: &Entry| match e {
-        Entry::Reply(r) => r.id,
-        Entry::State(s) => s.id,
-    };
+    let entry_id = Entry::id;
 
     // Root markup index for each entry (None = unresolvable). Iterative, memoised.
     #[derive(Clone, Copy)]
@@ -374,6 +515,7 @@ pub(crate) fn history_to_write(m: &Markup) -> Vec<StatusChange> {
             state: state.to_string(),
             on_reply: None,
             nm: None,
+            extras: None,
         });
     }
     h
@@ -462,6 +604,9 @@ pub(crate) fn note_rect(parent_rect: Option<[f32; 4]>) -> [f32; 4] {
 pub(crate) fn reply_dict(r: &Reply, anchor: &NoteAnchor) -> Dictionary {
     let mut d = base_dict(r.id, r.nm.as_deref(), &r.author, &r.at, anchor, REPLY_FLAGS);
     d.set("Contents", encode_text(&r.contents));
+    if let Some(x) = &r.extras {
+        apply_extras(&mut d, x, &r.contents);
+    }
     d
 }
 
@@ -469,11 +614,42 @@ pub(crate) fn state_dict(c: &StatusChange, anchor: &NoteAnchor) -> Dictionary {
     let mut d = base_dict(c.id, c.nm.as_deref(), &c.author, &c.at, anchor, STATE_FLAGS);
     d.set("StateModel", encode_text(&c.model));
     d.set("State", encode_text(&c.state));
-    d.set(
-        "Contents",
-        encode_text(&format!("{} set by {}", c.state, c.author.display_name)),
-    );
+    let contents = format!("{} set by {}", c.state, c.author.display_name);
+    d.set("Contents", encode_text(&contents));
+    if let Some(x) = &c.extras {
+        apply_extras(&mut d, x, &contents);
+    }
     d
+}
+
+/// Add the pop-up annotation of a rewritten reply / state (`note`) and point the note's
+/// `/Popup` at it. Returns the new annotation's id for the page's `/Annots`, or `None` when
+/// the carried rectangle is not finite (hostile input) and no pop-up is written.
+pub(crate) fn add_popup(
+    doc: &mut lopdf::Document,
+    note: ObjectId,
+    page: ObjectId,
+    p: &PopupProps,
+) -> Option<ObjectId> {
+    if !p.rect.iter().all(|c| c.is_finite()) {
+        return None;
+    }
+    let mut d = dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Popup",
+        "Rect" => p.rect.iter().map(|v| Object::Real(*v)).collect::<Vec<_>>(),
+        "Open" => p.open,
+        "Parent" => Object::Reference(note),
+        "P" => Object::Reference(page),
+    };
+    if let Some(f) = p.flags {
+        d.set("F", f);
+    }
+    let popup = doc.add_object(Object::Dictionary(d));
+    doc.get_dictionary_mut(note)
+        .ok()?
+        .set("Popup", Object::Reference(popup));
+    Some(popup)
 }
 
 /// An empty Form XObject used as the `/AP` of reply and state notes, so no viewer that
@@ -517,6 +693,7 @@ pub(crate) mod tests {
             contents: text.to_string(),
             in_reply_to: parent,
             nm: None,
+            extras: None,
         }
     }
 
@@ -529,6 +706,7 @@ pub(crate) mod tests {
             state: state.to_string(),
             on_reply: None,
             nm: None,
+            extras: None,
         }
     }
 

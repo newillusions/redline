@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::geometry::{PdfPoint, Quad};
 
-mod annotation;
+pub(crate) mod annotation;
 pub mod foreign;
 pub(crate) mod replies;
 pub(crate) mod appearance;
@@ -281,6 +281,41 @@ pub struct Reply {
     /// name): written back unchanged because Revu matches annotations by `/NM`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nm: Option<String>,
+    /// Keys of the source annotation redline does not model, carried so a save does not
+    /// strip them (see [`SourceExtras`]). `None` for a reply redline authored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extras: Option<SourceExtras>,
+}
+
+/// What a reply / state annotation authored by another viewer carried beyond the fields
+/// redline models: `/Subj`, `/C`, `/RC` and Bluebeam-private keys (as [`foreign::ForeignKey`]s,
+/// the allowlist of [`foreign::Scope::Reply`]) plus its pop-up window. Set only by the PDF
+/// reader and never accepted from input (see [`Markup::clear_reader_owned`]); written back
+/// unchanged on save.
+///
+/// `/RC` (rich text) is a second rendering of `/Contents`. It is written back only while the
+/// text still equals `contents_at_read`; once a reply's text has been edited the stale `/RC`
+/// is DROPPED (viewers then show the new `/Contents`), never regenerated or left to disagree.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceExtras {
+    #[serde(default)]
+    pub keys: Vec<foreign::ForeignKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub popup: Option<PopupProps>,
+    /// The annotation's `/Contents` when read (what `/RC` in `keys` belongs to).
+    #[serde(default)]
+    pub contents_at_read: String,
+}
+
+/// The pop-up window of a reply (`/Popup` -> an annotation of subtype `/Popup`): rebuilt on
+/// write as a fresh annotation parented to the rewritten reply.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PopupProps {
+    pub rect: [f32; 4],
+    #[serde(default)]
+    pub open: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flags: Option<i64>,
 }
 
 /// One entry of a markup's status history: a standard PDF state annotation (a hidden
@@ -304,6 +339,9 @@ pub struct StatusChange {
     /// Original `/NM` when it is not just this `id` (see [`Reply::nm`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nm: Option<String>,
+    /// See [`Reply::extras`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extras: Option<SourceExtras>,
 }
 
 /// The `/StateModel` name of the standard review model.
@@ -524,6 +562,11 @@ pub struct Markup {
     /// back unchanged so Revu keeps matching the markup and a load+save cycle is idempotent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_nm: Option<String>,
+    /// A foreign sticky note's original `/Rect` (`[x0, y0, x1, y1]`, true page space), kept
+    /// while the note has not been moved so a save writes it back instead of a normalised
+    /// icon box (see `appearance::interop_rect`). Set only by the PDF reader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rect: Option<[f64; 4]>,
 }
 
 /// Default `/F` annotation flags for a markup redline creates itself: `4` (Print, bit 3
@@ -575,6 +618,7 @@ impl Markup {
             note: None,
             foreign_keys: Vec::new(),
             source_nm: None,
+            source_rect: None,
         }
     }
 
@@ -584,24 +628,38 @@ impl Markup {
         self.id = id;
     }
 
-    /// True if this markup carries any reader-owned name (`source_nm`, reply or state `nm`).
+    /// True if this markup carries any reader-owned field (`source_nm`, `source_rect`, reply
+    /// or state `nm` / `extras`).
     pub fn has_reader_owned(&self) -> bool {
         self.source_nm.is_some()
-            || self.workflow.thread.iter().any(|r| r.nm.is_some())
-            || self.workflow.status_history.iter().any(|c| c.nm.is_some())
+            || self.source_rect.is_some()
+            || self
+                .workflow
+                .thread
+                .iter()
+                .any(|r| r.nm.is_some() || r.extras.is_some())
+            || self
+                .workflow
+                .status_history
+                .iter()
+                .any(|c| c.nm.is_some() || c.extras.is_some())
     }
 
-    /// Drop every reader-owned field (`source_nm`, reply and state `nm`). Called on a markup
-    /// that arrives from outside (GUI IPC, MCP) and has no counterpart in the store: those
-    /// fields are only ever set by the PDF reader, and a crafted value equal to a foreign
-    /// annotation's `/NM` would make a save delete that annotation.
+    /// Drop every reader-owned field (`source_nm`, `source_rect`, reply and state `nm` /
+    /// `extras`). Called on a markup that arrives from outside (GUI IPC, MCP) and has no
+    /// counterpart in the store: those fields are only ever set by the PDF reader, and a
+    /// crafted value equal to a foreign annotation's `/NM` would make a save delete that
+    /// annotation.
     pub fn clear_reader_owned(&mut self) {
         self.source_nm = None;
+        self.source_rect = None;
         for r in &mut self.workflow.thread {
             r.nm = None;
+            r.extras = None;
         }
         for c in &mut self.workflow.status_history {
             c.nm = None;
+            c.extras = None;
         }
     }
 
@@ -611,23 +669,26 @@ impl Markup {
     pub fn adopt_reader_owned_from(&mut self, existing: &Markup) {
         self.clear_reader_owned();
         self.source_nm = existing.source_nm.clone();
-        let reply_nm: std::collections::HashMap<Uuid, &String> = existing
-            .workflow
-            .thread
-            .iter()
-            .filter_map(|r| r.nm.as_ref().map(|n| (r.id, n)))
-            .collect();
+        self.source_rect = existing.source_rect;
+        let replies: std::collections::HashMap<Uuid, &Reply> =
+            existing.workflow.thread.iter().map(|r| (r.id, r)).collect();
         for r in &mut self.workflow.thread {
-            r.nm = reply_nm.get(&r.id).map(|n| (*n).clone());
+            if let Some(old) = replies.get(&r.id) {
+                r.nm = old.nm.clone();
+                r.extras = old.extras.clone();
+            }
         }
-        let state_nm: std::collections::HashMap<Uuid, &String> = existing
+        let states: std::collections::HashMap<Uuid, &StatusChange> = existing
             .workflow
             .status_history
             .iter()
-            .filter_map(|c| c.nm.as_ref().map(|n| (c.id, n)))
+            .map(|c| (c.id, c))
             .collect();
         for c in &mut self.workflow.status_history {
-            c.nm = state_nm.get(&c.id).map(|n| (*n).clone());
+            if let Some(old) = states.get(&c.id) {
+                c.nm = old.nm.clone();
+                c.extras = old.extras.clone();
+            }
         }
     }
 
@@ -740,6 +801,9 @@ pub fn check_not_locked(existing: &Markup) -> Result<(), MarkupLockError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod interop_integrity_tests;
 
 #[cfg(test)]
 mod tests {

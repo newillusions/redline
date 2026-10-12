@@ -262,13 +262,43 @@ pub(crate) fn interop_rect(m: &Markup) -> Option<[f64; 4]> {
             let pad = COUNT_MARKER_RADIUS + 4.0;
             Some([p.x - pad, p.y - pad, p.x + pad, p.y + pad])
         }
-        // Sticky Note: the icon box (/Rect of the /Text annotation) centred on the point.
+        // Sticky Note: the icon box (/Rect of the /Text annotation) centred on the point. A
+        // foreign note that has not been moved keeps the box it was read with.
         (MarkupType::Note, MarkupGeometry::Point(p)) if p.x.is_finite() && p.y.is_finite() => {
+            if let Some(r) = unmoved_source_rect(m, *p) {
+                return Some(r);
+            }
             let h = NOTE_ICON_PT / 2.0;
             Some([p.x - h, p.y - h, p.x + h, p.y + h])
         }
         _ => None,
     }
+}
+
+/// Largest side of a foreign note's `/Rect` that is carried through a save. A real icon box
+/// is tens of points; the value only bounds hostile JSON (`Markup::source_rect` can arrive
+/// from a caller that the store did not clear).
+const MAX_SOURCE_NOTE_RECT: f64 = 1_000.0;
+
+/// How far (points) a note's point may sit from its source box's centre and still count as
+/// unmoved: absorbs the page-rotation round trip, far below anything a user can drag.
+const NOTE_UNMOVED_TOLERANCE: f64 = 1e-3;
+
+/// A foreign sticky note's original `/Rect` (normalised to min/max), if the note is still at
+/// the centre of it and the rectangle is sane; `None` once moved, or for a redline-made note.
+fn unmoved_source_rect(m: &Markup, p: PdfPoint) -> Option<[f64; 4]> {
+    let [x0, y0, x1, y1] = m.source_rect?;
+    if ![x0, y0, x1, y1].iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let r = [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)];
+    let (w, h) = (r[2] - r[0], r[3] - r[1]);
+    if !(w > 0.0 && h > 0.0 && w <= MAX_SOURCE_NOTE_RECT && h <= MAX_SOURCE_NOTE_RECT) {
+        return None;
+    }
+    let (cx, cy) = ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0);
+    ((p.x - cx).abs() <= NOTE_UNMOVED_TOLERANCE && (p.y - cy).abs() <= NOTE_UNMOVED_TOLERANCE)
+        .then_some(r)
 }
 
 /// The Form's own bounding box - and, as of the annotation-interop fix below, the ONLY
@@ -1200,6 +1230,21 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>, Option<Stamp
             let h = NOTE_ICON_PT / 2.0;
             let (x0, y0) = (p.x - h, p.y - h);
             out.push_str("q\n");
+            // A foreign note whose original box is smaller than the icon: shrink the icon
+            // about its centre so it stays inside the /AP /BBox (= that box) instead of
+            // being clipped.
+            if let Some(r) = unmoved_source_rect(m, *p) {
+                let k = ((r[2] - r[0]).min(r[3] - r[1]) / NOTE_ICON_PT).min(1.0);
+                if k < 1.0 {
+                    out.push_str(&format!(
+                        "{} 0 0 {} {} {} cm\n",
+                        num(k),
+                        num(k),
+                        num(p.x * (1.0 - k)),
+                        num(p.y * (1.0 - k))
+                    ));
+                }
+            }
             fill_color(&mut out, &a.color);
             out.push_str(&format!(
                 "0 0 0 RG\n0.75 w\n{} {} {} {} re\nB\n",
@@ -1416,6 +1461,7 @@ mod tests {
             note: None,
             foreign_keys: Vec::new(),
             source_nm: None,
+            source_rect: None,
         }
     }
 

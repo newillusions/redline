@@ -40,6 +40,13 @@ pub struct DocEntry {
     /// `add` never trusts names from its input. Holds only markups this store held, i.e.
     /// reader output for this document. Cleared when the document is closed or reloaded.
     pub tombstones: std::collections::HashMap<Uuid, Markup>,
+    /// Names (`/NM` values: the markup id and any original foreign `source_nm`) of markups
+    /// deleted since the document was loaded. A save passes them to
+    /// `annots::write_markups_removing`: a markup a foreign viewer (Revu, Acrobat) authored
+    /// has no `/RLType`, so absent from the model it would otherwise be kept as foreign and
+    /// the delete would never reach the file. Only names of markups this store held, never
+    /// input. An undo (`add` of the same id) takes them back out. Cleared with `tombstones`.
+    pub removed_names: std::collections::HashSet<String>,
 }
 
 /// One open document as reported by [`MarkupStore::list_open`] - the data
@@ -106,6 +113,7 @@ impl MarkupStore {
                 saving: false,
                 dirty: false,
                 tombstones: Default::default(),
+                removed_names: Default::default(),
             },
         );
     }
@@ -221,6 +229,12 @@ impl MarkupStore {
             Some(deleted) => m.adopt_reader_owned_from(&deleted),
             None => m.clear_reader_owned(),
         }
+        // Back in the model: no longer a deletion. (The tombstone's names are the ones that
+        // were recorded for it; `m` has just adopted exactly those.)
+        e.removed_names.remove(&m.id().to_string());
+        if let Some(nm) = &m.source_nm {
+            e.removed_names.remove(nm);
+        }
         e.markups.push(m);
         e.dirty = true;
         Ok(())
@@ -269,6 +283,10 @@ impl MarkupStore {
         if existing.has_reader_owned() {
             e.tombstones.insert(id, existing.clone());
         }
+        e.removed_names.insert(id.to_string());
+        if let Some(nm) = &existing.source_nm {
+            e.removed_names.insert(nm.clone());
+        }
         e.markups.retain(|x| x.id() != id);
         e.dirty = true;
         Ok(())
@@ -291,6 +309,7 @@ impl MarkupStore {
         merged.append(&mut e.markups);
         e.markups = merged;
         e.tombstones.clear();
+        e.removed_names.clear();
         e.loaded = true;
         Ok(e.markups.clone())
     }
@@ -313,6 +332,17 @@ impl MarkupStore {
         if let Some(e) = self.docs.lock().unwrap().get_mut(doc_id) {
             e.saving = false;
         }
+    }
+
+    /// Names of markups deleted since load, for `annots::write_markups_removing` (see
+    /// [`DocEntry::removed_names`]). Empty for an unknown doc.
+    pub fn removed_names(&self, doc_id: &str) -> std::collections::HashSet<String> {
+        self.docs
+            .lock()
+            .unwrap()
+            .get(doc_id)
+            .map(|e| e.removed_names.clone())
+            .unwrap_or_default()
     }
 
     /// Snapshot of the current markups (cloned; store stays locked only briefly).

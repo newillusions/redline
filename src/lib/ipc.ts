@@ -242,6 +242,8 @@ export interface MarkupReply {
   in_reply_to?: string | null;
   /** Original `/NM` of a foreign annotation; opaque, written back unchanged. */
   nm?: string | null;
+  /** Source-annotation keys the backend carries verbatim; opaque, never edit. */
+  extras?: unknown;
 }
 
 /**
@@ -257,6 +259,8 @@ export interface StatusChange {
   /** Set when the state is on a reply rather than the markup; such entries never drive status. */
   on_reply?: string | null;
   nm?: string | null;
+  /** Source-annotation keys the backend carries verbatim; opaque, never edit. */
+  extras?: unknown;
 }
 
 export interface MarkupWorkflow {
@@ -342,6 +346,8 @@ export interface Markup {
   foreign_keys?: unknown[];
   /** Original non-UUID `/NM` (Revu); opaque, written back unchanged. */
   source_nm?: string | null;
+  /** A foreign sticky note's original `/Rect`; opaque, written back while the note is unmoved. */
+  source_rect?: number[] | null;
 }
 
 /** ISO 32000-1 Table 165 bit 8, `Locked` (decimal `128`/`0x80`) - mirrors Rust
