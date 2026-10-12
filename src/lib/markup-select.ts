@@ -4,7 +4,7 @@
  * space (y-up, origin bottom-left, f64). No DOM, no Svelte, no clocks/UUIDs.
  */
 import type { Markup, MarkupGeometry, PdfPoint } from "./ipc";
-import { DEFAULT_TEXT_BOX } from "./markup-tools";
+import { allLeaders, calloutBox } from "./callout";
 
 // ---------------------------------------------------------------------------
 // Bounds + handle types
@@ -86,7 +86,9 @@ export function boundsOf(m: Markup): Bounds {
     };
   }
   if ("Polyline" in g) {
-    const leader = _boundsOfPoints(g.Polyline);
+    const leader = _boundsOfPoints(
+      m.markup_type === "Callout" ? allLeaders(m).flat() : g.Polyline,
+    );
     // A Callout's leader is only 2 points (target + anchor) - the rendered text box at the
     // anchor end is not part of the geometry, so its AABB must be unioned in here or the
     // box is unselectable/excluded from marquee selection outside a thin band near the
@@ -158,28 +160,13 @@ function _unionBounds(a: Bounds, b: Bounds): Bounds {
 }
 
 /**
- * AABB of a Callout's synthesized text box, anchored at the leader's LAST polyline point
- * (the box origin). Mirrors the SVG-preview convention (markup-render.ts markupToSvg
- * "callout" branch): the anchor is the box's PDF-space top-left (max-Y, min-X) corner, and
- * the box extends toward lower Y (down-screen) and higher X (right) by DEFAULT_TEXT_BOX.
+ * AABB of a Callout's text box (`callout.box_min/box_max`; see `callout.ts` `calloutBox`).
+ * A callout with no props gets the legacy box: anchored at the leader's last point as its
+ * top-left (max-Y, min-X) corner, extending right and down by the legacy 144x18pt size.
  * Returns null for non-Callout markups or degenerate/empty leader geometry.
- *
- * Note: appearance.rs's saved-PDF appearance stream anchors the box the OPPOSITE way
- * (bottom-left, extending up) - a pre-existing mismatch between the live SVG preview and
- * the exported PDF's visual, out of scope for this fix (which targets interactive
- * selection/editing, not the appearance-stream geometry). Flagged for a follow-up.
  */
 export function calloutBoxBounds(m: Markup): Bounds | null {
-  if (m.markup_type !== "Callout" || !("Polyline" in m.geometry)) return null;
-  const pts = m.geometry.Polyline;
-  const anchor = pts[pts.length - 1];
-  if (!anchor) return null;
-  return {
-    minX: anchor.x,
-    minY: anchor.y - DEFAULT_TEXT_BOX.height,
-    maxX: anchor.x + DEFAULT_TEXT_BOX.width,
-    maxY: anchor.y,
-  };
+  return calloutBox(m);
 }
 
 // ---------------------------------------------------------------------------
@@ -215,9 +202,12 @@ function _hits(m: Markup, p: PdfPoint, tol: number): boolean {
     );
   }
   if ("Polyline" in g) {
-    const verts = g.Polyline;
-    for (let i = 0; i < verts.length - 1; i++) {
-      if (_segDistance(p, verts[i], verts[i + 1]) <= tol) return true;
+    // Every leader of a Callout (extra leaders are not part of the geometry).
+    const leaders = m.markup_type === "Callout" ? allLeaders(m) : [g.Polyline];
+    for (const verts of leaders) {
+      for (let i = 0; i < verts.length - 1; i++) {
+        if (_segDistance(p, verts[i], verts[i + 1]) <= tol) return true;
+      }
     }
     // A Callout's rendered text box is not part of the leader geometry - hit-test it too
     // so a click anywhere inside the box (not just within `tol` of the thin leader line)

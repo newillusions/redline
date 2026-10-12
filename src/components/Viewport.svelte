@@ -68,15 +68,20 @@
   import { MarkupStore, type ToolKind } from "$lib/markup-store.svelte";
   import {
     hitTest, marqueeHits, boundsOf, isRectResizable,
-    handleAnchors, resizeBounds, translateGeometry, scaleGeometryToBounds,
+    handleAnchors, resizeBounds, scaleGeometryToBounds,
     expandSelectionToGroups, moveVertex, insertVertex, deleteVertex, calloutBoxBounds,
     type Bounds, type HandleId,
   } from "$lib/markup-select";
+  import { type CalloutEdit, applyCalloutEdit, hitCallout, translateMarkup } from "$lib/callout-edit";
+  import {
+    addLeader, allLeaders, calloutBox, fitBoxSize, leaderHandles, newCallout, nearestOnPolygon,
+    rectCloudVertices, refitBox, removeLeader,
+  } from "$lib/callout";
   import {
     dragDrawGeometry, buildMarkup, bumpAudit, isDrawTool,
     isMultiClickTool, isInkTool, polylineGeometry, inkGeometry,
     isMultiClickComplete, type MultiClickTool,
-    isTextTool, textBoxGeometry, calloutGeometry, DEFAULT_TEXT_FONT,
+    isTextTool, textBoxGeometry, DEFAULT_TEXT_FONT,
     isTextMarkupTool, textMarkupAppearance, noteAppearance, DEFAULT_NOTE_PROPS,
     type TextMarkupTool,
     translateToolGeometry, extractPromptedLabels, toolPlacementDelta, shiftGeometry,
@@ -84,7 +89,7 @@
   import { patchGroup } from "$lib/markup-properties";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
   import { measureLength, measureArea, measurePerimeter, measureAngleDegrees, formatAngleLabel } from "$lib/measurement-tools";
-  import { addScale, type MeasurementPayload, type SearchHit } from "$lib/ipc";
+  import { addScale, type CalloutProps, type MeasurementPayload, type SearchHit } from "$lib/ipc";
   import { pdfUserSpaceToScreen } from "$lib/viewport";
   import { getPageSnapTargets, findNearestSnap, type SnapTarget } from "$lib/snap";
   import CalibrationDialog from "./CalibrationDialog.svelte";
@@ -260,6 +265,19 @@
   let drawStartPdf: { x: number; y: number } | null = null;
   let previewMarkup = $state<Markup | null>(null);
 
+  // --- Cloud drag-rectangle / Cloud+ state (docs/callout-cloud.md) ---
+  /** Press point of a Cloud / Cloud+ gesture; becomes a rectangle cloud once dragged past
+   *  CLOUD_DRAG_PX, else the click goes on to add a polygon vertex. */
+  let cloudDragStart: { x: number; y: number } | null = null;
+  /** Cloud+ : the finished cloud polygon waiting for the click that places its callout box. */
+  let cloudPlusVerts = $state<{ x: number; y: number }[] | null>(null);
+  /** A rectangle cloud was just committed on pointer-up: ignore the click that follows. */
+  let suppressClickUntil = 0;
+  /** Screen px a press must travel to count as a drag (not a click). */
+  const CLOUD_DRAG_PX = 5;
+  /** Screen px within which a click on the first vertex closes the polygon. */
+  const CLOUD_CLOSE_PX = 8;
+
   // --- Multi-click state ---
   let mcVerts = $state<{ x: number; y: number }[]>([]);
   let mcCursor = $state<{ x: number; y: number } | null>(null);
@@ -330,6 +348,8 @@
     anchorPdf: { x: number; y: number };
     leaderPdf: { x: number; y: number } | null;
     editingId: string | null;
+    /** Cloud+ only: the finished cloud polygon this callout text attaches to. */
+    cloudVerts?: { x: number; y: number }[];
   } | null>(null);
   let editorText = $state("");
   let calloutTarget: { x: number; y: number } | null = null; // first Callout click (leader start)
@@ -349,7 +369,12 @@
   /** Grab radius (screen px) around a handle centre. */
   const HANDLE_GRAB_PX = 8;
   /** Active transform gesture on the selection. */
-  let gesture: "none" | "move" | "resize" | "vertex" = "none";
+  let gesture: "none" | "move" | "resize" | "vertex" | "callout" = "none";
+  /** Callout handle drag: what is being dragged, the committed markup (undo `before`) and the
+   *  markup the drag starts from (differs from `before` when Shift+knee added a leader). */
+  let calloutEdit: CalloutEdit | null = null;
+  let calloutBefore: Markup | null = null;
+  let calloutBase: Markup | null = null;
   let moveStartPdf: { x: number; y: number } | null = null;
   let moveOrigins: Markup[] = [];               // committed selected markups at gesture start
   let resizeHandle: HandleId | null = null;
@@ -378,9 +403,14 @@
   const CLOSED_MEASUREMENT_TOOLS: ReadonlySet<string> =
     new Set(["MeasurementArea", "MeasurementPerimeter", "MeasurementVolume"]);
 
+  /** Multi-click tools: the polyline-family tools plus Cloud+ (a cloud, then a callout). */
+  const isMcTool = (t: ToolKind): boolean => isMultiClickTool(t) || t === "CloudPlus";
+  /** The markup type a multi-click tool draws (Cloud+ draws a Cloud first). */
+  const mcType = (t: ToolKind): MultiClickTool => (t === "CloudPlus" ? "Cloud" : (t as MultiClickTool));
+
   /** True when any creation tool is active (all tools except hand/select). */
   const isCreateTool = (t = store.activeTool) =>
-    isDrawTool(t) || isMultiClickTool(t) || isInkTool(t) || isTextTool(t) ||
+    isDrawTool(t) || isMcTool(t) || isInkTool(t) || isTextTool(t) ||
     t === "calibrate" || t === "MeasurementLength" || t === "MeasurementRadius" ||
     CLOSED_MEASUREMENT_TOOLS.has(t) || t === "MeasurementCount" || t === "MeasurementAngle" ||
     t === "placeTool" || t === "Note";
@@ -419,7 +449,7 @@
    * a known dimension line's endpoints is exactly the case this exists for.
    */
   const SNAP_ELIGIBLE_TOOLS: ReadonlySet<string> = new Set([
-    "calibrate", "Line", "Arrow", "Polyline", "Polygon", "Cloud",
+    "calibrate", "Line", "Arrow", "Polyline", "Polygon", "Cloud", "CloudPlus",
     "MeasurementLength", "MeasurementRadius", "MeasurementAngle",
     "MeasurementArea", "MeasurementPerimeter", "MeasurementVolume",
   ]);
@@ -504,7 +534,14 @@
 
   // Preview shape for the live draw gesture (not committed until pointerup).
   const previewShape = $derived<SvgShape | null>(
-    previewMarkup ? markupToSvg(previewMarkup, viewState) : null,
+    previewMarkup
+      ? markupToSvg(previewMarkup, viewState)
+      : cloudPlusVerts && identity
+        ? markupToSvg(buildMarkup({
+            markupType: "Cloud", page: pageIndex, geometry: polylineGeometry(cloudPlusVerts),
+            appearance: store.draftAppearance, identity, now: "", id: "preview",
+          }), viewState)
+        : null,
   );
 
   /** On-canvas label for one MeasurementAngle markup - positioned at its vertex (geometry
@@ -603,13 +640,21 @@
     return m.markup_type === "Callout" && "Polyline" in m.geometry ? m : null;
   });
 
-  // Screen-space handle at the Callout leader's target (arrow-head) end, index 0. null when none.
-  const calloutTargetHandle = $derived.by<{ x: number; y: number } | null>(() => {
+  // Screen-space handles of the selected Callout: every leader's tip and knee, plus the text
+  // box's eight resize handles. Tracks the live dragPreview so they follow a drag.
+  const calloutOverlay = $derived.by<{
+    points: { leader: number; index: number; kind: "tip" | "knee"; x: number; y: number }[];
+    box: { id: string; x: number; y: number }[];
+  } | null>(() => {
     const m = selectedCallout;
-    if (!m || !("Polyline" in m.geometry)) return null;
-    const target = m.geometry.Polyline[0];
-    if (!target) return null;
-    return pdfUserSpaceToScreen(target.x, target.y, viewState);
+    if (!m) return null;
+    const box = calloutBox(m);
+    return {
+      points: leaderHandles(m).map((h) => ({ ...h, ...pdfUserSpaceToScreen(h.point.x, h.point.y, viewState) })),
+      box: box
+        ? Object.entries(handleAnchors(box)).map(([id, q]) => ({ id, ...pdfUserSpaceToScreen(q.x, q.y, viewState) }))
+        : [],
+    };
   });
 
   // Search hit highlight rects for the current page in screen space.
@@ -1259,13 +1304,14 @@
       return;
     }
     // Revu single-key mark-up tool shortcuts (support.bluebeam.com/revu/resources/keyboard-
-    // shortcuts.html): U Underline, D Strikethrough, Shift+U Squiggly, N Note. No Cmd/Ctrl/Alt.
+    // shortcuts.html): U Underline, D Strikethrough, Shift+U Squiggly, N Note, Y Cloud, K Cloud+. No Cmd/Ctrl/Alt.
     if (!e.metaKey && !e.ctrlKey && !e.altKey) {
       // Decide by Shift, not by the character's case: with Caps Lock on, a plain U arrives
       // as "U" (and Shift+U as "u"), and a plain U must still pick Underline.
       const k = e.key.toLowerCase();
       const tool: ToolKind | null =
-        k === "u" ? (e.shiftKey ? "Squiggly" : "Underline") : k === "d" ? "StrikeOut" : k === "n" ? "Note" : null;
+        k === "u" ? (e.shiftKey ? "Squiggly" : "Underline") : k === "d" ? "StrikeOut" : k === "n" ? "Note"
+        : k === "y" ? "Cloud" : k === "k" ? "CloudPlus" : null;
       if (tool) {
         e.preventDefault();
         store.activeTool = tool;
@@ -1816,6 +1862,8 @@
 
   /** Reset all draw state — used by pointerup teardown and pointercancel. */
   function cancelDraw() {
+    cloudDragStart = null;
+    cloudPlusVerts = null;
     drawing = false;
     drawStartPdf = null;
     previewMarkup = null;
@@ -1884,13 +1932,14 @@
     editor = null;
     editorText = "";
     calloutTarget = null;
+    cloudPlusVerts = null;
   }
 
   function commitEditor() {
     if (!editor || !identity) { cancelEditor(); return; }
     const text = editorText.trim();
     // Capture all state before canceling (cancelEditor clears editor + editorText).
-    const { anchorPdf, leaderPdf, editingId } = editor;
+    const { anchorPdf, leaderPdf, editingId, cloudVerts } = editor;
 
     if (editingId) {
       // Editing an EXISTING Text/Callout's contents (opened via dblclick under the select
@@ -1901,7 +1950,9 @@
       cancelEditor();
       if (!existing) return;
       const now = new Date().toISOString();
-      store.update(existing, bumpAudit({ ...existing, contents: text || null }, identity, now));
+      const edited = { ...existing, contents: text || null };
+      const fontPt = edited.appearance.font?.size_pt ?? DEFAULT_TEXT_FONT.size_pt;
+      store.update(existing, bumpAudit(refitBox(edited, fontPt), identity, now));
       return;
     }
 
@@ -1909,32 +1960,58 @@
     const appearance = { ...store.draftAppearance, font: store.draftAppearance.font ?? DEFAULT_TEXT_FONT };
     let markupType: "Text" | "Callout";
     let geometry;
+    let callout: CalloutProps | undefined;
     if (leaderPdf) {
       markupType = "Callout";
-      geometry = calloutGeometry(leaderPdf, anchorPdf);
+      const made = newCallout(leaderPdf, anchorPdf, fitBoxSize(text, appearance.font.size_pt));
+      geometry = made.geometry;
+      callout = made.callout;
     } else {
       markupType = "Text";
       geometry = textBoxGeometry(anchorPdf);
     }
     cancelEditor();
-    store.create(buildMarkup({
+    const now = new Date().toISOString();
+    // Cloud+ : the cloud and its callout are created together, grouped (one undo step).
+    const groupId = cloudVerts ? crypto.randomUUID() : null;
+    const placed = buildMarkup({
       markupType,
       page: pageIndex,
       geometry,
       appearance,
       identity,
-      now: new Date().toISOString(),
+      now,
       id: crypto.randomUUID(),
       contents: text,
-    }));
+      groupId,
+    });
+    if (callout) placed.callout = callout;
+    if (cloudVerts) {
+      cloudPlusVerts = null;
+      store.createMany([
+        buildMarkup({
+          markupType: "Cloud", page: pageIndex, geometry: polylineGeometry(cloudVerts),
+          appearance: store.draftAppearance, identity, now, id: crypto.randomUUID(), groupId,
+        }),
+        placed,
+      ]);
+    } else {
+      store.create(placed);
+    }
   }
 
   function finishMultiClick() {
     const tool = store.activeTool;
-    if (!isMultiClickTool(tool) || !identity) return;
-    if (!isMultiClickComplete(tool as MultiClickTool, mcVerts)) { resetMultiClick(); return; }
+    if (!isMcTool(tool) || !identity) return;
+    if (!isMultiClickComplete(mcType(tool), mcVerts)) { resetMultiClick(); return; }
+    if (tool === "CloudPlus") {
+      // Cloud+ : the cloud is done; the next click places its callout text box.
+      cloudPlusVerts = mcVerts.map((v) => ({ x: v.x, y: v.y }));
+      resetMultiClick();
+      return;
+    }
     store.create(buildMarkup({
-      markupType: tool as MultiClickTool,
+      markupType: mcType(tool),
       page: pageIndex,
       geometry: polylineGeometry(mcVerts),
       appearance: store.draftAppearance,
@@ -1999,12 +2076,6 @@
     return null;
   }
 
-  /** True when (sx, sy) is within HANDLE_GRAB_PX of the selected Callout's target handle. */
-  function atCalloutTarget(sx: number, sy: number): boolean {
-    const h = calloutTargetHandle;
-    return !!h && Math.abs(h.x - sx) <= HANDLE_GRAB_PX && Math.abs(h.y - sy) <= HANDLE_GRAB_PX;
-  }
-
   /** The segment index (if any) whose midpoint handle is within HANDLE_GRAB_PX of (sx, sy). */
   function midpointAtScreen(sx: number, sy: number): number | null {
     if (!vertexHandles) return null;
@@ -2025,6 +2096,9 @@
     vertexBefore = null;
     vertexWorking = null;
     vertexIndex = null;
+    calloutEdit = null;
+    calloutBefore = null;
+    calloutBase = null;
     dragPreview = null;
   }
 
@@ -2104,36 +2178,50 @@
         }
       }
 
-      // 1c. Callout target handle: drag the leader's pointing (arrow-head) end (index 0) only.
-      //     Routes through the existing vertex gesture so pointermove/up move + commit point 0.
-      if (selectedCallout && atCalloutTarget(sx, sy)) {
-        gesture = "vertex";
-        vertexBefore = selectedCallout;
-        vertexWorking = selectedCallout;
-        vertexIndex = 0;
-        (e.target as Element).setPointerCapture(e.pointerId);
-        e.stopPropagation();
-        e.preventDefault();
-        return;
-      }
-
-      // 1d. Callout text box: dragging anywhere inside the synthesized box (not just a
-      //     handle dot) moves ONLY the anchor (last Polyline point) - independent of the
-      //     leader target, which stays put. Must come before the general hit-test below,
-      //     or a box click would fall through to "move whole callout" instead. Routes
-      //     through the same vertex gesture as 1c, just on the LAST index.
-      if (selectedCallout && "Polyline" in selectedCallout.geometry) {
-        const box = calloutBoxBounds(selectedCallout);
-        const tol = SELECT_GRAB_PX / zoom;
-        if (box && p.x >= box.minX - tol && p.x <= box.maxX + tol && p.y >= box.minY - tol && p.y <= box.maxY + tol) {
-          gesture = "vertex";
-          vertexBefore = selectedCallout;
-          vertexWorking = selectedCallout;
-          vertexIndex = selectedCallout.geometry.Polyline.length - 1;
-          (e.target as Element).setPointerCapture(e.pointerId);
-          e.stopPropagation();
-          e.preventDefault();
-          return;
+      // 1c. Callout handles (docs/callout-cloud.md): leader tips and knees, the text box's
+      //     resize handles, and the box body. Shift on a knee adds a leader (and drags its
+      //     tip); Shift on a tip removes that leader. Must come before the general hit-test
+      //     below, or a handle/box click would fall through to "move whole callout".
+      if (selectedCallout) {
+        const hit = hitCallout(selectedCallout, p, HANDLE_GRAB_PX / zoom);
+        if (hit) {
+          const before = selectedCallout;
+          let base = before;
+          let edit: CalloutEdit | null = null;
+          if (hit.kind === "point") {
+            if (e.shiftKey && hit.handle === "knee") {
+              const added = addLeader(before, p);
+              if (added) {
+                base = added;
+                edit = { kind: "point", leader: allLeaders(added).length - 1, index: 0 };
+              }
+            } else if (e.shiftKey && hit.handle === "tip") {
+              const removed = removeLeader(before, hit.leader);
+              if (removed !== before) {
+                store.applyBatch([{ before, after: bumpAudit(removed, identity ?? before.audit.modified_by, new Date().toISOString()) }]);
+                e.stopPropagation();
+                e.preventDefault();
+                return;
+              }
+            }
+            edit ??= { kind: "point", leader: hit.leader, index: hit.index };
+          } else if (hit.kind === "resize") {
+            const box = calloutBox(before);
+            if (box) edit = { kind: "resize", handle: hit.handle, box };
+          } else {
+            edit = { kind: "box", start: p };
+          }
+          if (edit) {
+            gesture = "callout";
+            calloutEdit = edit;
+            calloutBefore = before;
+            calloutBase = base;
+            dragPreview = [base];
+            (e.target as Element).setPointerCapture(e.pointerId);
+            e.stopPropagation();
+            e.preventDefault();
+            return;
+          }
         }
       }
 
@@ -2223,7 +2311,18 @@
     // --- CREATE tool branch ---
     if (!isCreateTool(tool) || !identity) return;
     // Multi-click tools handle gestures via click/dblclick, not pointer capture.
-    if (isMultiClickTool(tool) || CLOSED_MEASUREMENT_TOOLS.has(tool)) return;
+    if (isMcTool(tool) || CLOSED_MEASUREMENT_TOOLS.has(tool)) {
+      // Cloud / Cloud+ : press-drag makes a rectangle cloud (committed on release); a plain
+      // click is left to onOverlayClick (polygon vertices).
+      if ((tool === "Cloud" || tool === "CloudPlus") && mcVerts.length === 0 && !cloudPlusVerts) {
+        const start = localPdf(e);
+        if (start) {
+          cloudDragStart = start;
+          (e.target as Element).setPointerCapture(e.pointerId);
+        }
+      }
+      return;
+    }
     const p = localPdf(e);
     if (!p) return;
     (e.target as Element).setPointerCapture(e.pointerId);
@@ -2237,8 +2336,26 @@
     e.preventDefault();
   }
 
+  /** The rectangle cloud for a drag from `start` to `p`, or null while it is still a click. */
+  function draggedRectCloud(start: { x: number; y: number }, p: { x: number; y: number }) {
+    if (Math.hypot(p.x - start.x, p.y - start.y) * zoom < CLOUD_DRAG_PX) return null;
+    return rectCloudVertices(start, p);
+  }
+
   function onOverlayPointerMove(e: PointerEvent) {
     const tool = store.activeTool;
+
+    if (cloudDragStart && identity) {
+      const p = localPdf(e);
+      const verts = p ? draggedRectCloud(cloudDragStart, p) : null;
+      previewMarkup = verts
+        ? buildMarkup({
+            markupType: "Cloud", page: pageIndex, geometry: polylineGeometry(verts),
+            appearance: store.draftAppearance, identity, now: new Date().toISOString(), id: "preview",
+          })
+        : null;
+      return;
+    }
 
     // --- TEXT SELECTION (I-beam / text mark-up) tool: extend the range to the current point. ---
     if (isTextSelTool(tool)) {
@@ -2267,6 +2384,11 @@
 
     // --- SELECT tool: live resize / move / vertex preview, or marquee ---
     if (isSelectTool(tool)) {
+      if (gesture === "callout" && calloutEdit && calloutBase) {
+        const p = localPdf(e);
+        if (p) dragPreview = [applyCalloutEdit(calloutBase, calloutEdit, p)];
+        return;
+      }
       if (gesture === "vertex" && vertexWorking && vertexIndex !== null) {
         const p = localPdf(e);
         if (p) {
@@ -2287,7 +2409,7 @@
         if (p) {
           const dx = p.x - moveStartPdf.x;
           const dy = p.y - moveStartPdf.y;
-          dragPreview = moveOrigins.map((m) => ({ ...m, geometry: translateGeometry(m.geometry, dx, dy) }));
+          dragPreview = moveOrigins.map((m) => translateMarkup(m, dx, dy));
         }
         return;
       }
@@ -2342,6 +2464,35 @@
     previewMarkup = null; // clear the live preview unconditionally (no ghost on early-return)
     const tool = store.activeTool;
 
+    if (cloudDragStart) {
+      const start = cloudDragStart;
+      cloudDragStart = null;
+      const p = localPdf(e);
+      const verts = p ? draggedRectCloud(start, p) : null;
+      if (verts && identity) {
+        suppressClickUntil = performance.now() + 300; // the click after this drag is not a vertex
+        if (tool === "CloudPlus") {
+          cloudPlusVerts = verts;
+        } else {
+          store.create(buildMarkup({
+            markupType: "Cloud", page: pageIndex, geometry: polylineGeometry(verts),
+            appearance: store.draftAppearance, identity, now: new Date().toISOString(),
+            id: crypto.randomUUID(),
+          }));
+        }
+      }
+      return;
+    }
+
+    // Callout: a press-drag from the arrow tip to the box position (Revu's click-drag form)
+    // arms the tip here; the click that follows the release places the box.
+    if (tool === "Callout" && drawStartPdf && !calloutTarget) {
+      const end = localPdf(e);
+      if (end && Math.hypot(end.x - drawStartPdf.x, end.y - drawStartPdf.y) * zoom >= CLOUD_DRAG_PX) {
+        calloutTarget = drawStartPdf;
+      }
+    }
+
     // --- TEXT SELECTION (I-beam) tool: end the drag. The selection itself stays
     //     live (rendered + copyable) until Escape, a tool switch, or Enter commits
     //     it as a Highlight - mirrors how a native text selection persists after
@@ -2364,6 +2515,17 @@
     // --- SELECT tool: commit resize / move / vertex / marquee ---
     if (isSelectTool(tool)) {
       const now = new Date().toISOString();
+
+      if (gesture === "callout" && calloutEdit && calloutBefore && calloutBase) {
+        const before = calloutBefore, base = calloutBase, edit = calloutEdit;
+        const p = localPdf(e);
+        resetGesture();
+        const result = p ? applyCalloutEdit(base, edit, p) : base;
+        if (JSON.stringify(result) !== JSON.stringify(before)) {
+          store.applyBatch([{ before, after: bumpAudit(result, identity ?? before.audit.modified_by, now) }]);
+        }
+        return;
+      }
 
       if (gesture === "vertex" && vertexWorking && vertexIndex !== null && vertexBefore) {
         const before = vertexBefore, working = vertexWorking, idx = vertexIndex;
@@ -2404,7 +2566,7 @@
           if (dx !== 0 || dy !== 0) {
             const pairs = origins.map((m) => ({
               before: m,
-              after: bumpAudit({ ...m, geometry: translateGeometry(m.geometry, dx, dy) }, identity ?? m.audit.modified_by, now),
+              after: bumpAudit(translateMarkup(m, dx, dy), identity ?? m.audit.modified_by, now),
             }));
             store.applyBatch(pairs);
           }
@@ -2696,6 +2858,21 @@
     // Selection is handled by pointer events, not click.
     if (isSelectTool()) return;
     const tool = store.activeTool;
+    if (performance.now() < suppressClickUntil) { suppressClickUntil = 0; return; }
+
+    // Cloud+ : the cloud is finished; this click places the callout text box.
+    if (tool === "CloudPlus" && cloudPlusVerts && identity && containerEl) {
+      const p = localPdfFromMouse(e);
+      const tip = p ? nearestOnPolygon(cloudPlusVerts, p) : null;
+      if (!p || !tip) return;
+      const r = containerEl.getBoundingClientRect();
+      editorText = "";
+      editor = {
+        screenX: e.clientX - r.left, screenY: e.clientY - r.top,
+        anchorPdf: p, leaderPdf: tip, editingId: null, cloudVerts: cloudPlusVerts,
+      };
+      return;
+    }
 
     // Tool Chest Drawing-mode placement: single click drops a translated copy of the
     // armed tool's fixed geometry (spec "Tools & Tool Sets" - placement modes). Stays
@@ -2849,12 +3026,18 @@
       return;
     }
 
-    if (!isMultiClickTool(tool) || !identity) return;
+    if (!isMcTool(tool) || !identity) return;
     const p = localPdfFromMouse(e);
     if (!p) return;
+    // Cloud / Cloud+ : a click on the first vertex closes the polygon (Revu).
+    if ((tool === "Cloud" || tool === "CloudPlus") && mcVerts.length >= 3 &&
+        Math.hypot(p.x - mcVerts[0].x, p.y - mcVerts[0].y) * zoom <= CLOUD_CLOSE_PX) {
+      finishMultiClick();
+      return;
+    }
     mcVerts = [...mcVerts, p];
     // Update rubber-band preview.
-    const mcTool = tool as MultiClickTool;
+    const mcTool = mcType(tool);
     const vertsForPreview = mcCursor ? [...mcVerts, mcCursor] : mcVerts;
     if (vertsForPreview.length >= 2) {
       previewMarkup = buildMarkup({
@@ -2947,7 +3130,7 @@
     const tool = store.activeTool;
     const isClosedMeasurementTool = CLOSED_MEASUREMENT_TOOLS.has(tool);
     const isAngleTool = tool === "MeasurementAngle";
-    if (!isMultiClickTool(tool) && !isClosedMeasurementTool && !isAngleTool) return;
+    if (!isMcTool(tool) && !isClosedMeasurementTool && !isAngleTool) return;
     if (mcVerts.length === 0 || !identity) return;
     const p = localPdfFromMouse(e);
     if (!p) return;
@@ -2958,7 +3141,7 @@
       previewMarkup = buildMarkup({
         markupType: isClosedMeasurementTool || isAngleTool
           ? (tool as "MeasurementArea" | "MeasurementPerimeter" | "MeasurementVolume" | "MeasurementAngle")
-          : (tool as MultiClickTool),
+          : (mcType(tool)),
         page: pageIndex,
         geometry: polylineGeometry(vertsForPreview),
         appearance: store.draftAppearance,
@@ -3202,15 +3385,17 @@
         <!-- Leader/arrowhead have no independent Fill control - the arrowhead's
              fill-opacity tracks strokeOpacity too (mirrors the Arrow shape above and
              appearance.rs's line_gstate for the leader). -->
-        <polyline points={s.points} stroke={s.stroke} stroke-width={s.strokeWidth}
-          stroke-opacity={s.strokeOpacity} fill="none" stroke-dasharray={s.dashArray ?? undefined}
-          pointer-events="none" />
-        {#if s.arrowHead}
-          <!-- Arrowhead at the leader's pointing (target) end. Explicit polygon (WKWebView has
-               no fill="context-stroke"), filled with the leader colour; shaft stops at its base. -->
-          <polygon points={s.arrowHead} fill={s.stroke} fill-opacity={s.strokeOpacity} stroke="none"
+        {#each s.leaders as leader}
+          <polyline points={leader.points} stroke={s.stroke} stroke-width={s.strokeWidth}
+            stroke-opacity={s.strokeOpacity} fill="none" stroke-dasharray={s.dashArray ?? undefined}
             pointer-events="none" />
-        {/if}
+          {#if leader.arrowHead}
+            <!-- Arrowhead at the leader's pointing (tip) end. Explicit polygon (WKWebView has
+                 no fill="context-stroke"), filled with the leader colour; shaft stops at its base. -->
+            <polygon points={leader.arrowHead} fill={s.stroke} fill-opacity={s.strokeOpacity} stroke="none"
+              pointer-events="none" />
+          {/if}
+        {/each}
         <rect x={s.x} y={s.y} width={s.width} height={s.height}
           fill={s.fill} fill-opacity={s.fillOpacity}
           stroke={s.outline} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
@@ -3287,16 +3472,20 @@
       {/each}
     {/if}
 
-    <!-- Draggable target (arrow-head) handle for a selected Callout. Dragging it moves ONLY the
-         leader's pointing end (index 0); the text box + anchor stay put. pointer-events:none —
-         hit-testing is mathematical (atCalloutTarget), like every other overlay handle. -->
-    {#if calloutTargetHandle}
-      <rect
-        class="vertex-handle"
-        x={calloutTargetHandle.x - 4} y={calloutTargetHandle.y - 4}
-        width={8} height={8}
-        pointer-events="none"
-      />
+    <!-- Handles of a selected Callout: leader tips (arrow-head ends), knees, and the text
+         box's resize handles. pointer-events:none - hit-testing is mathematical
+         (hitCallout), like every other overlay handle. -->
+    {#if calloutOverlay}
+      {#each calloutOverlay.box as h (h.id)}
+        <rect class="vertex-handle" x={h.x - 3} y={h.y - 3} width={6} height={6} pointer-events="none" />
+      {/each}
+      {#each calloutOverlay.points as h (`${h.leader}:${h.index}`)}
+        {#if h.kind === "knee"}
+          <circle class="vertex-handle" cx={h.x} cy={h.y} r={4.5} pointer-events="none" />
+        {:else}
+          <rect class="vertex-handle" x={h.x - 4} y={h.y - 4} width={8} height={8} pointer-events="none" />
+        {/if}
+      {/each}
     {/if}
 
     <!-- Vector snap indicator (spec §5, v1): a ring at the point clientToPdf just

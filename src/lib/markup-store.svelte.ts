@@ -70,6 +70,8 @@ export interface MarkupIpc {
 export type ToolKind =
   | "hand" | "select" | "Rectangle" | "Ellipse" | "Line" | "Arrow" | "Highlight"
   | "Polyline" | "Polygon" | "Cloud" | "Ink" | "Text" | "Callout"
+  // Cloud+ : a cloud with an attached callout text (docs/callout-cloud.md).
+  | "CloudPlus"
   // Text mark-up (drag over text, created on release) and the sticky Note (click to place).
   | "Underline" | "StrikeOut" | "Squiggly" | "Note"
   // I-beam text-selection tool: drag to select real PDF text (not a drawn shape).
@@ -194,6 +196,15 @@ export class MarkupStore implements MarkupSink {
 
   // --- Mutations (undoable + mirrored) ---
   create(m: Markup) { this.dirty = true; this.enqueue(this.history.push(new CreateCmd(m))); this.historyVersion++; }
+
+  /** Create several markups as ONE undo frame (e.g. a Cloud+ : cloud and callout together). */
+  createMany(ms: Markup[]) {
+    if (ms.length === 0) return;
+    this.dirty = true;
+    const ops = this.history.pushBatch(ms.map((m) => new CreateCmd(m)));
+    ops.forEach((op) => this.enqueue(op));
+    this.historyVersion++;
+  }
 
   /** Refuses (sets `mirrorError`, no-op) if `before` is locked - see `lockRefusalMessage`. */
   update(before: Markup, after: Markup) {

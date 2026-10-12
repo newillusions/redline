@@ -23,6 +23,7 @@ import { MarkupStore } from "$lib/markup-store.svelte";
 import { TakeoffStore } from "$lib/takeoff-store.svelte";
 import { wheelZoomFactor } from "$lib/viewport";
 import { buildMarkup } from "$lib/markup-tools";
+import { newCallout } from "$lib/callout";
 
 /** The developer bench-overlay chord (bare "B" no longer toggles it - UX audit F8). */
 const BENCH_KEY = { key: "B", code: "KeyB", ctrlKey: true, altKey: true, shiftKey: true };
@@ -1752,13 +1753,20 @@ describe("Viewport G5 text + callout", () => {
     const m = store.markups[0];
     expect(m.markup_type).toBe("Callout");
     expect(m.contents).toBe("see note");
-    // Geometry is a Polyline with 2 verts (leader target → text anchor).
+    // Geometry is the leader [tip, knee, attach]: the tip is the first click, the attach
+    // point lies on the new text box (top-left at the second click, PDF(80,140)).
     const poly = (m.geometry as { Polyline: { x: number; y: number }[] }).Polyline;
-    expect(poly).toHaveLength(2);
-    expect(poly[0].x).toBeCloseTo(30);   // leader target x
+    expect(poly).toHaveLength(3);
+    expect(poly[0].x).toBeCloseTo(30);   // leader tip x
     expect(poly[0].y).toBeCloseTo(160);  // PDF y-flip: 200-40
-    expect(poly[1].x).toBeCloseTo(80);   // text anchor x
-    expect(poly[1].y).toBeCloseTo(140);  // PDF y-flip: 200-60
+    const box = m.callout!;
+    expect(box.autosize).toBe(true);
+    expect(box.box_min.x).toBeCloseTo(80);
+    expect(box.box_max.y).toBeCloseTo(140);
+    expect(poly[2].x).toBeCloseTo(80);   // tip is left of the box: attach on its left edge
+    expect(poly[2].y).toBeGreaterThan(box.box_min.y - 1e-6);
+    expect(poly[2].y).toBeLessThan(box.box_max.y + 1e-6);
+    expect(poly[1].x).toBeLessThan(poly[2].x); // the knee sits out from the box side
 
     // The callout renders a <polyline> + <text> in the SVG overlay.
     await tick();
@@ -2200,7 +2208,7 @@ describe("Viewport G6 select", () => {
   // S8: Callout text box is draggable INDEPENDENT of the leader target (bug fix:
   // "the text box is stuck and cannot be edited/moved").
   // -------------------------------------------------------------------------
-  it("S8: dragging inside a selected Callout's synthesized text box moves ONLY the anchor, leader target stays put", async () => {
+  it("S8: dragging inside a selected Callout's text box moves the box and its attach point, the tip stays put", async () => {
     const { overlay } = await mountViewport(store);
     seedCallout(store, "call-a");
     store.activeTool = "select";
@@ -2212,26 +2220,25 @@ describe("Viewport G6 select", () => {
     await tick();
     expect(store.selectedIds.has("call-a")).toBe(true);
 
-    // The synthesized box: anchor PDF(100,100) -> box PDF x:[100,244] y:[82,100] ->
-    // screen x:[100,244] y:[100,118] (pageHeight 200, zoom 1). Pick a point deep inside
-    // the box, well away from the leader segment (50,50)-(100,100): screen (150,110).
-    // The box-drag reuses the same vertex-drag machinery as the target handle (S6) -
-    // ABSOLUTE positioning (the anchor snaps to wherever the pointer currently is, not a
-    // relative offset from the grab point), so the final anchor position is exactly the
-    // PDF point under the pointerup, not the seeded anchor plus a screen delta.
+    // The legacy box: anchor PDF(100,100) is its top-left -> PDF x:[100,244] y:[82,100] ->
+    // screen x:[100,244] y:[100,118] (pageHeight 200, zoom 1). Press deep inside the box,
+    // away from the leader segment (50,50)-(100,100): screen (150,110). Dragging the box
+    // moves it BY THE DRAG DELTA (screen +20,+10 => PDF +20,-10) and takes the leader's
+    // attach point with it; the tip stays put.
     ptr(overlay, "pointerdown", 150, 110);
     ptr(overlay, "pointermove", 170, 120);
     ptr(overlay, "pointerup", 170, 120);
     await tick();
 
-    const poly = (store.markups[0].geometry as { Polyline: { x: number; y: number }[] }).Polyline;
+    const m = store.markups[0];
+    const poly = (m.geometry as { Polyline: { x: number; y: number }[] }).Polyline;
     expect(poly).toHaveLength(2);
-    // Target (index 0) is untouched.
-    expect(poly[0].x).toBeCloseTo(50);
+    expect(poly[0].x).toBeCloseTo(50); // tip untouched
     expect(poly[0].y).toBeCloseTo(150);
-    // Anchor (index 1) snapped to the pointerup's PDF position: screen(170,120) -> PDF(170,80).
-    expect(poly[1].x).toBeCloseTo(170);
-    expect(poly[1].y).toBeCloseTo(80);
+    expect(poly[1].x).toBeCloseTo(120); // attach moved with the box
+    expect(poly[1].y).toBeCloseTo(90);
+    expect(m.callout!.box_min).toEqual({ x: 120, y: 72 });
+    expect(m.callout!.box_max).toEqual({ x: 264, y: 90 });
   });
 
   // -------------------------------------------------------------------------
@@ -3223,5 +3230,236 @@ describe("S20 RSS poll gating", () => {
     const callsAtToggleOff = vi.mocked(ipcMocks.processRssMb).mock.calls.length;
     await new Promise((r) => setTimeout(r, 1200));
     expect(vi.mocked(ipcMocks.processRssMb).mock.calls.length).toBe(callsAtToggleOff);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Callout knee / multiple leaders / box handles, Cloud drag-rectangle, Cloud+
+// (behaviour spec: docs/callout-cloud.md)
+// ---------------------------------------------------------------------------
+
+describe("Viewport callout + cloud (docs/callout-cloud.md)", () => {
+  let ipc: ReturnType<typeof fakeIpc>;
+  let store: MarkupStore;
+  const AP = {
+    color: "#e02424", line_weight: 2, opacity: 1, fill: null, line_style: "Solid" as const,
+    font: { family: "Helvetica", size_pt: 12 },
+  };
+
+  /** pointer event with modifier keys (the shared `ptr` helper has none). */
+  function ptrMod(target: Element, type: string, x: number, y: number, mods: { shiftKey?: boolean } = {}) {
+    fireEvent(target, new PointerEvent(type, {
+      bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 1, ...mods,
+    }));
+  }
+
+  // Tip PDF(50,150) = screen(50,50). Box PDF x:[120,180] y:[100,120] = screen y:[80,100].
+  // Attach (120,110) = screen(120,90); knee (102,110) = screen(102,90).
+  function seedCallout(extra: { x: number; y: number }[][] = []) {
+    const made = newCallout({ x: 50, y: 150 }, { x: 120, y: 120 }, { width: 60, height: 20 });
+    const m = buildMarkup({
+      markupType: "Callout", page: 0, geometry: made.geometry, appearance: AP,
+      identity: FAKE_IDENTITY, now: "2026-01-01T00:00:00Z", id: "call-a", contents: "note",
+    });
+    m.callout = { ...made.callout, extra_leaders: extra };
+    store.markups.push(m);
+  }
+
+  async function selectSeeded(overlay: Element) {
+    store.activeTool = "select";
+    await tick();
+    ptr(overlay, "pointerdown", 76, 70); // on the tip -> knee segment
+    ptr(overlay, "pointerup", 76, 70);
+    await tick();
+    expect(store.selectedIds.has("call-a")).toBe(true);
+  }
+  const polyOf = (m: { geometry: unknown }) => (m.geometry as { Polyline: { x: number; y: number }[] }).Polyline;
+
+  beforeEach(() => {
+    vi.mocked(ipcMocks.getPageSize).mockResolvedValue(FAKE_PAGE_SIZE);
+    vi.mocked(ipcMocks.renderTile).mockResolvedValue({
+      doc_id: "d1", page_index: 0, tile_x: 0, tile_y: 0,
+      width_px: 512, height_px: 512, zoom: 1, dpr: 1, png_base64: "", render_ms: 1,
+    });
+    vi.mocked(ipcMocks.processRssMb).mockResolvedValue(0);
+    vi.mocked(ipcMocks.getUserIdentity).mockResolvedValue(FAKE_IDENTITY);
+    ipc = fakeIpc();
+    store = new MarkupStore("d1", ipc);
+  });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("C1: dragging the knee moves only the knee", async () => {
+    const { overlay } = await mountViewport(store);
+    seedCallout();
+    await selectSeeded(overlay);
+    ptr(overlay, "pointerdown", 102, 90);
+    ptr(overlay, "pointermove", 110, 60);
+    ptr(overlay, "pointerup", 110, 60);
+    await tick();
+    const poly = polyOf(store.markups[0]);
+    expect(poly).toHaveLength(3);
+    expect(poly[0]).toEqual({ x: 50, y: 150 });
+    expect(poly[1].x).toBeCloseTo(110);
+    expect(poly[1].y).toBeCloseTo(140);
+    expect(poly[2]).toEqual({ x: 120, y: 110 });
+  });
+
+  it("C2: Shift+click on the knee adds a leader and the same drag places its tip", async () => {
+    const { overlay } = await mountViewport(store);
+    seedCallout();
+    await selectSeeded(overlay);
+    ptrMod(overlay, "pointerdown", 102, 90, { shiftKey: true });
+    ptrMod(overlay, "pointermove", 140, 40, { shiftKey: true });
+    ptrMod(overlay, "pointerup", 140, 40, { shiftKey: true });
+    await tick();
+    const extra = store.markups[0].callout!.extra_leaders;
+    expect(extra).toHaveLength(1);
+    expect(extra[0][0].x).toBeCloseTo(140);
+    expect(extra[0][0].y).toBeCloseTo(160);
+    expect(extra[0].slice(1)).toEqual([{ x: 102, y: 110 }, { x: 120, y: 110 }]); // shares knee + attach
+    store.undo(); // one undo step removes the added leader
+    expect(store.markups[0].callout!.extra_leaders).toHaveLength(0);
+  });
+
+  it("C3: Shift+click on an extra leader's tip removes that leader; the last leader stays", async () => {
+    const { overlay } = await mountViewport(store);
+    seedCallout([[{ x: 160, y: 170 }, { x: 102, y: 110 }, { x: 120, y: 110 }]]);
+    await selectSeeded(overlay);
+    ptrMod(overlay, "pointerdown", 160, 30, { shiftKey: true }); // extra tip PDF(160,170)
+    ptrMod(overlay, "pointerup", 160, 30, { shiftKey: true });
+    await tick();
+    expect(store.markups[0].callout!.extra_leaders).toHaveLength(0);
+    ptrMod(overlay, "pointerdown", 50, 50, { shiftKey: true }); // the only leader's tip
+    ptrMod(overlay, "pointerup", 50, 50, { shiftKey: true });
+    await tick();
+    expect(polyOf(store.markups[0])[0]).toEqual({ x: 50, y: 150 });
+  });
+
+  it("C4: dragging a box corner resizes it, turns auto-size off and keeps the attach on the box", async () => {
+    const { overlay } = await mountViewport(store);
+    seedCallout();
+    await selectSeeded(overlay);
+    ptr(overlay, "pointerdown", 180, 100); // "se" corner, PDF(180,100)
+    ptr(overlay, "pointermove", 220, 120);
+    ptr(overlay, "pointerup", 220, 120);
+    await tick();
+    const c = store.markups[0].callout!;
+    expect(c.box_min).toEqual({ x: 120, y: 80 });
+    expect(c.box_max).toEqual({ x: 220, y: 120 });
+    expect(c.autosize).toBe(false);
+    expect(polyOf(store.markups[0])[2].x).toBe(120);
+  });
+
+  it("C5: editing the text of an auto-size callout refits its box", async () => {
+    const { container, overlay } = await mountViewport(store);
+    seedCallout();
+    store.activeTool = "select";
+    await tick();
+    fireEvent.dblClick(overlay, { clientX: 150, clientY: 90 });
+    await tick();
+    const textarea = container.querySelector("textarea.text-editor") as HTMLTextAreaElement;
+    textarea.value = "a much longer line of callout text";
+    fireEvent.input(textarea);
+    fireEvent.blur(textarea);
+    await tick();
+    const c = store.markups[0].callout!;
+    expect(c.box_max.x - c.box_min.x).toBeGreaterThan(60);
+    expect(c.box_min.x).toBe(120); // top-left corner kept
+    expect(c.box_max.y).toBe(120);
+  });
+
+  it("C6: Callout tool — press-drag from the tip to the box position opens the editor", async () => {
+    const { container, overlay } = await mountViewport(store);
+    store.activeTool = "Callout";
+    await tick();
+    ptr(overlay, "pointerdown", 30, 40);
+    ptr(overlay, "pointermove", 80, 60);
+    ptr(overlay, "pointerup", 80, 60);
+    fireEvent.click(overlay, { clientX: 80, clientY: 60 });
+    await tick();
+    const textarea = container.querySelector("textarea.text-editor") as HTMLTextAreaElement;
+    expect(textarea).not.toBeNull();
+    textarea.value = "dragged";
+    fireEvent.input(textarea);
+    fireEvent.blur(textarea);
+    await tick();
+    expect(store.markups).toHaveLength(1);
+    expect(polyOf(store.markups[0])[0].x).toBeCloseTo(30);
+    expect(store.markups[0].callout!.box_min.x).toBeCloseTo(80);
+  });
+
+  it("K1: Cloud tool — press-drag makes a rectangle cloud on release; the click after it adds no vertex", async () => {
+    const { overlay } = await mountViewport(store);
+    store.activeTool = "Cloud";
+    await tick();
+    ptr(overlay, "pointerdown", 50, 50);
+    ptr(overlay, "pointermove", 150, 100);
+    ptr(overlay, "pointerup", 150, 100);
+    fireEvent.click(overlay, { clientX: 150, clientY: 100 });
+    fireEvent.keyDown(window, { key: "Enter" });
+    await tick();
+    expect(store.markups).toHaveLength(1);
+    expect(store.markups[0].markup_type).toBe("Cloud");
+    expect(polyOf(store.markups[0])).toEqual([
+      { x: 50, y: 100 }, { x: 150, y: 100 }, { x: 150, y: 150 }, { x: 50, y: 150 },
+    ]);
+  });
+
+  it("K2: Cloud tool — clicking the first vertex closes the polygon", async () => {
+    const { overlay } = await mountViewport(store);
+    store.activeTool = "Cloud";
+    await tick();
+    for (const [x, y] of [[50, 50], [150, 50], [100, 120]]) {
+      ptr(overlay, "pointerdown", x, y);
+      ptr(overlay, "pointerup", x, y);
+      fireEvent.click(overlay, { clientX: x, clientY: y });
+    }
+    ptr(overlay, "pointerdown", 52, 52);
+    ptr(overlay, "pointerup", 52, 52);
+    fireEvent.click(overlay, { clientX: 52, clientY: 52 });
+    await tick();
+    expect(store.markups).toHaveLength(1);
+    expect(polyOf(store.markups[0])).toHaveLength(3);
+  });
+
+  it("K3: Cloud+ — draw a cloud, click for the callout text; both are created grouped, one undo step", async () => {
+    const { container, overlay } = await mountViewport(store);
+    store.activeTool = "CloudPlus";
+    await tick();
+    ptr(overlay, "pointerdown", 50, 50);
+    ptr(overlay, "pointermove", 100, 100);
+    ptr(overlay, "pointerup", 100, 100);
+    fireEvent.click(overlay, { clientX: 100, clientY: 100 }); // swallowed: not the box click
+    await tick();
+    expect(store.markups).toHaveLength(0);
+    expect(container.querySelector("textarea.text-editor")).toBeNull();
+
+    await new Promise((r) => setTimeout(r, 320)); // past the post-drag click guard
+    fireEvent.click(overlay, { clientX: 150, clientY: 60 }); // callout box top-left, PDF(150,140)
+    await tick();
+    const textarea = container.querySelector("textarea.text-editor") as HTMLTextAreaElement;
+    expect(textarea).not.toBeNull();
+    textarea.value = "revised";
+    fireEvent.input(textarea);
+    fireEvent.blur(textarea);
+    await tick();
+
+    expect(store.markups.map((m) => m.markup_type)).toEqual(["Cloud", "Callout"]);
+    const [cloud, call] = store.markups;
+    expect(cloud.group_id).not.toBeNull();
+    expect(call.group_id).toBe(cloud.group_id);
+    expect(call.contents).toBe("revised");
+    expect(polyOf(call)[0]).toEqual({ x: 100, y: 140 }); // tip on the cloud's right edge
+    expect(call.callout!.box_min.x).toBeCloseTo(150);
+    store.undo();
+    expect(store.markups).toHaveLength(0);
+  });
+
+  it("H1: Y selects Cloud, K selects Cloud+", async () => {
+    await mountViewport(store);
+    fireEvent.keyDown(window, { key: "y" });
+    expect(store.activeTool).toBe("Cloud");
+    fireEvent.keyDown(window, { key: "k" });
+    expect(store.activeTool).toBe("CloudPlus");
   });
 });

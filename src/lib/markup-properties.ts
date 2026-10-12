@@ -4,7 +4,8 @@
  * all mutation logic here.
  */
 import type { Markup, Appearance, UserRef, MarkupWorkflow, MarkupReply, StatusChange } from "./ipc";
-import { bumpAudit } from "./markup-tools";
+import { bumpAudit, DEFAULT_TEXT_FONT } from "./markup-tools";
+import { refitBox, setAutosize } from "./callout";
 
 /** Base-14 font families offered by the picker (reliable cross-viewer /DA rendering). */
 export const FONT_FAMILIES: readonly string[] = ["Helvetica", "Times", "Courier"];
@@ -23,11 +24,14 @@ export function patchAppearance(
   by: UserRef,
   now: string,
 ): Markup {
-  return bumpAudit(
-    { ...m, appearance: { ...m.appearance, ...patch } },
-    by,
-    now,
-  );
+  const patched: Markup = { ...m, appearance: { ...m.appearance, ...patch } };
+  return bumpAudit(refitBox(patched, patched.appearance.font?.size_pt ?? DEFAULT_TEXT_FONT.size_pt), by, now);
+}
+
+/** Turn a Callout's text-box auto-size on (refitting the box) or off. Other types pass through. */
+export function patchCalloutAutosize(m: Markup, on: boolean, by: UserRef, now: string): Markup {
+  if (m.markup_type !== "Callout") return m;
+  return bumpAudit(setAutosize(m, on, m.appearance.font?.size_pt ?? DEFAULT_TEXT_FONT.size_pt), by, now);
 }
 
 /**
@@ -46,7 +50,10 @@ export function patchFields(
   if ("contents" in patch) updated.contents = patch.contents ?? null;
   if ("subject" in patch) updated.subject = patch.subject ?? null;
   if ("layer" in patch) updated.layer = patch.layer ?? null;
-  return bumpAudit(updated, by, now);
+  const fitted = "contents" in patch
+    ? refitBox(updated, updated.appearance.font?.size_pt ?? DEFAULT_TEXT_FONT.size_pt)
+    : updated;
+  return bumpAudit(fitted, by, now);
 }
 
 /**

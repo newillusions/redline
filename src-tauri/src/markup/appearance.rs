@@ -112,7 +112,7 @@ const DEFAULT_FONT_SIZE: f64 = 12.0;
 /// zoom in a saved PDF's own coordinate space).
 const COUNT_MARKER_RADIUS: f64 = 6.0;
 /// Synthesized callout text-box size in PDF points (mirrors markup-render.ts CALLOUT_BOX_PT).
-const CALLOUT_BOX: (f64, f64) = (144.0, 18.0);
+const CALLOUT_BOX: (f64, f64) = super::callout::LEGACY_BOX;
 /// 4-bezier ellipse approximation constant (control-point offset = radius * kappa).
 const ELLIPSE_KAPPA: f64 = 0.552_284_75;
 
@@ -241,22 +241,8 @@ pub(crate) fn interop_rect(m: &Markup) -> Option<[f64; 4]> {
             min.y.max(max.y),
         ]),
         (MarkupType::Callout, MarkupGeometry::Polyline(pts)) if !pts.is_empty() => {
-            let anchor = *pts.last().unwrap();
-            let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-            for p in pts {
-                x0 = x0.min(p.x);
-                y0 = y0.min(p.y);
-                x1 = x1.max(p.x);
-                y1 = y1.max(p.y);
-            }
-            // Union with the synthesized text box (anchor .. anchor + CALLOUT_BOX), which the
-            // Callout appearance draws beyond the leader vertices.
-            Some([
-                x0.min(anchor.x),
-                y0.min(anchor.y),
-                x1.max(anchor.x + CALLOUT_BOX.0),
-                y1.max(anchor.y + CALLOUT_BOX.1),
-            ])
+            // All leaders unioned with the text box (the plain geometry bbox omits the box).
+            super::callout::bounds(m)
         }
         (MarkupType::MeasurementCount, MarkupGeometry::Point(p)) => {
             let pad = COUNT_MARKER_RADIUS + 4.0;
@@ -761,6 +747,33 @@ fn draw_text_block(
     out.push_str("ET\n");
 }
 
+/// One callout leader: shaft from the box end to the target, filled arrowhead at the target.
+fn draw_callout_leader(out: &mut String, leader: &[PdfPoint], a: &Appearance) {
+    let (Some(&target), Some(&anchor)) = (leader.first(), leader.last()) else {
+        return;
+    };
+    if leader.len() < 2 {
+        return;
+    }
+    let reversed: Vec<PdfPoint> = leader.iter().rev().copied().collect();
+    if let Some((_base, head)) = arrow_head(&reversed, a.line_weight) {
+        moveto(out, anchor);
+        for p in leader.iter().rev().skip(1) {
+            lineto(out, *p);
+        }
+        out.push_str("S\n");
+        fill_color(out, &a.color);
+        moveto(out, head[0]);
+        lineto(out, head[1]);
+        lineto(out, head[2]);
+        out.push_str("h\nf\n");
+    } else {
+        moveto(out, anchor);
+        lineto(out, target);
+        out.push_str("S\n");
+    }
+}
+
 /// Box border + optional fill for Text/Callout. Stroke (border) opacity and fill opacity
 /// are fully independent (`shape_gstate`): the box border always honours `a.opacity`, the
 /// fill (when present) always honours `a.fill_opacity` (default fully opaque) - setting
@@ -1098,9 +1111,9 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>, Option<Stamp
             }
         }
 
-        // --- FreeText: Callout (leader line + synthesized box) --------------------------
+        // --- FreeText: Callout (leaders + text box) -------------------------------------
         (MarkupType::Callout, MarkupGeometry::Polyline(pts)) if !pts.is_empty() => {
-            // The leader/arrowhead has its own gs scope (line_gstate: a.opacity drives both
+            // The leaders/arrowheads have their own gs scope (line_gstate: a.opacity drives both
             // the stroke and the arrowhead's incidental fill) - a SEPARATE resource name
             // from the box's shape_gstate below, since the two can legitimately differ (a
             // faint leader with an opaque box fill, or vice versa) and /Resources is a
@@ -1108,37 +1121,12 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>, Option<Stamp
             let leader_gs = res.add_gstate(line_gstate(a));
             out.push_str(&format!("q\n/{leader_gs} gs\n"));
             stroke_preamble(&mut out, a);
-            // Leader points AT the target (index 0); the box anchors at the last point.
-            let target = pts[0];
-            let anchor = *pts.last().unwrap();
-            if pts.len() >= 2 {
-                let reversed: Vec<PdfPoint> = pts.iter().rev().copied().collect();
-                if let Some((base, head)) = arrow_head(&reversed, a.line_weight) {
-                    moveto(&mut out, anchor);
-                    for p in pts.iter().rev().skip(1) {
-                        lineto(&mut out, *p);
-                    }
-                    // Shorten the final segment to the arrowhead base.
-                    let _ = base; // base already used inline below for the tip segment
-                    out.push_str("S\n");
-                    fill_color(&mut out, &a.color);
-                    moveto(&mut out, head[0]);
-                    lineto(&mut out, head[1]);
-                    lineto(&mut out, head[2]);
-                    out.push_str("h\nf\n");
-                } else {
-                    moveto(&mut out, anchor);
-                    lineto(&mut out, target);
-                    out.push_str("S\n");
-                }
+            // Each leader points AT its target (index 0) and ends on the text box (last point).
+            for leader in super::callout::all_leaders(m) {
+                draw_callout_leader(&mut out, &leader, a);
             }
             out.push_str("Q\n");
-            let rect = [
-                anchor.x,
-                anchor.y,
-                anchor.x + CALLOUT_BOX.0,
-                anchor.y + CALLOUT_BOX.1,
-            ];
+            let rect = super::callout::text_box(m);
             draw_text_box(&mut out, &mut res, a, rect);
             if let Some(text) = &m.contents {
                 let size = a.font.as_ref().map_or(DEFAULT_FONT_SIZE, |f| f.size_pt);
@@ -1464,6 +1452,7 @@ mod tests {
             source_rect: None,
             source_ref: None,
             source_popup: None,
+            callout: None,
         }
     }
 
@@ -1926,6 +1915,58 @@ mod tests {
         let c = content_str(&m);
         assert!(!c.contains("Tj\n"), "no contents means no Tj call");
         assert!(c.contains(" re\n"), "the box border still draws");
+    }
+
+    // --- Callout: knee, text box, extra leaders ---------------------------------------------
+
+    fn callout_with_props(extra: Vec<Vec<PdfPoint>>) -> Markup {
+        let mut m = base_markup(
+            MarkupType::Callout,
+            MarkupGeometry::Polyline(vec![
+                PdfPoint { x: 10.0, y: 10.0 },
+                PdfPoint { x: 40.0, y: 50.0 },
+                PdfPoint { x: 100.0, y: 50.0 },
+            ]),
+        );
+        m.contents = Some("note".into());
+        m.callout = Some(super::super::callout::CalloutProps {
+            box_min: PdfPoint { x: 100.0, y: 40.0 },
+            box_max: PdfPoint { x: 220.0, y: 70.0 },
+            extra_leaders: extra,
+            autosize: false,
+        });
+        m
+    }
+
+    #[test]
+    fn callout_draws_one_arrowhead_per_leader_through_the_knee() {
+        let m = callout_with_props(vec![vec![
+            PdfPoint { x: 10.0, y: 90.0 },
+            PdfPoint { x: 100.0, y: 60.0 },
+        ]]);
+        let c = content_str(&m);
+        assert_eq!(c.matches("h\nf\n").count(), 2, "one arrowhead per leader: {c}");
+        // The primary leader runs box end -> knee -> tip.
+        assert!(c.contains("100 50 m\n40 50 l\n10 10 l\nS\n"), "knee path missing: {c}");
+    }
+
+    #[test]
+    fn callout_bbox_covers_every_leader_and_the_explicit_box() {
+        let m = callout_with_props(vec![vec![
+            PdfPoint { x: -30.0, y: 120.0 },
+            PdfPoint { x: 100.0, y: 60.0 },
+        ]]);
+        assert_eq!(interop_rect(&m), Some([-30.0, 10.0, 220.0, 120.0]));
+    }
+
+    #[test]
+    fn callout_with_hostile_props_falls_back_to_the_legacy_box_without_panicking() {
+        let mut m = callout_with_props(vec![]);
+        m.callout.as_mut().unwrap().box_max = PdfPoint { x: f64::NAN, y: 70.0 };
+        let r = interop_rect(&m).unwrap();
+        assert!(r.iter().all(|v| v.is_finite()), "{r:?}");
+        assert_eq!(r, [10.0, 10.0, 244.0, 68.0]); // legacy 144x18 box at the anchor (100,50)
+        let _ = content_str(&m);
     }
 
     // --- Highlight: quads + freeform rect ----------------------------------------------------

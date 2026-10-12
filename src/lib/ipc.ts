@@ -348,6 +348,20 @@ export interface Markup {
   source_nm?: string | null;
   /** A foreign sticky note's original `/Rect`; opaque, written back while the note is unmoved. */
   source_rect?: number[] | null;
+  /** Callout only (mirrors Rust `Markup.callout`): text box, extra leaders, auto-size.
+   *  Absent/null = the legacy fixed box at the leader's anchor. See `lib/callout.ts`. */
+  callout?: CalloutProps | null;
+}
+
+/** Text box + extra leaders + auto-size of a Callout (mirrors Rust `markup::callout::CalloutProps`). */
+export interface CalloutProps {
+  /** Text box corners in PDF user space (`box_min` is bottom-left). */
+  box_min: PdfPoint;
+  box_max: PdfPoint;
+  /** Extra leaders, each `[tip, (knee,) attach]`; the primary leader is the geometry Polyline. */
+  extra_leaders: PdfPoint[][];
+  /** The box follows its text. */
+  autosize: boolean;
 }
 
 /** ISO 32000-1 Table 165 bit 8, `Locked` (decimal `128`/`0x80`) - mirrors Rust

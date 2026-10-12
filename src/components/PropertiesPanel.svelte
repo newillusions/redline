@@ -8,6 +8,7 @@
     patchFields,
     patchStatus,
     patchNoteIcon,
+    patchCalloutAutosize,
     NOTE_ICONS,
     commonValue,
     FONT_FAMILIES,
@@ -85,6 +86,19 @@
       before: m,
       after: patchFields(m, patch, by(m.audit.modified_by), now),
     }));
+    store.applyBatch(pairs);
+  }
+
+  // Auto-size toggle: shown only when every selected markup is a Callout.
+  const isCalloutSelection = $derived(
+    mode === "selection" && selected.length > 0 && selected.every((m) => m.markup_type === "Callout"),
+  );
+  function autosizeValue(): boolean {
+    return selected.length > 0 && selected.every((m) => m.callout?.autosize === true);
+  }
+  function commitAutosize(on: boolean) {
+    const now = new Date().toISOString();
+    const pairs = selected.map((m) => ({ before: m, after: patchCalloutAutosize(m, on, by(m.audit.modified_by), now) }));
     store.applyBatch(pairs);
   }
 
@@ -535,6 +549,19 @@
         {/each}
       </select>
     </div>
+
+    {#if isCalloutSelection}
+      <div class="prop-row">
+        <label for="prop-callout-autosize" class="prop-label">Auto-size box</label>
+        <input
+          id="prop-callout-autosize"
+          data-field="callout_autosize"
+          type="checkbox"
+          checked={autosizeValue()}
+          onchange={(e) => commitAutosize((e.currentTarget as HTMLInputElement).checked)}
+        />
+      </div>
+    {/if}
   </section>
 
   <!-- Text fields (selection mode only) -->

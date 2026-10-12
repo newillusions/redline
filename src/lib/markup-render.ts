@@ -7,6 +7,7 @@
  */
 import type { CountSymbol, Markup, MarkupType, PdfPoint } from "./ipc";
 import { pdfUserSpaceToScreen, type ViewportState } from "./viewport";
+import { allLeaders, calloutBox } from "./callout";
 import { type Bounds, type HandleId, HANDLE_IDS, handleAnchors, NOTE_ICON_PT } from "./markup-select";
 
 interface SvgStyle {
@@ -110,10 +111,9 @@ export type SvgShape =
     })
   | (SvgStyle & {
       kind: "callout";
-      /** Leader polyline, shortened so the shaft stops at the arrowhead base. */
-      points: string;
-      /** Explicit arrowhead triangle at the leader's pointing (target) end; "" when degenerate. */
-      arrowHead: string;
+      /** Every leader (primary first): polyline shortened so the shaft stops at the arrowhead
+       *  base, plus the explicit arrowhead triangle at the pointing (tip) end ("" when degenerate). */
+      leaders: { points: string; arrowHead: string }[];
       /** Text-box top-left in screen px (the leader's anchor end) - box + glyphs share this. */
       x: number;
       y: number;
@@ -234,8 +234,15 @@ function styleOf(m: Markup, v: ViewportState): SvgStyle {
  * Revision-cloud path: walk each closed edge placing outward semicircular arc "bumps"
  * (~2r apart). Screen-space points in, SVG path `d` out. Aesthetic only (not measured).
  */
-export function cloudPath(pts: { x: number; y: number }[], r: number): string {
-  if (pts.length < 2) return "";
+/** Most scallops one cloud path draws; a larger cloud gets proportionally bigger scallops.
+ *  Mirrors the bounded-work cap on hostile geometry (huge polygons at a tiny radius). */
+export const MAX_CLOUD_BUMPS = 4000;
+/** Most vertices a cloud path walks. */
+export const MAX_CLOUD_VERTICES = 2000;
+
+export function cloudPath(input: { x: number; y: number }[], radius: number): string {
+  const pts = input.filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y)).slice(0, MAX_CLOUD_VERTICES);
+  if (pts.length < 2 || !(radius > 0) || !Number.isFinite(radius)) return "";
   // Choose the SVG arc sweep flag from the polygon winding so the scallops always bulge to
   // the EXTERIOR regardless of draw direction. The incoming points are screen space (y-DOWN
   // via pdfUserSpaceToScreen), so the shoelace sign is inverted vs. the y-up convention:
@@ -249,6 +256,20 @@ export function cloudPath(pts: { x: number; y: number }[], r: number): string {
   }
   const sweep = area2 > 0 ? 1 : 0;
   const loop = [...pts, pts[0]];
+  // Bounded work: if the scallop count at this radius would exceed the cap, enlarge the
+  // scallops (the edge lengths are the only input to the count).
+  const totalBumps = (r: number): number => {
+    let n = 0;
+    for (let i = 0; i < loop.length - 1; i++) {
+      const len = Math.hypot(loop[i + 1].x - loop[i].x, loop[i + 1].y - loop[i].y) || 1;
+      n += Math.max(1, Math.round(len / (r * 2)));
+    }
+    return n;
+  };
+  let r = radius;
+  for (let guard = 0; guard < 8 && totalBumps(r) > MAX_CLOUD_BUMPS; guard++) {
+    r *= Math.max(2, totalBumps(r) / MAX_CLOUD_BUMPS);
+  }
   let d = `M ${pts[0].x.toFixed(2)} ${pts[0].y.toFixed(2)}`;
   for (let i = 0; i < loop.length - 1; i++) {
     const a = loop[i], b = loop[i + 1];
@@ -358,12 +379,7 @@ function pointsStr(pts: { x: number; y: number }[], v: ViewportState): string {
 
 const DEFAULT_FONT_PT = 12;
 
-/**
- * Synthesized callout text-box size in PDF points (mirrors markup-tools DEFAULT_TEXT_BOX).
- * The Callout geometry stores only the leader Polyline, so the text box is derived at render
- * time from the leader's anchor end at this fixed size (single leader / fixed attachment — the
- * configurable-box work is deferred).
- */
+/** Fallback text-box size (PDF pt) for a callout with no usable leader; see `callout.ts` `calloutBox`. */
 const CALLOUT_BOX_PT = { width: 144, height: 18 } as const;
 
 /** Highlighter wash alpha — a translucent marker pass over content, never an opaque fill. */
@@ -543,18 +559,22 @@ export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
     };
   }
   if (m.markup_type === "Callout" && "Polyline" in g) {
-    const screen = g.Polyline.map((p) => pdfUserSpaceToScreen(p.x, p.y, v));
-    // The leader POINTS at the target (index 0). arrowHeadData puts the head on the last
-    // point, so reverse a copy: the head lands on the target and the shaft stops at its base.
-    const { shortPoints, arrowHead } = arrowHeadData([...screen].reverse(), style.strokeWidth);
-    // The text box sits at the anchor (leader's last point); box + glyphs share this origin.
-    const last = g.Polyline[g.Polyline.length - 1] ?? { x: 0, y: 0 };
-    const anchor = pdfUserSpaceToScreen(last.x, last.y, v);
+    // Each leader POINTS at its tip (index 0). arrowHeadData puts the head on the last
+    // point, so reverse a copy: the head lands on the tip and the shaft stops at its base.
+    const leaders = allLeaders(m).map((l) => {
+      const screen = l.map((p) => pdfUserSpaceToScreen(p.x, p.y, v));
+      const { shortPoints, arrowHead } = arrowHeadData([...screen].reverse(), style.strokeWidth);
+      return { points: shortPoints, arrowHead };
+    });
+    // Box + glyphs share the box's top-left (the box is `callout.box_*`, or the legacy
+    // fixed box at the leader's last point when there are no props).
+    const box = calloutBox(m) ?? { minX: 0, maxY: 0, maxX: CALLOUT_BOX_PT.width, minY: -CALLOUT_BOX_PT.height };
+    const tl = pdfUserSpaceToScreen(box.minX, box.maxY, v);
     const { outline } = boxStyle(m);
     return {
-      ...style, kind: "callout", points: shortPoints, arrowHead,
-      x: anchor.x, y: anchor.y,
-      width: CALLOUT_BOX_PT.width * v.zoom, height: CALLOUT_BOX_PT.height * v.zoom,
+      ...style, kind: "callout", leaders,
+      x: tl.x, y: tl.y,
+      width: (box.maxX - box.minX) * v.zoom, height: (box.maxY - box.minY) * v.zoom,
       text: m.contents ?? "", fontPx, outline,
     };
   }

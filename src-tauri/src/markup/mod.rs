@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::geometry::{PdfPoint, Quad};
 
 pub(crate) mod annotation;
+pub mod callout;
 pub mod foreign;
 pub(crate) mod replies;
 pub(crate) mod appearance;
@@ -578,6 +579,11 @@ pub struct Markup {
     /// serialised.
     #[serde(skip)]
     pub source_popup: Option<PopupProps>,
+    /// Text box, extra leaders and auto-size of a [`MarkupType::Callout`] (see
+    /// [`callout`]). `None` = the legacy fixed box at the leader's anchor.
+    /// `#[serde(default)]` keeps pre-this-field JSON deserialising to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callout: Option<callout::CalloutProps>,
 }
 
 /// The annotation a markup was read from: its indirect object id (`None` for an inline
@@ -640,6 +646,7 @@ impl Markup {
             source_rect: None,
             source_ref: None,
             source_popup: None,
+            callout: None,
         }
     }
 

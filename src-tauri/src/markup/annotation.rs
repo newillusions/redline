@@ -542,6 +542,7 @@ impl Markup {
         // `interop_rect` doesn't special-case.
         let bb = super::appearance::ap_bbox(self);
         d.set("Rect", Object::Array(bb.iter().map(|v| real(*v)).collect()));
+        super::callout::write_keys(&mut d, self, bb);
         match &self.geometry {
             MarkupGeometry::Polyline(pts) => {
                 if matches!(pdf_subtype(t), "Line") && pts.len() >= 2 {
@@ -559,7 +560,8 @@ impl Markup {
                         d.set("Vertices", flatten(pts));
                     }
                 } else if matches!(t, MarkupType::Callout) {
-                    d.set("CL", flatten(pts)); // callout leader line (spec §19.2)
+                    // Callout leader line: tip first, 2 or 3 points (ISO 32000-1 12.5.6.6).
+                    d.set("CL", flatten(&super::callout::primary_leader(self)));
                 } else {
                     d.set("Vertices", flatten(pts));
                 }
@@ -1084,6 +1086,12 @@ impl Markup {
             });
 
         let mut geometry = geometry_from_dict(d);
+        let callout = if markup_type == MarkupType::Callout {
+            geometry = super::callout::compress_geometry(geometry);
+            super::callout::read_props(d)
+        } else {
+            None
+        };
         // A foreign /Text (sticky note) carries only a /Rect (the icon box), which the
         // foreign fallback reads as `Rect`; a Note's geometry is the icon CENTRE. The box
         // itself is kept (`source_rect`) so an unmoved note is written back with it.
@@ -1176,6 +1184,7 @@ impl Markup {
             source_rect,
             source_ref: None,
             source_popup: None,
+            callout,
         }
     }
 }

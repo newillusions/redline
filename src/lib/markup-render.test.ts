@@ -284,12 +284,13 @@ describe("text + callout rendering", () => {
     m.contents = "see note";
     const s = markupToSvg(m, VS);
     if (s.kind !== "callout") throw new Error("kind");
-    expect(s.points.split(" ").length).toBe(2);
+    expect(s.leaders).toHaveLength(1);
+    expect(s.leaders[0].points.split(" ").length).toBe(2);
     expect(s.text).toBe("see note");
     const anchor = pdfUserSpaceToScreen(50, 60, VS);
     expect(s.x).toBeCloseTo(anchor.x); expect(s.y).toBeCloseTo(anchor.y);
     // Arrowhead at the leader's pointing (target) end: an explicit 3-point polygon.
-    expect(s.arrowHead.split(" ").length).toBe(3);
+    expect(s.leaders[0].arrowHead.split(" ").length).toBe(3);
     // Synthesized text box at the anchor end has a positive size.
     expect(s.width).toBeGreaterThan(0);
     expect(s.height).toBeGreaterThan(0);
