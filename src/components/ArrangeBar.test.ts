@@ -83,6 +83,35 @@ describe("ArrangeBar", () => {
     expect(screen.getByRole("status").textContent).toBe("Made 2 markups");
   });
 
+  it("Multiply dialog: Centre to centre is the default, each option carries a tooltip, and Gap is remembered", async () => {
+    const { store, unmount } = mount();
+    store.selectedIds = new Set(["a"]); // a is 20 wide at x 10..30
+    await fireEvent.click(btn("Multiply..."));
+    const centre = screen.getByLabelText("Centre to centre") as HTMLInputElement;
+    const gap = screen.getByLabelText("Gap") as HTMLInputElement;
+    expect(centre.checked).toBe(true);
+    expect(centre.closest("label")!.title).toMatch(/centre of one copy to the centre of the next/i);
+    expect(gap.closest("label")!.title).toMatch(/edge of one copy to the edge of the next|clear space/i);
+    await fireEvent.click(gap);
+    await fireEvent.input(screen.getByLabelText("Distance"), { target: { value: "10" } });
+    await fireEvent.input(screen.getByLabelText("Copies"), { target: { value: "1" } });
+    await fireEvent.click(btn(/^Multiply$/));
+    expect(store.markups).toHaveLength(4);
+    expect((store.markups[3].geometry as { Rect: { min: { x: number } } }).Rect.min.x).toBe(40); // 30 + 10, not 10 + 10
+    unmount();
+    // A fresh dialog (new mount, same viewer) opens on Gap.
+    const second = mount();
+    second.store.selectedIds = new Set(["a"]);
+    await fireEvent.click(screen.getByRole("button", { name: "Multiply..." }));
+    expect((screen.getByLabelText("Gap") as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("Align: Center and Middle say which axis they fix", () => {
+    mount();
+    expect(btn("Center").title).toMatch(/horizontal centre.*same x/i);
+    expect(btn("Middle").title).toMatch(/vertical middle.*same y/i);
+  });
+
   it("Paste to pages: parses a page list, refuses a bad one, pastes in place on each", async () => {
     const { store } = mount();
     store.selectedIds = new Set(["a"]);

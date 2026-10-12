@@ -47,10 +47,10 @@
 
   const ALIGN: { mode: AlignMode; label: string; title: string }[] = [
     { mode: "left", label: "Left", title: "Align left edges to the first selected" },
-    { mode: "center", label: "Center", title: "Align horizontal centres to the first selected" },
+    { mode: "center", label: "Center", title: "Align horizontal centres (same x, a common vertical line) to the first selected" },
     { mode: "right", label: "Right", title: "Align right edges to the first selected" },
     { mode: "top", label: "Top", title: "Align top edges to the first selected" },
-    { mode: "middle", label: "Middle", title: "Align vertical middles to the first selected" },
+    { mode: "middle", label: "Middle", title: "Align vertical middles (same y, a common horizontal line) to the first selected" },
     { mode: "bottom", label: "Bottom", title: "Align bottom edges to the first selected" },
   ];
   const ORDER: { op: OrderOp; label: string; title: string }[] = [

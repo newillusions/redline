@@ -167,6 +167,70 @@ describe("multiplyOffsets", () => {
   });
 });
 
+describe("multiplyOffsets: centre-to-centre (default) vs gap", () => {
+  const page = { w: 600, h: 400 };
+  const narrow = { minX: 100, minY: 100, maxX: 110, maxY: 120 }; // 10 x 20
+  const wide = { minX: 100, minY: 100, maxX: 200, maxY: 120 }; // 100 x 20
+  const line = (m: "centre" | "gap" | undefined, direction: "right" | "up", pitch: number) =>
+    ({ kind: "line", direction, count: 2, pitch, ...(m ? { measure: m } : {}) }) as const;
+
+  it("centre-to-centre is the default and ignores the markup's width: same step for a narrow and a wide unit", () => {
+    for (const u of [narrow, wide]) {
+      expect(multiplyOffsets(line(undefined, "right", 50), u, page).offsets).toEqual([{ dx: 50, dy: 0 }, { dx: 100, dy: 0 }]);
+      expect(multiplyOffsets(line("centre", "right", 50), u, page).offsets).toEqual([{ dx: 50, dy: 0 }, { dx: 100, dy: 0 }]);
+    }
+  });
+  it("gap adds the unit's own extent along the direction: width for right/left, height for up/down", () => {
+    expect(multiplyOffsets(line("gap", "right", 5), narrow, page).offsets).toEqual([{ dx: 15, dy: 0 }, { dx: 30, dy: 0 }]);
+    expect(multiplyOffsets(line("gap", "right", 5), wide, page).offsets).toEqual([{ dx: 105, dy: 0 }, { dx: 210, dy: 0 }]);
+    expect(multiplyOffsets(line("gap", "up", 5), wide, page).offsets).toEqual([{ dx: 0, dy: 25 }, { dx: 0, dy: 50 }]);
+    const l = multiplyOffsets({ kind: "line", direction: "left", count: 1, pitch: 5, measure: "gap" }, narrow, page);
+    expect(l.offsets).toEqual([{ dx: -15, dy: 0 }]);
+  });
+  it("gap 0 is allowed (edges touch); a negative gap is refused", () => {
+    expect(multiplyOffsets(line("gap", "right", 0), narrow, page).offsets).toEqual([{ dx: 10, dy: 0 }, { dx: 20, dy: 0 }]);
+    expect(multiplyOffsets(line("gap", "right", -1), narrow, page).error).toBeTruthy();
+    expect(multiplyOffsets(line("centre", "right", 0), narrow, page).error).toBeTruthy();
+  });
+  it("a zero-size unit with gap 0 would stack the copies: refused", () => {
+    const dot = { minX: 5, minY: 5, maxX: 5, maxY: 5 };
+    expect(multiplyOffsets(line("gap", "right", 0), dot, page).error).toBeTruthy();
+  });
+  it("a grid in gap mode adds width across and height down", () => {
+    const res = multiplyOffsets({ kind: "grid", cols: 2, rows: 2, pitchX: 5, pitchY: 7, measure: "gap" }, narrow, page);
+    expect(res.offsets).toEqual([{ dx: 15, dy: 0 }, { dx: 0, dy: -27 }, { dx: 15, dy: -27 }]);
+  });
+  it("a grid in centre mode is unchanged", () => {
+    const res = multiplyOffsets({ kind: "grid", cols: 2, rows: 2, pitchX: 30, pitchY: 40, measure: "centre" }, wide, page);
+    expect(res.offsets).toEqual([{ dx: 30, dy: 0 }, { dx: 0, dy: -40 }, { dx: 30, dy: -40 }]);
+  });
+  it("fit is judged against the DISPLAY page size, so a 90/270 page (width and height swapped) clips differently", () => {
+    // Portrait 600 x 400 vs the same sheet rotated 90/270 (display 400 x 600): markups live in display space.
+    const spec = { kind: "line", direction: "right", count: 10, pitch: 100 } as const;
+    const u = { minX: 0, minY: 0, maxX: 20, maxY: 20 };
+    expect(multiplyOffsets(spec, u, { w: 600, h: 400 }).offsets).toHaveLength(5);
+    expect(multiplyOffsets(spec, u, { w: 400, h: 600 }).offsets).toHaveLength(3);
+  });
+});
+
+describe("align on rotated pages (display space, spec A3)", () => {
+  // Markups are held in PDFium display space (rotation baked in), so Center / Middle read the screen's x / y.
+  it.each([90, 270])("page rotated %i: Center gives equal x-centres, Middle equal y-centres, whatever the sizes", () => {
+    const a = r("a", 10, 10, 20, 30), b = r("b", 300, 200, 340, 210), c = r("c", 55, 400, 60, 460);
+    const cx = (ms: Markup[], mode: "center" | "middle") => {
+      const moved = applyMoves(alignMoves(units(ms), mode), BY, NOW).pairs.map((p) => p.after).concat(ms.slice(0, 1));
+      return moved.map((m) => {
+        const g = (m.geometry as { Rect: { min: { x: number; y: number }; max: { x: number; y: number } } }).Rect;
+        return mode === "center" ? (g.min.x + g.max.x) / 2 : (g.min.y + g.max.y) / 2;
+      });
+    };
+    expect(new Set(cx([a, b, c], "center")).size).toBe(1);
+    expect(new Set(cx([a, b, c], "middle")).size).toBe(1);
+    expect(cx([a, b, c], "center")[0]).toBe(15);
+    expect(cx([a, b, c], "middle")[0]).toBe(20);
+  });
+});
+
 describe("spacingToPoints", () => {
   const s = scale("s", 0.05, 0, "m");
   it("points as they are; the page scale's unit through its ratio", () => {
@@ -178,5 +242,10 @@ describe("spacingToPoints", () => {
     expect(spacingToPoints(1, "ft", s)).toBeNull();
     expect(spacingToPoints(0, "pt", null)).toBeNull();
     expect(spacingToPoints(NaN, "pt", null)).toBeNull();
+  });
+  it("zero is accepted only when asked for (a gap of 0), negatives never", () => {
+    expect(spacingToPoints(0, "pt", null, true)).toBe(0);
+    expect(spacingToPoints(0, "m", scale("s", 0.05, 0, "m"), true)).toBe(0);
+    expect(spacingToPoints(-1, "pt", null, true)).toBeNull();
   });
 });

@@ -253,6 +253,52 @@ describe("multiply", () => {
     expect(s.markups).toHaveLength(1);
   });
 
+  it("default is centre-to-centre: markups of different widths land the same pitch apart, centre to centre", () => {
+    for (const w of [10, 80]) {
+      const s = storeWith([mk("a", { rect: [100, 10, 100 + w, 30] })]);
+      select(s, "a");
+      multiplySelection(ctxFor(s), { kind: "line", direction: "right", count: 2, pitch: 120 });
+      const centres = s.markups.map((m) => (rect(m).min.x + rect(m).max.x) / 2);
+      expect(centres.map((c, i) => c - centres[0] - 120 * i)).toEqual([0, 0, 0]);
+    }
+  });
+
+  it("gap mode: the clear space between neighbours is the distance, whatever the widths, one undo step", () => {
+    for (const w of [10, 80]) {
+      const s = storeWith([mk("a", { rect: [100, 10, 100 + w, 30] })]);
+      select(s, "a");
+      const res = multiplySelection(ctxFor(s), { kind: "line", direction: "right", count: 3, pitch: 25, measure: "gap" });
+      expect(res.message).toBe("Made 3 markups");
+      for (let i = 1; i < s.markups.length; i++) {
+        expect(rect(s.markups[i]).min.x - rect(s.markups[i - 1]).max.x).toBe(25);
+      }
+      s.undo();
+      expect(s.markups).toHaveLength(1);
+      expect(s.canUndo).toBe(false);
+    }
+  });
+
+  it("gap mode on a multi-markup selection uses the selection's bounding box", () => {
+    const s = storeWith([mk("a", { rect: [0, 100, 10, 110] }), mk("b", { rect: [30, 100, 40, 110] })]);
+    select(s, "a", "b");
+    multiplySelection(ctxFor(s), { kind: "line", direction: "right", count: 1, pitch: 5, measure: "gap" });
+    expect(s.markups.slice(2).map((m) => rect(m).min.x)).toEqual([45, 75]);
+  });
+
+  it("gap mode keeps count_group stamping and the locked-source refusal", () => {
+    const s = storeWith([mkCount("solo", 20, 20, null)]);
+    select(s, "solo");
+    multiplySelection(ctxFor(s), { kind: "line", direction: "right", count: 2, pitch: 10, measure: "gap" });
+    expect(countGroups(s.markups)[0].total).toBe(3);
+    expect(s.getById("solo")!.count_group).toBe("solo");
+    const locked = storeWith([mkCount("lk", 20, 20, null, { annot_flags: 4 | 0x80 })]);
+    select(locked, "lk");
+    const res = multiplySelection(ctxFor(locked), { kind: "line", direction: "right", count: 2, pitch: 10, measure: "gap" });
+    expect(res.ok).toBe(false);
+    expect(res.message).toMatch(/locked/);
+    expect(locked.markups).toHaveLength(1);
+  });
+
   it("copies of a group are separate groups (Revu: independent, not grouped together)", () => {
     const s = storeWith([mk("a", { group_id: "G", rect: [0, 100, 10, 110] }), mk("b", { group_id: "G", rect: [20, 100, 30, 110] })]);
     select(s, "a", "b");

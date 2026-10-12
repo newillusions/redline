@@ -2,12 +2,14 @@
   /**
    * MultiplyDialog - Revu's Multiply (docs/arrange.md section 2): direction, distance between
    * copies with a unit, number of copies. "Grid" is redline's extension (columns x rows, growing
-   * right and down). The distance is a pitch (corresponding point to corresponding point). The
+   * right and down). The distance is centre to centre by default (the same as the step between
+   * corresponding points), or the clear gap between neighbours; the choice is remembered. The
    * unit list is points plus the page scale's own unit when the viewed page has a scale.
    * `onSubmit` returns an error message to keep the dialog open, or null when it worked.
    */
   import type { ScaleRecord } from "$lib/ipc";
-  import { spacingToPoints, type MultiplyDirection, type MultiplySpec } from "$lib/markup-arrange";
+  import { spacingToPoints, type MultiplyDirection, type MultiplyMeasure, type MultiplySpec } from "$lib/markup-arrange";
+  import { loadMultiplyMeasure, persistMultiplyMeasure } from "$lib/multiply-prefs";
 
   const {
     scale,
@@ -27,19 +29,22 @@
   let spacing = $state(36);
   let spacingV = $state(36);
   let unit = $state("pt");
+  let measure = $state<MultiplyMeasure>(loadMultiplyMeasure());
   let error = $state<string | null>(null);
 
   function submit() {
-    const pitch = spacingToPoints(spacing, unit, scale);
-    const pitchV = spacingToPoints(spacingV, unit, scale);
+    const gap = measure === "gap";
+    const pitch = spacingToPoints(spacing, unit, scale, gap);
+    const pitchV = spacingToPoints(spacingV, unit, scale, gap);
     if (pitch === null || (mode === "grid" && pitchV === null)) {
-      error = "Enter a distance above zero.";
+      error = gap ? "Enter a distance of zero or more." : "Enter a distance above zero.";
       return;
     }
     const spec: MultiplySpec =
       mode === "grid"
-        ? { kind: "grid", cols, rows, pitchX: pitch, pitchY: pitchV! }
-        : { kind: "line", direction: mode, count: copies, pitch };
+        ? { kind: "grid", cols, rows, pitchX: pitch, pitchY: pitchV!, measure }
+        : { kind: "line", direction: mode, count: copies, pitch, measure };
+    persistMultiplyMeasure(measure);
     error = onSubmit(spec);
   }
 
@@ -80,6 +85,17 @@
   {#if mode === "grid"}
     <label class="row"><span>Down</span><input type="number" min="0" step="any" bind:value={spacingV} aria-label="Distance down" /></label>
   {/if}
+  <div class="row" role="radiogroup" aria-label="Distance is measured">
+    <span>Measured</span>
+    <span class="choices">
+      <label title="From the centre of one copy to the centre of the next. The copies step by exactly this distance, whatever their size.">
+        <input type="radio" name="multiply-measure" value="centre" bind:group={measure} aria-label="Centre to centre" /> Centre to centre
+      </label>
+      <label title="The clear space from the edge of one copy to the edge of the next. The step is the copy's width (across) or height (down) plus this distance.">
+        <input type="radio" name="multiply-measure" value="gap" bind:group={measure} aria-label="Gap" /> Gap
+      </label>
+    </span>
+  </div>
   <label class="row">
     <span>Unit</span>
     <select bind:value={unit} aria-label="Unit">
@@ -87,7 +103,7 @@
       {#if scale}<option value={scale.unit}>{scale.unit} (page scale)</option>{/if}
     </select>
   </label>
-  <p class="hint">Distance is from one copy to the next, point to point. Copies that would leave the page are not made.</p>
+  <p class="hint">{measure === "gap" ? "Distance is the clear space between one copy and the next." : "Distance is from the centre of one copy to the centre of the next."} Copies that would leave the page are not made.</p>
 
   {#if error}<p class="error" role="alert">{error}</p>{/if}
 
@@ -113,6 +129,9 @@
     border: 1px solid var(--color-border); border-radius: var(--radius-sm);
     background: var(--color-bg-input); color: var(--color-text); font-size: var(--font-size-sm);
   }
+  .choices { display: flex; flex-direction: column; gap: var(--space-1); width: 180px; }
+  .choices label { display: flex; align-items: center; gap: var(--space-2); }
+  .choices input { width: auto; }
   .hint { font-size: var(--font-size-sm); color: var(--color-text-secondary); margin: var(--space-2) 0; }
   .error { font-size: var(--font-size-sm); color: var(--color-danger, #e02424); margin: var(--space-2) 0; }
   .button-row { display: flex; gap: var(--space-2); justify-content: flex-end; margin-top: var(--space-3); }

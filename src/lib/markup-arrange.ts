@@ -205,12 +205,20 @@ export function orderChanges(
 
 export type MultiplyDirection = "right" | "left" | "up" | "down";
 
+/**
+ * What the distance means (Revu's Multiply, owner-confirmed 2026-10-12): `centre` (the default)
+ * is centre to centre, so copies step by exactly that distance whatever their size; `gap` is the
+ * clear space between one copy's edge and the next's, so the step is the unit's width (across)
+ * or height (down) plus the distance.
+ */
+export type MultiplyMeasure = "centre" | "gap";
+
 export type MultiplySpec =
   /** `count` copies in one of the four cardinal directions, `pitch` PDF pt apart (Revu). */
-  | { kind: "line"; direction: MultiplyDirection; count: number; pitch: number }
+  | { kind: "line"; direction: MultiplyDirection; count: number; pitch: number; measure?: MultiplyMeasure }
   /** `cols` x `rows` cells counting the original at the top-left, growing right and down; the
    *  original's cell is not copied. */
-  | { kind: "grid"; cols: number; rows: number; pitchX: number; pitchY: number };
+  | { kind: "grid"; cols: number; rows: number; pitchX: number; pitchY: number; measure?: MultiplyMeasure };
 
 export interface Offset {
   dx: number;
@@ -228,6 +236,7 @@ export interface MultiplyOffsets {
 
 const okCount = (n: unknown): n is number => typeof n === "number" && Number.isInteger(n) && n >= 1;
 const okPitch = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n > 0;
+const okGap = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0;
 
 /**
  * Offsets of every copy of a unit whose bounding box is `unit`, with copies that would leave
@@ -242,26 +251,39 @@ export function multiplyOffsets(
   maxCopies: number = MAX_COPY_ITEMS,
 ): MultiplyOffsets {
   const bad = (error: string): MultiplyOffsets => ({ offsets: [], requested: 0, clipped: 0, error });
+  const gap = spec.measure === "gap";
+  const okDistance = gap ? okGap : okPitch;
+  const distanceError = gap ? "a distance of zero or more" : "a distance above zero";
+  const width = unit.maxX - unit.minX;
+  const height = unit.maxY - unit.minY;
+  /** The step between neighbouring copies: the distance itself (centre to centre) or the unit's extent plus it (gap). */
+  const step = (distance: number, extent: number) => (gap ? extent + distance : distance);
+  const stackError = "The copies would sit on top of each other; enter a distance above zero.";
   let cells: Offset[];
   let requested: number;
   if (spec.kind === "line") {
-    if (!okCount(spec.count) || !okPitch(spec.pitch)) return bad("Enter a whole number of copies and a distance above zero.");
+    if (!okCount(spec.count) || !okDistance(spec.pitch)) return bad(`Enter a whole number of copies and ${distanceError}.`);
     if (spec.count > maxCopies) return bad(`At most ${maxCopies} copies at a time.`);
     requested = spec.count;
     const [sx, sy] = spec.direction === "right" ? [1, 0] : spec.direction === "left" ? [-1, 0] : spec.direction === "up" ? [0, 1] : [0, -1];
-    cells = Array.from({ length: requested }, (_, k) => ({ dx: sx * spec.pitch * (k + 1), dy: sy * spec.pitch * (k + 1) }));
+    const pitch = step(spec.pitch, sx !== 0 ? width : height);
+    if (!(pitch > 0)) return bad(stackError);
+    cells = Array.from({ length: requested }, (_, k) => ({ dx: sx * pitch * (k + 1), dy: sy * pitch * (k + 1) }));
   } else {
-    if (!okCount(spec.cols) || !okCount(spec.rows) || !okPitch(spec.pitchX) || !okPitch(spec.pitchY)) {
-      return bad("Enter whole numbers of columns and rows and distances above zero.");
+    if (!okCount(spec.cols) || !okCount(spec.rows) || !okDistance(spec.pitchX) || !okDistance(spec.pitchY)) {
+      return bad(`Enter whole numbers of columns and rows and ${distanceError}.`);
     }
     requested = spec.cols * spec.rows - 1;
     if (requested < 1) return bad("A grid of one cell has nothing to copy.");
     if (requested > maxCopies) return bad(`At most ${maxCopies} copies at a time.`);
+    const pitchX = step(spec.pitchX, width);
+    const pitchY = step(spec.pitchY, height);
+    if (!(pitchX > 0) || !(pitchY > 0)) return bad(stackError);
     cells = [];
     for (let j = 0; j < spec.rows; j++) {
       for (let i = 0; i < spec.cols; i++) {
         if (i === 0 && j === 0) continue;
-        cells.push({ dx: spec.pitchX * i, dy: j === 0 ? 0 : -spec.pitchY * j });
+        cells.push({ dx: pitchX * i, dy: j === 0 ? 0 : -pitchY * j });
       }
     }
   }
@@ -279,10 +301,11 @@ export function multiplyOffsets(
 
 /**
  * A distance typed in `unit` as PDF points: "pt" as it is, or the page scale's own unit divided
- * by its ratio (real-world units per point). Null when the unit is unknown or the value unusable.
+ * by its ratio (real-world units per point). Null when the unit is unknown or the value unusable;
+ * zero counts as usable only with `allowZero` (a gap of 0 makes the edges touch).
  */
-export function spacingToPoints(value: number, unit: string, scale: ScaleRecord | null): number | null {
-  if (!Number.isFinite(value) || value <= 0) return null;
+export function spacingToPoints(value: number, unit: string, scale: ScaleRecord | null, allowZero = false): number | null {
+  if (!Number.isFinite(value) || value < 0 || (value === 0 && !allowZero)) return null;
   if (unit === "pt") return value;
   if (scale && unit === scale.unit && Number.isFinite(scale.ratio) && scale.ratio > 0) return value / scale.ratio;
   return null;
