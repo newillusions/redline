@@ -63,6 +63,7 @@
     markupToSvg, selectionChrome, vertexChrome, isClosedMarkupType, quadToScreenPolygon,
     type SvgShape, type SelectionChrome, type VertexChrome,
   } from "$lib/markup-render";
+  import { computeRows, sanitizeLegend, type LegendRow } from "$lib/legend";
   import { charIndexAtPoint, getTextSelection, selectionRange, copyToClipboard, cursorForTextTool, type Quad } from "$lib/text-select";
   import TextSelectionActionBar from "./TextSelectionActionBar.svelte";
   import { MarkupStore, type ToolKind } from "$lib/markup-store.svelte";
@@ -530,15 +531,34 @@
   // so the overlay stays glued to the page with no manual redraw.
   // During a move/resize drag, the selected markups render at their previewed
   // positions (dragPreview) instead of their committed ones, glued to viewState.
+  // The computed rows of each Legend on this page: depend on the mark-ups only, so panning and
+  // zooming redraw the table without recomputing it.
+  const legendRows = $derived.by(() => {
+    const out = new Map<string, LegendRow[]>();
+    for (const m of store.markups) {
+      if (m.markup_type === "Legend" && m.legend && m.page === pageIndex) {
+        out.set(m.id, computeRows(m.page, sanitizeLegend(m.legend), store.markups));
+      }
+    }
+    return out;
+  });
+
   const pageShapes = $derived.by<SvgShape[]>(() => {
     const previewIds = new Set(dragPreview?.map((m) => m.id) ?? []);
     const committed = store.markups
       .filter((m) => m.page === pageIndex && !previewIds.has(m.id))
-      .map((m) => markupToSvg(m, viewState));
+      .map((m) => markupToSvg(m, viewState, legendRows.get(m.id)));
     const preview = (dragPreview ?? [])
       .filter((m) => m.page === pageIndex)
-      .map((m) => markupToSvg(m, viewState));
+      .map((m) => markupToSvg(m, viewState, legendRows.get(m.id)));
     return [...committed, ...preview];
+  });
+
+  // Legends follow the mark-ups they count: keep each stored rectangle equal to its table.
+  // The call READS every mark-up (so any add/edit/delete re-runs it) and writes only when a
+  // rectangle actually changes, so it settles after one extra pass.
+  $effect(() => {
+    store.syncLegends();
   });
 
   // Preview shape for the live draw gesture (not committed until pointerup).
@@ -3460,6 +3480,51 @@
         <text x={s.x} y={s.y} fill={s.stroke} font-size={s.fontPx}
           dominant-baseline="hanging"
           pointer-events="none">{s.text}</text>
+      {:else if s.kind === "legend"}
+        <!-- A Legend table (docs/legends.md): background, title bar, grid, border, then the
+             text and symbols. Every string is mark-up data and is rendered as text only. -->
+        <rect x={s.x} y={s.y} width={s.width} height={s.height}
+          fill={s.fill} fill-opacity={s.fillOpacity}
+          stroke="none" pointer-events="none" />
+        {#if s.titleBar}
+          <rect x={s.titleBar.x} y={s.titleBar.y} width={s.titleBar.width} height={s.titleBar.height}
+            fill="#e6e6e6" stroke="none" pointer-events="none" />
+        {/if}
+        {#each s.lines as ln, i (i)}
+          <line x1={ln.x1} y1={ln.y1} x2={ln.x2} y2={ln.y2}
+            stroke={s.stroke} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
+            pointer-events="none" />
+        {/each}
+        <rect x={s.x} y={s.y} width={s.width} height={s.height}
+          fill="none" stroke={s.stroke} stroke-width={s.strokeWidth} stroke-opacity={s.strokeOpacity}
+          pointer-events="none" />
+        {#each s.texts as t, i (i)}
+          <text x={t.x} y={t.y} fill="#000000" font-size={t.fontPx} font-family="Helvetica, Arial, sans-serif"
+            pointer-events="none">{t.text}</text>
+        {/each}
+        {#each s.symbols as sym, i (i)}
+          {#if sym.kind === "count"}
+            {#if sym.render.shape === "circle"}
+              <circle cx={sym.render.cx} cy={sym.render.cy} r={sym.render.r}
+                stroke={sym.color} stroke-width="1.2" fill={sym.color} pointer-events="none" />
+            {:else if sym.render.shape === "polygon"}
+              <polygon points={sym.render.points}
+                stroke={sym.color} stroke-width="1.2" fill={sym.color} stroke-linejoin="round"
+                pointer-events="none" />
+            {:else if sym.render.shape === "cross"}
+              {#each sym.render.lines as ln, j (j)}
+                <line x1={ln.x1} y1={ln.y1} x2={ln.x2} y2={ln.y2}
+                  stroke={sym.color} stroke-width="1.2" stroke-linecap="round" pointer-events="none" />
+              {/each}
+            {/if}
+          {:else if sym.kind === "line"}
+            <line x1={sym.x1} y1={sym.y1} x2={sym.x2} y2={sym.y2}
+              stroke={sym.color} stroke-width="1.6" pointer-events="none" />
+          {:else}
+            <rect x={sym.x} y={sym.y} width={sym.size} height={sym.size}
+              fill={sym.fill ?? "none"} stroke={sym.color} stroke-width="1.2" pointer-events="none" />
+          {/if}
+        {/each}
       {:else if s.kind === "callout"}
         <!-- Leader/arrowhead have no independent Fill control - the arrowhead's
              fill-opacity tracks strokeOpacity too (mirrors the Arrow shape above and

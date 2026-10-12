@@ -8,6 +8,9 @@
 import type { CountSymbol, Markup, MarkupType, PdfPoint } from "./ipc";
 import { pdfUserSpaceToScreen, type ViewportState } from "./viewport";
 import { allLeaders, calloutBox } from "./callout";
+import {
+  COLUMN_HEADER, cellText, clipCell, effectiveRect, isLineType, layout, sanitizeLegend, type LegendRow,
+} from "./legend";
 import { type Bounds, type HandleId, HANDLE_IDS, handleAnchors, NOTE_ICON_PT } from "./markup-select";
 
 interface SvgStyle {
@@ -123,7 +126,25 @@ export type SvgShape =
       text: string;
       fontPx: number;
       outline: string;
+    })
+  | (SvgStyle & {
+      /** A Legend table (docs/legends.md), computed from the document's mark-ups. */
+      kind: "legend";
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      titleBar: { x: number; y: number; width: number; height: number } | null;
+      lines: { x1: number; y1: number; x2: number; y2: number }[];
+      /** Text with its baseline at (x, y), screen space. */
+      texts: { x: number; y: number; text: string; fontPx: number }[];
+      symbols: LegendSymbolDraw[];
     });
+
+export type LegendSymbolDraw =
+  | { kind: "count"; render: PointSymbolRender; color: string }
+  | { kind: "line"; x1: number; y1: number; x2: number; y2: number; color: string }
+  | { kind: "box"; x: number; y: number; size: number; fill: string | null; color: string };
 
 /** Screen-space radius (CSS px) of a count marker — half its bounding box. */
 export const COUNT_MARKER_RADIUS = 6;
@@ -541,9 +562,96 @@ export function vertexChrome(pts: PdfPoint[], v: ViewportState, closed: boolean)
   return { vertices, midpoints };
 }
 
-export function markupToSvg(m: Markup, v: ViewportState): SvgShape {
+/**
+ * The table of a Legend in screen space, mirroring `appearance.rs::draw_legend` (the saved
+ * appearance). `rows` are the legend's computed rows (`computeRows`), supplied by the caller so
+ * they are recomputed when the mark-ups change, not on every pan or zoom.
+ */
+function legendShape(m: Markup, v: ViewportState, rows: readonly LegendRow[], style: SvgStyle): SvgShape | null {
+  const props = sanitizeLegend(m.legend);
+  const rect = effectiveRect(m, rows.length);
+  if (!rect) return null;
+  const lay = layout(props, rect.x1 - rect.x0, rows.length);
+  const P = (x: number, y: number) => pdfUserSpaceToScreen(x, y, v);
+  const { x0, y1 } = { x0: rect.x0, y1: rect.y1 };
+  const bodyTop = y1 - lay.titleH;
+  const tl = P(x0, y1);
+  const br = P(x0 + lay.width, y1 - lay.height);
+  const font = lay.font;
+  const fontPx = font * v.zoom;
+  const base = (top: number, band: number) => top - band / 2 - font * 0.32;
+  const pad = font * 0.5;
+
+  const lines: { x1: number; y1: number; x2: number; y2: number }[] = [];
+  const hline = (y: number) => {
+    const a = P(x0, y);
+    const b = P(x0 + lay.width, y);
+    lines.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y });
+  };
+  if (props.show_title) hline(bodyTop);
+  let cursor = bodyTop;
+  if (props.show_headers) { cursor -= lay.headerH; hline(cursor); }
+  for (let i = 0; i < Math.max(rows.length, 1); i++) { cursor -= lay.rowH; hline(cursor); }
+  for (const c of lay.columns.slice(1)) {
+    const a = P(x0 + c.x, bodyTop);
+    const b = P(x0 + c.x, y1 - lay.height);
+    lines.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y });
+  }
+
+  const texts: { x: number; y: number; text: string; fontPx: number }[] = [];
+  const text = (t: string, x: number, y: number) => {
+    if (t === "") return;
+    const p = P(x, y);
+    texts.push({ x: p.x, y: p.y, text: t, fontPx });
+  };
+  if (props.show_title) text(clipCell(props.title, lay.width, font), x0 + pad, base(y1, lay.titleH));
+  let top = bodyTop;
+  if (props.show_headers) {
+    for (const c of lay.columns) text(clipCell(COLUMN_HEADER[c.column], c.w, font), x0 + c.x + pad, base(top, lay.headerH));
+    top -= lay.headerH;
+  }
+  const sym = lay.columns.find((c) => c.column === "Symbol");
+  const symbols: LegendSymbolDraw[] = [];
+  const radius = lay.rowH * 0.3;
+  for (const row of rows) {
+    for (const c of lay.columns) {
+      if (c.column !== "Symbol") text(clipCell(cellText(row, c.column), c.w, font), x0 + c.x + pad, base(top, lay.rowH));
+    }
+    if (sym) {
+      const c = P(x0 + sym.x + Math.min(sym.w, lay.rowH) / 2, top - lay.rowH / 2);
+      const r = radius * v.zoom;
+      if (row.symbol) symbols.push({ kind: "count", render: countSymbolRender(row.symbol, c.x, c.y, r), color: row.color });
+      else if (isLineType(row.key.markup_type)) symbols.push({ kind: "line", x1: c.x - r, y1: c.y, x2: c.x + r, y2: c.y, color: row.color });
+      else symbols.push({ kind: "box", x: c.x - r, y: c.y - r, size: 2 * r, fill: row.fill, color: row.color });
+    }
+    top -= lay.rowH;
+  }
+  const titleBar = props.show_title
+    ? { x: tl.x, y: tl.y, width: br.x - tl.x, height: lay.titleH * v.zoom }
+    : null;
+  return {
+    ...style,
+    fill: m.appearance.fill ?? "#ffffff",
+    kind: "legend",
+    x: tl.x,
+    y: tl.y,
+    width: br.x - tl.x,
+    height: br.y - tl.y,
+    titleBar,
+    lines,
+    texts,
+    symbols,
+  };
+}
+
+export function markupToSvg(m: Markup, v: ViewportState, legendRows: readonly LegendRow[] = []): SvgShape {
   const style = styleOf(m, v);
   const g = m.geometry;
+
+  if (m.markup_type === "Legend" && m.legend) {
+    const shape = legendShape(m, v, legendRows, style);
+    if (shape) return shape;
+  }
 
   const fontPx = (m.appearance.font?.size_pt ?? DEFAULT_FONT_PT) * v.zoom;
   if (m.markup_type === "Text" && "Rect" in g) {

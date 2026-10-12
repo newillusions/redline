@@ -604,6 +604,23 @@ impl MarkupStore {
         Ok(())
     }
 
+    /// Bring every stored measurement under the document's current `scales`, with the rule the
+    /// frontend and the exports use (`takeoff::recompute_all`). Returns how many changed. The
+    /// quantities are derived data, so a locked markup is recomputed too.
+    pub fn recompute_measurements(
+        &self,
+        doc_id: &str,
+        scales: &[crate::takeoff::ScaleRecord],
+    ) -> usize {
+        let mut g = self.docs.lock().unwrap();
+        let Some(e) = g.get_mut(doc_id) else { return 0 };
+        let changed = crate::takeoff::recompute_all(&mut e.markups, scales);
+        if changed > 0 {
+            e.dirty = true;
+        }
+        changed
+    }
+
     /// Merge markups loaded from the PDF beneath any unsaved in-memory ones
     /// (the store wins on id collision) and mark the doc as loaded.
     /// Returns the merged set.

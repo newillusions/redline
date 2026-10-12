@@ -38,12 +38,7 @@ pub fn group_totals(markups: &[Markup]) -> HashMap<Uuid, u64> {
     let mut totals: HashMap<Uuid, u64> = HashMap::new();
     for m in markups.iter().filter(|m| is_count(m)) {
         if let Some(g) = m.count_group {
-            let v = m
-                .measurement
-                .as_ref()
-                .and_then(|x| x.count_value)
-                .unwrap_or(1);
-            *totals.entry(g).or_insert(0) += u64::from(v);
+            *totals.entry(g).or_insert(0) += item_value(m);
         }
     }
     totals
@@ -60,6 +55,12 @@ fn with_total(m: &Markup, total: u64) -> Markup {
     row
 }
 
+/// A count item's own value: a placed count mark counts once when no value is recorded (a
+/// foreign or hand-edited item), the same rule as the group totals and every panel.
+fn item_value(m: &Markup) -> u64 {
+    u64::from(m.measurement.as_ref().and_then(|x| x.count_value).unwrap_or(1))
+}
+
 /// One row per count group: the first item of each group stands in for the whole group
 /// with its total; ungrouped items and every non-count markup pass through unchanged.
 /// Order of first appearance is preserved.
@@ -74,6 +75,8 @@ pub fn collapse_groups(markups: &[Markup]) -> Vec<Markup> {
                     out.push(with_total(m, totals.get(&g).copied().unwrap_or(1)));
                 }
             }
+            // An ungrouped count is a count of one item: its own value (1 if none recorded).
+            (true, None) => out.push(with_total(m, item_value(m))),
             _ => out.push(m.clone()),
         }
     }
@@ -88,6 +91,7 @@ pub fn with_group_totals(all: &[Markup], picked: &[&Markup]) -> Vec<Markup> {
         .iter()
         .map(|m| match (is_count(m), m.count_group) {
             (true, Some(g)) => with_total(m, totals.get(&g).copied().unwrap_or(1)),
+            (true, None) => with_total(m, item_value(m)),
             _ => (*m).clone(),
         })
         .collect()
@@ -168,6 +172,24 @@ mod tests {
         let grouped = ms.iter().filter(|m| m.count_group.is_some()).count();
         assert_eq!(grouped, MAX_COUNT_GROUP_ITEMS);
         assert!(ms.last().unwrap().count_group.is_none());
+    }
+
+    #[test]
+    fn a_count_with_no_value_counts_once_everywhere() {
+        let a = Uuid::new_v4();
+        let mut loose = item(None);
+        loose.measurement.as_mut().unwrap().count_value = None;
+        loose.measurement.as_mut().unwrap().computed_quantity = 0.0;
+        let mut grouped = item(Some(a));
+        grouped.measurement.as_mut().unwrap().count_value = None;
+        assert_eq!(group_totals(std::slice::from_ref(&grouped))[&a], 1);
+        let rows = collapse_groups(&[loose.clone(), grouped.clone()]);
+        assert_eq!(rows[0].measurement.as_ref().unwrap().computed_quantity, 1.0);
+        assert_eq!(rows[0].measurement.as_ref().unwrap().count_value, Some(1));
+        assert_eq!(rows[1].measurement.as_ref().unwrap().computed_quantity, 1.0);
+        let picked: Vec<&Markup> = vec![&loose];
+        let with = with_group_totals(&[loose.clone(), grouped], &picked);
+        assert_eq!(with[0].measurement.as_ref().unwrap().computed_quantity, 1.0);
     }
 
     #[test]

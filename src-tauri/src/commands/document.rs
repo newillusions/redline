@@ -6,7 +6,7 @@ use tauri::{Manager, State};
 
 use crate::document::known_passwords;
 use crate::document::page_ops;
-use crate::document::save::{load_markups_from, save_decrypted_copy, save_with_markups_removing};
+use crate::document::save::{load_markups_from, save_decrypted_copy, save_with_markups_scaled};
 use crate::document::{new_doc_id, DocumentInfo, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD};
 use crate::markup::Markup;
 use crate::render::OpenOutcome;
@@ -499,10 +499,14 @@ async fn save_inner(
     //    has no re-encrypt-on-save path, so saving would silently strip the PDF's
     //    password protection.
     let staged = dest.with_extension("pdf.redline-staged");
+    // Legend tables are computed from quantities under the document's current scales (the
+    // recompute the exports run first), so load them like an export does.
+    crate::commands::takeoff::ensure_scales_loaded(state, doc_id);
+    let scales = state.scales.lock().unwrap().list(doc_id).to_vec();
     {
         let staged = staged.clone();
         tokio::task::spawn_blocking(move || {
-            save_with_markups_removing(&write_src, &staged, &markups, &removed)
+            save_with_markups_scaled(&write_src, &staged, &markups, &removed, &scales)
         })
             .await
             .map_err(|e| e.to_string())?
@@ -580,10 +584,23 @@ async fn save_inner(
 /// Writing markups FIRST fixes both: `op` (flatten/optimize/redact/rotate/delete/
 /// reorder/insert) now always operates on the CURRENT markup state, and nothing runs
 /// afterward to undo it.
+#[cfg(test)]
 fn apply_edit_and_save(
     src: &std::path::Path,
     markups: &[Markup],
     removed: &std::collections::HashSet<crate::markup::SourceRef>,
+    op: impl FnOnce(&mut lopdf::Document) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    apply_edit_and_save_scaled(src, markups, removed, &[], op)
+}
+
+/// [`apply_edit_and_save`] with the document's scales, so legend tables are computed from
+/// quantities recomputed under them (see `annots::write_markups_scaled`).
+pub(crate) fn apply_edit_and_save_scaled(
+    src: &std::path::Path,
+    markups: &[Markup],
+    removed: &std::collections::HashSet<crate::markup::SourceRef>,
+    scales: &[crate::takeoff::ScaleRecord],
     op: impl FnOnce(&mut lopdf::Document) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let mut doc =
@@ -599,7 +616,7 @@ fn apply_edit_and_save(
     }
     // Bring annotations up to the CURRENT markup state first, then apply the edit -
     // see the doc comment above for why this order matters.
-    crate::document::annots::write_markups_removing(&mut doc, markups, removed)?;
+    crate::document::annots::write_markups_scaled(&mut doc, markups, removed, scales)?;
     op(&mut doc)?;
     // Atomic write: temp + rename.
     let dir = src.parent().context("no parent dir")?;
@@ -656,10 +673,14 @@ pub(crate) async fn apply_page_edit(
     ensure_source_unchanged(&state.markups, doc_id, was_loaded)?;
     let markups = state.markups.list(doc_id)?;
     let removed = state.markups.removed_sources(doc_id);
+    crate::commands::takeoff::ensure_scales_loaded(state, doc_id);
+    let scales = state.scales.lock().unwrap().list(doc_id).to_vec();
 
     // Apply the op + save in a blocking task.
     let src2 = src.clone();
-    tokio::task::spawn_blocking(move || apply_edit_and_save(&src2, &markups, &removed, op))
+    tokio::task::spawn_blocking(move || {
+        apply_edit_and_save_scaled(&src2, &markups, &removed, &scales, op)
+    })
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("{e:#}"))?;
@@ -758,11 +779,24 @@ pub async fn insert_blank_page(
 
 /// Core logic behind [`extract_pages`], extracted so it's directly testable (file
 /// round-trip, tempfile + lopdf) the same way [`apply_edit_and_save`] is.
+#[cfg(test)]
 fn extract_pages_to_new_file(
     src: &std::path::Path,
     dest: &std::path::Path,
     markups: &[Markup],
     removed: &std::collections::HashSet<crate::markup::SourceRef>,
+    page_indices: &[u32],
+) -> anyhow::Result<()> {
+    extract_pages_to_new_file_scaled(src, dest, markups, removed, &[], page_indices)
+}
+
+/// [`extract_pages_to_new_file`] with the document's scales (legend tables, as for a save).
+pub(crate) fn extract_pages_to_new_file_scaled(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    markups: &[Markup],
+    removed: &std::collections::HashSet<crate::markup::SourceRef>,
+    scales: &[crate::takeoff::ScaleRecord],
     page_indices: &[u32],
 ) -> anyhow::Result<()> {
     let mut doc =
@@ -776,7 +810,7 @@ fn extract_pages_to_new_file(
     // Bring annotations up to the CURRENT markup state first (matches every other page
     // op - see apply_edit_and_save's doc comment), so extracted pages carry whatever's
     // actually on screen, not a stale on-disk snapshot.
-    crate::document::annots::write_markups_removing(&mut doc, markups, removed)?;
+    crate::document::annots::write_markups_scaled(&mut doc, markups, removed, scales)?;
     crate::document::page_ops::extract_pages(&mut doc, page_indices)?;
 
     let dir = dest.parent().context("no parent dir for destination path")?;
@@ -837,9 +871,11 @@ pub async fn extract_pages(
     ensure_source_unchanged(&state.markups, &doc_id, was_loaded)?;
     let markups = state.markups.list(&doc_id)?;
     let removed = state.markups.removed_sources(&doc_id);
+    crate::commands::takeoff::ensure_scales_loaded(&state, &doc_id);
+    let scales = state.scales.lock().unwrap().list(&doc_id).to_vec();
 
     tokio::task::spawn_blocking(move || {
-        extract_pages_to_new_file(&src, &dest, &markups, &removed, &page_indices)
+        extract_pages_to_new_file_scaled(&src, &dest, &markups, &removed, &scales, &page_indices)
     })
     .await
     .map_err(|e| e.to_string())?

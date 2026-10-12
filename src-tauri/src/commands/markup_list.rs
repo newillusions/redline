@@ -144,7 +144,7 @@ fn cell(m: &Markup, number: usize, col: &ListColumn) -> String {
             .as_ref()
             .map(|meas| {
                 if matches!(m.markup_type, crate::markup::MarkupType::MeasurementCount) {
-                    format!("{:.0}", f64::from(meas.count_value.unwrap_or(0)))
+                    format!("{:.0}", f64::from(meas.count_value.unwrap_or(1)))
                 } else {
                     format!("{:.2} {}", meas.computed_quantity, meas.unit)
                         .trim_end()

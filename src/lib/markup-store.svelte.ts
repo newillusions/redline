@@ -7,6 +7,7 @@
 import { isMarkupContentsLocked, isMarkupLocked, type Markup, type Appearance, type CountSet, type CountSymbol, type Tool } from "./ipc";
 import { History, CreateCmd, UpdateCmd, DeleteCmd, type MarkupSink, type MirrorOp } from "./markup-commands";
 import type { CountRun } from "./count-groups";
+import { fitLegendGeometry } from "./legend";
 
 /**
  * Up-front lock refusal message for `m`, or `null` if unlocked. Checked BEFORE any
@@ -134,7 +135,7 @@ export class MarkupStore implements MarkupSink {
    *  is the $state dependency the `canUndo`/`canRedo` getters read to stay reactive. */
   private historyVersion = $state(0);
 
-  constructor(private readonly docId: string, private readonly ipc: MarkupIpc) {
+  constructor(readonly docId: string, private readonly ipc: MarkupIpc) {
     // Seed one default set so the Count tool tallies into a named bucket out of the box.
     const def = this.makeCountSet("Count 1", "Circle");
     this.countSets = [def];
@@ -294,6 +295,23 @@ export class MarkupStore implements MarkupSink {
     const ops = this.history.pushBatch(cmds);
     ops.forEach((op) => this.enqueue(op));
     this.historyVersion++;
+  }
+
+  /**
+   * Keep every Legend's stored rectangle equal to the table it shows (docs/legends.md R1):
+   * the rows follow the other mark-ups, so the bottom edge moves when they change. A derived,
+   * in-memory refit, not a user edit: no undo entry, no audit bump, NOT marked dirty (a freshly
+   * opened document stays clean) and not mirrored (the backend recomputes the rectangle from
+   * the mark-ups it holds at every save, and the legend's next real edit carries the fitted
+   * rectangle). Locked legends are left alone. Call from an effect that watches `markups`; it
+   * settles after one pass.
+   */
+  syncLegends(): void {
+    for (const l of this.markups) {
+      if (l.markup_type !== "Legend" || isMarkupLocked(l)) continue;
+      const fitted = fitLegendGeometry(l, this.markups);
+      if (fitted !== l) this.replace(fitted);
+    }
   }
 
   /** Forget the in-progress count run (the next click starts a new count). */

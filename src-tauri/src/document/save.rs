@@ -12,7 +12,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use lopdf::Document;
 
-use super::annots::{read_markups, write_markups_removing};
+use super::annots::{read_markups, write_markups_scaled};
 use crate::markup::Markup;
 
 /// Read the markup set from a PDF on disk.
@@ -69,6 +69,18 @@ pub fn save_with_markups_removing(
     markups: &[Markup],
     removed: &HashSet<crate::markup::SourceRef>,
 ) -> Result<()> {
+    save_with_markups_scaled(src, dest, markups, removed, &[])
+}
+
+/// [`save_with_markups_removing`] that also passes the document's scales, so saved legend
+/// tables use quantities recomputed under them (see `annots::write_markups_scaled`).
+pub fn save_with_markups_scaled(
+    src: &Path,
+    dest: &Path,
+    markups: &[Markup],
+    removed: &HashSet<crate::markup::SourceRef>,
+    scales: &[crate::takeoff::ScaleRecord],
+) -> Result<()> {
     let mut doc = Document::load(src).with_context(|| format!("load {}", src.display()))?;
     if doc.is_encrypted() {
         anyhow::bail!(
@@ -76,7 +88,7 @@ pub fn save_with_markups_removing(
              would strip the file's password protection. Your changes were not saved."
         );
     }
-    write_markups_removing(&mut doc, markups, removed)?;
+    write_markups_scaled(&mut doc, markups, removed, scales)?;
 
     let dir = dest.parent().context("dest has no parent dir")?;
     let tmp = dir.join(format!(

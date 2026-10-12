@@ -27,6 +27,15 @@ pub fn ensure_scales_loaded(state: &AppState, doc_id: &str) {
         .ensure_loaded(doc_id, path.as_deref());
 }
 
+/// Recompute the document's stored measurements under its current scales (after they changed).
+pub fn recompute_stored_measurements(
+    markups: &crate::document::store::MarkupStore,
+    scales: &crate::takeoff::ScaleStore,
+    doc_id: &str,
+) -> usize {
+    markups.recompute_measurements(doc_id, scales.list(doc_id))
+}
+
 /// Add (or replace by applies_to target) a scale record for the document. Persists to sidecar.
 #[tauri::command]
 pub async fn add_scale(
@@ -62,6 +71,9 @@ pub async fn add_scale(
     // Update in-memory store (load the sidecar first so earlier scales are not lost)
     ensure_scales_loaded(&state, &doc_id);
     state.scales.lock().unwrap().add(&doc_id, rec.clone());
+    // Bring the stored measurements under the new scale, as the GUI does on a calibration, so
+    // an MCP `add_scale` cannot leave stale quantities for a later save or export.
+    recompute_stored_measurements(&state.markups, &state.scales.lock().unwrap(), &doc_id);
 
     Ok(rec)
 }
@@ -91,6 +103,9 @@ pub async fn delete_scale(
             meta.scales.retain(|r| r.id != scale_id);
             save_meta(&pdf_path, &meta).map_err(|e| e.to_string())?;
         }
+        // The measurements taken under that scale now fall back to the scale that applies
+        // (as the GUI recomputes): never leave stale quantities for a save, page op or export.
+        recompute_stored_measurements(&state.markups, &state.scales.lock().unwrap(), &doc_id);
     }
     Ok(removed)
 }

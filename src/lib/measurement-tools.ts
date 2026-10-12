@@ -38,7 +38,7 @@ export function countSubtotals(markups: Markup[]): CountSubtotal[] {
       };
       groups.set(key, row);
     }
-    row.count += m.measurement?.count_value ?? 0;
+    row.count += m.measurement?.count_value ?? 1;
   }
   return [...groups.values()];
 }
@@ -79,7 +79,8 @@ export function countSubtotalsByPage(markups: Markup[]): CountSubtotalWithPages[
       };
       groups.set(key, row);
     }
-    const val = m.measurement?.count_value ?? 0;
+    // A placed count mark counts once when no value is recorded (one rule everywhere).
+    const val = m.measurement?.count_value ?? 1;
     row.count += val;
     const existing = row.byPage.find((bp) => bp.page === m.page);
     if (existing) {

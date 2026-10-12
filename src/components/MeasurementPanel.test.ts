@@ -97,6 +97,25 @@ describe("MeasurementPanel", () => {
     expect(screen.getByText("Length")).toBeTruthy();
   });
 
+  it("prints two decimals for scaled and unscaled measurements, like the exports and Markups List", async () => {
+    render(MeasurementPanel, { props: { store, takeoffStore, docId: "d1" } });
+    store.markups.push(makeMeasurementMarkup("m1", "MeasurementLength", 12.5, "pt", null));
+    store.markups.push(makeMeasurementMarkup("m2", "MeasurementLength", 3.14159, "m", "s1"));
+    await tick();
+    const cells = [...document.querySelectorAll("tbody td.num-col")].map((c) => c.textContent?.trim());
+    expect(cells).toEqual(["12.50", "3.14"]);
+  });
+
+  it("a count with no recorded value counts once (the same rule as the Markups List and exports)", async () => {
+    render(MeasurementPanel, { props: { store, takeoffStore, docId: "d1" } });
+    store.markups.push(makeMeasurementMarkup("c1", "MeasurementCount", 1, "ea", null, null));
+    await tick();
+    const row = document.querySelector("tbody tr")!;
+    expect(row.querySelector("td.num-col")!.textContent!.trim()).toBe("1");
+    const subtotal = document.querySelector("tfoot tr.count-subtotal td.num-col")!;
+    expect(subtotal.textContent!.trim()).toBe("1");
+  });
+
   it("filters out non-measurement markups", async () => {
     render(MeasurementPanel, { props: { store, takeoffStore, docId: "d1" } });
     // A regular rectangle markup should not appear.

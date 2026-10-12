@@ -162,6 +162,8 @@ fn pdf_subtype(t: MarkupType) -> &'static str {
         // draws from the appearance stream (a zero-size FreeText was dropped by Bluebeam - G9
         // defect 5). redline recovers the MeasurementCount type from /RLType on read.
         MarkupType::MeasurementCount => "Stamp",
+        // A legend is a table drawn entirely by its /AP, same reasoning as a count marker.
+        MarkupType::Legend => "Stamp",
         MarkupType::Text | MarkupType::Callout => "FreeText",
         MarkupType::Cloud
         | MarkupType::Polygon
@@ -258,7 +260,8 @@ fn line_style_from_tag(s: &str) -> LineStyle {
 
 fn hex_to_rgb(hex: &str) -> Option<[f64; 3]> {
     let h = hex.trim_start_matches('#');
-    if h.len() != 6 {
+    // PDF data: slicing a non-ASCII string by byte offset would panic.
+    if h.len() != 6 || !h.is_ascii() {
         return None;
     }
     let c = |a: usize| {
@@ -267,6 +270,12 @@ fn hex_to_rgb(hex: &str) -> Option<[f64; 3]> {
             .map(|v| v as f64 / 255.0)
     };
     Some([c(0)?, c(2)?, c(4)?])
+}
+
+/// `#rrggbb`, ASCII hex digits only.
+fn is_hex_colour(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 7 && b[0] == b'#' && b[1..].iter().all(u8::is_ascii_hexdigit)
 }
 
 fn rgb_to_hex(c: &[f64]) -> String {
@@ -568,6 +577,7 @@ impl Markup {
         let bb = super::appearance::ap_bbox(self);
         d.set("Rect", Object::Array(bb.iter().map(|v| real(*v)).collect()));
         super::callout::write_keys(&mut d, self, bb);
+        super::legend::write_keys(&mut d, self);
         match &self.geometry {
             MarkupGeometry::Polyline(pts) => {
                 if matches!(subtype, "Line") && pts.len() >= 2 {
@@ -1126,7 +1136,11 @@ impl Markup {
             .map(|set_id| CountSet {
                 id: set_id,
                 name: get_string(d, b"RLCountSetName").unwrap_or_default(),
-                color: get_string(d, b"RLCountSetColor").unwrap_or_else(|| color.clone()),
+                // A set colour is drawn into legends and appearances: only a plain `#rrggbb`
+                // is accepted, anything else falls back to the annotation's own colour.
+                color: get_string(d, b"RLCountSetColor")
+                    .filter(|c| is_hex_colour(c))
+                    .unwrap_or_else(|| color.clone()),
                 symbol: count_symbol_from_tag(&get_name(d, b"RLCountSymbol").unwrap_or_default()),
             });
 
@@ -1251,6 +1265,9 @@ impl Markup {
             source_le: (markup_type == MarkupType::Callout)
                 .then(|| super::callout::LineEnding::read(d)),
             callout,
+            legend: (markup_type == MarkupType::Legend)
+                .then(|| super::legend::read_props(d))
+                .flatten(),
         }
     }
 }

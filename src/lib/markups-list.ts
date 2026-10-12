@@ -99,7 +99,8 @@ export function measurementText(m: Markup): { text: string; value: number | null
   const meas = m.measurement;
   if (!meas) return { text: "", value: null };
   if (m.markup_type === "MeasurementCount") {
-    const n = meas.count_value ?? 0;
+    // A placed count mark counts once when no value is recorded (one rule everywhere).
+    const n = meas.count_value ?? 1;
     return { text: n.toFixed(0), value: n };
   }
   const q = meas.computed_quantity;

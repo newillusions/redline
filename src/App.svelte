@@ -987,7 +987,9 @@
     try {
       await tab.store.flush();
       const report = await reloadKeepingMarkups(tab.docId);
-      tab.store.seed(await listMarkups(tab.docId));
+      // Computed-only normalisation under the document's scales, like on open, so the panels
+      // and any legend show the numbers the exports compute after a reload too.
+      tab.store.seed(normaliseMeasurements(await listMarkups(tab.docId), tab.takeoffStore.scales));
       tab.store.dirty = report.applied > 0; // re-applied edits are still unsaved
       await handleThumbnailPageOp();
       reloadNonce += 1;
@@ -1113,7 +1115,7 @@
     if (!tab) return;
     try {
       const markups = await loadMarkups(tab.docId);
-      tab.store.seed(markups);
+      tab.store.seed(normaliseMeasurements(markups, tab.takeoffStore.scales));
       tab.store.clearDirty();
       await handleThumbnailPageOp();
       reloadNonce += 1;
@@ -1870,7 +1872,7 @@
           testId="accordion-properties"
         >
           {#if activeTab}
-            <PropertiesPanel store={activeTab.store} takeoffStore={activeTab.takeoffStore} />
+            <PropertiesPanel store={activeTab.store} takeoffStore={activeTab.takeoffStore} currentPage={activeTab.viewportSnapshot.pageIndex} />
           {:else}
             <p class="panel-hint muted">Select a markup to edit its properties.</p>
           {/if}
@@ -1913,6 +1915,7 @@
               store={activeTab.store}
               takeoffStore={activeTab.takeoffStore}
               docId={activeTab.docId}
+              currentPage={activeTab.viewportSnapshot.pageIndex}
             />
           </Accordion>
         {/if}

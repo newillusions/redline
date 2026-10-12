@@ -21,8 +21,9 @@
   import type { TakeoffStore } from "$lib/takeoff-store.svelte";
   import CountControls from "./CountControls.svelte";
   import PolylengthControls from "./PolylengthControls.svelte";
+  import LegendControls from "./LegendControls.svelte";
 
-  const { store, takeoffStore }: { store: MarkupStore; takeoffStore?: TakeoffStore } = $props();
+  const { store, takeoffStore, currentPage = 0 }: { store: MarkupStore; takeoffStore?: TakeoffStore; currentPage?: number } = $props();
 
   let identity = $state<UserRef | null>(null);
 
@@ -361,6 +362,7 @@
   {#if mode === "selection"}
     <CountControls {store} {identity} />
     <PolylengthControls {store} {takeoffStore} {identity} />
+    <LegendControls {store} {identity} {currentPage} />
   {/if}
 
   <!-- Appearance group -->

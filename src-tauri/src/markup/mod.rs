@@ -22,6 +22,7 @@ pub(crate) mod annotation;
 pub(crate) mod appearance;
 pub mod callout;
 pub mod foreign;
+pub mod legend;
 pub(crate) mod replies;
 
 /// v1 markup types (spec §12 decision a — locked).
@@ -54,6 +55,8 @@ pub enum MarkupType {
     MeasurementCount,
     MeasurementAngle,
     MeasurementRadius,
+    // A table of the document's mark-up quantities placed on a page (docs/legends.md).
+    Legend,
 }
 
 impl MarkupType {
@@ -659,6 +662,9 @@ pub struct Markup {
     /// `#[serde(default)]` keeps pre-this-field JSON deserialising to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callout: Option<callout::CalloutProps>,
+    /// Definition of a [`MarkupType::Legend`] (see [`legend`]). `None` for every other type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legend: Option<legend::LegendProps>,
 }
 
 /// The annotation a markup was read from: its indirect object id (`None` for an inline
@@ -731,6 +737,7 @@ impl Markup {
             source_intensity: None,
             source_le: None,
             callout: None,
+            legend: None,
         }
     }
 
@@ -956,6 +963,9 @@ pub fn check_not_locked(existing: &Markup) -> Result<(), MarkupLockError> {
 
 #[cfg(test)]
 mod interop_integrity_tests;
+
+#[cfg(test)]
+mod legend_tests;
 
 #[cfg(test)]
 mod preserve_tests;

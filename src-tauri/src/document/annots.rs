@@ -740,6 +740,18 @@ pub(crate) fn write_markups_removing(
     markups: &[Markup],
     removed: &std::collections::HashSet<SourceRef>,
 ) -> Result<()> {
+    write_markups_scaled(doc, markups, removed, &[])
+}
+
+/// [`write_markups_removing`] that also takes the document's scales: legend tables are computed
+/// from quantities recomputed under them (the same recompute the exports run), so a stored
+/// quantity that predates the latest scale cannot reach the saved table.
+pub(crate) fn write_markups_scaled(
+    doc: &mut Document,
+    markups: &[Markup],
+    removed: &std::collections::HashSet<SourceRef>,
+    scales: &[crate::takeoff::ScaleRecord],
+) -> Result<()> {
     // Managed = redline-owned: redline-authored (/RLType), or the very annotation (object id
     // and /NM) a store markup was imported from, so a Revu-authored markup is replaced on
     // save rather than kept next to its rewritten copy. Never matched by /NM alone.
@@ -817,8 +829,25 @@ pub(crate) fn write_markups_removing(
     let mut group_members: std::collections::BTreeMap<uuid::Uuid, Vec<ObjectId>> =
         std::collections::BTreeMap::new();
 
+    // Legends are tables computed from the other markups: refresh their rows and geometry
+    // from the set being saved (docs/legends.md). Empty when the document has no legend.
+    let legend_updates = crate::markup::legend::refresh_for_save_scaled(markups, scales);
+
     // Phase 2: append the current markups to their pages as fresh indirect objects.
     for m in markups {
+        let m: std::borrow::Cow<Markup> = match legend_updates.get(&m.id()) {
+            Some((props, upd)) => {
+                let mut fresh = m.clone();
+                fresh.legend = Some(crate::markup::legend::LegendProps {
+                    rows: upd.rows.clone(),
+                    ..props.clone()
+                });
+                fresh.geometry = upd.geometry.clone();
+                std::borrow::Cow::Owned(fresh)
+            }
+            None => std::borrow::Cow::Borrowed(m),
+        };
+        let m: &Markup = &m;
         let page_no = m.page + 1; // store is 0-based, get_pages is 1-based
         let page_id = *pages.get(&page_no).with_context(|| {
             format!(

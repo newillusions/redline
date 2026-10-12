@@ -15,7 +15,8 @@
   import type { MarkupStore } from "$lib/markup-store.svelte";
   import type { TakeoffStore } from "$lib/takeoff-store.svelte";
   import type { Markup, UserRef } from "$lib/ipc";
-  import { exportMarkupList, getUserIdentity, type ExportFormat } from "$lib/ipc";
+  import { exportMarkupList, getPageSize, getUserIdentity, type ExportFormat } from "$lib/ipc";
+  import { legendFromCountSets } from "$lib/legend";
   import { onMount } from "svelte";
   import { countSubtotalsByPage } from "$lib/measurement-tools";
   import { countGroups as groupCounts, groupKey, resumeRun } from "$lib/count-groups";
@@ -27,7 +28,8 @@
     store,
     takeoffStore,
     docId,
-  }: { store: MarkupStore; takeoffStore: TakeoffStore; docId: string } = $props();
+    currentPage = 0,
+  }: { store: MarkupStore; takeoffStore: TakeoffStore; docId: string; currentPage?: number } = $props();
 
   const MEASUREMENT_TYPES = new Set([
     "MeasurementLength", "MeasurementArea", "MeasurementCount",
@@ -66,6 +68,28 @@
       .then((u) => { identity = u; })
       .catch(() => {});
   });
+
+  // A legend of the document's count sets (docs/legends.md R4), placed at the top-left of the
+  // current page; new sets are added to it automatically. Select it to edit it.
+  async function createCountSetLegend() {
+    if (!identity || store.countSets.length === 0) return;
+    let size = { width_pts: 612, height_pts: 792 };
+    try {
+      size = await getPageSize(docId, currentPage);
+    } catch {
+      /* fall back to a Letter page; the legend can be moved */
+    }
+    const legend = legendFromCountSets(store.countSets, {
+      page: currentPage,
+      topLeft: { x: 36, y: size.height_pts - 36 },
+      identity,
+      now: new Date().toISOString(),
+      id: crypto.randomUUID(),
+    });
+    store.create(legend);
+    store.selectedIds = new Set([legend.id]);
+    store.activeTool = "select";
+  }
 
   function selectCount(ids: string[]) {
     store.selectedIds = new Set(ids);
@@ -142,6 +166,10 @@
     <button class="btn-export" onclick={() => handleExport("Csv")} disabled={store.markups.length === 0}>
       Export CSV
     </button>
+    <button class="btn-export" data-action="legend-from-count-sets" onclick={createCountSetLegend}
+      disabled={!identity || store.countSets.length === 0}>
+      Legend from count sets
+    </button>
   </div>
 
   {#if exportMessage}
@@ -180,8 +208,8 @@
                 ? group
                   ? group.total.toFixed(0)
                   : m.markup_type === "MeasurementCount"
-                  ? (m.measurement.count_value ?? 0).toFixed(0)
-                  : m.measurement.computed_quantity.toFixed(m.measurement.scale_ref ? 2 : 1)
+                  ? (m.measurement.count_value ?? 1).toFixed(0)
+                  : m.measurement.computed_quantity.toFixed(2)
                 : "-"}
             </td>
             <td>{m.measurement?.unit ?? "-"}</td>

@@ -2408,6 +2408,150 @@ pub(crate) mod tests {
         );
     }
 
+    /// A saved Legend painted by PDFium's own annotation pipeline: the table's ink (border,
+    /// text) lands inside the authored left/right/top edges and below no further than the
+    /// derived bottom edge, and the row's count symbol is painted in its set colour.
+    #[test]
+    fn strict_reader_paints_a_saved_legend_inside_its_derived_rectangle() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+        use crate::geometry::PdfPoint;
+        use crate::markup::legend::{LegendColumn, LegendEntry, LegendProps, LegendScope};
+        use crate::markup::{
+            Appearance, CountSet, CountSymbol, Markup, MarkupGeometry, MarkupType, Measurement,
+            UserRef,
+        };
+
+        let user = || UserRef {
+            user_id: uuid::Uuid::new_v4(),
+            display_name: "Test".into(),
+        };
+        let set = CountSet {
+            id: uuid::Uuid::new_v4(),
+            name: "Downlight".into(),
+            color: "#ff0000".into(),
+            symbol: CountSymbol::Square,
+        };
+        let mut count = Markup::new(
+            MarkupType::MeasurementCount,
+            0,
+            MarkupGeometry::Point(PdfPoint { x: 500.0, y: 100.0 }),
+            Appearance {
+                color: "#ff0000".into(),
+                ..Appearance::default()
+            },
+            user(),
+        );
+        count.count_set = Some(set.clone());
+        count.measurement = Some(Measurement {
+            scale_ref: None,
+            raw_measure: 3.0,
+            unit: "ea".into(),
+            computed_quantity: 3.0,
+            depth: None,
+            count_value: Some(3),
+            custom_columns: Default::default(),
+            rise_drop: Vec::new(),
+        });
+        let mut legend = Markup::new(
+            MarkupType::Legend,
+            0,
+            MarkupGeometry::Rect {
+                min: PdfPoint { x: 100.0, y: 400.0 },
+                max: PdfPoint { x: 400.0, y: 700.0 },
+            },
+            Appearance {
+                fill: Some("#ffffff".into()),
+                ..Appearance::default()
+            },
+            user(),
+        );
+        legend.legend = Some(
+            LegendProps {
+                scope: LegendScope::AllPages,
+                columns: vec![
+                    LegendColumn::Symbol,
+                    LegendColumn::Subject,
+                    LegendColumn::Quantity,
+                ],
+                entries: vec![LegendEntry {
+                    key: crate::markup::legend::key_of(&count),
+                    label: None,
+                    description: None,
+                    hidden: false,
+                    symbol: None,
+                    set_name: None,
+                }],
+                ..LegendProps::default()
+            }
+            .sanitized(),
+        );
+        let (mut doc, _page_id) = crate::document::annots::tests::one_page_doc();
+        crate::document::annots::write_markups(&mut doc, &[count, legend])
+            .expect("write_markups");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legend.pdf");
+        doc.save(&path).expect("save fixture");
+
+        let bindings = Pdfium::bind_to_library(
+            std::env::var("PDFIUM_DYNAMIC_LIB_PATH").expect("checked above"),
+        )
+        .expect("bind pdfium");
+        let pdfium = Pdfium::new(bindings);
+        let document = pdfium.load_pdf_from_file(&path, None).expect("load fixture");
+        let page = document.pages().get(0).expect("page 0");
+        let bitmap = page
+            .render_with_config(
+                &PdfRenderConfig::new()
+                    .scale_page_by_factor(1.0)
+                    .render_annotations(true),
+            )
+            .expect("render");
+        let img = bitmap.as_image().into_rgba8();
+
+        // Derived rectangle in device px (page height 792): x [100,400], top y = 792-700 = 92;
+        // 1 row at the default 9 pt font -> height 19.8 + 16.2 + 16.2 = 52.2 -> bottom ~144.
+        let (left, right, top, bottom) = (100i64, 400i64, 92i64, 144i64);
+        let dark = |p: &image::Rgba<u8>| {
+            let [r, g, b, a] = p.0;
+            a > 0 && r < 90 && g < 90 && b < 90
+        };
+        let red = |p: &image::Rgba<u8>| {
+            let [r, g, b, a] = p.0;
+            a > 0 && r > 180 && g < 100 && b < 100
+        };
+        let (mut dx0, mut dy0, mut dx1, mut dy1) = (i64::MAX, i64::MAX, 0i64, 0i64);
+        let mut red_in_symbol_cell = 0u32;
+        for (x, y, p) in img.enumerate_pixels() {
+            let (x, y) = (i64::from(x), i64::from(y));
+            if dark(p) {
+                dx0 = dx0.min(x);
+                dy0 = dy0.min(y);
+                dx1 = dx1.max(x);
+                dy1 = dy1.max(y);
+            }
+            // The symbol column is the first 16 px, the row starts under title + header.
+            if red(p) && x >= left && x <= left + 18 && y >= top + 36 && y <= bottom {
+                red_in_symbol_cell += 1;
+            }
+        }
+        assert!(dx1 > 0, "the table painted no dark ink (border/text) at all");
+        let tol = 2i64;
+        assert!(
+            (dx0 - left).abs() <= tol
+                && (dx1 - right).abs() <= tol
+                && (dy0 - top).abs() <= tol
+                && (dy1 - bottom).abs() <= tol + 1,
+            "table ink spans [{dx0},{dy0}]-[{dx1},{dy1}]px, expected [{left},{top}]-[{right},{bottom}]px"
+        );
+        assert!(
+            red_in_symbol_cell > 10,
+            "the row's count symbol (red) was not painted in the symbol cell: {red_in_symbol_cell}"
+        );
+    }
+
     /// Text mark-up + sticky Note, painted by an independent strict reader (PDFium's own
     /// annotation pipeline, `render_annotations(true)`, which honours `/AP`). Proves the
     /// exported appearance streams land where the authored geometry says: an Underline on

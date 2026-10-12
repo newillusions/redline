@@ -66,7 +66,8 @@ fn num(v: f64) -> String {
 
 fn hex_to_rgb(hex: &str) -> [f64; 3] {
     let h = hex.trim_start_matches('#');
-    if h.len() != 6 {
+    // Colours are PDF data: slicing a non-ASCII string by byte offset would panic.
+    if h.len() != 6 || !h.is_ascii() {
         return [0.0, 0.0, 0.0];
     }
     let c = |a: usize| {
@@ -77,8 +78,49 @@ fn hex_to_rgb(hex: &str) -> [f64; 3] {
     [c(0), c(2), c(4)]
 }
 
-/// Escape a string for a PDF literal string token `(...)`, dropping to `?` for anything
-/// outside the printable Latin-1 range this simple encoder can represent losslessly.
+/// The WinAnsiEncoding (Windows-1252) byte for `c`, the encoding every text font in this module
+/// declares. ASCII is itself, U+00A0..U+00FF is the same code, and the 0x80..0x9F block holds the
+/// punctuation Latin-1 lacks (dashes, curly quotes, euro, bullet). `None` = not representable.
+fn winansi_byte(c: char) -> Option<u8> {
+    let u = c as u32;
+    match u {
+        0x20..=0x7E | 0xA0..=0xFF => Some(u as u8),
+        0x20AC => Some(0x80),
+        0x201A => Some(0x82),
+        0x0192 => Some(0x83),
+        0x201E => Some(0x84),
+        0x2026 => Some(0x85),
+        0x2020 => Some(0x86),
+        0x2021 => Some(0x87),
+        0x02C6 => Some(0x88),
+        0x2030 => Some(0x89),
+        0x0160 => Some(0x8A),
+        0x2039 => Some(0x8B),
+        0x0152 => Some(0x8C),
+        0x017D => Some(0x8E),
+        0x2018 => Some(0x91),
+        0x2019 => Some(0x92),
+        0x201C => Some(0x93),
+        0x201D => Some(0x94),
+        0x2022 => Some(0x95),
+        0x2013 => Some(0x96),
+        0x2014 => Some(0x97),
+        0x02DC => Some(0x98),
+        0x2122 => Some(0x99),
+        0x0161 => Some(0x9A),
+        0x203A => Some(0x9B),
+        0x0153 => Some(0x9C),
+        0x017E => Some(0x9E),
+        0x0178 => Some(0x9F),
+        _ => None,
+    }
+}
+
+/// Escape a string for a PDF literal string token `(...)` in WinAnsiEncoding. Everything outside
+/// printable ASCII is written as a 3-digit octal escape of its WinAnsi byte, so the content
+/// stream stays pure ASCII (it is built as a Rust `String`) and the viewer shows the right glyph
+/// (a raw UTF-8 `Ø` would read as two WinAnsi characters). A character WinAnsi cannot represent
+/// becomes `?`.
 fn escape_pdf_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -86,8 +128,13 @@ fn escape_pdf_string(s: &str) -> String {
             '(' => out.push_str("\\("),
             ')' => out.push_str("\\)"),
             '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 256 => out.push(c),
-            _ => out.push('?'),
+            // Control characters keep their pre-WinAnsi behaviour (written through as is).
+            c if (c as u32) < 0x20 || c as u32 == 0x7F => out.push(c),
+            c => match winansi_byte(c) {
+                Some(b) if (0x20..0x7F).contains(&b) => out.push(b as char),
+                Some(b) => out.push_str(&format!("\\{b:03o}")),
+                None => out.push('?'),
+            },
         }
     }
     out
@@ -247,6 +294,11 @@ pub(crate) fn interop_rect(m: &Markup) -> Option<[f64; 4]> {
         (MarkupType::MeasurementCount, MarkupGeometry::Point(p)) => {
             let pad = COUNT_MARKER_RADIUS + 4.0;
             Some([p.x - pad, p.y - pad, p.x + pad, p.y + pad])
+        }
+        // A legend's table: left, right and top edge as authored, bottom edge from its rows.
+        (MarkupType::Legend, MarkupGeometry::Rect { .. }) => {
+            let rows = m.legend.as_ref().map_or(0, |l| l.rows.len());
+            super::legend::effective_rect(m, rows)
         }
         // Sticky Note: the icon box (/Rect of the /Text annotation) centred on the point. A
         // foreign note that has not been moved keeps the box it was read with.
@@ -1147,6 +1199,177 @@ pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// One line of Helvetica text with its baseline at (x, y).
+fn text_at(out: &mut String, res: &mut Resources, text: &str, x: f64, y: f64, size: f64) {
+    if text.is_empty() {
+        return;
+    }
+    let (res_name, _) = res.add_font("Helvetica");
+    out.push_str(&format!(
+        "BT\n0 0 0 rg\n/{res_name} {} Tf\n{} {} Td\n({}) Tj\nET\n",
+        num(size),
+        num(x),
+        num(y),
+        escape_pdf_string(text)
+    ));
+}
+
+/// The table of a [`MarkupType::Legend`] (docs/legends.md): background, title bar, header,
+/// one row per computed row with its symbol, grid lines and border. Text is clipped to its
+/// column with the shared `legend::clip_cell` rule so the app and this appearance agree.
+fn draw_legend(out: &mut String, res: &mut Resources, m: &Markup, a: &Appearance) {
+    use super::legend::{cell_text, clip_cell, effective_rect, layout, LegendColumn};
+    let Some(raw) = &m.legend else { return };
+    let props = raw.sanitized();
+    let rows = &raw.rows;
+    let Some(rect) = effective_rect(m, rows.len()) else {
+        return;
+    };
+    let lay = layout(&props, rect[2] - rect[0], rows.len());
+    let (x0, y1) = (rect[0], rect[3]);
+    let (w, h) = (lay.width, lay.height);
+    let body_top = y1 - lay.title_h;
+    let lw = a.line_weight.clamp(0.25, 10.0);
+
+    // Background, title bar, grid and border share one alpha scope.
+    let gs = res.add_gstate(shape_gstate(a));
+    out.push_str(&format!("q\n/{gs} gs\n"));
+    fill_color(out, a.fill.as_deref().unwrap_or("#ffffff"));
+    out.push_str(&format!("{} {} {} {} re\nf\n", num(x0), num(y1 - h), num(w), num(h)));
+    if props.show_title {
+        fill_color(out, "#e6e6e6");
+        out.push_str(&format!(
+            "{} {} {} {} re\nf\n",
+            num(x0),
+            num(body_top),
+            num(w),
+            num(lay.title_h)
+        ));
+    }
+    let [r, g, b] = hex_to_rgb(&a.color);
+    out.push_str(&format!("{} {} {} RG\n{} w\n", num(r), num(g), num(b), num(lw)));
+    // Horizontal lines: under the title, under the header, under every row.
+    let mut ys = Vec::new();
+    if props.show_title {
+        ys.push(body_top);
+    }
+    let mut cursor = body_top;
+    if props.show_headers {
+        cursor -= lay.header_h;
+        ys.push(cursor);
+    }
+    for _ in 0..rows.len().max(1) {
+        cursor -= lay.row_h;
+        ys.push(cursor);
+    }
+    for y in &ys {
+        out.push_str(&format!("{} {} m\n{} {} l\nS\n", num(x0), num(*y), num(x0 + w), num(*y)));
+    }
+    for c in lay.columns.iter().skip(1) {
+        out.push_str(&format!(
+            "{} {} m\n{} {} l\nS\n",
+            num(x0 + c.x),
+            num(body_top),
+            num(x0 + c.x),
+            num(y1 - h)
+        ));
+    }
+    out.push_str(&format!("{} {} {} {} re\nS\nQ\n", num(x0), num(y1 - h), num(w), num(h)));
+
+    // Text, fully opaque like Text/Callout (outside the alpha scope).
+    let font = lay.font;
+    let base = |top: f64, band: f64| top - band / 2.0 - font * 0.32;
+    let pad = font * 0.5;
+    if props.show_title {
+        let t = super::legend::clip_cell(&props.title, w, font);
+        text_at(out, res, &t, x0 + pad, base(y1, lay.title_h), font);
+    }
+    let mut top = body_top;
+    if props.show_headers {
+        for c in &lay.columns {
+            let t = clip_cell(c.column.header(), c.w, font);
+            text_at(out, res, &t, x0 + c.x + pad, base(top, lay.header_h), font);
+        }
+        top -= lay.header_h;
+    }
+    for row in rows {
+        for c in &lay.columns {
+            if c.column == LegendColumn::Symbol {
+                continue;
+            }
+            let t = clip_cell(&cell_text(row, c.column), c.w, font);
+            text_at(out, res, &t, x0 + c.x + pad, base(top, lay.row_h), font);
+        }
+        top -= lay.row_h;
+    }
+
+    // Symbols.
+    if let Some(sym) = lay.columns.iter().find(|c| c.column == LegendColumn::Symbol) {
+        let gs = res.add_gstate(line_gstate(a));
+        out.push_str(&format!("q\n/{gs} gs\n"));
+        let radius = lay.row_h * 0.3;
+        let mut top = body_top - if props.show_headers { lay.header_h } else { 0.0 };
+        for row in rows {
+            let cx = x0 + sym.x + sym.w.min(lay.row_h) / 2.0;
+            let cy = top - lay.row_h / 2.0;
+            draw_legend_symbol(out, row, cx, cy, radius);
+            top -= lay.row_h;
+        }
+        out.push_str("Q\n");
+    }
+}
+
+fn draw_legend_symbol(out: &mut String, row: &super::legend::LegendRow, cx: f64, cy: f64, r: f64) {
+    let [sr, sg, sb] = hex_to_rgb(&row.color);
+    out.push_str(&format!("{} {} {} RG\n1.2 w\n", num(sr), num(sg), num(sb)));
+    if let Some(symbol) = row.symbol {
+        fill_color(out, &row.color);
+        match symbol {
+            super::CountSymbol::Circle => {
+                ellipse_path(out, cx, cy, r, r);
+                out.push_str("B\n");
+            }
+            super::CountSymbol::Cross => {
+                out.push_str(&format!(
+                    "{} {} m\n{} {} l\nS\n{} {} m\n{} {} l\nS\n",
+                    num(cx - r),
+                    num(cy - r),
+                    num(cx + r),
+                    num(cy + r),
+                    num(cx - r),
+                    num(cy + r),
+                    num(cx + r),
+                    num(cy - r)
+                ));
+            }
+            other => {
+                path_from_points(out, &count_symbol_points(other, cx, cy, r));
+                out.push_str("b\n");
+            }
+        }
+    } else if super::legend::is_line_type(row.key.markup_type) {
+        out.push_str(&format!(
+            "1.6 w\n{} {} m\n{} {} l\nS\n",
+            num(cx - r),
+            num(cy),
+            num(cx + r),
+            num(cy)
+        ));
+    } else {
+        if let Some(f) = &row.fill {
+            fill_color(out, f);
+        }
+        out.push_str(&format!(
+            "{} {} {} {} re\n{}\n",
+            num(cx - r),
+            num(cy - r),
+            num(2.0 * r),
+            num(2.0 * r),
+            if row.fill.is_some() { "B" } else { "S" }
+        ));
+    }
+}
+
 /// Build the content-stream operators + resources for `m`. Returns (content, resources,
 /// auxiliary image xobjects, auxiliary form xobject) - both auxiliary outputs are empty/
 /// `None` except for a PNG- or Bluebeam-Form-backed Stamp/StampDynamic respectively.
@@ -1567,6 +1790,26 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>, Option<Stamp
             out.push_str("Q\n");
         }
 
+        // --- Legend: the table, from the rows computed at save -------------------------
+        (MarkupType::Legend, MarkupGeometry::Rect { min, max }) => {
+            if m.legend.is_some() {
+                draw_legend(&mut out, &mut res, m, a);
+            } else {
+                // No usable definition (refused on read): an empty outlined box, so the
+                // legend stays visible and selectable instead of vanishing.
+                let gs_name = res.add_gstate(shape_gstate(a));
+                out.push_str(&format!("q\n/{gs_name} gs\n"));
+                stroke_preamble(&mut out, a);
+                out.push_str(&format!(
+                    "{} {} {} {} re\nS\nQ\n",
+                    num(min.x),
+                    num(min.y),
+                    num(max.x - min.x),
+                    num(max.y - min.y)
+                ));
+            }
+        }
+
         // --- Fallback: nothing drawable for this (type, geometry) combination. A named,
         // structural gap - the annotation still has an empty-but-valid appearance rather
         // than none at all (viewers show a blank box instead of nothing/dropping it).
@@ -1635,6 +1878,7 @@ mod tests {
             source_intensity: None,
             source_le: None,
             callout: None,
+            legend: None,
         }
     }
 

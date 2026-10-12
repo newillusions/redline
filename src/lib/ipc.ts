@@ -5,6 +5,7 @@
  * Matches the Rust command signatures in src-tauri/src/commands/.
  */
 import { invoke } from "@tauri-apps/api/core";
+import type { LegendProps } from "./legend";
 
 // ---------------------------------------------------------------------------
 // Types (mirrors Rust structs)
@@ -203,7 +204,9 @@ export type MarkupType =
   | "MeasurementVolume"
   | "MeasurementCount"
   | "MeasurementAngle"
-  | "MeasurementRadius";
+  | "MeasurementRadius"
+  // A table of the document's mark-up quantities placed on a page (docs/legends.md).
+  | "Legend";
 
 export type MarkupGeometry =
   | { Point: PdfPoint }
@@ -379,6 +382,9 @@ export interface Markup {
   /** Callout only (mirrors Rust `Markup.callout`): text box, extra leaders, auto-size.
    *  Absent/null = the legacy fixed box at the leader's anchor. See `lib/callout.ts`. */
   callout?: CalloutProps | null;
+  /** Legend only (mirrors Rust `Markup.legend`): the definition; rows are computed, never stored.
+   *  See `lib/legend.ts`. */
+  legend?: LegendProps | null;
 }
 
 /** Text box + extra leaders + auto-size of a Callout (mirrors Rust `markup::callout::CalloutProps`). */
