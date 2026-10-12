@@ -5,7 +5,7 @@
  * injected IPC. flush() awaits a full drain — App.svelte calls it before save_document.
  */
 import { isMarkupContentsLocked, isMarkupLocked, type Markup, type Appearance, type CountSet, type CountSymbol, type Tool } from "./ipc";
-import { History, CreateCmd, UpdateCmd, DeleteCmd, type MarkupSink, type MirrorOp } from "./markup-commands";
+import { History, CreateCmd, UpdateCmd, DeleteCmd, ReorderCmd, refillOrder, type MarkupSink, type MirrorOp } from "./markup-commands";
 import type { CountRun } from "./count-groups";
 import { fitLegendGeometry } from "./legend";
 import { onNewMarkup } from "./layers-store.svelte";
@@ -68,6 +68,8 @@ export interface MarkupIpc {
   add(doc_id: string, m: Markup): Promise<void>;
   update(doc_id: string, m: Markup): Promise<void>;
   remove(doc_id: string, id: string): Promise<void>;
+  /** Z-order (Arrange). Optional so an ipc stub that predates it still type-checks. */
+  reorder?(doc_id: string, ids: string[]): Promise<void>;
 }
 
 export type ToolKind =
@@ -179,6 +181,7 @@ export class MarkupStore implements MarkupSink {
     this.selectedIds = next;
   }
   getById(id: string) { return this.markups.find((x) => x.id === id); }
+  reorder(ids: string[]) { this.markups = refillOrder(this.markups, ids); }
 
   /** Mark the document as clean (call after a successful save). */
   clearDirty(): void { this.dirty = false; }
@@ -315,6 +318,37 @@ export class MarkupStore implements MarkupSink {
     }
   }
 
+  /**
+   * Z-order change (Arrange) as ONE undo frame: each change lists one page's markups in their
+   * old and new relative order (`ReorderCmd`). Changes that move nothing are dropped.
+   */
+  applyReorder(changes: { before: string[]; after: string[] }[]): void {
+    const cmds = changes
+      .filter((c) => c.before.some((id, i) => id !== c.after[i]))
+      .map((c) => new ReorderCmd(c.before, c.after));
+    if (cmds.length === 0) return;
+    this.dirty = true;
+    const ops = this.history.pushBatch(cmds);
+    ops.forEach((op) => this.enqueue(op));
+    this.historyVersion++;
+  }
+
+  /**
+   * Make sure `sets` are available as count sets of this document (a count pasted from another
+   * document brings its set along). Idempotent; sets are derived from the markups on reopen, so
+   * this needs no undo entry or save step.
+   */
+  adoptCountSets(sets: readonly CountSet[]): void {
+    const known = new Set(this.countSets.map((s) => s.id));
+    const fresh: CountSet[] = [];
+    for (const s of sets) {
+      if (known.has(s.id)) continue;
+      known.add(s.id);
+      fresh.push(s);
+    }
+    if (fresh.length > 0) this.countSets = [...this.countSets, ...fresh];
+  }
+
   /** Forget the in-progress count run (the next click starts a new count). */
   resetCountRun(): void { this.countRun = null; }
 
@@ -360,6 +394,7 @@ export class MarkupStore implements MarkupSink {
       try {
         if (op.kind === "add") await this.ipc.add(this.docId, op.markup);
         else if (op.kind === "update") await this.ipc.update(this.docId, op.markup);
+        else if (op.kind === "reorder") await this.ipc.reorder?.(this.docId, op.ids);
         else await this.ipc.remove(this.docId, op.id);
       } catch (e) {
         this.mirrorError = `Sync failed: ${e instanceof Error ? e.message : String(e)}`;

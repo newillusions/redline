@@ -187,6 +187,35 @@ mod tests {
         assert!(load_markups_from(&src, None).unwrap().is_empty());
     }
 
+    /// Arrange: the store's order is the z-order and is exactly the order the markups are
+    /// written to the page's `/Annots` and read back (docs/arrange.md A12).
+    #[test]
+    fn reordered_markups_are_saved_and_reloaded_in_the_new_order() {
+        use crate::document::store::MarkupStore;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.pdf");
+        let (mut doc, _) = one_page_doc();
+        doc.save(&src).unwrap();
+
+        let store = MarkupStore::default();
+        store.register("d", src.clone(), None);
+        let ms = [redline_markup(0), redline_markup(0), redline_markup(0)];
+        let ids: Vec<uuid::Uuid> = ms.iter().map(|m| m.id()).collect();
+        for m in ms {
+            store.add("d", m).unwrap();
+        }
+        store.reorder("d", &[ids[2], ids[0], ids[1]]).unwrap();
+
+        let dest = dir.path().join("out.pdf");
+        save_with_markups(&src, &dest, &store.list("d").unwrap()).unwrap();
+        let got: Vec<uuid::Uuid> = load_markups_from(&dest, None)
+            .unwrap()
+            .iter()
+            .map(|m| m.id())
+            .collect();
+        assert_eq!(got, vec![ids[2], ids[0], ids[1]]);
+    }
+
     #[test]
     fn save_in_place_via_temp_swap() {
         let dir = tempfile::tempdir().unwrap();

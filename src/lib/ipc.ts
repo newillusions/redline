@@ -475,6 +475,11 @@ export async function deleteMarkup(doc_id: string, markup_id: string): Promise<v
   return invoke<void>("delete_markup", { docId: doc_id, markupId: markup_id });
 }
 
+/** Z-order (Arrange): `markup_ids` in their new relative order; see Rust `MarkupStore::reorder`. */
+export async function reorderMarkups(doc_id: string, markup_ids: string[]): Promise<void> {
+  return invoke<void>("reorder_markups", { docId: doc_id, markupIds: markup_ids });
+}
+
 /** Persisted app user identity (generated on first run). */
 export async function getUserIdentity(): Promise<UserRef> {
   return invoke<UserRef>("get_user_identity");

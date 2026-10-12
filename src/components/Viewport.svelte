@@ -98,6 +98,12 @@
   import { getPageSnapTargets, findNearestSnap, type SnapTarget } from "$lib/snap";
   import CalibrationDialog from "./CalibrationDialog.svelte";
   import StampPromptDialog from "./StampPromptDialog.svelte";
+  import ArrangeBar from "./ArrangeBar.svelte";
+  import { nativeEditingOwnsClipboardKeys } from "$lib/keyboard-shortcuts";
+  import { markupClipboard } from "$lib/markup-clipboard.svelte";
+  import {
+    copySelection, cutSelection, pasteClipboard, duplicateSelection, type ArrangeCtx, type ActionResult,
+  } from "$lib/arrange-actions";
   import LinkOverlay from "./LinkOverlay.svelte";
   import type { NavigationStore } from "$lib/navigation-store.svelte";
   import type { LinkView, NavTarget } from "$lib/navigation-ipc";
@@ -1320,6 +1326,33 @@
     persistToolbarPrefs({ collapsed: zoomToolbarCollapsed, corner });
   }
 
+  // --- Copy / paste / arrange (docs/arrange.md) ---------------------------------------
+  /** Pointer position on the viewed page in PDF pt, or null while the pointer is elsewhere. */
+  let arrangeCursor: { x: number; y: number } | null = null;
+  /** Result of a keyboard copy/cut/paste/duplicate, shown in the Arrange bar. */
+  let arrangeNotice = $state<string | null>(null);
+  let arrangeNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function trackArrangeCursor(e: PointerEvent) {
+    if (!containerEl) return;
+    const r = containerEl.getBoundingClientRect();
+    arrangeCursor = screenToPdfUserSpace(e.clientX - r.left, e.clientY - r.top, viewState) ?? null;
+  }
+
+  function arrangeCtx(): ArrangeCtx {
+    return {
+      store, identity, scales: takeoffStore.scales, pageIndex, pageCount: docInfo.page_count,
+      pageWidthPts, pageHeightPts, cursor: arrangeCursor,
+      viewCenter: screenToPdfUserSpace(containerWidth / 2, containerHeight / 2, viewState) ?? null,
+    };
+  }
+
+  function showArrangeNotice(r: ActionResult) {
+    arrangeNotice = r.message;
+    if (arrangeNoticeTimer) clearTimeout(arrangeNoticeTimer);
+    arrangeNoticeTimer = setTimeout(() => { arrangeNotice = null; }, 3500);
+  }
+
   // Keyboard handler: bench overlay toggle + multi-click finish/cancel.
   function onKeyDown(e: KeyboardEvent) {
     // Every shortcut below (bare-key AND modifier) is this component's own feature
@@ -1365,6 +1398,26 @@
         e.preventDefault();
         copyTextSelection();
         return;
+      }
+      // Copy / Cut / Paste / Paste in place / Duplicate the selected markups (docs/arrange.md).
+      // Copy only reaches here when there is no text selection (handled above).
+      if (!e.altKey && !isTextSelTool(store.activeTool)
+          && !nativeEditingOwnsClipboardKeys(document.activeElement, window.getSelection(), containerEl)) {
+        const k = e.key.toLowerCase();
+        const act: ((c: ArrangeCtx) => ActionResult) | null =
+          k === "c" && !e.shiftKey ? copySelection
+          : k === "x" && !e.shiftKey ? cutSelection
+          : k === "d" && !e.shiftKey ? duplicateSelection
+          : k === "v" ? (c) => pasteClipboard(c, e.shiftKey ? "inplace" : "cursor")
+          : null;
+        if (act) {
+          // Only a command that ran takes the key from the browser; a refusal ("Select a
+          // markup to copy.") lets a native copy/paste proceed.
+          const r = act(arrangeCtx());
+          if (r.ok) e.preventDefault();
+          showArrangeNotice(r);
+          return;
+        }
       }
       if (e.key === "=" || e.key === "+") { e.preventDefault(); applyZoom(zoom * 1.1, containerWidth / 2, containerHeight / 2); return; }
       if (e.key === "-" || e.key === "_") { e.preventDefault(); applyZoom(zoom / 1.1, containerWidth / 2, containerHeight / 2); return; }
@@ -3377,6 +3430,8 @@
   bind:this={containerEl}
   onmousedown={onMouseDown}
   onwheel={onWheel}
+  onpointermove={trackArrangeCursor}
+  onpointerleave={() => { arrangeCursor = null; }}
   role="application"
   aria-label="PDF viewport — two-finger swipe or wheel to pan, pinch or Ctrl/Cmd/Shift+scroll to zoom, Space+drag to pan with any tool"
 >
@@ -3940,6 +3995,9 @@
         <div class="shortcuts-row"><span>T</span><span>Show/hide the zoom toolbar</span></div>
         <div class="shortcuts-row"><span>U / Shift+U / D</span><span>Underline / Squiggly / Strikethrough</span></div>
         <div class="shortcuts-row"><span>N</span><span>Sticky Note</span></div>
+        <div class="shortcuts-row"><span>⌘/Ctrl + C / X / V</span><span>Copy / cut / paste markups (paste lands at the pointer)</span></div>
+        <div class="shortcuts-row"><span>⌘/Ctrl + Shift + V</span><span>Paste markups in place</span></div>
+        <div class="shortcuts-row"><span>⌘/Ctrl + D</span><span>Duplicate the selected markups</span></div>
         <div class="shortcuts-hint">Esc or click outside to close</div>
       </div>
     </div>
@@ -3981,6 +4039,12 @@
         targets: pan ≤33ms · settle ≤250ms · tile ≤60ms · RSS ≤2048MB
       </div>
     </div>
+  {/if}
+
+  <!-- Copy / paste / Multiply / align / order (docs/arrange.md). Select tool only, and only
+       when there is something to act on. -->
+  {#if isSelectTool() && (store.selectedIds.size > 0 || markupClipboard.size > 0)}
+    <ArrangeBar {store} getCtx={arrangeCtx} notice={arrangeNotice} />
   {/if}
 
   <!-- Text-selection (I-beam tool) action bar + toast - explicit outcome for a

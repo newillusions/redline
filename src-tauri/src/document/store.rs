@@ -604,6 +604,43 @@ impl MarkupStore {
         Ok(())
     }
 
+    /// Reorder markups (Arrange: bring to front / send to back / forward / backward). The
+    /// store's order IS the z-order and the order they are written to the page's `/Annots`.
+    ///
+    /// `ids` lists some markups in their NEW relative order: the positions those markups
+    /// occupy are refilled with them in that order, every other markup stays where it is. So
+    /// a caller sends only the markups of one page and never disturbs the rest. Ids with no
+    /// counterpart (deleted since) are ignored; the same id twice is refused. Nothing is
+    /// added, removed or edited, so locks do not apply (a lock guards a markup's content).
+    pub fn reorder(&self, doc_id: &str, ids: &[Uuid]) -> Result<(), String> {
+        let mut g = self.docs.lock().unwrap();
+        let e = g
+            .get_mut(doc_id)
+            .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+        let at: std::collections::HashMap<Uuid, usize> =
+            e.markups.iter().enumerate().map(|(i, m)| (m.id(), i)).collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut order: Vec<usize> = Vec::new();
+        for id in ids {
+            let Some(&i) = at.get(id) else { continue };
+            if !seen.insert(i) {
+                return Err(format!("duplicate markup id {id} in reorder"));
+            }
+            order.push(i);
+        }
+        let mut slots = order.clone();
+        slots.sort_unstable();
+        if slots == order {
+            return Ok(()); // already in this order
+        }
+        let moved: Vec<Markup> = order.iter().map(|&i| e.markups[i].clone()).collect();
+        for (slot, m) in slots.into_iter().zip(moved) {
+            e.markups[slot] = m;
+        }
+        e.dirty = true;
+        Ok(())
+    }
+
     /// Bring every stored measurement under the document's current `scales`, with the rule the
     /// frontend and the exports use (`takeoff::recompute_all`). Returns how many changed. The
     /// quantities are derived data, so a locked markup is recomputed too.
@@ -863,6 +900,66 @@ mod tests {
     fn password_none_for_unknown_doc() {
         let s = MarkupStore::default();
         assert_eq!(s.password("nope"), None);
+    }
+
+    fn ids_of(s: &MarkupStore) -> Vec<Uuid> {
+        s.list("d1").unwrap().iter().map(|m| m.id()).collect()
+    }
+
+    #[test]
+    fn reorder_refills_the_listed_slots_and_leaves_the_rest() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let ms: Vec<Markup> = (0..5).map(|_| markup()).collect();
+        let ids: Vec<Uuid> = ms.iter().map(|m| m.id()).collect();
+        for m in ms {
+            s.add("d1", m).unwrap();
+        }
+        // Reorder only 1, 3 and 4 (as one page would): 0 and 2 keep their slots.
+        s.reorder("d1", &[ids[4], ids[1], ids[3]]).unwrap();
+        assert_eq!(ids_of(&s), vec![ids[0], ids[4], ids[2], ids[1], ids[3]]);
+    }
+
+    #[test]
+    fn reorder_ignores_unknown_ids_refuses_duplicates_and_noops_when_unchanged() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let (a, b) = (markup(), markup());
+        let (ia, ib) = (a.id(), b.id());
+        s.add("d1", a).unwrap();
+        s.add("d1", b).unwrap();
+        s.reorder("d1", &[Uuid::new_v4(), ib, ia]).unwrap();
+        assert_eq!(ids_of(&s), vec![ib, ia]);
+        assert!(s.reorder("d1", &[ia, ia]).is_err());
+        assert_eq!(
+            ids_of(&s),
+            vec![ib, ia],
+            "a refused reorder changes nothing"
+        );
+        assert!(s.reorder("nope", &[]).is_err());
+        // An order that matches the current one does not mark the document dirty again.
+        s.docs.lock().unwrap().get_mut("d1").unwrap().dirty = false;
+        s.reorder("d1", &[ib, ia]).unwrap();
+        assert!(!s.docs.lock().unwrap().get("d1").unwrap().dirty);
+    }
+
+    #[test]
+    fn reorder_does_not_touch_locked_or_foreign_state() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let mut a = markup();
+        a.annot_flags |= 0x80; // Locked
+        let (ia, ib) = (a.id(), {
+            let b = markup();
+            let id = b.id();
+            s.add("d1", a).unwrap();
+            s.add("d1", b).unwrap();
+            id
+        });
+        s.reorder("d1", &[ib, ia]).unwrap();
+        let got = s.list("d1").unwrap();
+        assert_eq!(got[1].id(), ia);
+        assert!(got[1].is_locked(), "z-order does not edit a locked markup");
     }
 
     #[test]

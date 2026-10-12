@@ -398,6 +398,7 @@ pub fn run() {
             commands::document::reload_keeping_markups,
             commands::document::update_markup,
             commands::document::delete_markup,
+            commands::document::reorder_markups,
             commands::document::get_user_identity,
             commands::document::save_unprotected_copy,
             commands::document::remember_password,

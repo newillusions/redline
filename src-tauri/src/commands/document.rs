@@ -246,6 +246,24 @@ pub async fn delete_markup(
     state.markups.delete(&doc_id, id)
 }
 
+/// Reorder markups (Arrange): `markup_ids` lists markups in their new relative order, see
+/// `MarkupStore::reorder`. Bounded: no more ids than the largest document can hold.
+#[tauri::command]
+pub async fn reorder_markups(
+    state: State<'_, AppState>,
+    doc_id: String,
+    markup_ids: Vec<String>,
+) -> Result<(), String> {
+    if markup_ids.len() > 1_000_000 {
+        return Err("too many markup ids".into());
+    }
+    let ids = markup_ids
+        .iter()
+        .map(|s| uuid::Uuid::parse_str(s).map_err(|e| format!("bad markup id: {e}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    state.markups.reorder(&doc_id, &ids)
+}
+
 /// Return the persisted app user identity, generating it on first run.
 #[tauri::command]
 pub fn get_user_identity(app: tauri::AppHandle) -> Result<crate::identity::Identity, String> {

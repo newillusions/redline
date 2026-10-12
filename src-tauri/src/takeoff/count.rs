@@ -150,6 +150,26 @@ mod tests {
         assert_eq!(rows[1].measurement.as_ref().unwrap().count_value, Some(1));
     }
 
+    /// Arrange / Multiply (docs/arrange.md M8): the source count and its copies all carry the
+    /// source's own id as `count_group`, so the exports and the Markups List see ONE count of
+    /// N+1. (A source left with no group would be a separate row of 1 - the review round 1 F1
+    /// mismatch; the frontend stamps it for exactly this reason.)
+    #[test]
+    fn multiplied_count_is_one_row_of_n_plus_one() {
+        let source_id = Uuid::new_v4();
+        let ms: Vec<Markup> = (0..4).map(|_| item(Some(source_id))).collect();
+        let rows = collapse_groups(&ms);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].measurement.as_ref().unwrap().count_value, Some(4));
+        let picked: Vec<&Markup> = vec![&ms[0]];
+        let with = with_group_totals(&ms, &picked);
+        assert_eq!(with[0].measurement.as_ref().unwrap().count_value, Some(4));
+        // Unstamped source + 3 copies: the 1 + 3 split the stamp prevents.
+        let mut split = vec![item(None)];
+        split.extend((0..3).map(|_| item(Some(source_id))));
+        assert_eq!(collapse_groups(&split).len(), 2);
+    }
+
     #[test]
     fn with_group_totals_uses_the_whole_group_not_the_picked_subset() {
         let a = Uuid::new_v4();

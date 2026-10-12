@@ -16,13 +16,16 @@ export interface MarkupSink {
   replace(m: Markup): void;
   removeById(id: string): void;
   getById(id: string): Markup | undefined;
+  /** Z-order (Arrange): see `refillOrder`. Optional so a plain sink needs no ordering. */
+  reorder?(ids: string[]): void;
 }
 
 /** A backend mirror operation implied by a command (1:1 with the granular IPC ops). */
 export type MirrorOp =
   | { kind: "add"; markup: Markup }
   | { kind: "update"; markup: Markup }
-  | { kind: "delete"; id: string };
+  | { kind: "delete"; id: string }
+  | { kind: "reorder"; ids: string[] };
 
 export interface Command {
   apply(sink: MarkupSink): MirrorOp;
@@ -45,6 +48,41 @@ export class DeleteCmd implements Command {
   constructor(private readonly markup: Markup) {}
   apply(sink: MarkupSink): MirrorOp { sink.removeById(this.markup.id); return { kind: "delete", id: this.markup.id }; }
   invert(sink: MarkupSink): MirrorOp { sink.insert(this.markup); return { kind: "add", markup: this.markup }; }
+}
+
+/**
+ * Z-order change (Arrange). `before` / `after` list the same markups (one page's) in their old
+ * and new relative order; applying either refills the slots those markups occupy in the
+ * document order (`refillOrder`), so everything else keeps its place.
+ */
+export class ReorderCmd implements Command {
+  constructor(private readonly before: string[], private readonly after: string[]) {}
+  apply(sink: MarkupSink): MirrorOp { sink.reorder?.(this.after); return { kind: "reorder", ids: this.after }; }
+  invert(sink: MarkupSink): MirrorOp { sink.reorder?.(this.before); return { kind: "reorder", ids: this.before }; }
+}
+
+/**
+ * `markups` with the slots held by `ids` refilled with those markups in the order of `ids`
+ * (the same slot rule as Rust `MarkupStore::reorder`): unknown ids are ignored, every other
+ * markup keeps its index. A repeated id is ignored after its first use here, where Rust refuses
+ * it - callers never send one. Returns `markups` itself when nothing moves.
+ */
+export function refillOrder(markups: Markup[], ids: readonly string[]): Markup[] {
+  const at = new Map<string, number>();
+  markups.forEach((m, i) => at.set(m.id, i));
+  const order: number[] = [];
+  const seen = new Set<number>();
+  for (const id of ids) {
+    const i = at.get(id);
+    if (i === undefined || seen.has(i)) continue;
+    seen.add(i);
+    order.push(i);
+  }
+  const slots = [...order].sort((a, b) => a - b);
+  if (slots.every((s, k) => s === order[k])) return markups;
+  const out = markups.slice();
+  slots.forEach((slot, k) => { out[slot] = markups[order[k]]; });
+  return out;
 }
 
 /** Frame-based undo/redo history. Each frame is a Command[]; a single push() wraps the

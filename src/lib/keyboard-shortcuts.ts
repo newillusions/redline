@@ -126,3 +126,23 @@ export function resolveViewerModeToggleShortcut(e: ViewerModeKeyEvent): boolean 
   if (isEditableTarget(e.target ?? null)) return false;
   return e.key.toLowerCase() === "r";
 }
+
+// ---------------------------------------------------------------------------
+// Markup copy / paste vs. native text copy (docs/arrange.md, review round 1 F2)
+// ---------------------------------------------------------------------------
+
+/**
+ * True when the browser's own Ctrl/Cmd+C/X/V/D should be left alone: focus is in an editable
+ * element, or the user has text selected somewhere OUTSIDE the viewport (a side panel, a
+ * dialog, a contenteditable). The viewport's markup copy / paste shortcuts are window-level, so
+ * without this they would swallow a native copy of that text.
+ */
+export function nativeEditingOwnsClipboardKeys(
+  active: Element | null,
+  selection: Selection | null,
+  viewportRoot: Node | null,
+): boolean {
+  if (active && isEditableTarget(active)) return true;
+  if (!selection || selection.isCollapsed || selection.toString() === "") return false;
+  return !(viewportRoot && selection.anchorNode && viewportRoot.contains(selection.anchorNode));
+}
