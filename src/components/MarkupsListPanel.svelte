@@ -28,9 +28,13 @@
     store,
     docId,
     onjump,
+    pageLabels = [],
   }: {
     store: MarkupStore;
     docId: string;
+    /** Page label per page (`""` = none): the Page column shows it, and the Page label
+     *  column / export use it (docs/navigation.md RL1). */
+    pageLabels?: readonly string[];
     /** Navigate the viewport to a mark-up (zero-based page + PDF-space rect). */
     onjump?: (target: { page: number; rect: [number, number, number, number]; markupId: string }) => void;
   } = $props();
@@ -69,7 +73,7 @@
   let error = $state<string | null>(null);
   let fromList = false;
 
-  const allRows = $derived(buildRows(store.markups));
+  const allRows = $derived(buildRows(store.markups, pageLabels));
   const customNames = $derived(customColumnNames(allRows));
   // Custom columns appear in the picker once the document has them (hidden until ticked).
   const effective = $derived(normalizeColumnConfig(config, customNames));

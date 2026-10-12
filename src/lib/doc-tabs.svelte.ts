@@ -13,6 +13,7 @@
 import type { DocumentInfo } from "./ipc";
 import { MarkupStore } from "./markup-store.svelte";
 import { TakeoffStore } from "./takeoff-store.svelte";
+import { NavigationStore } from "./navigation-store.svelte";
 
 // ---------------------------------------------------------------------------
 // Viewport snapshot (type defined in viewport.ts, re-exported for convenience)
@@ -38,6 +39,8 @@ export interface DocTab {
   doc: DocumentInfo;
   store: MarkupStore;
   takeoffStore: TakeoffStore;
+  /** Bookmarks, page labels and links (docs/navigation.md "Document structure"). */
+  navStore: NavigationStore;
   /** Last-known viewport state; restored when this tab is re-activated. */
   viewportSnapshot: ViewportSnapshot;
   /**
@@ -81,6 +84,7 @@ export class DocTabStore {
       doc,
       store,
       takeoffStore,
+      navStore: new NavigationStore(doc.doc_id),
       viewportSnapshot: { ...DEFAULT_VIEWPORT_SNAPSHOT },
       isEncrypted,
     };

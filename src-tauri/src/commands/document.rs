@@ -185,6 +185,8 @@ pub async fn close_document(state: State<'_, AppState>, doc_id: String) -> Resul
         .await
         .map_err(|e| format!("{:#}", e))?;
     state.markups.remove(&doc_id);
+    state.nav_history.lock().unwrap().remove(&doc_id);
+    state.page_labels.lock().unwrap().remove(&doc_id);
     state.layers.remove(&doc_id);
     // Scales live in the sidecar; forget the in-memory copy so a reopen reloads it.
     state.scales.lock().unwrap().clear(&doc_id);
@@ -389,6 +391,10 @@ async fn reload_keeping_inner(
         .and_then(|outcome| outcome.into_page_count())
         .map_err(|e| format!("reopen after reload: {e:#}"))?;
 
+    // The file was replaced by another program: navigation undo entries describe the old one
+    // (and its page labels may differ; the frontend re-reads them after a reload).
+    state.nav_history.lock().unwrap().remove(doc_id);
+    state.page_labels.lock().unwrap().remove(doc_id);
     state.markups.commit_reload(doc_id, txn, loaded, page_count)
 }
 
@@ -546,6 +552,9 @@ async fn save_inner(
     state.markups.clear_dirty(doc_id);
     if rebuild {
         state.markups.forget_source(doc_id);
+        // The rebuilt file is the PDF as it was opened: navigation undo entries described
+        // the file as edited since, so they no longer apply.
+        state.nav_history.lock().unwrap().remove(doc_id);
     }
     state.markups.rebaseline_after_write(doc_id);
     Ok(())
@@ -650,6 +659,19 @@ pub(crate) async fn apply_page_edit(
     doc_id: &str,
     op: impl FnOnce(&mut lopdf::Document) -> anyhow::Result<()> + Send + 'static,
 ) -> Result<(), String> {
+    apply_page_edit_keeping_history(state, doc_id, op, false).await
+}
+
+/// [`apply_page_edit`] with a choice about the navigation undo history. Every other caller
+/// rewrites page structure or object numbering, which would leave the Navigator's undo
+/// entries (page indices, link object ids) pointing at the wrong things, so it clears them.
+/// The navigation commands themselves pass `keep_nav_history = true`.
+pub(crate) async fn apply_page_edit_keeping_history(
+    state: &State<'_, AppState>,
+    doc_id: &str,
+    op: impl FnOnce(&mut lopdf::Document) -> anyhow::Result<()> + Send + 'static,
+    keep_nav_history: bool,
+) -> Result<(), String> {
     let src = state
         .markups
         .path(doc_id)
@@ -706,6 +728,9 @@ pub(crate) async fn apply_page_edit(
     // Phase 2a; see DocEntry::dirty's doc comment).
     state.markups.clear_dirty(doc_id);
     state.markups.rebaseline_after_write(doc_id);
+    if !keep_nav_history {
+        state.nav_history.lock().unwrap().remove(doc_id);
+    }
     Ok(())
 }
 
@@ -731,9 +756,15 @@ pub async fn delete_page(
     page_idx: u32,
 ) -> Result<(), String> {
     apply_page_edit(&state, &doc_id, move |doc| {
+        // Page labels belong to the sheet: carry them with their pages (before the page
+        // count changes).
+        crate::document::navigation::edit::carry_labels_delete(doc, page_idx)?;
         page_ops::delete_page(doc, page_idx)
     })
-    .await
+    .await?;
+    // Labels moved with their pages; the frontend re-reads them after a page operation.
+    state.page_labels.lock().unwrap().remove(&doc_id);
+    Ok(())
 }
 
 /// Reorder pages. `new_order` is a permutation of `0..page_count` (0-based).
@@ -744,9 +775,13 @@ pub async fn reorder_pages(
     new_order: Vec<u32>,
 ) -> Result<(), String> {
     apply_page_edit(&state, &doc_id, move |doc| {
+        crate::document::navigation::edit::carry_labels_reorder(doc, &new_order)?;
         page_ops::reorder_pages(doc, new_order)
     })
-    .await
+    .await?;
+    // Labels moved with their pages; the frontend re-reads them after a page operation.
+    state.page_labels.lock().unwrap().remove(&doc_id);
+    Ok(())
 }
 
 /// Insert a blank page at position `at` (0-based; `at == page_count` appends).
@@ -759,9 +794,13 @@ pub async fn insert_blank_page(
     height: f32,
 ) -> Result<(), String> {
     apply_page_edit(&state, &doc_id, move |doc| {
+        crate::document::navigation::edit::carry_labels_insert(doc, at)?;
         page_ops::insert_blank_page(doc, at, width, height)
     })
-    .await
+    .await?;
+    // Labels moved with their pages; the frontend re-reads them after a page operation.
+    state.page_labels.lock().unwrap().remove(&doc_id);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

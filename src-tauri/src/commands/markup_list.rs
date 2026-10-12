@@ -30,6 +30,8 @@ pub enum ListColumn {
     Type,
     Subject,
     Page,
+    /// The page's label (`E-101`), falling back to its number. Needs the document's labels.
+    PageLabel,
     Comment,
     Author,
     Date,
@@ -51,6 +53,7 @@ impl ListColumn {
             "type" => Self::Type,
             "subject" => Self::Subject,
             "page" => Self::Page,
+            "page_label" => Self::PageLabel,
             "comment" => Self::Comment,
             "author" => Self::Author,
             "date" => Self::Date,
@@ -81,6 +84,7 @@ impl ListColumn {
             Self::Type => "Type".into(),
             Self::Subject => "Subject".into(),
             Self::Page => "Page".into(),
+            Self::PageLabel => "Page label".into(),
             Self::Comment => "Comments".into(),
             Self::Author => "Author".into(),
             Self::Date => "Date".into(),
@@ -107,6 +111,7 @@ impl ListColumn {
         matches!(
             self,
             Self::Subject
+                | Self::PageLabel
                 | Self::Comment
                 | Self::Author
                 | Self::Layer
@@ -121,8 +126,9 @@ fn stamp(t: &chrono::DateTime<chrono::Utc>) -> String {
     t.format("%Y-%m-%d %H:%M").to_string()
 }
 
-/// Cell text for `m`; `number` is its 1-based position in the exported view.
-fn cell(m: &Markup, number: usize, col: &ListColumn) -> String {
+/// Cell text for `m`; `number` is its 1-based position in the exported view. `labels` is the
+/// document's page-label text per page (empty when unknown).
+fn cell(m: &Markup, number: usize, col: &ListColumn, labels: &[String]) -> String {
     match col {
         ListColumn::Number => number.to_string(),
         ListColumn::Type => format!("{:?}", m.markup_type),
@@ -131,6 +137,11 @@ fn cell(m: &Markup, number: usize, col: &ListColumn) -> String {
             .clone()
             .unwrap_or_else(|| format!("{:?}", m.markup_type)),
         ListColumn::Page => (m.page + 1).to_string(),
+        ListColumn::PageLabel => labels
+            .get(m.page as usize)
+            .filter(|l| !l.is_empty())
+            .cloned()
+            .unwrap_or_else(|| (m.page + 1).to_string()),
         ListColumn::Comment => m.contents.clone().unwrap_or_default(),
         ListColumn::Author => m.audit.created_by.display_name.clone(),
         ListColumn::Date => stamp(&m.audit.created_at),
@@ -229,6 +240,20 @@ pub fn export_view_with_scales(
     path: &Path,
     format: ExportFormat,
 ) -> Result<usize, String> {
+    export_view_with_labels(all, scales, ids, column_keys, path, format, &[])
+}
+
+/// [`export_view_with_scales`] that also knows the document's page labels, for the
+/// `page_label` column.
+pub fn export_view_with_labels(
+    all: &[Markup],
+    scales: &[crate::takeoff::ScaleRecord],
+    ids: &[String],
+    column_keys: &[String],
+    path: &Path,
+    format: ExportFormat,
+    labels: &[String],
+) -> Result<usize, String> {
     let mut recomputed = all.to_vec();
     crate::takeoff::recompute_all(&mut recomputed, scales);
     let all = &recomputed[..];
@@ -238,8 +263,8 @@ pub fn export_view_with_scales(
     let with_totals = crate::takeoff::count::with_group_totals(all, &picked);
     let rows: Vec<&Markup> = with_totals.iter().collect();
     match format {
-        ExportFormat::Csv => write_csv(&rows, &cols, path).map_err(|e| e.to_string())?,
-        ExportFormat::Xlsx => write_xlsx(&rows, &cols, path).map_err(|e| e.to_string())?,
+        ExportFormat::Csv => write_csv(&rows, &cols, path, labels).map_err(|e| e.to_string())?,
+        ExportFormat::Xlsx => write_xlsx(&rows, &cols, path, labels).map_err(|e| e.to_string())?,
     }
     Ok(rows.len())
 }
@@ -248,13 +273,14 @@ fn write_csv(
     rows: &[&Markup],
     cols: &[ListColumn],
     path: &Path,
+    labels: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut wtr = csv::Writer::from_path(path)?;
     // Headers can carry untrusted text (custom column names), so they are neutralised too.
     wtr.write_record(cols.iter().map(|c| neutralise_formula(&c.header())))?;
     for (i, m) in rows.iter().enumerate() {
         wtr.write_record(cols.iter().map(|c| {
-            let text = cell(m, i + 1, c);
+            let text = cell(m, i + 1, c, labels);
             if c.is_untrusted_text() {
                 neutralise_formula(&text)
             } else {
@@ -270,6 +296,7 @@ fn write_xlsx(
     rows: &[&Markup],
     cols: &[ListColumn],
     path: &Path,
+    labels: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     use rust_xlsxwriter::{Format, Workbook};
 
@@ -282,7 +309,7 @@ fn write_xlsx(
     for (ri, m) in rows.iter().enumerate() {
         let r = (ri + 1) as u32;
         for (ci, c) in cols.iter().enumerate() {
-            let text = cell(m, ri + 1, c);
+            let text = cell(m, ri + 1, c, labels);
             if c.is_numeric() {
                 ws.write_number(r, ci as u16, text.parse::<f64>().unwrap_or(0.0))?;
             } else {
@@ -310,7 +337,15 @@ pub async fn export_markups_view(
     let all = state.markups.list(&doc_id)?;
     crate::commands::takeoff::ensure_scales_loaded(&state, &doc_id);
     let scales = state.scales.lock().unwrap().list(&doc_id).to_vec();
-    export_view_with_scales(&all, &scales, &ids, &columns, &PathBuf::from(&path), format)
+    export_view_with_labels(
+        &all,
+        &scales,
+        &ids,
+        &columns,
+        &PathBuf::from(&path),
+        format,
+        &crate::commands::navigation::labels_for(&state, &doc_id),
+    )
 }
 
 #[cfg(test)]
@@ -736,5 +771,44 @@ mod tests {
         .unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(text.contains("5.00 m"), "{text}");
+    }
+
+    #[test]
+    fn the_page_label_column_shows_the_label_and_falls_back_to_the_number() {
+        let a = mk(0, "first", "A");
+        let b = mk(1, "second", "A");
+        let c = mk(2, "third", "A");
+        let ids: Vec<String> = [&a, &b, &c].iter().map(|m| m.id().to_string()).collect();
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("v.csv");
+        let labels = vec!["E-101".to_string(), String::new(), "=1+1".to_string()];
+        export_view_with_labels(
+            &[a, b, c],
+            &[],
+            &ids,
+            &keys(&["page", "page_label"]),
+            &out,
+            ExportFormat::Csv,
+            &labels,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "Page,Page label");
+        assert_eq!(lines[1], "1,E-101");
+        assert_eq!(lines[2], "2,2", "an unlabelled page shows its number");
+        assert_eq!(
+            lines[3], "3,'=1+1",
+            "a label is document text, so it is formula-neutralised"
+        );
+        // Without labels the column is just the number.
+        export_view_to(
+            &[mk(4, "x", "A")],
+            &[],
+            &keys(&["page_label"]),
+            &out,
+            ExportFormat::Csv,
+        )
+        .unwrap();
     }
 }

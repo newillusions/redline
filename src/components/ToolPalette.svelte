@@ -1,6 +1,20 @@
 <script lang="ts">
   import type { MarkupStore, ToolKind } from "$lib/markup-store.svelte";
-  const { store }: { store: MarkupStore } = $props();
+  import type { NavigationStore } from "$lib/navigation-store.svelte";
+  const { store, navStore = undefined }: { store: MarkupStore; navStore?: NavigationStore } = $props();
+
+  // The Link tool is not a mark-up tool: it draws a Link annotation (docs/navigation.md
+  // RH1). It rides on the Hand tool, so choosing it selects Hand first; choosing any
+  // mark-up tool leaves link mode (Viewport watches for that).
+  function toggleLinkTool() {
+    if (!navStore) return;
+    if (navStore.linkMode) {
+      navStore.endLinkMode();
+    } else {
+      store.activeTool = "hand";
+      navStore.beginLinkMode();
+    }
+  }
   const TOOLS: { kind: ToolKind; label: string; title: string; iconClass?: string }[] = [
     { kind: "hand", label: "✋", title: "Pan (Hand)" },
     { kind: "select", label: "↖", title: "Select / Pointer (V)" },
@@ -64,6 +78,17 @@
       onclick={() => (store.activeTool = t.kind)}
     >{t.label}</button>
   {/each}
+  {#if navStore}
+    <button
+      class="tool-btn"
+      class:active={navStore.linkMode}
+      title="Link - drag a rectangle, then choose a page or web address (Esc to stop)"
+      aria-label="Link tool"
+      aria-pressed={navStore.linkMode}
+      disabled={!navStore.fileEditable && !navStore.linkMode}
+      onclick={toggleLinkTool}
+    >&#x1F517;</button>
+  {/if}
 </div>
 <style>
   .tool-strip {

@@ -974,3 +974,41 @@ fn after_an_mcp_delete_scale_save_page_op_and_extract_all_print_what_the_export_
         "extract from stale values"
     );
 }
+
+// --- page labels in the Pages column (docs/navigation.md RL1) -----------------------------
+
+#[test]
+fn the_pages_column_lists_page_labels_when_the_document_has_them() {
+    use crate::document::navigation::labels::{write_ranges, LabelRange, LabelStyle};
+    let a = set("Downlight", "#ff0000", CountSymbol::Circle);
+    let make = || {
+        let mut l = legend_for(&[&counted(0, &a, 1, None)], LegendScope::AllPages);
+        l.legend.as_mut().unwrap().columns = vec![LegendColumn::Subject, LegendColumn::Pages];
+        vec![counted(0, &a, 2, None), l]
+    };
+
+    // No labels: the page number.
+    let (mut doc, _) = one_page_doc();
+    write_markups(&mut doc, &make()).unwrap();
+    let plain = reload(&mut doc);
+    let text = ap_text(&plain, &legend_dict(&plain));
+    assert!(text.contains("(1) Tj"), "page number expected:\n{text}");
+    assert!(!text.contains("(E-101) Tj"));
+
+    // Labelled: the label.
+    let (mut doc, _) = one_page_doc();
+    write_ranges(
+        &mut doc,
+        &[LabelRange {
+            start: 0,
+            style: Some(LabelStyle::Decimal),
+            prefix: "E-".into(),
+            first: 101,
+        }],
+    )
+    .unwrap();
+    write_markups(&mut doc, &make()).unwrap();
+    let labelled = reload(&mut doc);
+    let text = ap_text(&labelled, &legend_dict(&labelled));
+    assert!(text.contains("(E-101) Tj"), "label expected:\n{text}");
+}

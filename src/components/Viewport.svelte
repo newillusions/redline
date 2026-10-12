@@ -98,6 +98,10 @@
   import { getPageSnapTargets, findNearestSnap, type SnapTarget } from "$lib/snap";
   import CalibrationDialog from "./CalibrationDialog.svelte";
   import StampPromptDialog from "./StampPromptDialog.svelte";
+  import LinkOverlay from "./LinkOverlay.svelte";
+  import type { NavigationStore } from "$lib/navigation-store.svelte";
+  import type { LinkView, NavTarget } from "$lib/navigation-ipc";
+  import { linksOnPage } from "$lib/navigation";
 
   // ---------------------------------------------------------------------------
   // Props
@@ -112,6 +116,8 @@
     initialState = undefined,
     onviewportchange = undefined,
     onsearchtext = undefined,
+    navStore = undefined,
+    onfollowlink = undefined,
   }: {
     docInfo: DocumentInfo;
     store: MarkupStore;
@@ -133,6 +139,9 @@
       page: number;
       rect?: [number, number, number, number];
       markupId?: string;
+      /** Bookmark / link destination: place this point at the top-left of the view, at
+       *  `zoom` when given (docs/navigation.md RB2). */
+      view?: { left: number; top: number; zoom: number | null };
       nonce: number;
     } | null;
     /**
@@ -153,6 +162,11 @@
      * driving search itself (mirrors onviewportchange's callback-prop shape).
      */
     onsearchtext?: (text: string) => void;
+    /** Links, page labels and the Link tool for this document (docs/navigation.md). */
+    navStore?: NavigationStore;
+    /** A link was clicked in the Hand tool: run its target (App.svelte owns the confirm
+     *  dialog for web addresses). */
+    onfollowlink?: (target: NavTarget) => void;
   } = $props();
 
   // ---------------------------------------------------------------------------
@@ -538,7 +552,7 @@
     const out = new Map<string, LegendRow[]>();
     for (const m of store.markups) {
       if (m.markup_type === "Legend" && m.legend && m.page === pageIndex) {
-        out.set(m.id, computeRows(m.page, sanitizeLegend(m.legend), store.markups));
+        out.set(m.id, computeRows(m.page, sanitizeLegend(m.legend), store.markups, navStore?.labels ?? []));
       }
     }
     return out;
@@ -848,19 +862,32 @@
   let _lastAppliedJumpNonce = -1;
 
   /** Navigate to a search-result target: switch page if needed, then center/select. */
+  /** Put a destination's point at the top-left of the view, at its zoom when it has one. */
+  function placeView(v: { left: number; top: number; zoom: number | null }) {
+    if (v.zoom !== null && v.zoom > 0) applyZoom(v.zoom, 0, 0);
+    scrollX = v.left * zoom;
+    scrollY = (pageHeightPts - v.top) * zoom;
+    clampScroll();
+    requestTiles();
+  }
+
   async function applyJumpRequest(req: {
     page: number;
     rect?: [number, number, number, number];
     markupId?: string;
+    view?: { left: number; top: number; zoom: number | null };
   }) {
     const target = Math.max(0, Math.min(req.page, docInfo.page_count - 1));
     if (target !== pageIndex) {
       pageIndex = target;
       invalidateTiles();
       await loadPageSize(req.rect);
+      if (req.view) placeView(req.view);
     } else if (req.rect) {
       centerOnRect(req.rect);
       requestTiles();
+    } else if (req.view) {
+      placeView(req.view);
     }
     if (req.markupId) {
       // Switch to the select tool FIRST: a separate $effect clears selectedIds
@@ -882,6 +909,29 @@
       void applyJumpRequest(req);
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // Links (docs/navigation.md RH1-RH3)
+  // ---------------------------------------------------------------------------
+  const pageLinks = $derived(navStore ? linksOnPage(navStore.links, pageIndex) : []);
+  /** Hand tool follows links; the Link tool draws them; any mark-up tool leaves them alone. */
+  const linkMode = $derived<"off" | "follow" | "draw">(
+    navStore?.linkMode ? "draw" : store.activeTool === "hand" ? "follow" : "off",
+  );
+  // Picking a mark-up tool while the Link tool is on ends link mode.
+  $effect(() => {
+    if (navStore?.linkMode && store.activeTool !== "hand") navStore.endLinkMode();
+  });
+
+  function followLink(l: LinkView) {
+    onfollowlink?.(l.target);
+  }
+
+  function createLink(rect: [number, number, number, number]) {
+    if (!navStore) return;
+    navStore.pendingLink = { page: pageIndex, rect };
+    navStore.endLinkMode();
+  }
 
   // ---------------------------------------------------------------------------
   // Tile loading
@@ -3710,6 +3760,18 @@
       />
     {/each}
   </svg>
+
+  {#if navStore}
+    <LinkOverlay
+      links={pageLinks}
+      {viewState}
+      mode={linkMode}
+      labels={navStore.labels}
+      onfollow={followLink}
+      oncreate={createLink}
+      oncancel={() => navStore.endLinkMode()}
+    />
+  {/if}
 
   <!-- Calibration dialog: shown after user clicks two points with the calibrate tool. -->
   {#if showCalibDialog}

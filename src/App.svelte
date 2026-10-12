@@ -95,6 +95,14 @@
   import PageIndicator from "./components/PageIndicator.svelte";
   import ThumbnailPanel from "./components/ThumbnailPanel.svelte";
   import ExtractPagesDialog from "./components/ExtractPagesDialog.svelte";
+  import BookmarksPanel from "./components/BookmarksPanel.svelte";
+  import LinksPanel from "./components/LinksPanel.svelte";
+  import NumberPagesDialog from "./components/NumberPagesDialog.svelte";
+  import NavActionDialog from "./components/NavActionDialog.svelte";
+  import ConfirmDialog from "./components/ConfirmDialog.svelte";
+  import { getPageSize } from "$lib/ipc";
+  import { confirmExternalOpen, prepareExternalOpen, type LabelStyle, type LinkView, type NavTarget, type TargetInput } from "$lib/navigation-ipc";
+  import { bookmarkForMarkup, currentViewDest, jumpFor, type JumpTarget } from "$lib/navigation";
 
   // ---------------------------------------------------------------------------
   // S2b client entitlement gate - null while the initial (offline, fast) check
@@ -147,8 +155,150 @@
   let searchFolderIndexStatus = $state<IndexStatus | null>(null);
   let searchJumpNonce = 0;
   let viewportJumpRequest = $state<
-    { page: number; rect?: [number, number, number, number]; markupId?: string; nonce: number } | null
+    {
+      page: number;
+      rect?: [number, number, number, number];
+      markupId?: string;
+      view?: { left: number; top: number; zoom: number | null };
+      nonce: number;
+    } | null
   >(null);
+
+  // ---------------------------------------------------------------------------
+  // Navigator: bookmarks, page labels, links (docs/navigation.md "Document structure").
+  // The data lives in each tab's NavigationStore; this is the glue that needs App-level
+  // pieces: the viewport jump request, the confirm-before-opening dialog for web
+  // addresses, and the dialogs that several panels share.
+  // ---------------------------------------------------------------------------
+  /** The web address (as normalised by the backend) the user is being asked about, with the
+   *  token that answers the question. */
+  let externalOpen = $state<{ token: string; uri: string } | null>(null);
+  /** Number Pages dialog; `selected` pre-selects the thumbnails' selection. */
+  let numberPages = $state<{ selected: number[] } | null>(null);
+  /** The link whose action is being changed (Links panel > Edit action). */
+  let editingLink = $state<LinkView | null>(null);
+
+  // Read the structure once per tab, in the background.
+  $effect(() => {
+    const t = activeTab;
+    if (t && !t.navStore.loaded) void t.navStore.refresh();
+  });
+
+  // A navigation edit refused because the PDF changed on disk gets the same recovery dialog
+  // as a refused save (reload and keep my mark-ups / Save As).
+  $effect(() => {
+    const t = activeTab;
+    const err = t?.navStore.error;
+    if (t && err && isDiskChangedError(err)) {
+      t.navStore.clearError();
+      void showStaleDialog(t.docId);
+    }
+  });
+
+  function jumpTo(j: JumpTarget) {
+    searchJumpNonce += 1;
+    viewportJumpRequest = { page: j.page, rect: j.rect, view: j.view, nonce: searchJumpNonce };
+  }
+
+  /** Run a bookmark's or link's target. A web address is never opened without asking. */
+  function followTarget(t: NavTarget) {
+    if (t.kind === "page") {
+      const j = jumpFor(t);
+      if (j) jumpTo(j);
+    } else if (t.kind === "uri") {
+      void askToOpen(t.uri);
+    } else if (t.kind === "unsupported") {
+      docOpsStatus = `This action (${t.action}) is not supported, so it was not run.`;
+    } else if (t.kind === "blocked") {
+      docOpsStatus = `This address was blocked (${t.reason}).`;
+    } else if (t.kind === "broken") {
+      docOpsStatus = "The page this points to no longer exists in the document.";
+    }
+  }
+
+  /** Validate the address in the backend and show the user what will actually be opened. */
+  async function askToOpen(uri: string) {
+    try {
+      externalOpen = await prepareExternalOpen(uri);
+    } catch (e) {
+      docOpsStatus = `This address cannot be opened: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  }
+
+  async function confirmExternalUri() {
+    const q = externalOpen;
+    externalOpen = null;
+    if (!q) return;
+    try {
+      await confirmExternalOpen(q.token);
+    } catch (e) {
+      docOpsStatus = `Could not open the address: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  }
+
+  /** The page and view on screen now, as a destination. */
+  async function getCurrentView(): Promise<TargetInput | null> {
+    const t = activeTab;
+    if (!t) return null;
+    const snap = t.viewportSnapshot;
+    const inherit: TargetInput = {
+      kind: "page",
+      page: snap.pageIndex,
+      view: { kind: "xyz", left: null, top: null, zoom: null },
+    };
+    // In reading mode the scroll offsets belong to the whole column, not one page.
+    if (viewerMode === "reading") return inherit;
+    try {
+      const size = await getPageSize(t.docId, snap.pageIndex);
+      return currentViewDest(snap.pageIndex, snap.zoom, snap.scrollX, snap.scrollY, size.height_pts);
+    } catch {
+      return inherit;
+    }
+  }
+
+  /** A bookmark for the selected mark-up, if exactly one is selected. */
+  function selectionBookmark() {
+    const sel = activeTab?.store.selectedMarkups ?? [];
+    return sel.length === 1 ? bookmarkForMarkup(sel[0]) : null;
+  }
+
+  async function applyNumberPages(r: {
+    pages: number[];
+    style: LabelStyle | null;
+    prefix: string;
+    start: number;
+  }) {
+    const t = activeTab;
+    numberPages = null;
+    if (!t) return;
+    await t.navStore.edit({ op: "labels_number", ...r });
+    if (t.navStore.error) openError = t.navStore.error;
+  }
+
+  async function renamePageLabel(page: number, text: string) {
+    const t = activeTab;
+    if (!t) return;
+    await t.navStore.edit({ op: "label_rename", page, text });
+    if (t.navStore.error) openError = t.navStore.error;
+  }
+
+  async function createLink(target: TargetInput) {
+    const t = activeTab;
+    const pending = t?.navStore.pendingLink;
+    if (!t || !pending) return;
+    t.navStore.pendingLink = null;
+    await t.navStore.edit({ op: "link_create", page: pending.page, rect: pending.rect, target });
+    if (t.navStore.error) openError = t.navStore.error;
+  }
+
+  async function changeLinkTarget(target: TargetInput) {
+    const t = activeTab;
+    const link = editingLink;
+    editingLink = null;
+    if (!t || !link || link.id === null) return;
+    await t.navStore.edit({ op: "link_set_target", page: link.page, id: link.id, target });
+    if (t.navStore.error) openError = t.navStore.error;
+  }
   let folderIndexPollTimer: ReturnType<typeof setInterval> | null = null;
 
   function docSearchInput(tab: { docId: string; doc: DocumentInfo; store: MarkupStore }): DocSearchInput {
@@ -896,6 +1046,8 @@
     } catch (e) {
       console.error("Failed to refresh page count after a page operation:", e);
     }
+    // Page labels and links follow the page order, and the undo history was cleared.
+    void tabStore.tabs.find((t) => t.docId === docId)?.navStore.refresh();
   }
 
   // ---------------------------------------------------------------------------
@@ -971,6 +1123,7 @@
       await saveDocumentAsRebuild(tab.docId, dest);
       tab.store.clearDirty();
       adoptPath(tab.docId, dest);
+      void tab.navStore.refresh(); // the rebuilt file is the PDF as it was opened
       docOpsStatus = `Your mark-ups were saved to ${baseName(dest)}, rebuilt from the PDF as you opened it.`;
     } catch (e) {
       openError = `Save As (rebuild) failed: ${e instanceof Error ? e.message : String(e)}`;
@@ -1324,6 +1477,13 @@
     }
     items.push(
       {
+        id: "number-pages",
+        label: "Number pages…",
+        title: "Label the pages (E-101, A-1, iv, ...) - shown in the page box, thumbnails and the Markups List",
+        disabled: !activeTab || !activeTab.navStore.fileEditable || docBusy,
+        onselect: () => (numberPages = { selected: [] }),
+      },
+      {
         id: "ocr",
         label: isOcrRunning && ocrRunningDocId === activeTab?.docId ? "OCR running…" : "OCR this document",
         title: "Recognise scanned text and embed it as an invisible, searchable layer",
@@ -1534,6 +1694,7 @@
         <PageIndicator
           currentPage={activeTab.viewportSnapshot.pageIndex}
           pageCount={activeTab.doc.page_count}
+          labels={activeTab.navStore.labels}
           onjump={(idx) => {
             searchJumpNonce += 1;
             viewportJumpRequest = { page: idx, nonce: searchJumpNonce };
@@ -1656,7 +1817,7 @@
   {/if}
 
   {#if activeTab}
-    <ToolPalette store={activeTab.store} />
+    <ToolPalette store={activeTab.store} navStore={activeTab.navStore} />
   {/if}
 
   {#if openError}
@@ -1774,8 +1935,49 @@
             <ToolChestPanel toolChest={toolChestStore} markupStore={activeTab?.store ?? null} />
           </Accordion>
         </div>
-        <!-- Navigator: page thumbnails (PR-B, 2026-09-15). Bookmarks/Layers remain
-             unbuilt - not part of this feature set. -->
+        <!-- Bookmarks and Links (docs/navigation.md "Document structure"). -->
+        <div class="panel-section panel-section--nav">
+          <Accordion
+            title="Bookmarks"
+            storageKey="left-bookmarks"
+            bodyClass="panel-body panel-body-flush"
+            testId="accordion-bookmarks"
+          >
+            {#if activeTab}
+              <BookmarksPanel
+                nav={activeTab.navStore}
+                pageCount={activeTab.doc.page_count}
+                currentPage={activeTab.viewportSnapshot.pageIndex}
+                onfollow={followTarget}
+                {getCurrentView}
+                getSelectionBookmark={selectionBookmark}
+              />
+            {:else}
+              <p class="panel-hint muted">Open a PDF to begin.</p>
+            {/if}
+          </Accordion>
+        </div>
+        <div class="panel-section panel-section--nav">
+          <Accordion
+            title="Links"
+            storageKey="left-links"
+            defaultCollapsed={true}
+            bodyClass="panel-body panel-body-flush"
+            testId="accordion-links"
+          >
+            {#if activeTab}
+              <LinksPanel
+                nav={activeTab.navStore}
+                onjump={jumpTo}
+                onfollow={followTarget}
+                onedit={(l) => (editingLink = l)}
+              />
+            {:else}
+              <p class="panel-hint muted">Open a PDF to begin.</p>
+            {/if}
+          </Accordion>
+        </div>
+        <!-- Navigator: page thumbnails (PR-B, 2026-09-15). -->
         <div class="panel-section panel-section--secondary">
           <Accordion
             title="Navigator"
@@ -1794,6 +1996,9 @@
                 }}
                 onextract={(indices) => (extractPagesDialogIndices = indices)}
                 onPageOp={handleThumbnailPageOp}
+                labels={activeTab.navStore.labels}
+                onnumber={(sel) => (numberPages = { selected: sel })}
+                onrenamelabel={renamePageLabel}
               />
             {:else}
               <p class="panel-hint muted">Open a PDF to begin.</p>
@@ -1878,6 +2083,8 @@
               jumpRequest={viewportJumpRequest}
               searchHits={searchOverlay.hits}
               activeSearchHitIdx={searchOverlay.activeIdx}
+              navStore={activeTab.navStore}
+              onfollowlink={followTarget}
             />
           {/if}
         {/key}
@@ -1927,6 +2134,7 @@
             <MarkupsListPanel
               store={activeTab.store}
               docId={activeTab.docId}
+              pageLabels={activeTab.navStore.labels}
               onjump={(t) => {
                 searchJumpNonce += 1;
                 viewportJumpRequest = { page: t.page, rect: t.rect, nonce: searchJumpNonce };
@@ -2033,6 +2241,50 @@
       pageIndices={extractPagesDialogIndices}
       onClose={() => (extractPagesDialogIndices = null)}
       onExtracted={() => (extractPagesDialogIndices = null)}
+    />
+  {/if}
+
+  <!-- Navigator dialogs (docs/navigation.md "Document structure") -->
+  {#if numberPages && activeTab}
+    <NumberPagesDialog
+      pageCount={activeTab.doc.page_count}
+      currentPage={activeTab.viewportSnapshot.pageIndex}
+      selectedPages={numberPages.selected}
+      onConfirm={(r) => void applyNumberPages(r)}
+      onCancel={() => (numberPages = null)}
+    />
+  {/if}
+  {#if activeTab?.navStore.pendingLink}
+    <NavActionDialog
+      title="New link"
+      confirmLabel="Create link"
+      pageCount={activeTab.doc.page_count}
+      labels={activeTab.navStore.labels}
+      currentPage={activeTab.navStore.pendingLink.page}
+      onCancel={() => { if (activeTab) activeTab.navStore.pendingLink = null; }}
+      onConfirm={(t) => void createLink(t)}
+    />
+  {/if}
+  {#if editingLink && activeTab}
+    <NavActionDialog
+      title="Link action"
+      pageCount={activeTab.doc.page_count}
+      labels={activeTab.navStore.labels}
+      currentPage={editingLink.page}
+      initial={editingLink.target}
+      onCancel={() => (editingLink = null)}
+      onConfirm={(t) => void changeLinkTarget(t)}
+    />
+  {/if}
+  {#if externalOpen}
+    <ConfirmDialog
+      title="Open this address?"
+      message={externalOpen.uri}
+      hint="This address comes from the PDF. Open it only if you trust it."
+      confirmLabel="Open"
+      cancelLabel="Cancel"
+      onConfirm={() => void confirmExternalUri()}
+      onCancel={() => (externalOpen = null)}
     />
   {/if}
 
@@ -2270,6 +2522,15 @@
   }
   .panel-section--secondary {
     flex: 1;
+    overflow: hidden;
+  }
+  /* Bookmarks and Links size to their content (a collapsed one is just its header) up to
+     a share of the sidebar, then scroll inside - they must not each claim an equal slice
+     of the column like the other stacked panels do. */
+  .panel-section.panel-section--nav {
+    flex: 0 1 auto;
+    min-height: 0;
+    max-height: 45%;
     overflow: hidden;
   }
   /* Search stacks ABOVE Recent Documents/Tool Chest/Navigator (owner defect fix,

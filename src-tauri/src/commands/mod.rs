@@ -11,6 +11,7 @@ pub mod geometry;
 pub mod layers;
 pub mod license;
 pub mod markup_list;
+pub mod navigation;
 pub mod ocr;
 pub mod recent_docs;
 pub mod render;

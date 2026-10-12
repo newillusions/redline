@@ -39,6 +39,7 @@ export const COLUMN_DEFS: readonly ColumnDef[] = [
   { key: "subject", label: "Subject", kind: "text", defaultVisible: true, width: 130 },
   { key: "type", label: "Type", kind: "text", defaultVisible: false, width: 110 },
   { key: "page", label: "Page", kind: "number", defaultVisible: true, width: 56 },
+  { key: "page_label", label: "Page label", kind: "text", defaultVisible: false, width: 84 },
   { key: "comment", label: "Comments", kind: "text", defaultVisible: true, width: 240 },
   { key: "author", label: "Author", kind: "text", defaultVisible: true, width: 110 },
   { key: "date", label: "Date", kind: "text", defaultVisible: true, width: 135 },
@@ -67,6 +68,8 @@ export interface ListRow {
   subject: string;
   /** 1-based page number. */
   page: number;
+  /** The page's label (`E-101`), or "" when the page has none (docs/navigation.md RL1). */
+  pageLabel: string;
   comment: string;
   author: string;
   date: string;
@@ -111,7 +114,7 @@ export function measurementText(m: Markup): { text: string; value: number | null
   return { text: `${q.toFixed(2)} ${meas.unit ?? ""}`.trimEnd(), value: q };
 }
 
-export function buildRow(m: Markup, index: number): ListRow {
+export function buildRow(m: Markup, index: number, pageLabels: readonly string[] = []): ListRow {
   const change = latestReviewChange(m.workflow.status_history);
   const { text, value } = measurementText(m);
   const custom: Record<string, string> = {};
@@ -129,6 +132,7 @@ export function buildRow(m: Markup, index: number): ListRow {
     typeLabel: m.markup_type,
     subject,
     page: m.page + 1,
+    pageLabel: clip(pageLabels[m.page] ?? "").trim(),
     comment,
     author,
     date: formatStamp(m.audit.created_at),
@@ -147,7 +151,7 @@ export function buildRow(m: Markup, index: number): ListRow {
   };
 }
 
-export function buildRows(markups: readonly Markup[]): ListRow[] {
+export function buildRows(markups: readonly Markup[], pageLabels: readonly string[] = []): ListRow[] {
   // A count is ONE row (docs/count-polylength.md): the first item of each `count_group`
   // stands for the whole count and shows its total; ungrouped items are rows of their own.
   const totals = new Map<string, number>();
@@ -163,13 +167,13 @@ export function buildRows(markups: readonly Markup[]): ListRow[] {
     if (g) {
       if (seen.has(g)) continue;
       seen.add(g);
-      const row = buildRow(m, rows.length + 1);
+      const row = buildRow(m, rows.length + 1, pageLabels);
       const n = totals.get(g) ?? 1;
       row.measurement = n.toFixed(0);
       row.measurementValue = n;
       rows.push(row);
     } else {
-      rows.push(buildRow(m, rows.length + 1));
+      rows.push(buildRow(m, rows.length + 1, pageLabels));
     }
   }
   return rows;
@@ -195,7 +199,8 @@ export function cellText(r: ListRow, key: string): string {
     case "number": return String(r.index);
     case "subject": return r.subject;
     case "type": return r.typeLabel;
-    case "page": return String(r.page);
+    case "page": return r.pageLabel !== "" ? r.pageLabel : String(r.page);
+    case "page_label": return r.pageLabel !== "" ? r.pageLabel : String(r.page);
     case "comment": return r.comment;
     case "author": return r.author;
     case "date": return r.date;

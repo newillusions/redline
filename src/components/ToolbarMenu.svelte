@@ -27,6 +27,7 @@
     title = undefined,
     align = "left",
     testId = undefined,
+    fixed = false,
   }: {
     label: string;
     items: ToolbarMenuItem[];
@@ -34,10 +35,24 @@
     title?: string;
     align?: "left" | "right";
     testId?: string;
+    /** Place the list with `position: fixed` under the trigger instead of `absolute`, so a
+     *  menu inside a scrolling side panel is not clipped by it. */
+    fixed?: boolean;
   } = $props();
 
   let open = $state(false);
   let root = $state<HTMLElement | null>(null);
+  let listStyle = $state<string | undefined>(undefined);
+
+  function toggle() {
+    open = !open;
+    if (open && fixed && root) {
+      const r = root.getBoundingClientRect();
+      const width = 240;
+      const left = Math.max(8, Math.min(r.left, window.innerWidth - width - 8));
+      listStyle = `position: fixed; top: ${r.bottom + 2}px; left: ${left}px; right: auto;`;
+    }
+  }
 
   function choose(item: ToolbarMenuItem) {
     if (item.disabled) return;
@@ -77,12 +92,12 @@
     aria-expanded={open}
     {title}
     {disabled}
-    onclick={() => (open = !open)}
+    onclick={toggle}
   >
     {label} <span aria-hidden="true">▾</span>
   </button>
   {#if open}
-    <div class="menu-list" class:menu-right={align === "right"} role="menu">
+    <div class="menu-list" class:menu-right={align === "right"} role="menu" style={fixed ? listStyle : undefined}>
       {#each items as item (item.id)}
         {#if item.separator}<div class="menu-sep" role="separator"></div>{/if}
         <button

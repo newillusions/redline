@@ -294,6 +294,17 @@ describe("hostile input", () => {
     expect(clipCell("x".repeat(500), 100, 9).endsWith("...")).toBe(true);
     expect(clipCell("abc", Number.NaN, 9)).toBe("");
   });
+
+  it("the pages cell lists page labels when the document has them (same text as Rust)", () => {
+    const labels = ["E-101", "E-102", "E-103", "", "E-105"];
+    // Mirrors src-tauri/src/markup/legend.rs `pages_cell_compresses_and_clips`.
+    expect(pagesText([0, 1, 3, 4], labels)).toBe("E-101, E-102, 4, E-105");
+    expect(pagesText([3], labels)).toBe("4");
+    expect(pagesText([0, 1, 2, 4, 9], [])).toBe("1-3, 5, 10");
+    const long = pagesText(Array.from({ length: 60 }, (_, i) => i), Array.from({ length: 60 }, (_, i) => `SHEET-${i}`));
+    expect([...long].length).toBeLessThanOrEqual(MAX_PAGES_CELL_CHARS);
+    expect(long.endsWith("...")).toBe(true);
+  });
 });
 
 describe("page spec", () => {

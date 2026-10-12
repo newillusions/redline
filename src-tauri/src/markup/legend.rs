@@ -424,6 +424,38 @@ pub fn fixed2(q: f64) -> String {
 }
 
 fn pages_text(pages: &BTreeSet<u32>) -> String {
+    pages_text_labelled(pages, &[])
+}
+
+/// The Pages cell. A document with page labels lists them (`E-101, E-102`, an unlabelled page
+/// by its number); one without lists page-number ranges (`1-3, 5`). Clipped either way.
+fn pages_text_labelled(pages: &BTreeSet<u32>, labels: &[String]) -> String {
+    let label_of = |p: u32| {
+        labels
+            .get(p as usize)
+            .map(String::as_str)
+            .filter(|l| !l.is_empty())
+    };
+    if pages.iter().any(|p| label_of(*p).is_some()) {
+        let mut out = String::new();
+        for p in pages {
+            if !out.is_empty() {
+                out.push_str(", ");
+            }
+            match label_of(*p) {
+                Some(l) => out.push_str(l),
+                None => out.push_str(&(p + 1).to_string()),
+            }
+            if out.chars().count() > MAX_PAGES_CELL_CHARS {
+                break;
+            }
+        }
+        if out.chars().count() > MAX_PAGES_CELL_CHARS {
+            let cut: String = out.chars().take(MAX_PAGES_CELL_CHARS - 3).collect();
+            return format!("{cut}...");
+        }
+        return out;
+    }
     let mut out = String::new();
     let mut it = pages.iter().map(|p| p + 1).peekable();
     while let Some(start) = it.next() {
@@ -550,6 +582,7 @@ fn build_row(
     entry: Option<&LegendEntry>,
     key: &LegendKey,
     items: &[&Markup],
+    labels: &[String],
 ) -> LegendRow {
     let (quantity, quantity_text, unit) = quantity_of(key.markup_type, items);
     let set = items.iter().find_map(|m| m.count_set.as_ref());
@@ -594,7 +627,7 @@ fn build_row(
         quantity,
         quantity_text,
         unit,
-        pages: pages_text(&pages),
+        pages: pages_text_labelled(&pages, labels),
         matched: items.len(),
         color: safe_color(&[
             set.map(|s| s.color.as_str()),
@@ -651,6 +684,17 @@ fn split_by_unit<'a>(ty: MarkupType, items: &[&'a Markup]) -> Vec<Vec<&'a Markup
 /// The visible rows of a legend sitting on `legend_page`, computed from `markups`.
 /// `props` must be sanitised. The legend mark-ups themselves are never counted.
 pub fn compute_rows(legend_page: u32, props: &LegendProps, markups: &[Markup]) -> Vec<LegendRow> {
+    compute_rows_labelled(legend_page, props, markups, &[])
+}
+
+/// [`compute_rows`] with the document's page labels (text per page, `""` = none) for the
+/// Pages column.
+pub fn compute_rows_labelled(
+    legend_page: u32,
+    props: &LegendProps,
+    markups: &[Markup],
+    labels: &[String],
+) -> Vec<LegendRow> {
     let norms: Vec<Norm> = props.entries.iter().map(|e| Norm::of(&e.key)).collect();
     let mut claimed: Vec<Vec<&Markup>> = vec![Vec::new(); props.entries.len()];
     // Implicit rows: count sets no explicit entry claimed, in order of first appearance.
@@ -687,7 +731,7 @@ pub fn compute_rows(legend_page: u32, props: &LegendProps, markups: &[Markup]) -
         }
         // Measured quantities in different units are never added together: one row per unit.
         for group in split_by_unit(e.key.markup_type, &claimed[i]) {
-            rows.push(build_row(Some(i), Some(e), &e.key, &group));
+            rows.push(build_row(Some(i), Some(e), &e.key, &group, labels));
             if rows.len() >= MAX_ROWS {
                 return rows;
             }
@@ -701,7 +745,7 @@ pub fn compute_rows(legend_page: u32, props: &LegendProps, markups: &[Markup]) -
             color: String::new(),
             fill: None,
         };
-        rows.push(build_row(None, None, &key, &items));
+        rows.push(build_row(None, None, &key, &items, labels));
         if rows.len() >= MAX_ROWS {
             break;
         }
@@ -839,12 +883,21 @@ pub fn refresh_for_save_scaled(
     markups: &[Markup],
     scales: &[crate::takeoff::ScaleRecord],
 ) -> HashMap<Uuid, (LegendProps, SaveUpdate)> {
+    refresh_for_save_scaled_labelled(markups, scales, &[])
+}
+
+/// [`refresh_for_save_scaled`] with the document's page labels for the Pages column.
+pub fn refresh_for_save_scaled_labelled(
+    markups: &[Markup],
+    scales: &[crate::takeoff::ScaleRecord],
+    labels: &[String],
+) -> HashMap<Uuid, (LegendProps, SaveUpdate)> {
     if scales.is_empty() || !markups.iter().any(|m| m.markup_type == MarkupType::Legend) {
-        return refresh_for_save(markups);
+        return refresh_for_save_labelled(markups, labels);
     }
     let mut copy = markups.to_vec();
     crate::takeoff::recompute_all(&mut copy, scales);
-    refresh_for_save(&copy)
+    refresh_for_save_labelled(&copy, labels)
 }
 
 /// Rows and geometry to apply to a legend at save.
@@ -856,6 +909,14 @@ pub struct SaveUpdate {
 /// For every legend among `markups`: its sanitised definition with the freshly computed rows
 /// and the geometry that matches them, keyed by mark-up id. Empty when there is no legend.
 pub fn refresh_for_save(markups: &[Markup]) -> HashMap<Uuid, (LegendProps, SaveUpdate)> {
+    refresh_for_save_labelled(markups, &[])
+}
+
+/// [`refresh_for_save`] with the document's page labels for the Pages column.
+pub fn refresh_for_save_labelled(
+    markups: &[Markup],
+    labels: &[String],
+) -> HashMap<Uuid, (LegendProps, SaveUpdate)> {
     let mut out = HashMap::new();
     for m in markups {
         if m.markup_type != MarkupType::Legend {
@@ -863,7 +924,7 @@ pub fn refresh_for_save(markups: &[Markup]) -> HashMap<Uuid, (LegendProps, SaveU
         }
         let Some(raw) = &m.legend else { continue };
         let props = raw.sanitized();
-        let rows = compute_rows(m.page, &props, markups);
+        let rows = compute_rows_labelled(m.page, &props, markups, labels);
         let Some(r) = rect_for(&props, &m.geometry, rows.len()) else {
             continue;
         };
@@ -1231,6 +1292,20 @@ mod tests {
     fn pages_cell_compresses_and_clips() {
         let set: BTreeSet<u32> = [0, 1, 2, 4, 9].into_iter().collect();
         assert_eq!(pages_text(&set), "1-3, 5, 10");
+        // With page labels the cell lists them instead (an unlabelled page by its number).
+        let labels: Vec<String> = ["E-101", "E-102", "E-103", "", "E-105"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let some: BTreeSet<u32> = [0, 1, 3, 4].into_iter().collect();
+        assert_eq!(
+            pages_text_labelled(&some, &labels),
+            "E-101, E-102, 4, E-105"
+        );
+        // No labelled page in the set: ranges, as before.
+        let unlabelled: BTreeSet<u32> = [3].into_iter().collect();
+        assert_eq!(pages_text_labelled(&unlabelled, &labels), "4");
+        assert_eq!(pages_text_labelled(&set, &[]), "1-3, 5, 10");
         let many: BTreeSet<u32> = (0..200).map(|i| i * 2).collect();
         let t = pages_text(&many);
         assert!(t.chars().count() <= MAX_PAGES_CELL_CHARS);

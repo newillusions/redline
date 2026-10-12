@@ -131,6 +131,9 @@ image = { version = "0.25", features = ["png", "jpeg"] }
 
 # --- Unique IDs ---
 uuid = { version = "1.0", features = ["v4", "serde"] }
+# Address validation for links and bookmarks (document/navigation/uri.rs); already in the lock
+# file through reqwest, so this adds no new crate.
+url = "2"
 
 # --- Time ---
 chrono = { version = "0.4", features = ["serde"] }

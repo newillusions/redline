@@ -94,6 +94,7 @@
     font-weight: 600;
     margin: 0 0 var(--space-2);
     color: var(--color-text);
+    overflow-wrap: anywhere; /* a long web address has no break points */
   }
 
   .prompt-hint {

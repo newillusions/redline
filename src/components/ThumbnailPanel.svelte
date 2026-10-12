@@ -30,6 +30,7 @@
   import { fitWidthZoom } from "$lib/viewport";
   import { pageTileSizeCss } from "$lib/reading-mode";
   import { onDestroy } from "svelte";
+  import { labelOf } from "$lib/navigation";
 
   interface Props {
     docId: string;
@@ -44,9 +45,58 @@
     onextract?: (pageIndices: number[]) => void;
     /** Optional callback when pages change (e.g. to trigger re-render). */
     onPageOp?: () => void;
+    /** Page label per page (`""` = none), shown under each thumbnail (Revu shows labels in
+     *  its Thumbnails panel; docs/navigation.md L1). */
+    labels?: readonly string[];
+    /** Open Number Pages for the selected pages (none selected = the dialog's own choice). */
+    onnumber?: (selectedPages: number[]) => void;
+    /** Rename one page's label to plain text (double-click the caption or press F2). */
+    onrenamelabel?: (page: number, text: string) => void;
   }
 
-  const { docId, pageCount, currentPage = null, onjump, onextract, onPageOp }: Props = $props();
+  const {
+    docId,
+    pageCount,
+    currentPage = null,
+    onjump,
+    onextract,
+    onPageOp,
+    labels = [],
+    onnumber,
+    onrenamelabel,
+  }: Props = $props();
+
+  // Label renaming (F2 / double-click on the caption).
+  let renamingIdx = $state<number | null>(null);
+  let renameText = $state("");
+
+  function startRename(idx: number) {
+    if (!onrenamelabel) return;
+    renamingIdx = idx;
+    renameText = labelOf(labels, idx);
+  }
+
+  function commitRename() {
+    const idx = renamingIdx;
+    renamingIdx = null;
+    if (idx === null) return;
+    const text = renameText.trim();
+    if (text === labelOf(labels, idx).trim()) return;
+    onrenamelabel?.(idx, text);
+  }
+
+  function focusSelect(el: HTMLInputElement) {
+    el.focus();
+    el.select();
+  }
+
+  function onPanelKeyDown(e: KeyboardEvent) {
+    if (renamingIdx !== null || e.key !== "F2") return;
+    const target = selected.size === 1 ? [...selected][0] : currentPage;
+    if (target === null || target === undefined) return;
+    e.preventDefault();
+    startRename(target);
+  }
 
   // ---------------------------------------------------------------------------
   // Selection (PR-C)
@@ -299,10 +349,14 @@
   <div class="extract-action-bar">
     <span class="extract-count">{selected.size} page{selected.size === 1 ? "" : "s"} selected</span>
     <button class="btn-extract" onclick={handleExtractClick}>Extract…</button>
+    {#if onnumber}
+      <button class="btn-extract" onclick={() => onnumber?.(Array.from(selected))}>Number pages…</button>
+    {/if}
     <button class="btn-clear-selection" onclick={clearSelection} title="Clear selection">✕</button>
   </div>
 {/if}
-<aside class="thumbnail-panel" aria-label="Page thumbnails">
+<!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+<aside class="thumbnail-panel" aria-label="Page thumbnails" tabindex="0" onkeydown={onPanelKeyDown}>
   {#each Array.from({ length: pageCount }, (_, i) => i) as idx (idx)}
     <div
       class="thumbnail"
@@ -323,6 +377,30 @@
       ondrop={(e) => handleDrop(e, idx)}
     >
       <div class="thumbnail-number">{idx + 1}</div>
+      {#if renamingIdx === idx}
+        <input
+          class="label-edit"
+          use:focusSelect
+          bind:value={renameText}
+          aria-label={`Label for page ${idx + 1}`}
+          maxlength="256"
+          onclick={(e) => e.stopPropagation()}
+          ondblclick={(e) => e.stopPropagation()}
+          onblur={commitRename}
+          onkeydown={(e) => {
+            e.stopPropagation();
+            if (e.key === "Enter") { e.preventDefault(); commitRename(); }
+            else if (e.key === "Escape") { e.preventDefault(); renamingIdx = null; }
+          }}
+        />
+      {:else if labelOf(labels, idx).trim() !== ""}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div
+          class="thumbnail-label"
+          title={onrenamelabel ? "Double-click to rename this page label (F2)" : "Page label"}
+          ondblclick={(e) => { e.stopPropagation(); startRename(idx); }}
+        >{labelOf(labels, idx)}</div>
+      {/if}
       <div class="thumbnail-preview" aria-hidden="true" use:lazyThumbnail={idx}>
         {#if thumbs[idx]}
           <img src={thumbs[idx].src} alt="" class="thumbnail-image" />
@@ -404,6 +482,27 @@
     outline: 2px solid var(--color-primary);
     outline-offset: -1px;
     background: var(--color-bg-active);
+  }
+
+  .thumbnail-label {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    color: var(--color-text);
+  }
+
+  .label-edit {
+    width: 100%;
+    box-sizing: border-box;
+    background: var(--color-bg);
+    color: var(--color-text);
+    border: 1px solid var(--color-primary);
+    border-radius: var(--radius-sm);
+    padding: 1px var(--space-1);
+    font-size: var(--font-size-sm);
   }
 
   .extract-action-bar {

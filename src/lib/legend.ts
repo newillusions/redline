@@ -244,9 +244,27 @@ export function fixed2(q: number): string {
   return (q === 0 ? 0 : q).toFixed(2);
 }
 
-/** Pages as ranges (`1-3, 5`), clipped to `MAX_PAGES_CELL_CHARS`. `pages` are 0-based. */
-export function pagesText(pages: Iterable<number>): string {
-  const sorted = [...new Set(pages)].sort((a, b) => a - b).map((p) => p + 1);
+/** Pages as ranges (`1-3, 5`), clipped to `MAX_PAGES_CELL_CHARS`. `pages` are 0-based.
+ *  A document with page labels lists them instead (`E-101, E-102`, an unlabelled page by its
+ *  number); mirrors Rust `pages_text_labelled`. */
+export function pagesText(pages: Iterable<number>, labels: readonly string[] = []): string {
+  const sortedPages = [...new Set(pages)].sort((a, b) => a - b);
+  const labelOf = (p: number): string => {
+    const l = labels[p];
+    return typeof l === "string" && l !== "" ? l : "";
+  };
+  const clip = (out: string): string =>
+    [...out].length > MAX_PAGES_CELL_CHARS ? [...out].slice(0, MAX_PAGES_CELL_CHARS - 3).join("") + "..." : out;
+  if (sortedPages.some((p) => labelOf(p) !== "")) {
+    let out = "";
+    for (const p of sortedPages) {
+      if (out !== "") out += ", ";
+      out += labelOf(p) !== "" ? labelOf(p) : String(p + 1);
+      if ([...out].length > MAX_PAGES_CELL_CHARS) break;
+    }
+    return clip(out);
+  }
+  const sorted = sortedPages.map((p) => p + 1);
   let out = "";
   for (let i = 0; i < sorted.length; ) {
     const start = sorted[i];
@@ -257,8 +275,7 @@ export function pagesText(pages: Iterable<number>): string {
     out += end === start ? String(start) : `${start}-${end}`;
     if ([...out].length > MAX_PAGES_CELL_CHARS) break;
   }
-  if ([...out].length > MAX_PAGES_CELL_CHARS) return [...out].slice(0, MAX_PAGES_CELL_CHARS - 3).join("") + "...";
-  return out;
+  return clip(out);
 }
 
 /** The first candidate that is a valid `#rrggbb`, else black (colours are PDF data). */
@@ -305,7 +322,7 @@ function firstText(items: readonly Markup[], f: (m: Markup) => string | null | u
   return null;
 }
 
-function buildRow(entryIdx: number | null, entry: LegendEntry | null, key: LegendKey, items: readonly Markup[]): LegendRow {
+function buildRow(entryIdx: number | null, entry: LegendEntry | null, key: LegendKey, items: readonly Markup[], labels: readonly string[]): LegendRow {
   const { q, text, unit } = quantityOf(key.markup_type, items);
   const set = items.find((m) => m.count_set)?.count_set ?? null;
   const labelRaw = entry?.label != null ? cleanText(entry.label, MAX_TEXT_CHARS) : "";
@@ -323,7 +340,7 @@ function buildRow(entryIdx: number | null, entry: LegendEntry | null, key: Legen
     quantity: q,
     quantity_text: text,
     unit,
-    pages: pagesText(items.map((m) => m.page)),
+    pages: pagesText(items.map((m) => m.page), labels),
     matched: items.length,
     color: safeColor([set?.color, first?.appearance.color, key.color]),
     fill: first
@@ -348,8 +365,14 @@ function splitByUnit(ty: MarkupType, items: Markup[]): Markup[][] {
   return [...groups.values()];
 }
 
-/** The visible rows of a legend sitting on `legendPage`. `props` must be sanitised. */
-export function computeRows(legendPage: number, props: LegendProps, markups: readonly Markup[]): LegendRow[] {
+/** The visible rows of a legend sitting on `legendPage`. `props` must be sanitised. `labels` is
+ *  the document's page-label text per page (`""` = none), for the Pages column. */
+export function computeRows(
+  legendPage: number,
+  props: LegendProps,
+  markups: readonly Markup[],
+  labels: readonly string[] = [],
+): LegendRow[] {
   const norms = props.entries.map((e) => normOf(e.key));
   const claimed: Markup[][] = props.entries.map(() => []);
   const implicitOrder: string[] = [];
@@ -380,13 +403,13 @@ export function computeRows(legendPage: number, props: LegendProps, markups: rea
     if (e.hidden || (props.hide_empty && claimed[i].length === 0)) continue;
     // Measured quantities in different units are never added together: one row per unit.
     for (const group of splitByUnit(e.key.markup_type, claimed[i])) {
-      rows.push(buildRow(i, e, e.key, group));
+      rows.push(buildRow(i, e, e.key, group, labels));
       if (rows.length >= MAX_ROWS) return rows;
     }
   }
   for (const id of implicitOrder) {
     const key: LegendKey = { markup_type: "MeasurementCount", count_set: id, color: "", fill: null };
-    rows.push(buildRow(null, null, key, implicit.get(id) ?? []));
+    rows.push(buildRow(null, null, key, implicit.get(id) ?? [], labels));
     if (rows.length >= MAX_ROWS) break;
   }
   return rows;

@@ -35,6 +35,7 @@ pub const ERR_WRONG_PASSWORD: &str = "WRONG_PASSWORD";
 
 pub mod annots;
 pub mod known_passwords;
+pub mod navigation;
 pub mod page_ops;
 pub mod recover;
 pub mod save;

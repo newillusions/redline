@@ -174,7 +174,8 @@ pub async fn export_markup_list(
     let markups = state.markups.list(&doc_id)?;
     ensure_scales_loaded(&state, &doc_id);
     let scales = state.scales.lock().unwrap().list(&doc_id).to_vec();
-    export_markup_list_with_scales(&markups, &scales, &PathBuf::from(&path), format)
+    let labels = crate::commands::navigation::labels_for(&state, &doc_id);
+    export_markup_list_with_labels(&markups, &scales, &PathBuf::from(&path), format, &labels)
 }
 
 /// Core of [`export_markup_list`], extracted so it can be called with just a markup
@@ -198,12 +199,25 @@ pub fn export_markup_list_with_scales(
     path: &std::path::Path,
     format: ExportFormat,
 ) -> Result<(), String> {
+    export_markup_list_with_labels(markups, scales, path, format, &[])
+}
+
+/// [`export_markup_list_with_scales`] that also knows the document's page labels: when any
+/// page has one, a trailing **Page label** column is added (the page's label, else its
+/// number). Documents without labels export exactly as before.
+pub fn export_markup_list_with_labels(
+    markups: &[Markup],
+    scales: &[crate::takeoff::ScaleRecord],
+    path: &std::path::Path,
+    format: ExportFormat,
+    labels: &[String],
+) -> Result<(), String> {
     let mut rows = markups.to_vec();
     crate::takeoff::recompute_all(&mut rows, scales);
     let rows = crate::takeoff::count::collapse_groups(&rows);
     match format {
-        ExportFormat::Xlsx => export_xlsx(&rows, path).map_err(|e| e.to_string()),
-        ExportFormat::Csv => export_csv(&rows, path).map_err(|e| e.to_string()),
+        ExportFormat::Xlsx => export_xlsx_labelled(&rows, path, labels).map_err(|e| e.to_string()),
+        ExportFormat::Csv => export_csv_labelled(&rows, path, labels).map_err(|e| e.to_string()),
     }
 }
 
@@ -215,7 +229,29 @@ fn export_xlsx(
     markups: &[crate::markup::Markup],
     path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    export_xlsx_labelled(markups, path, &[])
+}
+
+/// The page's label, else its 1-based number (the Page label export column).
+fn page_label_cell(m: &crate::markup::Markup, labels: &[String]) -> String {
+    labels
+        .get(m.page as usize)
+        .filter(|l| !l.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| (m.page + 1).to_string())
+}
+
+fn any_label(labels: &[String]) -> bool {
+    labels.iter().any(|l| !l.trim().is_empty())
+}
+
+fn export_xlsx_labelled(
+    markups: &[crate::markup::Markup],
+    path: &std::path::Path,
+    labels: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
     use rust_xlsxwriter::{Format, Workbook};
+    let with_labels = any_label(labels);
 
     let mut wb = Workbook::new();
     let ws = wb.add_worksheet();
@@ -227,6 +263,9 @@ fn export_xlsx(
     ];
     for (col, h) in headers.iter().enumerate() {
         ws.write_string_with_format(0, col as u16, *h, &header_fmt)?;
+    }
+    if with_labels {
+        ws.write_string_with_format(0, headers.len() as u16, "Page label", &header_fmt)?;
     }
 
     for (row_idx, m) in markups.iter().enumerate() {
@@ -252,6 +291,9 @@ fn export_xlsx(
         ws.write_string(row, 8, &qty)?;
         ws.write_string(row, 9, &unit)?;
         ws.write_string(row, 10, format!("{:?}", m.workflow.status))?;
+        if with_labels {
+            ws.write_string(row, 11, page_label_cell(m, labels))?;
+        }
     }
 
     wb.save(path)?;
@@ -266,32 +308,50 @@ fn export_csv(
     markups: &[crate::markup::Markup],
     path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    export_csv_labelled(markups, path, &[])
+}
+
+fn export_csv_labelled(
+    markups: &[crate::markup::Markup],
+    path: &std::path::Path,
+    labels: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let with_labels = any_label(labels);
     let mut wtr = csv::Writer::from_path(path)?;
-    wtr.write_record([
+    let mut header: Vec<&str> = vec![
         "#", "Type", "Page", "Subject", "Author", "Date", "Contents", "Layer", "Quantity", "Unit",
         "Status",
-    ])?;
+    ];
+    if with_labels {
+        header.push("Page label");
+    }
+    wtr.write_record(header)?;
     for (i, m) in markups.iter().enumerate() {
         let (qty, unit) = m
             .measurement
             .as_ref()
             .map(|meas| (format!("{:.2}", meas.computed_quantity), meas.unit.clone()))
             .unwrap_or_default();
-        wtr.write_record([
-            &(i + 1).to_string(),
-            &format!("{:?}", m.markup_type),
-            &(m.page + 1).to_string(),
+        let mut record: Vec<String> = vec![
+            (i + 1).to_string(),
+            format!("{:?}", m.markup_type),
+            (m.page + 1).to_string(),
             // Text that came from the PDF is neutralised against spreadsheet formula
             // injection; app-formatted cells (page, date, quantity) stay as they are.
-            &neutralise_formula(m.subject.as_deref().unwrap_or("")),
-            &neutralise_formula(&m.audit.created_by.display_name),
-            &m.audit.created_at.format("%Y-%m-%d %H:%M").to_string(),
-            &neutralise_formula(m.contents.as_deref().unwrap_or("")),
-            &neutralise_formula(m.layer.as_deref().unwrap_or("")),
-            &qty,
-            &neutralise_formula(&unit),
-            &format!("{:?}", m.workflow.status),
-        ])?;
+            neutralise_formula(m.subject.as_deref().unwrap_or("")),
+            neutralise_formula(&m.audit.created_by.display_name),
+            m.audit.created_at.format("%Y-%m-%d %H:%M").to_string(),
+            neutralise_formula(m.contents.as_deref().unwrap_or("")),
+            neutralise_formula(m.layer.as_deref().unwrap_or("")),
+            qty,
+            neutralise_formula(&unit),
+            format!("{:?}", m.workflow.status),
+        ];
+        if with_labels {
+            // A label is document text: neutralised like every other PDF-derived cell.
+            record.push(neutralise_formula(&page_label_cell(m, labels)));
+        }
+        wtr.write_record(record)?;
     }
     wtr.flush()?;
     Ok(())
@@ -506,5 +566,75 @@ mod tests {
         let mut rdr = csv::Reader::from_path(&out).unwrap();
         let rec = rdr.records().next().unwrap().unwrap();
         assert_eq!(&rec[8], "3.00", "1000 x 0.002 + 1 m rise under the NEW scale");
+    }
+
+    #[test]
+    fn a_document_with_page_labels_gets_a_trailing_page_label_column() {
+        let mut a = sample_markup(crate::markup::MarkupType::Rectangle);
+        a.page = 0;
+        let mut b = sample_markup(crate::markup::MarkupType::Rectangle);
+        b.page = 1;
+        let mut c = sample_markup(crate::markup::MarkupType::Rectangle);
+        c.page = 2;
+        let labels = vec!["E-101".to_string(), String::new(), "=1+1".to_string()];
+        let dir = tempdir().unwrap();
+
+        let out = dir.path().join("labelled.csv");
+        export_markup_list_with_labels(
+            &[a.clone(), b.clone(), c.clone()],
+            &[],
+            &out,
+            ExportFormat::Csv,
+            &labels,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].ends_with(",Status,Page label"), "{}", lines[0]);
+        assert!(lines[1].ends_with(",E-101"), "{}", lines[1]);
+        assert!(
+            lines[2].ends_with(",2"),
+            "an unlabelled page shows its number: {}",
+            lines[2]
+        );
+        assert!(
+            lines[3].ends_with(",'=1+1"),
+            "a label is document text and is neutralised: {}",
+            lines[3]
+        );
+        // The numeric Page column is unchanged.
+        assert!(lines[1].contains(",1,"));
+
+        // Without labels the export is exactly the old shape.
+        let plain = dir.path().join("plain.csv");
+        export_markup_list_with_labels(&[a.clone()], &[], &plain, ExportFormat::Csv, &[]).unwrap();
+        assert!(!std::fs::read_to_string(&plain)
+            .unwrap()
+            .contains("Page label"));
+        let blank = dir.path().join("blank.csv");
+        export_markup_list_with_labels(
+            &[a.clone()],
+            &[],
+            &blank,
+            ExportFormat::Csv,
+            &["".to_string(), " ".to_string()],
+        )
+        .unwrap();
+        assert!(!std::fs::read_to_string(&blank)
+            .unwrap()
+            .contains("Page label"));
+
+        // XLSX carries the same column (header cell present in the file's shared strings).
+        let x = dir.path().join("labelled.xlsx");
+        export_markup_list_with_labels(&[a, b, c], &[], &x, ExportFormat::Xlsx, &labels).unwrap();
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&x).unwrap()).unwrap();
+        let mut shared = String::new();
+        std::io::Read::read_to_string(
+            &mut archive.by_name("xl/sharedStrings.xml").unwrap(),
+            &mut shared,
+        )
+        .unwrap();
+        assert!(shared.contains("Page label"), "header cell");
+        assert!(shared.contains("E-101"), "a label cell");
     }
 }

@@ -10,17 +10,22 @@
    * A separate leaf component (mirrors UndoRedoControls' rationale) so it's directly
    * testable with @testing-library/svelte without mounting App.svelte or a real Viewport.
    */
-  import { parsePageJumpInput } from "$lib/reading-mode";
+  import { labelOf, resolvePageInput } from "$lib/navigation";
 
   interface Props {
     /** 0-based index of the current page, or null when no document is open. */
     currentPage: number | null;
     pageCount: number;
+    /** Page label per page (`""` = none), when the document has labels. Shown beside the
+     *  number, and typing a label (`E-101`) jumps to it just like typing a number. */
+    labels?: readonly string[];
     /** Called with a 0-based page index when the user commits a valid jump. */
     onjump: (pageIndex: number) => void;
   }
 
-  const { currentPage, pageCount, onjump }: Props = $props();
+  const { currentPage, pageCount, labels = [], onjump }: Props = $props();
+
+  const currentLabel = $derived(currentPage === null ? "" : labelOf(labels, currentPage).trim());
 
   let editing = $state(false);
   let draft = $state("");
@@ -57,7 +62,7 @@
       editing = false;
       return;
     }
-    const parsed = parsePageJumpInput(draft, pageCount);
+    const parsed = resolvePageInput(draft, labels, pageCount);
     if (parsed !== null) onjump(parsed);
     // Invalid input: silently revert to the current page rather than leaving a stuck
     // bad value in the field (mirrors Viewport.svelte's zoom-percent input contract).
@@ -103,6 +108,9 @@
     </button>
   {/if}
   <span class="page-indicator-total">/ {pageCount}</span>
+  {#if currentLabel !== ""}
+    <span class="page-indicator-label" title="Page label" data-testid="page-label">{currentLabel}</span>
+  {/if}
 </div>
 
 
@@ -149,5 +157,14 @@
 
   .page-indicator-total {
     color: var(--color-text-muted);
+  }
+
+  .page-indicator-label {
+    color: var(--color-text);
+    font-weight: 600;
+    max-width: 10em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>

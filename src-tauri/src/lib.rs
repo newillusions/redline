@@ -86,6 +86,19 @@ pub struct AppState {
     /// and the MCP bridge's `close_document` dispatch arm both clear it when it matches
     /// the closed doc_id).
     pub active_doc: Mutex<Option<String>>,
+    /// Undo / redo stacks for Navigator edits (bookmarks, page labels, links), per open
+    /// document. In memory only. Cleared by any command that rewrites the file's structure
+    /// (see `commands::document::apply_page_edit_keeping_history`) and on close.
+    pub nav_history:
+        Mutex<std::collections::HashMap<String, document::navigation::edit::NavHistory>>,
+    /// Page-label text per page for each open document, as last read by the Navigator
+    /// (`commands::navigation`). Lets the exports (Quantities, Markups List - and so the MCP
+    /// bridge too) add a Page label column without re-reading the PDF. Absent = unknown, and
+    /// the exports then simply have no label column.
+    pub page_labels: Mutex<std::collections::HashMap<String, Vec<String>>>,
+    /// The single web address the user is being asked about before it is opened
+    /// (`commands::navigation::prepare_external_open` / `confirm_external_open`).
+    pub pending_open: Mutex<document::navigation::uri::PendingOpen>,
     /// Per-document layer (optional content) state: the view-overlay base read from the
     /// file. See `commands::layers`.
     pub layers: commands::layers::LayerSessions,
@@ -347,6 +360,9 @@ pub fn run() {
                 toolchest,
                 sequence_counters: SequenceCounters::new(),
                 active_doc: Mutex::new(None),
+                nav_history: Mutex::new(std::collections::HashMap::new()),
+                page_labels: Mutex::new(std::collections::HashMap::new()),
+                pending_open: Mutex::new(document::navigation::uri::PendingOpen::default()),
                 layers: Default::default(),
             });
             // MCP companion bridge (design §2/§5) - started once, after AppState is
@@ -391,6 +407,13 @@ pub fn run() {
             commands::document::reorder_pages,
             commands::document::insert_blank_page,
             commands::document::extract_pages,
+            // Navigator: bookmarks, page labels, links (docs/navigation.md "Document structure")
+            commands::navigation::get_navigation,
+            commands::navigation::navigation_edit,
+            commands::navigation::navigation_undo,
+            commands::navigation::navigation_redo,
+            commands::navigation::prepare_external_open,
+            commands::navigation::confirm_external_open,
             // Diagnostics (in-app §20 bench overlay)
             commands::diag::process_rss_mb,
             commands::diag::auto_open_path,

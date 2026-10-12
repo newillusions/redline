@@ -839,7 +839,18 @@ pub(crate) fn write_markups_scaled(
 
     // Legends are tables computed from the other markups: refresh their rows and geometry
     // from the set being saved (docs/legends.md). Empty when the document has no legend.
-    let legend_updates = crate::markup::legend::refresh_for_save_scaled(markups, scales);
+    // The Pages column lists page labels when the document has them.
+    let page_labels = if markups
+        .iter()
+        .any(|m| m.markup_type == crate::markup::MarkupType::Legend)
+    {
+        let ranges = crate::document::navigation::labels::read_ranges(doc);
+        crate::document::navigation::labels::page_labels(&ranges, pages.len() as u32)
+    } else {
+        Vec::new()
+    };
+    let legend_updates =
+        crate::markup::legend::refresh_for_save_scaled_labelled(markups, scales, &page_labels);
 
     // Phase 2: append the current markups to their pages as fresh indirect objects.
     for m in markups {
