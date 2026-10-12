@@ -662,6 +662,26 @@ fn ap_usable(doc: &Document, o: &Object) -> bool {
     })
 }
 
+/// `d` with an indirect `/Measure` replaced by the dictionary it points to, so the scale of a
+/// foreign polylength is captured like a direct one (`foreign::capture` skips references).
+fn measure_inlined(doc: &Document, d: &Dictionary) -> Dictionary {
+    let Ok(Object::Reference(r)) = d.get(b"Measure") else {
+        return d.clone();
+    };
+    let mut out = d.clone();
+    // Size-check the BORROWED object first: a huge /Measure shared by many annotations must
+    // not be deep-cloned once per annotation just to be rejected afterwards.
+    match doc.get_object(*r) {
+        Ok(m @ Object::Dictionary(_)) if crate::markup::foreign::fits_carry_budget(m) => {
+            out.set("Measure", m.clone());
+        }
+        _ => {
+            out.remove(b"Measure");
+        }
+    }
+    out
+}
+
 /// `doc`'s object `r`, for [`crate::markup::foreign::sanitized_original`] to inline indirect
 /// references (borrowed: nothing is copied until it passes the sanitiser's budget).
 fn resolve_object(doc: &Document, r: ObjectId) -> Option<&Object> {
@@ -1026,7 +1046,7 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
         let page_id = *pages.get(&page_no_1based).context("page id for collected annotation")?;
         let (rotation, w0, h0, ox, oy) = page_space.get(page_id, page_no_1based - 1)?;
         {
-            let mut m = Markup::from_annotation_dict(&dict);
+            let mut m = Markup::from_annotation_dict(&measure_inlined(doc, &dict));
             m.page = page_no_1based - 1;
             m.source_ref = source_ref_of(c.oid, &dict, (page_no_1based, c.idx));
             // A foreign annotation keeps its (sanitized) original so an unedited one is

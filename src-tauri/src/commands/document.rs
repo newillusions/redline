@@ -274,10 +274,14 @@ pub async fn load_markups(
         .path(&doc_id)
         .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
 
+    // Snapshot the file BEFORE reading it (first load only): stamp, private copy and the
+    // object ids parsed below then all describe the same bytes.
+    let snapshot = state.markups.begin_first_load(&doc_id);
+
     // Fast path: return the cached parse if the file is unchanged since the last load —
     // skips the ~tens-of-seconds lopdf parse on reopen of a large, unmodified file.
     if let Some(cached) = state.markups.check_mtime_cache(&path) {
-        return state.markups.seed_loaded(&doc_id, cached);
+        return state.markups.seed_loaded_with(&doc_id, cached, snapshot);
     }
 
     // Slow path: full lopdf parse (blocking; tens of seconds on large files).
@@ -291,13 +295,13 @@ pub async fn load_markups(
     .map_err(|e| format!("{e:#}"))?;
     // Populate the cache so the next reopen of this unmodified file returns immediately.
     state.markups.cache_loaded(path, loaded.clone());
-    state.markups.seed_loaded(&doc_id, loaded)
+    state.markups.seed_loaded_with(&doc_id, loaded, snapshot)
 }
 
 /// Save the in-memory markups into the open file (atomic in-place).
 #[tauri::command]
 pub async fn save_document(state: State<'_, AppState>, doc_id: String) -> Result<(), String> {
-    save_impl(state, doc_id, None).await
+    save_impl(state, doc_id, None, false).await
 }
 
 /// Save-As: write to `new_path` and switch the open document to it (same doc_id).
@@ -307,7 +311,96 @@ pub async fn save_document_as(
     doc_id: String,
     new_path: String,
 ) -> Result<(), String> {
-    save_impl(state, doc_id, Some(PathBuf::from(new_path))).await
+    save_impl(state, doc_id, Some(PathBuf::from(new_path)), false).await
+}
+
+/// Save As (rebuild): recovery for a PDF another program changed since redline loaded it
+/// (`ERR_DISK_CHANGED`). Writes the in-memory mark-ups to a NEW file built from the bytes
+/// redline loaded (a private copy kept at open / last write), never from the changed file;
+/// every foreign mark-up is rebuilt from the model. The changed file is left untouched, and
+/// the document switches to the new file like any Save As.
+#[tauri::command]
+pub async fn save_document_as_rebuild(
+    state: State<'_, AppState>,
+    doc_id: String,
+    new_path: String,
+) -> Result<(), String> {
+    save_impl(state, doc_id, Some(PathBuf::from(new_path)), true).await
+}
+
+/// True if redline holds a private copy of the file as it was loaded, i.e. Save As (rebuild)
+/// can run (no copy for a file over the size cap, or when the copy could not be made).
+#[tauri::command]
+pub fn can_rebuild_from_original(state: State<'_, AppState>, doc_id: String) -> bool {
+    state.markups.original_copy(&doc_id).is_some_and(|p| p.exists())
+}
+
+/// Reload and keep my mark-ups: recovery for a PDF another program changed since redline
+/// loaded it. Re-reads the changed file, then re-applies the user's unsaved edits where
+/// their targets still exist; the report names any that could not be applied. Nothing is
+/// written to disk. The caller re-reads the markups (`list_markups`) and refreshes the view.
+#[tauri::command]
+pub async fn reload_keeping_markups(
+    state: State<'_, AppState>,
+    doc_id: String,
+) -> Result<crate::document::recover::ReloadReport, String> {
+    state.markups.begin_save(&doc_id)?;
+    let result = reload_keeping_inner(&state, &doc_id).await;
+    state.markups.end_save(&doc_id);
+    result
+}
+
+async fn reload_keeping_inner(
+    state: &State<'_, AppState>,
+    doc_id: &str,
+) -> Result<crate::document::recover::ReloadReport, String> {
+    let path = state
+        .markups
+        .path(doc_id)
+        .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+    if !state.markups.is_loaded(doc_id) {
+        return Err("This document's mark-ups were never loaded, so there is nothing to keep. \
+                    Close and reopen it."
+            .to_string());
+    }
+    let password = state.markups.password(doc_id);
+
+    // Transactional: the snapshot (stamp + private copy), the parsed markups and the reopened
+    // render all live in locals until every step has succeeded. Any failure returns here with
+    // the old stamp, copy and markups untouched, so the stale-file refusal still applies.
+    let txn = state.markups.begin_reload(doc_id)?;
+    let (p, pw) = (path.clone(), password.clone());
+    let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))?;
+
+    // The render engine still shows the old file.
+    state
+        .render
+        .close_document(doc_id.to_string())
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let page_count = state
+        .render
+        .open_document(path.clone(), doc_id.to_string(), password)
+        .await
+        .and_then(|outcome| outcome.into_page_count())
+        .map_err(|e| format!("reopen after reload: {e:#}"))?;
+
+    state.markups.commit_reload(doc_id, txn, loaded, page_count)
+}
+
+/// True if `a` and `b` name the same file, however spelled (case-insensitive file systems,
+/// symlinked folders). A path that does not exist yet is compared through its parent.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let canon = |p: &std::path::Path| {
+        std::fs::canonicalize(p).ok().or_else(|| {
+            let parent = std::fs::canonicalize(p.parent()?).ok()?;
+            Some(parent.join(p.file_name()?))
+        })
+    };
+    a == b || matches!((canon(a), canon(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// Refuse any write that would use the loaded markups' object ids (save, Save As, every page
@@ -335,9 +428,10 @@ async fn save_impl(
     state: State<'_, AppState>,
     doc_id: String,
     new_path: Option<PathBuf>,
+    rebuild: bool,
 ) -> Result<(), String> {
     state.markups.begin_save(&doc_id)?;
-    let result = save_inner(&state, &doc_id, new_path).await;
+    let result = save_inner(&state, &doc_id, new_path, rebuild).await;
     state.markups.end_save(&doc_id);
     result
 }
@@ -350,6 +444,7 @@ async fn save_inner(
     state: &State<'_, AppState>,
     doc_id: &str,
     new_path: Option<PathBuf>,
+    rebuild: bool,
 ) -> Result<(), String> {
     let src = state
         .markups
@@ -363,21 +458,41 @@ async fn save_inner(
     // would replace pre-existing redline annotations with only the new ones.
     let was_loaded = state.markups.is_loaded(doc_id);
     if !was_loaded {
+        let snapshot = state.markups.begin_first_load(doc_id);
         let p = src.clone();
         let pw = password.clone();
         let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| format!("{e:#}"))?;
-        state.markups.seed_loaded(doc_id, loaded)?;
+        state.markups.seed_loaded_with(doc_id, loaded, snapshot)?;
     }
     let markups = state.markups.list(doc_id)?;
     let removed = state.markups.removed_sources(doc_id);
 
     // Annotation matching and preserved originals use the loaded file's object ids: refuse
     // any write (in place or Save As, which reads the same source) once another program has
-    // rewritten the file since. Only a reload is safe.
-    ensure_source_unchanged(&state.markups, doc_id, was_loaded)?;
+    // rewritten the file since. Only a reload, or a rebuild from redline's own copy of the
+    // loaded bytes (below), is safe.
+    let rebuild = rebuild && was_loaded;
+    let (markups, removed, write_src) = if rebuild {
+        if same_file(&dest, &src) {
+            return Err("Save As (rebuild) writes a new file: choose a different name or \
+                        folder, not the changed file."
+                .to_string());
+        }
+        let copy = state.markups.original_copy(doc_id).ok_or_else(|| {
+            "redline has no private copy of the file as it was loaded (it was too large to \
+             keep, or could not be copied), so it cannot rebuild from it. Use \
+             \"reload and keep my mark-ups\" instead."
+                .to_string()
+        })?;
+        let (markups, removed) = crate::document::recover::rebuild_inputs(&markups, &removed);
+        (markups, removed, copy)
+    } else {
+        ensure_source_unchanged(&state.markups, doc_id, was_loaded)?;
+        (markups, removed, src.clone())
+    };
 
     // 1. Stage the complete rewritten file next to the destination. Encrypted source
     //    documents are refused inside save_with_markups (see its doc comment) - lopdf
@@ -385,10 +500,9 @@ async fn save_inner(
     //    password protection.
     let staged = dest.with_extension("pdf.redline-staged");
     {
-        let src = src.clone();
         let staged = staged.clone();
         tokio::task::spawn_blocking(move || {
-            save_with_markups_removing(&src, &staged, &markups, &removed)
+            save_with_markups_removing(&write_src, &staged, &markups, &removed)
         })
             .await
             .map_err(|e| e.to_string())?
@@ -425,6 +539,9 @@ async fn save_inner(
     // The current markup state is now on disk - clear dirty (MCP server design, Phase
     // 2a `close_document`/`list_open_documents`; see `DocEntry::dirty`'s doc comment).
     state.markups.clear_dirty(doc_id);
+    if rebuild {
+        state.markups.forget_source(doc_id);
+    }
     state.markups.rebaseline_after_write(doc_id);
     Ok(())
 }
@@ -525,13 +642,14 @@ pub(crate) async fn apply_page_edit(
     // redline annotations that haven't been loaded into memory yet.
     let was_loaded = state.markups.is_loaded(doc_id);
     if !was_loaded {
+        let snapshot = state.markups.begin_first_load(doc_id);
         let p = src.clone();
         let pw = password.clone();
         let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| format!("{e:#}"))?;
-        state.markups.seed_loaded(doc_id, loaded)?;
+        state.markups.seed_loaded_with(doc_id, loaded, snapshot)?;
     }
     // The write below re-baselines the disk stamp (`invalidate_cache`), so verify it first:
     // a page op over a file another program changed would write stale object ids.
@@ -707,13 +825,14 @@ pub async fn extract_pages(
     let password = state.markups.password(&doc_id);
     let was_loaded = state.markups.is_loaded(&doc_id);
     if !was_loaded {
+        let snapshot = state.markups.begin_first_load(&doc_id);
         let p = src.clone();
         let pw = password.clone();
         let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| format!("{e:#}"))?;
-        state.markups.seed_loaded(&doc_id, loaded)?;
+        state.markups.seed_loaded_with(&doc_id, loaded, snapshot)?;
     }
     ensure_source_unchanged(&state.markups, &doc_id, was_loaded)?;
     let markups = state.markups.list(&doc_id)?;
@@ -730,6 +849,25 @@ pub async fn extract_pages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_file_sees_through_spelling_and_symlinks_but_not_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pdf");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(dir.path().join("b.pdf"), b"x").unwrap();
+        let dotted = dir.path().join("sub").join("..").join("a.pdf");
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        assert!(same_file(&a, &dotted));
+        assert!(!same_file(&a, &dir.path().join("b.pdf")));
+        assert!(!same_file(&a, &dir.path().join("new.pdf")), "a not-yet-existing name is a different file");
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.pdf");
+            std::os::unix::fs::symlink(&a, &link).unwrap();
+            assert!(same_file(&a, &link));
+        }
+    }
     use crate::document::annots::tests::{one_page_doc, redline_markup};
     use crate::docops::{flatten_annotations, optimize_in_place};
     use crate::geometry::PdfPoint;

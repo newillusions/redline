@@ -64,6 +64,31 @@ describe("ipc invoke argument keys (Tauri v2 camelCase)", () => {
     expect(mockInvoke).toHaveBeenCalledWith("save_document_as", { docId: "d1", newPath: "/tmp/x.pdf" });
   });
 
+  it("save_document_as_rebuild → docId / newPath", async () => {
+    await ipc.saveDocumentAsRebuild("d1", "/tmp/x.pdf");
+    expect(mockInvoke).toHaveBeenCalledWith("save_document_as_rebuild", { docId: "d1", newPath: "/tmp/x.pdf" });
+  });
+
+  it("can_rebuild_from_original → docId", async () => {
+    mockInvoke.mockResolvedValueOnce(false);
+    expect(await ipc.canRebuildFromOriginal("d1")).toBe(false);
+    expect(mockInvoke).toHaveBeenCalledWith("can_rebuild_from_original", { docId: "d1" });
+  });
+
+  it("reload_keeping_markups → docId, returns the report", async () => {
+    const report = { applied: 2, skipped: ["Square on page 1: no longer in the changed file"], notes: [] };
+    mockInvoke.mockResolvedValueOnce(report);
+    expect(await ipc.reloadKeepingMarkups("d1")).toEqual(report);
+    expect(mockInvoke).toHaveBeenCalledWith("reload_keeping_markups", { docId: "d1" });
+  });
+
+  it("recognises the changed-on-disk refusal from a rejected string or an Error", () => {
+    const msg = "The PDF was changed on disk by another program after redline opened it";
+    expect(ipc.isDiskChangedError(msg)).toBe(true);
+    expect(ipc.isDiskChangedError(new Error(msg))).toBe(true);
+    expect(ipc.isDiskChangedError("swap failed: permission denied")).toBe(false);
+  });
+
   it("save_unprotected_copy → docId / destPath", async () => {
     await ipc.saveUnprotectedCopy("d1", "/tmp/x_unprotected.pdf");
     expect(mockInvoke).toHaveBeenCalledWith("save_unprotected_copy", {

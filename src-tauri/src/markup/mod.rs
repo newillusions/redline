@@ -959,6 +959,8 @@ mod interop_integrity_tests;
 
 #[cfg(test)]
 mod preserve_tests;
+#[cfg(test)]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {

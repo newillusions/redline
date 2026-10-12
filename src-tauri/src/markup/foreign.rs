@@ -50,6 +50,9 @@ pub const ALLOWED: &[(&str, Shape)] = &[
     ("PitchRun", Shape::Data),
     ("RiseDrop", Shape::Data),
     ("SlopeType", Shape::Data),
+    // A polylength's scale (with /IT /PolyLineDimension, written by `to_annotation_dict`):
+    // carried so an edited or rebuilt foreign polylength keeps its measurement.
+    ("Measure", Shape::Data),
 ];
 
 /// Extra keys carried on a reply / state annotation only (never on a markup, whose own
@@ -180,7 +183,56 @@ fn is_safe_token(t: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-'))
 }
 
-fn check_plain(v: &PdfValue, depth: usize, nodes: &mut usize) -> Result<(), &'static str> {
+/// True if the borrowed `o` is small enough to be carried as plain data: within the node,
+/// depth and string limits of [`validate`], with no reference or stream. Walks at most
+/// `MAX_NODES` nodes, so the cost is bounded whatever the size of `o`; callers use it to
+/// refuse a huge shared object BEFORE cloning it.
+pub fn fits_carry_budget(o: &Object) -> bool {
+    /// Total string, name and key bytes: bounds the clone whatever the node count.
+    const MAX_BYTES: usize = 1024 * 1024;
+    fn walk(o: &Object, depth: usize, nodes: &mut usize, bytes: &mut usize) -> bool {
+        *nodes += 1;
+        if depth > MAX_DEPTH || *nodes > MAX_NODES {
+            return false;
+        }
+        let mut text = |len: usize| {
+            *bytes += len;
+            len <= MAX_STRING_BYTES && *bytes <= MAX_BYTES
+        };
+        match o {
+            Object::Reference(_) | Object::Stream(_) => false,
+            Object::String(b, _) => text(b.len()),
+            Object::Name(n) => text(n.len()),
+            Object::Array(a) => a.iter().all(|e| walk(e, depth + 1, nodes, bytes)),
+            Object::Dictionary(d) => d
+                .iter()
+                .all(|(k, v)| {
+                    let key_ok = {
+                        *bytes += k.len();
+                        k.len() <= MAX_NAME_BYTES && *bytes <= MAX_BYTES
+                    };
+                    key_ok && walk(v, depth + 1, nodes, bytes)
+                }),
+            _ => true,
+        }
+    }
+    walk(o, 0, &mut 0, &mut 0)
+}
+
+/// The keys of a `/Measure` dictionary and its `/NumberFormat` entries (ISO 32000-1 12.9),
+/// the only ones accepted inside a carried `/Measure`. Several (`/A`, `/F`, `/D`) share a
+/// name with an action key, which is why a measure is checked against this list instead.
+const MEASURE_KEYS: &[&str] = &[
+    "Type", "Subtype", "R", "X", "Y", "D", "A", "T", "S", "O", "CYX", "U", "C", "F", "FD", "RT",
+    "RD", "PS", "SS",
+];
+
+fn check_plain(
+    v: &PdfValue,
+    depth: usize,
+    nodes: &mut usize,
+    measure: bool,
+) -> Result<(), &'static str> {
     *nodes += 1;
     if depth > MAX_DEPTH || *nodes > MAX_NODES {
         return Err("value too deep or too large");
@@ -194,10 +246,15 @@ fn check_plain(v: &PdfValue, depth: usize, nodes: &mut usize) -> Result<(), &'st
         PdfValue::Name(_) => Err("name with unsafe characters"),
         PdfValue::Str(b, _) if b.len() <= MAX_STRING_BYTES => Ok(()),
         PdfValue::Str(..) => Err("string too long"),
-        PdfValue::Array(a) => a.iter().try_for_each(|e| check_plain(e, depth + 1, nodes)),
+        PdfValue::Array(a) => a.iter().try_for_each(|e| check_plain(e, depth + 1, nodes, measure)),
         PdfValue::Dict(d) => {
             for (k, val) in d {
-                if !is_safe_token(k) || ACTION_KEYS.contains(&k.as_str()) {
+                let allowed = if measure {
+                    MEASURE_KEYS.contains(&k.as_str())
+                } else {
+                    !ACTION_KEYS.contains(&k.as_str())
+                };
+                if !is_safe_token(k) || !allowed {
                     return Err("action-bearing or unsafe dictionary key");
                 }
                 if k == "S" {
@@ -207,7 +264,7 @@ fn check_plain(v: &PdfValue, depth: usize, nodes: &mut usize) -> Result<(), &'st
                         }
                     }
                 }
-                check_plain(val, depth + 1, nodes)?;
+                check_plain(val, depth + 1, nodes, measure)?;
             }
             Ok(())
         }
@@ -245,7 +302,7 @@ pub fn validate_in(scope: Scope, k: &ForeignKey) -> Result<(), &'static str> {
             Ok(())
         }
         (Shape::Number, _) => Err("expected a number"),
-        (Shape::Data, v) => check_plain(v, 0, &mut 0),
+        (Shape::Data, v) => check_plain(v, 0, &mut 0, k.name == "Measure"),
     }
 }
 
@@ -540,12 +597,9 @@ pub fn sanitized_original(
         match clean_original(v, resolve, 0, &mut st) {
             Ok(Some(v)) => out.set(k.clone(), v),
             Ok(None) => {}
-            // The inlining budget is spent: leave this key out, keep the rest.
-            Err(Fail::Key) => {
-                st.active.clear();
-                log::warn!("foreign annotation: /{} dropped (inlined content over budget)", String::from_utf8_lossy(k));
-            }
-            Err(Fail::Whole) => {
+            // A key's inlined content is over budget: a preserved original is never partial,
+            // so rebuild the whole markup from the model instead of dropping the key.
+            Err(Fail::Key | Fail::Whole) => {
                 log::warn!("foreign annotation: original dictionary too large to carry; rebuilding");
                 return None;
             }

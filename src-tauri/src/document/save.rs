@@ -85,8 +85,15 @@ pub fn save_with_markups_removing(
         uuid::Uuid::new_v4().simple()
     ));
     let result = (|| -> Result<()> {
-        let f = doc
-            .save(&tmp)
+        // create_new (O_EXCL): the temp file is ours alone, and a symlink or file already at
+        // that path is an error, never followed or overwritten. The final rename replaces a
+        // symlink at `dest` itself; it never writes through it.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        doc.save_to(&mut f)
             .with_context(|| format!("write {}", tmp.display()))?;
         f.sync_all().context("fsync temp")?;
         // Dir-fsync skipped deliberately: APFS/NTFS journal the rename; desktop-app

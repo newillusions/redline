@@ -541,7 +541,12 @@ impl Markup {
             pdf_subtype(t)
         };
         d.set("Subtype", name(subtype));
-        if polylength {
+        // A foreign polylength (a PolyLine carrying a /Measure scale) stays a dimension when
+        // it is rebuilt; the /Measure itself comes back through `foreign_keys`.
+        let foreign_dimension = matches!(t, MarkupType::Polyline)
+            && subtype == "PolyLine"
+            && self.foreign_keys.iter().any(|k| k.name == "Measure");
+        if polylength || foreign_dimension {
             d.set("IT", name("PolyLineDimension"));
         }
 

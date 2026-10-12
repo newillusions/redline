@@ -52,21 +52,147 @@ pub struct DocEntry {
     /// file another program rewrote since would be saved over with stale ids (duplicating or
     /// stripping annotations). `None` when the file could not be stat'ed.
     pub disk_stamp: Option<DiskStamp>,
+    /// A private copy of the file's bytes as redline last opened or wrote them (None when the
+    /// file was too large to copy or the copy failed). "Save As (rebuild)" writes the user's
+    /// mark-ups from these bytes after the real file changed under redline.
+    pub original: Option<OriginalCopy>,
+    /// Edit fingerprint of every markup as the file has it (loaded or last written), by id.
+    /// The difference between this and `markups` is the user's unsaved work, which "Reload
+    /// and keep my mark-ups" re-applies on top of the changed file.
+    pub baseline: HashMap<Uuid, u64>,
+    /// [`super::recover::content_key`] of every unnamed foreign markup as loaded, by id.
+    pub keys: HashMap<Uuid, u64>,
 }
 
-/// Modified time + size of a file on disk.
-pub type DiskStamp = (SystemTime, u64);
+/// Modified time, size and content hash of a file on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskStamp {
+    pub modified: SystemTime,
+    pub len: u64,
+    /// Content hash (not cryptographic: it tells "same bytes" from "different bytes" within
+    /// one run). `None` when the file could not be read through.
+    pub hash: Option<u64>,
+}
 
-/// Shown when a write finds the file changed under redline. Save As is NOT offered: it
-/// reads the same changed file, whose object numbers no longer match what redline loaded.
+/// Files above this size are hashed but not copied for [`DocEntry::original`].
+const ORIGINAL_COPY_CAP: u64 = 256 * 1024 * 1024;
+
+/// Shown when a write finds the file changed under redline. A plain Save As is NOT offered:
+/// it reads the same changed file, whose object numbers no longer match what redline loaded.
+/// The recovery paths (`save_document_as_rebuild`, `reload_keeping_markups`) do not.
 pub const ERR_DISK_CHANGED: &str = "The PDF was changed on disk by another program after redline \
-opened it, so nothing was written (writing now could duplicate or remove annotations). \
-Close and reopen the document to reload it; markup changes made since then are not saved, so \
-note anything you need first.";
+opened it, so nothing was written (writing now could duplicate or remove annotations). Your \
+mark-ups are still in redline. Press Save to recover them: Save As (rebuild) writes them to a \
+new file, or you can reload the changed file and keep your mark-ups.";
 
-fn disk_stamp_of(path: &std::path::Path) -> Option<DiskStamp> {
+/// Modified time and size only (cheap): enough to tell most changes apart.
+fn stat_of(path: &std::path::Path) -> Option<(SystemTime, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     Some((meta.modified().ok()?, meta.len()))
+}
+
+/// Content hash of `path`, optionally copying the bytes to `copy_to` in the same pass.
+fn hash_file(path: &std::path::Path, mut copy_to: Option<&mut std::fs::File>) -> Option<u64> {
+    use std::hash::Hasher;
+    use std::io::{Read, Write};
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        h.write(&buf[..n]);
+        if let Some(out) = copy_to.as_deref_mut() {
+            out.write_all(&buf[..n]).ok()?;
+        }
+    }
+    Some(h.finish())
+}
+
+/// The process-private directory for original copies: a fresh random name, created
+/// exclusively with mode 0700 (the `tempfile` crate), never a fixed or guessable path. Files
+/// in it are `TempPath`s, deleted when dropped; the directory itself is swept on a later run
+/// if a crash left it behind.
+pub(crate) fn originals_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        sweep_old_originals();
+        let mut b = tempfile::Builder::new();
+        b.prefix("redline-originals-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            b.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        b.tempdir().ok().map(tempfile::TempDir::keep)
+    })
+    .as_deref()
+}
+
+/// Remove directories left by earlier runs that crashed before dropping their copies.
+fn sweep_old_originals() {
+    let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    // A week: a long-running instance of ours keeps its directory younger by creating files.
+    let day = std::time::Duration::from_secs(7 * 24 * 3600);
+    for e in rd.flatten() {
+        let ours = e.file_name().to_string_lossy().starts_with("redline-originals-");
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > day);
+        // `symlink_metadata` semantics: never follow a link planted under our prefix.
+        let real_dir = e.file_type().is_ok_and(|t| t.is_dir() && !t.is_symlink());
+        if ours && old && real_dir {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// A private, randomly named, exclusively created (0600 on unix) copy of a document's bytes;
+/// the file is deleted when this is dropped (document closed, copy replaced, store dropped).
+pub type OriginalCopy = tempfile::TempPath;
+
+/// A consistent view of a file taken in one read: its stamp and the private copy of its
+/// bytes. It is committed to a document as one unit (with the markups parsed from the same
+/// file), never piecemeal.
+pub struct Snapshot {
+    path: PathBuf,
+    stamp: Option<DiskStamp>,
+    original: Option<OriginalCopy>,
+}
+
+/// Snapshot `path` now.
+pub fn take_snapshot(path: &std::path::Path) -> Snapshot {
+    let (stamp, original) = snapshot_of(path);
+    Snapshot { path: path.to_path_buf(), stamp, original }
+}
+
+/// The file's current stamp, and - when it is small enough - a private copy of its bytes,
+/// made in the same read as the hash. Never fails: what could not be read is `None`. Every
+/// call makes a NEW file, so a copy is never shared or reused across documents.
+fn snapshot_of(path: &std::path::Path) -> (Option<DiskStamp>, Option<OriginalCopy>) {
+    let Some((modified, len)) = stat_of(path) else {
+        return (None, None);
+    };
+    let mut copy: Option<(OriginalCopy, std::fs::File)> = None;
+    if len <= ORIGINAL_COPY_CAP {
+        // NamedTempFile: random name, O_EXCL create, mode 0600.
+        copy = originals_dir()
+            .and_then(|d| tempfile::Builder::new().suffix(".pdf").tempfile_in(d).ok())
+            .map(|t| {
+                let (file, tp) = t.into_parts();
+                (tp, file)
+            });
+    }
+    let hash = hash_file(path, copy.as_mut().map(|(_, f)| f));
+    let stamp = Some(DiskStamp { modified, len, hash });
+    // A copy whose read failed halfway is partial: drop (and so delete) it.
+    let copy = copy.filter(|_| hash.is_some()).map(|(tp, _)| tp);
+    (stamp, copy)
 }
 
 /// One open document as reported by [`MarkupStore::list_open`] - the data
@@ -123,10 +249,14 @@ pub struct MarkupStore {
 
 impl MarkupStore {
     pub fn register(&self, doc_id: &str, path: PathBuf, password: Option<String>) {
+        let (disk_stamp, original) = snapshot_of(&path);
         self.docs.lock().unwrap().insert(
             doc_id.to_string(),
             DocEntry {
-                disk_stamp: disk_stamp_of(&path),
+                disk_stamp,
+                original,
+                baseline: HashMap::new(),
+                keys: HashMap::new(),
                 path,
                 password,
                 markups: Vec::new(),
@@ -140,6 +270,7 @@ impl MarkupStore {
     }
 
     pub fn remove(&self, doc_id: &str) {
+        // The entry's `original` (a `TempPath`) deletes the copy as it drops here.
         self.docs.lock().unwrap().remove(doc_id);
     }
 
@@ -216,11 +347,13 @@ impl MarkupStore {
     }
 
     pub fn set_path(&self, doc_id: &str, path: PathBuf) -> Result<(), String> {
+        let (stamp, original) = snapshot_of(&path);
         let mut g = self.docs.lock().unwrap();
         let e = g
             .get_mut(doc_id)
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
-        e.disk_stamp = disk_stamp_of(&path);
+        e.disk_stamp = stamp;
+        e.original = original;
         e.path = path;
         Ok(())
     }
@@ -241,22 +374,147 @@ impl MarkupStore {
             e.markups.iter_mut().for_each(drop_inline);
             e.tombstones.values_mut().for_each(drop_inline);
             e.removed_sources.clear();
+            // What was written is now the file: nothing is unsaved relative to it.
+            e.baseline = fingerprints(&e.markups);
+            // Written markups carry a /NM now: matched by id from here on.
+            e.keys.clear();
         }
     }
 
     /// Err([`ERR_DISK_CHANGED`]) if the file registered for `doc_id` is no longer the one
-    /// redline opened or last wrote (modified time or size differ). Fails open (Ok) when
-    /// either stamp is unknown: the check exists to stop a stale-id save, not to block one
-    /// on a stat error.
+    /// redline opened or last wrote. A different size is a change. A different modified time
+    /// alone (a touch, a sync client) is a change only if the content hash differs too; an
+    /// unchanged hash re-baselines the time. Fails open (Ok) when either stamp is unknown:
+    /// the check exists to stop a stale-id save, not to block one on a stat error.
     pub fn check_disk_unchanged(&self, doc_id: &str) -> Result<(), String> {
+        let (before, path) = {
+            let g = self.docs.lock().unwrap();
+            let e = g
+                .get(doc_id)
+                .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+            (e.disk_stamp, e.path.clone())
+        };
+        let (Some(before), Some((modified, len))) = (before, stat_of(&path)) else {
+            return Ok(());
+        };
+        if (before.modified, before.len) == (modified, len) {
+            return Ok(());
+        }
+        // Hash outside the lock: it reads the whole file.
+        let same_content = len == before.len
+            && before.hash.is_some()
+            && hash_file(&path, None) == before.hash;
+        if !same_content {
+            return Err(ERR_DISK_CHANGED.to_string());
+        }
+        if let Some(e) = self.docs.lock().unwrap().get_mut(doc_id) {
+            if e.path == path {
+                e.disk_stamp = Some(DiskStamp { modified, ..before });
+            }
+        }
+        Ok(())
+    }
+
+    /// Start a reload of the changed file: capture the user's unsaved work and a snapshot of
+    /// the file as it is NOW, into locals. Nothing in the store changes until
+    /// [`Self::commit_reload`], so any failure in between (parse, render reopen) leaves the
+    /// old stamp, private copy and markups intact and the stale-file refusal in force.
+    pub fn begin_reload(&self, doc_id: &str) -> Result<ReloadTxn, String> {
+        let path = {
+            let g = self.docs.lock().unwrap();
+            let e = g
+                .get(doc_id)
+                .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+            if !e.loaded {
+                return Err("This document's mark-ups were never loaded, so there is nothing \
+                            to keep. Close and reopen it."
+                    .to_string());
+            }
+            e.path.clone()
+        };
+        // Drop only the cached parse (it is keyed by modified time and could be stale).
+        self.cache.lock().unwrap().invalidate(&path);
+        let snapshot = take_snapshot(&path);
         let g = self.docs.lock().unwrap();
         let e = g
             .get(doc_id)
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
-        match (e.disk_stamp, disk_stamp_of(&e.path)) {
-            (Some(before), Some(now)) if before != now => Err(ERR_DISK_CHANGED.to_string()),
-            _ => Ok(()),
+        let mut unsaved = super::recover::Unsaved::default();
+        for m in &e.markups {
+            match e.baseline.get(&m.id()) {
+                None => unsaved.added.push(m.clone()),
+                Some(fp) if m.edit_fingerprint() != Some(*fp) => unsaved.modified.push(m.clone()),
+                Some(_) => {}
+            }
         }
+        let present: std::collections::HashSet<Uuid> = e.markups.iter().map(|m| m.id()).collect();
+        unsaved.deleted = e.baseline.keys().filter(|id| !present.contains(id)).copied().collect();
+        Ok(ReloadTxn {
+            path,
+            unsaved,
+            baseline: e.baseline.clone(),
+            keys: e.keys.clone(),
+            snapshot,
+        })
+    }
+
+    /// Finish a reload once the changed file is parsed (`loaded`) and the render engine shows
+    /// it (`page_count`): merge the unsaved edits, then install markups, stamp and private
+    /// copy TOGETHER. Refuses (store untouched) if the document was re-pointed meanwhile.
+    pub fn commit_reload(
+        &self,
+        doc_id: &str,
+        txn: ReloadTxn,
+        loaded: Vec<Markup>,
+        page_count: u32,
+    ) -> Result<super::recover::ReloadReport, String> {
+        let (merged, removed, report) = super::recover::merge_unsaved(
+            loaded.clone(),
+            &txn.baseline,
+            &txn.keys,
+            txn.unsaved,
+            page_count,
+        );
+        let mut g = self.docs.lock().unwrap();
+        let e = g
+            .get_mut(doc_id)
+            .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+        if e.path != txn.snapshot.path {
+            return Err("The document was moved while it was being reloaded; try again.".into());
+        }
+        e.markups = merged;
+        e.baseline = fingerprints(&loaded);
+        e.keys = content_keys(&loaded);
+        e.tombstones.clear();
+        e.removed_sources = removed;
+        e.loaded = true;
+        e.dirty = report.applied > 0;
+        e.disk_stamp = txn.snapshot.stamp;
+        e.original = txn.snapshot.original;
+        drop(g);
+        self.cache.lock().unwrap().set(txn.snapshot.path, loaded);
+        Ok(report)
+    }
+
+    /// After a Save As (rebuild): the new file holds every markup as redline wrote it, so the
+    /// object ids, original dictionaries and names of the OLD file mean nothing there and
+    /// could match an unrelated annotation. Forget them all.
+    pub fn forget_source(&self, doc_id: &str) {
+        if let Some(e) = self.docs.lock().unwrap().get_mut(doc_id) {
+            let forget = |m: &mut Markup| {
+                m.source_ref = None;
+                m.source_dict = None;
+                m.source_fp = None;
+            };
+            e.markups.iter_mut().for_each(forget);
+            e.tombstones.values_mut().for_each(forget);
+            e.removed_sources.clear();
+        }
+    }
+
+    /// The private copy of the bytes redline last opened or wrote, for Save As (rebuild).
+    pub fn original_copy(&self, doc_id: &str) -> Option<PathBuf> {
+        self.docs.lock().unwrap().get(doc_id).and_then(|e| e.original.as_ref().map(|c| c.to_path_buf()))
     }
 
     /// True if the PDF's existing annotations have been loaded into the store.
@@ -349,11 +607,64 @@ impl MarkupStore {
     /// Merge markups loaded from the PDF beneath any unsaved in-memory ones
     /// (the store wins on id collision) and mark the doc as loaded.
     /// Returns the merged set.
+    ///
+    /// On a collision a foreign markup the user never edited is replaced by the loaded one;
+    /// any other stored markup keeps its model (the user's unsaved edits) but takes
+    /// the reader-owned state of the loaded one: the file may have been replaced since the
+    /// stored copy was read (a History restore), and a stale original or object id there
+    /// would be written back or matched against the wrong annotation.
     pub fn seed_loaded(&self, doc_id: &str, loaded: Vec<Markup>) -> Result<Vec<Markup>, String> {
+        self.seed_loaded_with(doc_id, loaded, None)
+    }
+
+    /// The snapshot to pass to [`Self::seed_loaded_with`]: taken BEFORE the file is parsed, and
+    /// only for a document whose markups are not loaded yet. The stamp, private copy and
+    /// markup ids then all describe the same file even if it changed after the document was
+    /// registered. `None` when already loaded (the existing baseline stays authoritative).
+    pub fn begin_first_load(&self, doc_id: &str) -> Option<Snapshot> {
+        let path = {
+            let g = self.docs.lock().unwrap();
+            let e = g.get(doc_id)?;
+            (!e.loaded).then(|| e.path.clone())?
+        };
+        Some(take_snapshot(&path))
+    }
+
+    /// [`Self::seed_loaded`], also adopting `snapshot` (from [`Self::begin_first_load`]) as the
+    /// document's stamp and private copy if it is still the first load of the same path.
+    pub fn seed_loaded_with(
+        &self,
+        doc_id: &str,
+        loaded: Vec<Markup>,
+        snapshot: Option<Snapshot>,
+    ) -> Result<Vec<Markup>, String> {
         let mut g = self.docs.lock().unwrap();
         let e = g
             .get_mut(doc_id)
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+        if let Some(snap) = snapshot {
+            if !e.loaded && e.path == snap.path {
+                e.disk_stamp = snap.stamp;
+                e.original = snap.original;
+            }
+        }
+        for (id, k) in content_keys(&loaded) {
+            e.keys.insert(id, k);
+        }
+        for (id, fp) in fingerprints(&loaded) {
+            e.baseline.insert(id, fp);
+        }
+        let by_id: HashMap<Uuid, &Markup> = loaded.iter().map(|m| (m.id(), m)).collect();
+        for stored in e.markups.iter_mut() {
+            if let Some(fresh) = by_id.get(&stored.id()) {
+                if stored.is_unedited() {
+                    // Never touched since it was read: the file's copy is the truth.
+                    *stored = (*fresh).clone();
+                } else {
+                    stored.adopt_reader_owned_from(fresh);
+                }
+            }
+        }
         let unsaved: std::collections::HashSet<uuid::Uuid> =
             e.markups.iter().map(|m| m.id()).collect();
         let mut merged: Vec<Markup> = loaded
@@ -424,13 +735,58 @@ impl MarkupStore {
     pub fn invalidate_cache(&self, path: &PathBuf) {
         self.cache.lock().unwrap().invalidate(path);
         // Every caller has just written `path` itself, so it is again the file redline knows.
-        let stamp = disk_stamp_of(path);
-        for e in self.docs.lock().unwrap().values_mut() {
-            if e.path == *path {
-                e.disk_stamp = stamp;
+        let ids: Vec<String> = self
+            .docs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| e.path == *path)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let (stamp, original) = snapshot_of(path);
+            if let Some(e) = self.docs.lock().unwrap().get_mut(&id) {
+                if e.path == *path {
+                    e.disk_stamp = stamp;
+                    e.original = original;
+                }
             }
         }
     }
+}
+
+/// An in-flight reload (see [`MarkupStore::begin_reload`]).
+pub struct ReloadTxn {
+    path: PathBuf,
+    unsaved: super::recover::Unsaved,
+    baseline: HashMap<Uuid, u64>,
+    keys: HashMap<Uuid, u64>,
+    snapshot: Snapshot,
+}
+
+impl ReloadTxn {
+    /// The unsaved work, the baseline fingerprints and the content keys captured at the start.
+    pub fn into_parts(
+        self,
+    ) -> (super::recover::Unsaved, HashMap<Uuid, u64>, HashMap<Uuid, u64>) {
+        (self.unsaved, self.baseline, self.keys)
+    }
+}
+
+fn content_keys(markups: &[Markup]) -> HashMap<Uuid, u64> {
+    markups
+        .iter()
+        .filter_map(|m| super::recover::content_key(m).map(|k| (m.id(), k)))
+        .collect()
+}
+
+/// Edit fingerprint per markup id (a markup that cannot be fingerprinted is left out, so it
+/// always reads as changed).
+fn fingerprints(markups: &[Markup]) -> HashMap<Uuid, u64> {
+    markups
+        .iter()
+        .filter_map(|m| m.edit_fingerprint().map(|f| (m.id(), f)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -971,7 +1327,7 @@ mod tests {
         std::fs::write(&p, b"%PDF-1.5 rewritten by another program").unwrap();
         let err = s.check_disk_unchanged("d1").unwrap_err();
         assert_eq!(err, ERR_DISK_CHANGED);
-        assert!(err.contains("reopen") && !err.contains("Save As"), "{err}");
+        assert!(err.contains("Save As (rebuild)") && err.contains("reload"), "{err}");
 
         // redline's own write (every caller of invalidate_cache) makes it the known file again.
         s.invalidate_cache(&p);
@@ -985,6 +1341,7 @@ mod tests {
         std::fs::write(&a, b"AAAA").unwrap();
         let s = MarkupStore::default();
         s.register("d1", a.clone(), None);
+        std::fs::write(&a, b"CCCC").unwrap(); // same size, different content
         let f = std::fs::OpenOptions::new().write(true).open(&a).unwrap();
         f.set_modified(SystemTime::now() + std::time::Duration::from_secs(60)).unwrap();
         assert_eq!(s.check_disk_unchanged("d1"), Err(ERR_DISK_CHANGED.to_string()));

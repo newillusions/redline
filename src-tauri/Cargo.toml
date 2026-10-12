@@ -60,6 +60,7 @@ path = "src/bin/ocr_selftest.rs"
 tauri-build = { version = "2.2.0", features = [] }
 
 [dependencies]
+tempfile = "3"
 # --- Tauri core ---
 tauri = { version = "2.5.0", features = ["macos-private-api"] }
 tauri-plugin-dialog = "2.2.2"
@@ -196,7 +197,6 @@ default = []
 ocr = ["dep:leptess"]
 
 [dev-dependencies]
-tempfile = "3"
 
 [profile.dev]
 incremental = true

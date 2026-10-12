@@ -845,11 +845,9 @@ fn security_fan_out_to_one_big_object_is_charged_per_expansion_and_dropped() {
     set_annots(&mut doc, page, vec![ann.into()]);
     let (ms, took) = timed_read(&doc);
     assert!(took.as_secs() < 2, "{took:?}");
-    let src = ms[0].source_dict.as_ref().expect("the rest is still carried");
-    assert!(!src.has(b"Fan"), "over the inlining budget: the key is left out");
-    assert_eq!(src.get(b"Small").unwrap().as_i64().unwrap(), 7);
-    let total: usize = format!("{src:?}").len();
-    assert!(total < 100_000, "bounded output, got {total} bytes of debug text");
+    // Over the inlining budget: the markup is rebuilt - a preserved original is never partial.
+    assert!(ms[0].source_dict.is_none(), "one key over budget rebuilds the whole markup");
+    assert!(ms[0].contents.is_some() || ms[0].source_nm.is_some(), "the model itself is intact");
     // Nested arrays of references share the same budget.
     let nested: Vec<Object> = (0..200)
         .map(|_| Object::Array((0..200).map(|_| Object::Reference(big)).collect()))
@@ -865,7 +863,7 @@ fn security_fan_out_to_one_big_object_is_charged_per_expansion_and_dropped() {
     set_annots(&mut doc2, page2, vec![ann2.into()]);
     let (ms2, took2) = timed_read(&doc2);
     assert!(took2.as_secs() < 2, "{took2:?}");
-    assert!(!ms2[0].source_dict.as_ref().unwrap().has(b"Nest2"));
+    assert!(ms2[0].source_dict.is_none(), "nested over budget: rebuilt, not partial");
 }
 
 // --- security: document-wide budget across many annotations ------------------------------

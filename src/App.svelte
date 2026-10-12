@@ -32,12 +32,13 @@
   import ComparePanel from "./components/ComparePanel.svelte";
   import TabBar from "./components/TabBar.svelte";
   import SavePromptDialog from "./components/SavePromptDialog.svelte";
+  import StaleFileDialog from "./components/StaleFileDialog.svelte";
   import PasswordPromptDialog from "./components/PasswordPromptDialog.svelte";
   import DocOpDialog from "./components/DocOpDialog.svelte";
   import VersionPanel from "./components/VersionPanel.svelte";
   import ToolbarMenu from "./components/ToolbarMenu.svelte";
   import type { ToolbarMenuItem } from "./components/ToolbarMenu.svelte";
-  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listScales, saveDocument, saveDocumentAs, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, snapshotVersion, exportMarkupList, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity, getPageCount, type ScaleRecord } from "$lib/ipc";
+  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listMarkups, listScales, saveDocument, saveDocumentAs, saveDocumentAsRebuild, canRebuildFromOriginal, reloadKeepingMarkups, isDiskChangedError, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, snapshotVersion, exportMarkupList, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity, getPageCount, type ScaleRecord } from "$lib/ipc";
   import { normaliseMeasurements } from "$lib/polylength";
   import type { IndexStatus, OcrProgressEvent } from "$lib/ipc";
   import { listen } from "@tauri-apps/api/event";
@@ -381,6 +382,15 @@
   let openError = $state<string | null>(null);
   let isOpening = $state(false);
   let isSaving = $state(false);
+  /** Doc whose save was refused because the PDF changed on disk (recovery dialog open). */
+  let staleDocId = $state<string | null>(null);
+  /** Whether redline holds the loaded bytes, so "Save As (rebuild)" is available. */
+  let staleCanRebuild = $state(true);
+
+  async function showStaleDialog(docId: string) {
+    staleCanRebuild = await canRebuildFromOriginal(docId).catch(() => false);
+    staleDocId = docId;
+  }
   let isFlattening = $state(false);
   let isOptimizing = $state(false);
   let isRedacting = $state(false);
@@ -893,12 +903,14 @@
     if (!activeTab || isSaving) return;
     openError = null;
     isSaving = true;
+    const docId = activeTab.docId;
     try {
       await activeTab.store.flush();
-      await saveDocument(activeTab.docId);
+      await saveDocument(docId);
       activeTab.store.clearDirty();
     } catch (e) {
-      openError = `Save failed: ${e instanceof Error ? e.message : String(e)}`;
+      if (isDiskChangedError(e)) await showStaleDialog(docId);
+      else openError = `Save failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
       isSaving = false;
     }
@@ -917,13 +929,76 @@
     const dest = await saveDialog({ filters: [{ name: "PDF", extensions: ["pdf"] }] });
     if (!dest) return;
     isSaving = true;
+    const docId = activeTab.docId;
     try {
       await activeTab.store.flush();
-      await saveDocumentAs(activeTab.docId, dest);
+      await saveDocumentAs(docId, dest);
       activeTab.store.clearDirty();
-      adoptPath(activeTab.docId, dest);
+      adoptPath(docId, dest);
     } catch (e) {
-      openError = `Save As failed: ${e instanceof Error ? e.message : String(e)}`;
+      if (isDiskChangedError(e)) await showStaleDialog(docId);
+      else openError = `Save As failed: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      isSaving = false;
+    }
+  }
+
+  // The PDF changed on disk under redline: nothing was written. Two recoveries, neither of
+  // which writes over the changed file (see StaleFileDialog).
+
+  /** Save As (rebuild): the mark-ups go to a new file built from the bytes redline loaded. */
+  async function handleStaleRebuild() {
+    const docId = staleDocId;
+    staleDocId = null;
+    const tab = tabStore.tabs.find((t) => t.docId === docId);
+    if (!tab || isSaving) return;
+    const dest = await saveDialog({
+      title: "Save your mark-ups to a new file",
+      defaultPath: tab.doc.path.replace(/\.pdf$/i, "") + "-rebuilt.pdf",
+      filters: [{ name: "PDF", extensions: ["pdf"] }],
+    });
+    if (!dest) {
+      staleDocId = docId; // backed out of the file dialog: offer the choice again
+      return;
+    }
+    openError = null;
+    isSaving = true;
+    try {
+      await tab.store.flush();
+      await saveDocumentAsRebuild(tab.docId, dest);
+      tab.store.clearDirty();
+      adoptPath(tab.docId, dest);
+      docOpsStatus = `Your mark-ups were saved to ${baseName(dest)}, rebuilt from the PDF as you opened it.`;
+    } catch (e) {
+      openError = `Save As (rebuild) failed: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      isSaving = false;
+    }
+  }
+
+  /** Reload and keep my mark-ups: re-read the changed file, re-apply the unsaved edits. */
+  async function handleStaleReload() {
+    const docId = staleDocId;
+    staleDocId = null;
+    const tab = tabStore.tabs.find((t) => t.docId === docId);
+    if (!tab || isSaving) return;
+    openError = null;
+    isSaving = true;
+    try {
+      await tab.store.flush();
+      const report = await reloadKeepingMarkups(tab.docId);
+      tab.store.seed(await listMarkups(tab.docId));
+      tab.store.dirty = report.applied > 0; // re-applied edits are still unsaved
+      await handleThumbnailPageOp();
+      reloadNonce += 1;
+      docOpsStatus = `Reloaded the changed file and re-applied ${report.applied} of your edits.`;
+      if (report.skipped.length > 0) {
+        openError = `Could not re-apply: ${report.skipped.join("; ")}`;
+      } else if (report.notes.length > 0) {
+        docOpsStatus += ` ${report.notes.join("; ")}`;
+      }
+    } catch (e) {
+      openError = `Reload failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
       isSaving = false;
     }
@@ -1106,7 +1181,8 @@
         tab.store.clearDirty();
       } catch (e) {
         // Keep the window open: closing now would lose this tab's mark-ups.
-        openError = `Save failed: ${e instanceof Error ? e.message : String(e)}`;
+        if (isDiskChangedError(e)) await showStaleDialog(docId);
+        else openError = `Save failed: ${e instanceof Error ? e.message : String(e)}`;
         quitQueue = [];
         return;
       }
@@ -1852,6 +1928,20 @@
       onDiscard={handleSavePromptDiscard}
       onCancel={handleSavePromptCancel}
     />
+  {/if}
+
+  <!-- Changed-on-disk recovery - shown when a save is refused because another program rewrote the PDF -->
+  {#if staleDocId !== null}
+    {@const staleTab = tabStore.tabs.find((t) => t.docId === staleDocId)}
+    {#if staleTab}
+      <StaleFileDialog
+        filename={baseName(staleTab.doc.path)}
+        canRebuild={staleCanRebuild}
+        onRebuild={handleStaleRebuild}
+        onReload={handleStaleReload}
+        onCancel={() => (staleDocId = null)}
+      />
+    {/if}
   {/if}
 
   <!-- Password prompt dialog - shown when open_document reports an encrypted PDF -->

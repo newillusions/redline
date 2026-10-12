@@ -30,6 +30,29 @@ export interface DocumentInfo {
 export const ERR_PASSWORD_REQUIRED = "PASSWORD_REQUIRED";
 export const ERR_WRONG_PASSWORD = "WRONG_PASSWORD";
 
+/**
+ * Text every "the PDF changed on disk" refusal contains (`ERR_DISK_CHANGED` in
+ * `src-tauri/src/document/store.rs`) - keep in sync. A write that fails with it is
+ * recoverable: see `saveDocumentAsRebuild` and `reloadKeepingMarkups`.
+ */
+export const ERR_DISK_CHANGED_MARKER = "changed on disk by another program";
+
+/** True if `e` (a rejected IPC value or Error) is the changed-on-disk refusal. */
+export function isDiskChangedError(e: unknown): boolean {
+  const text = e instanceof Error ? e.message : String(e);
+  return text.includes(ERR_DISK_CHANGED_MARKER);
+}
+
+/** What "reload and keep my mark-ups" did (`recover::ReloadReport`). */
+export interface ReloadReport {
+  /** Unsaved edits applied to the reloaded file. */
+  applied: number;
+  /** Unsaved edits that could not be applied, one line each. */
+  skipped: string[];
+  /** Applied edits worth a look (the file's own copy of the mark-up also changed). */
+  notes: string[];
+}
+
 export interface PageSize {
   doc_id: string;
   page_index: number;
@@ -408,6 +431,27 @@ export async function saveDocument(doc_id: string): Promise<void> {
 
 export async function saveDocumentAs(doc_id: string, new_path: string): Promise<void> {
   return invoke<void>("save_document_as", { docId: doc_id, newPath: new_path });
+}
+
+/**
+ * Recovery for a PDF changed on disk: write the in-memory mark-ups to a NEW file built from
+ * the bytes redline loaded (never from the changed file), every foreign mark-up rebuilt.
+ */
+export async function saveDocumentAsRebuild(doc_id: string, new_path: string): Promise<void> {
+  return invoke<void>("save_document_as_rebuild", { docId: doc_id, newPath: new_path });
+}
+
+/** True if redline holds the bytes it loaded, so `saveDocumentAsRebuild` can run. */
+export async function canRebuildFromOriginal(doc_id: string): Promise<boolean> {
+  return invoke<boolean>("can_rebuild_from_original", { docId: doc_id });
+}
+
+/**
+ * Recovery for a PDF changed on disk: re-read the changed file and re-apply the unsaved
+ * edits where their targets still exist. Re-read the mark-ups (`listMarkups`) afterwards.
+ */
+export async function reloadKeepingMarkups(doc_id: string): Promise<ReloadReport> {
+  return invoke<ReloadReport>("reload_keeping_markups", { docId: doc_id });
 }
 
 export async function updateMarkup(doc_id: string, markup: Markup): Promise<void> {
