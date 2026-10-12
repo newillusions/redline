@@ -1441,6 +1441,7 @@ mod tests {
             },
             measurement: None,
             count_set: None,
+            count_group: None,
             stamp_asset: None,
             annot_flags: 4,
             rich_text: None,

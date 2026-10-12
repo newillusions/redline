@@ -43,8 +43,15 @@ export class TakeoffStore {
     }
   }
 
-  /** Insert or replace a scale record. Sets it as active. */
+  /**
+   * Insert or replace a scale record. Sets it as active. A new calibration of the same
+   * target (same page, or the document default) REPLACES the old record, as the backend's
+   * `add_scale` does - otherwise the old scale would linger and shadow the new one.
+   */
   addScale(rec: ScaleRecord): void {
+    this.scales = this.scales.filter(
+      (s) => s.id === rec.id || JSON.stringify(s.applies_to) !== JSON.stringify(rec.applies_to),
+    );
     const idx = this.scales.findIndex((s) => s.id === rec.id);
     if (idx >= 0) {
       this.scales[idx] = rec;

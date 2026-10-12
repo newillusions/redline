@@ -556,3 +556,38 @@ describe("MarkupStore dirty tracking", () => {
     expect(s.dirty).toBe(false);
   });
 });
+
+describe("MarkupStore.applyEdits (update + create as ONE undo frame)", () => {
+  it("applies the update and the creation, and ONE undo reverts both", async () => {
+    const ipc = fakeIpc();
+    const s = new MarkupStore("doc1", ipc);
+    const a = mk("a", "old");
+    s.create(a);
+    await s.flush();
+    s.applyEdits({ updates: [{ before: a, after: mk("a", "first-half") }], creates: [mk("b", "second-half")] });
+    expect(s.markups.map((m) => [m.id, m.contents])).toEqual([["a", "first-half"], ["b", "second-half"]]);
+    await s.flush();
+    expect(ipc.add).toHaveBeenLastCalledWith("doc1", expect.objectContaining({ id: "b" }));
+    s.undo();
+    expect(s.markups.map((m) => [m.id, m.contents])).toEqual([["a", "old"]]);
+    s.redo();
+    expect(s.markups).toHaveLength(2);
+  });
+
+  it("a locked update skips the whole edit when creations accompany it (no half-applied split)", async () => {
+    const ipc = fakeIpc();
+    const s = new MarkupStore("doc1", ipc);
+    const locked = mk("a", "old", 4 | 128);
+    s.create(locked);
+    await s.flush();
+    s.applyEdits({ updates: [{ before: locked, after: mk("a", "new") }], creates: [mk("b")] });
+    expect(s.markups.map((m) => m.id)).toEqual(["a"]);
+    expect(s.mirrorError).toMatch(/locked/);
+  });
+
+  it("an empty edit records nothing", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    s.applyEdits({});
+    expect(s.canUndo).toBe(false);
+  });
+});

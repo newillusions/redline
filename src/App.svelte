@@ -1788,7 +1788,7 @@
           testId="accordion-properties"
         >
           {#if activeTab}
-            <PropertiesPanel store={activeTab.store} />
+            <PropertiesPanel store={activeTab.store} takeoffStore={activeTab.takeoffStore} />
           {:else}
             <p class="panel-hint muted">Select a markup to edit its properties.</p>
           {/if}

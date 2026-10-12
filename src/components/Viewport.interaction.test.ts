@@ -2792,6 +2792,161 @@ describe("Viewport G8 grouping", () => {
   });
 
   // -------------------------------------------------------------------------
+  // Count run: clicks in one run are ONE count (count_group); Esc starts a new count
+  // -------------------------------------------------------------------------
+  it("count run: successive clicks share one count_group; Esc starts a new count", async () => {
+    const takeoffStore = new TakeoffStore();
+    const { overlay } = await mountViewport(store, takeoffStore);
+    store.activeTool = "MeasurementCount";
+    await tick();
+
+    fireEvent.click(overlay, { clientX: 50, clientY: 50, bubbles: true });
+    fireEvent.click(overlay, { clientX: 80, clientY: 50, bubbles: true });
+    await tick();
+    fireEvent.keyDown(window, { key: "Escape" });
+    await tick();
+    expect(store.countRun).toBeNull();
+    store.activeTool = "MeasurementCount"; // Esc falls back to the select tool
+    await tick();
+    fireEvent.click(overlay, { clientX: 110, clientY: 50, bubbles: true });
+    await tick();
+
+    expect(store.markups).toHaveLength(3);
+    const [a, b, c] = store.markups;
+    expect(a.count_group).toBeTruthy();
+    expect(b.count_group).toBe(a.count_group);
+    expect(c.count_group).toBeTruthy();
+    expect(c.count_group).not.toBe(a.count_group);
+  });
+
+  it("a resumed count keeps adding to the same count_group with its label and colour", async () => {
+    const takeoffStore = new TakeoffStore();
+    const { overlay } = await mountViewport(store, takeoffStore);
+    store.activeTool = "MeasurementCount";
+    await tick();
+    fireEvent.click(overlay, { clientX: 50, clientY: 50, bubbles: true });
+    await tick();
+    const first = store.markups[0];
+    store.applyBatch([{ before: first, after: { ...first, subject: "Type A", appearance: { ...first.appearance, color: "#00aa00" } } }]);
+    store.activeTool = "select";
+    store.resetCountRun();
+    await tick();
+
+    const { resumeRun } = await import("$lib/count-groups");
+    const r = resumeRun(store.markups, first.id);
+    if (!("run" in r)) throw new Error(r.error);
+    store.countRun = r.run;
+    store.activeTool = "MeasurementCount";
+    await tick();
+    fireEvent.click(overlay, { clientX: 90, clientY: 50, bubbles: true });
+    await tick();
+
+    expect(store.markups).toHaveLength(2);
+    expect(store.markups[1].count_group).toBe(first.count_group);
+    expect(store.markups[1].subject).toBe("Type A");
+    expect(store.markups[1].appearance.color).toBe("#00aa00");
+  });
+
+  // -------------------------------------------------------------------------
+  // Polylength: click each vertex, double-click / Enter finishes
+  // -------------------------------------------------------------------------
+  it("Polylength: clicks + Enter create a MeasurementLength over every vertex", async () => {
+    const takeoffStore = new TakeoffStore();
+    const { overlay } = await mountViewport(store, takeoffStore);
+    store.activeTool = "MeasurementPolylength";
+    await tick();
+
+    fireEvent.click(overlay, { clientX: 50, clientY: 50 });
+    fireEvent.click(overlay, { clientX: 100, clientY: 50 });
+    fireEvent.click(overlay, { clientX: 100, clientY: 100 });
+    fireEvent.keyDown(window, { key: "Enter" });
+    await tick();
+
+    expect(store.markups).toHaveLength(1);
+    const m = store.markups[0];
+    expect(m.markup_type).toBe("MeasurementLength");
+    expect("Polyline" in m.geometry && m.geometry.Polyline).toHaveLength(3);
+    expect(m.measurement?.raw_measure).toBeCloseTo(100, 6);
+    expect(m.measurement?.rise_drop).toEqual([]);
+  });
+
+  it("Polylength: a single vertex is not enough to finish", async () => {
+    const takeoffStore = new TakeoffStore();
+    const { overlay } = await mountViewport(store, takeoffStore);
+    store.activeTool = "MeasurementPolylength";
+    await tick();
+    fireEvent.click(overlay, { clientX: 50, clientY: 50 });
+    fireEvent.keyDown(window, { key: "Enter" });
+    await tick();
+    expect(store.markups).toHaveLength(0);
+  });
+
+  it("Polylength: total includes the active scale", async () => {
+    const takeoffStore = new TakeoffStore();
+    takeoffStore.addScale({ id: "s", applies_to: { kind: "DocumentDefault" }, method: "Preset", ratio: 0.01, unit: "m", label: "t", precision: 2 });
+    const { overlay } = await mountViewport(store, takeoffStore);
+    store.activeTool = "MeasurementPolylength";
+    await tick();
+    fireEvent.click(overlay, { clientX: 50, clientY: 50 });
+    fireEvent.click(overlay, { clientX: 150, clientY: 50 });
+    fireEvent.click(overlay, { clientX: 150, clientY: 150 });
+    fireEvent.keyDown(window, { key: "Enter" });
+    await tick();
+    const m = store.markups[0];
+    expect(m.measurement?.raw_measure).toBeCloseTo(200, 6);
+    expect(m.measurement?.computed_quantity).toBeCloseTo(2, 6);
+    expect(m.measurement?.scale_ref).toBe("s");
+  });
+
+  // -------------------------------------------------------------------------
+  // Recalibration recomputes existing measurements (takeoff recompute_measurement wiring)
+  // -------------------------------------------------------------------------
+  it("recalibrating recomputes existing measurements as ONE undo step", async () => {
+    const takeoffStore = new TakeoffStore();
+    takeoffStore.addScale({ id: "old", applies_to: { kind: "DocumentDefault" }, method: "TwoPoint", ratio: 0.001, unit: "m", label: "old", precision: 2 });
+    const pts = [{ x: 0, y: 0 }, { x: 1000, y: 0 }];
+    const len = buildMarkup({
+      markupType: "MeasurementLength", page: 0, geometry: { Polyline: pts },
+      appearance: store.draftAppearance, identity: FAKE_IDENTITY, now: "2026-01-01T00:00:00Z", id: "len-1",
+    });
+    len.measurement = {
+      scale_ref: "old", raw_measure: 1000, unit: "m", computed_quantity: 1, depth: null, count_value: null,
+      custom_columns: {}, rise_drop: [{ segment: 0, amount: 2, unit: "m" }],
+    };
+    store.create(len);
+    const { overlay } = await mountViewport(store, takeoffStore);
+
+    vi.mocked(ipcMocks.addScale).mockResolvedValueOnce({
+      id: "new", applies_to: { kind: "DocumentDefault" }, method: "TwoPoint",
+      ratio: 0.005, unit: "m", label: "1:200", precision: 2,
+    });
+    store.activeTool = "calibrate";
+    await tick();
+    ptr(overlay, "pointerdown", 20, 20);
+    ptr(overlay, "pointerdown", 120, 20);
+    await tick();
+    const input = await waitFor(() => {
+      const el = document.querySelector('input[aria-label="Known distance"]') as HTMLInputElement | null;
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    await fireEvent.input(input, { target: { value: "5" } });
+    await tick();
+    await fireEvent.click(document.querySelector(".btn-primary") as HTMLElement);
+
+    await waitFor(() => {
+      expect(store.getById("len-1")!.measurement!.scale_ref).toBe("new");
+    });
+    // 1000 pt x 0.005 + 2 m rise = 7 m
+    expect(store.getById("len-1")!.measurement!.computed_quantity).toBeCloseTo(7, 9);
+    expect(takeoffStore.scales.map((r) => r.id)).toEqual(["new"]);
+    store.undo();
+    // ONE undo restores the stored pre-recalibration value (the scale record itself is not a markup edit).
+    expect(store.getById("len-1")!.measurement!.computed_quantity).toBe(1);
+    expect(store.getById("len-1")!.measurement!.scale_ref).toBe("old");
+  });
+
+  // -------------------------------------------------------------------------
   // M3-4: MeasurementRadius drag-draw creates a MeasurementRadius markup
   // (identical two-point gesture to MeasurementLength - see M3-2 above).
   // -------------------------------------------------------------------------

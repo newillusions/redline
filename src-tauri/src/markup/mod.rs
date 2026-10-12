@@ -19,10 +19,10 @@ use uuid::Uuid;
 use crate::geometry::{PdfPoint, Quad};
 
 pub(crate) mod annotation;
+pub(crate) mod appearance;
 pub mod callout;
 pub mod foreign;
 pub(crate) mod replies;
-pub(crate) mod appearance;
 
 /// v1 markup types (spec §12 decision a — locked).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,14 +418,11 @@ impl Workflow {
 
     /// The most recent Review-model status entry (who/when set the current status).
     pub fn latest_review_change(&self) -> Option<&StatusChange> {
-        self.status_history
-            .iter()
-            .rev()
-            .find(|c| {
-                c.on_reply.is_none()
-                    && c.model == REVIEW_MODEL
-                    && MarkupStatus::from_review_state(&c.state).is_some()
-            })
+        self.status_history.iter().rev().find(|c| {
+            c.on_reply.is_none()
+                && c.model == REVIEW_MODEL
+                && MarkupStatus::from_review_state(&c.state).is_some()
+        })
     }
 }
 
@@ -443,6 +440,59 @@ pub struct Measurement {
     pub count_value: Option<u32>,
     /// Estimating custom columns (spec §7).
     pub custom_columns: BTreeMap<String, String>,
+    /// Polylength rise/drop vertical runs (docs/count-polylength.md). Real-world amounts
+    /// added to `computed_quantity` on top of the scaled path length; empty for every
+    /// other measurement. `#[serde(default)]` keeps pre-this-field JSON deserialising to
+    /// empty.
+    #[serde(default)]
+    pub rise_drop: Vec<RiseDrop>,
+}
+
+/// Hard limits on untrusted rise/drop data (a hostile PDF's `/RLMeasure` JSON).
+pub const MAX_RISE_DROP_ENTRIES: usize = 10_000;
+/// Largest accepted |amount| of a single rise/drop run, in its own unit.
+pub const MAX_RISE_DROP_AMOUNT: f64 = 1e9;
+/// Most vertices a polylength may carry.
+pub const MAX_POLYLENGTH_VERTICES: usize = 10_000;
+/// Most items a single count group may hold.
+pub const MAX_COUNT_GROUP_ITEMS: usize = 10_000;
+
+/// A vertical run (rise or drop) on one polylength segment. Both a rise and a drop add to
+/// the total length, so only the magnitude matters; the sign is kept for display.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RiseDrop {
+    /// Segment index: the segment from vertex `segment` to vertex `segment + 1`.
+    pub segment: u32,
+    /// Real-world amount in `unit` (rise positive, drop negative by convention). A JSON
+    /// `null` (what serde writes for a non-finite float) reads back as NaN and is then
+    /// dropped by [`Measurement::sanitise_rise_drop`], so one bad entry cannot discard the
+    /// whole measurement payload.
+    #[serde(deserialize_with = "null_as_nan")]
+    pub amount: f64,
+    /// Unit the amount was entered in (the scale unit at entry time).
+    pub unit: String,
+}
+
+fn null_as_nan<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    Ok(Option::<f64>::deserialize(d)?.unwrap_or(f64::NAN))
+}
+
+impl Measurement {
+    /// Drop rise/drop entries that fall outside the polylength (segment out of range), are
+    /// non-finite or oversized, or are duplicates of a segment already seen (first wins);
+    /// bound the list. Run on every read of untrusted data and before every write.
+    pub fn sanitise_rise_drop(&mut self, vertex_count: usize) {
+        let segments = vertex_count.saturating_sub(1);
+        let mut seen = std::collections::BTreeSet::new();
+        self.rise_drop.retain(|r| {
+            (r.segment as usize) < segments
+                && r.amount.is_finite()
+                && r.amount.abs() <= MAX_RISE_DROP_AMOUNT
+                && r.unit.len() <= 16
+                && seen.insert(r.segment)
+        });
+        self.rise_drop.truncate(MAX_RISE_DROP_ENTRIES);
+    }
 }
 
 /// Properties specific to a sticky [`MarkupType::Note`] (a standard PDF `/Text`
@@ -500,6 +550,12 @@ pub struct Markup {
     /// annotation. `#[serde(default)]` keeps pre-count-set JSON deserialising to `None`.
     #[serde(default)]
     pub count_set: Option<CountSet>,
+    /// The count (a run of count items) this `MeasurementCount` item belongs to. Items
+    /// sharing a `count_group` are ONE count for totals, Resume, Split and Merge
+    /// (docs/count-polylength.md). `None` = a count of one (legacy documents). Serialised
+    /// to `/RLCountGroup`. `#[serde(default)]` keeps older JSON deserialising to `None`.
+    #[serde(default)]
+    pub count_group: Option<Uuid>,
     /// Snapshot of the placing Tool's backing visual asset, for `MarkupType::Stamp` /
     /// `StampDynamic` markups only (spec "Stamps"). Set once at placement time
     /// (`Markup::with_stamp_asset`) so `appearance::build_ap_stream` can render the real
@@ -635,6 +691,7 @@ impl Markup {
             workflow: Workflow::default(),
             measurement: None,
             count_set: None,
+            count_group: None,
             stamp_asset: None,
             annot_flags: default_annot_flags(),
             rich_text: None,
@@ -728,7 +785,9 @@ impl Markup {
 
     /// The `/NM` to write: the original source name if there was one, else the id.
     pub fn nm_for_pdf(&self) -> String {
-        self.source_nm.clone().unwrap_or_else(|| self.id.to_string())
+        self.source_nm
+            .clone()
+            .unwrap_or_else(|| self.id.to_string())
     }
 
     /// The stable, immutable id (read-only — there is deliberately no setter).
@@ -1003,6 +1062,7 @@ mod tests {
             depth: None,
             count_value: Some(1),
             custom_columns: BTreeMap::new(),
+            rise_drop: Vec::new(),
         });
         m.count_set = Some(cs.clone());
 
@@ -1098,6 +1158,7 @@ mod tests {
             depth: None,
             count_value: None,
             custom_columns: cols,
+            rise_drop: Vec::new(),
         });
 
         assert!(m.markup_type.is_measurement());

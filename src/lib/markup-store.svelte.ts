@@ -6,6 +6,7 @@
  */
 import { isMarkupContentsLocked, isMarkupLocked, type Markup, type Appearance, type CountSet, type CountSymbol, type Tool } from "./ipc";
 import { History, CreateCmd, UpdateCmd, DeleteCmd, type MarkupSink, type MirrorOp } from "./markup-commands";
+import type { CountRun } from "./count-groups";
 
 /**
  * Up-front lock refusal message for `m`, or `null` if unlocked. Checked BEFORE any
@@ -81,6 +82,9 @@ export type ToolKind =
   // M3 measurement tools:
   | "calibrate"
   | "MeasurementLength"
+  // Multi-click length: click each vertex, double-click or Enter to finish. Creates a
+  // MeasurementLength markup with 2+ vertices (docs/count-polylength.md).
+  | "MeasurementPolylength"
   | "MeasurementArea"
   | "MeasurementCount"
   // Perimeter/Volume/Angle/Radius: model/IPC/render support predates this - only the
@@ -117,6 +121,9 @@ export class MarkupStore implements MarkupSink {
   countSets = $state<CountSet[]>([]);
   /** Id of the set new count markers are assigned to (null → counts go unassigned). */
   activeCountSetId = $state<string | null>(null);
+  /** The count the next Count click joins (a run of clicks is ONE count). Cleared when the
+   *  tool changes, on Esc, or via `resetCountRun`; set by Resume. */
+  countRun = $state<CountRun | null>(null);
 
   private history = new History(this);
   private queue: MirrorOp[] = [];
@@ -263,6 +270,34 @@ export class MarkupStore implements MarkupSink {
     ops.forEach((op) => this.enqueue(op));
     this.historyVersion++;
   }
+
+  /**
+   * Apply updates AND creations as ONE undo frame (e.g. splitting a polylength updates the
+   * first half and creates the second). Locked `before`s are skipped and reported like
+   * `applyBatch`; the creations are skipped too when the update they accompany was.
+   */
+  applyEdits(edits: { updates?: { before: Markup; after: Markup }[]; creates?: Markup[] }): void {
+    const updates = edits.updates ?? [];
+    const creates = edits.creates ?? [];
+    const locked = updates.filter((p) => lockRefusalMessage(p.before) !== null);
+    if (locked.length > 0) {
+      this.mirrorError = `${locked.length} locked markup(s) skipped: ${locked.map((p) => p.before.id).join(", ")}`;
+      if (creates.length > 0) return; // a half-applied split would duplicate geometry
+    }
+    const allowed = updates.filter((p) => lockRefusalMessage(p.before) === null);
+    const cmds = [
+      ...allowed.map(({ before, after }) => new UpdateCmd(before, after)),
+      ...creates.map((m) => new CreateCmd(m)),
+    ];
+    if (cmds.length === 0) return;
+    this.dirty = true;
+    const ops = this.history.pushBatch(cmds);
+    ops.forEach((op) => this.enqueue(op));
+    this.historyVersion++;
+  }
+
+  /** Forget the in-progress count run (the next click starts a new count). */
+  resetCountRun(): void { this.countRun = null; }
 
   /**
    * Delete all currently-selected markups as ONE undo frame. Clears selectedIds.

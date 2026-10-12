@@ -17,6 +17,7 @@
   import type { Markup } from "$lib/ipc";
   import { exportMarkupList, type ExportFormat } from "$lib/ipc";
   import { countSubtotalsByPage } from "$lib/measurement-tools";
+  import { countGroups as groupCounts, groupKey, resumeRun } from "$lib/count-groups";
   import { countSymbolRender, COUNT_MARKER_RADIUS } from "$lib/markup-render";
   import { save as saveDialog } from "@tauri-apps/plugin-dialog";
   import CountSetPicker from "./CountSetPicker.svelte";
@@ -35,6 +36,45 @@
   const measurements = $derived(
     store.markups.filter((m: Markup) => MEASUREMENT_TYPES.has(m.markup_type))
   );
+
+  // One table row per measurement - except count items: a count (a run of items sharing
+  // `count_group`) is ONE row carrying the group's label and total (docs/count-polylength.md).
+  const countGroupByKey = $derived(new Map(groupCounts(measurements).map((g) => [g.key, g])));
+  const rows = $derived.by(() => {
+    const seen = new Set<string>();
+    const out: { m: Markup; group: ReturnType<typeof groupCounts>[number] | null }[] = [];
+    for (const m of measurements) {
+      if (m.markup_type !== "MeasurementCount") {
+        out.push({ m, group: null });
+        continue;
+      }
+      const k = groupKey(m);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push({ m, group: countGroupByKey.get(k) ?? null });
+    }
+    return out;
+  });
+
+  let countMessage = $state<string | null>(null);
+
+  function selectCount(ids: string[]) {
+    store.selectedIds = new Set(ids);
+    store.activeTool = "select";
+  }
+
+  function resumeCount(itemId: string) {
+    const r = resumeRun(store.markups, itemId);
+    if ("error" in r) {
+      countMessage = r.error;
+      return;
+    }
+    store.applyBatch(r.pairs);
+    if (r.run.setId) store.setActiveCountSet(r.run.setId);
+    store.countRun = r.run;
+    store.activeTool = "MeasurementCount";
+    countMessage = null;
+  }
 
   const totalLength = $derived(
     measurements
@@ -105,6 +145,8 @@
 
   <CountSetPicker {store} />
 
+  {#if countMessage}<div class="export-error" role="status">{countMessage}</div>{/if}
+
   {#if measurements.length === 0}
     <p class="empty-hint">No measurements yet. Use the calibrate + measurement tools to add some.</p>
   {:else}
@@ -116,16 +158,19 @@
           <th class="num-col">Quantity</th>
           <th>Unit</th>
           <th>Scale</th>
+          <th></th>
         </tr>
       </thead>
       <tbody>
-        {#each measurements as m (m.id)}
-          <tr>
+        {#each rows as { m, group } (m.id)}
+          <tr data-count-group={group?.key}>
             <td class="type-cell">{m.markup_type.replace("Measurement", "")}</td>
-            <td>{m.contents ?? ""}</td>
+            <td>{group ? `${group.label} (${group.ids.length} item${group.ids.length === 1 ? "" : "s"})` : (m.contents ?? "")}</td>
             <td class="num-col">
               {m.measurement
-                ? m.markup_type === "MeasurementCount"
+                ? group
+                  ? group.total.toFixed(0)
+                  : m.markup_type === "MeasurementCount"
                   ? (m.measurement.count_value ?? 0).toFixed(0)
                   : m.measurement.computed_quantity.toFixed(m.measurement.scale_ref ? 2 : 1)
                 : "-"}
@@ -133,6 +178,12 @@
             <td>{m.measurement?.unit ?? "-"}</td>
             <td class="scale-cell">
               {m.measurement?.scale_ref ? (scale?.label ?? "-") : "raw"}
+            </td>
+            <td class="actions-cell">
+              {#if group}
+                <button type="button" class="row-action" data-action="resume-count" onclick={() => resumeCount(m.id)}>Resume</button>
+                <button type="button" class="row-action" data-action="select-count" onclick={() => selectCount(group.ids)}>Select</button>
+              {/if}
             </td>
           </tr>
         {/each}
@@ -198,6 +249,17 @@
 </div>
 
 <style>
+  .actions-cell { white-space: nowrap; }
+  .row-action {
+    font-size: var(--font-size-xs);
+    padding: 0 var(--space-2);
+    margin-right: var(--space-1);
+    background: var(--color-bg-active);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
   .measurement-panel {
     display: flex;
     flex-direction: column;

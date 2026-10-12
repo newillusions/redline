@@ -12,10 +12,14 @@
 //! and references a `scale_id`. Recalibrating a scale deterministically recomputes all
 //! dependent measurements — no stale quantities.
 
+pub mod count;
 pub mod math;
 pub mod measure;
 pub mod scale;
 
-pub use math::{compute_area, compute_length, recompute_measurement};
+pub use math::{
+    compute_area, compute_length, convert_length, recompute_all, recompute_markup,
+    recompute_measurement, rise_drop_total,
+};
 pub use measure::{applicable_scales, find_scale, write_measure_dict};
 pub use scale::{ScaleMethod, ScaleRecord, ScaleStore, ScaleTarget};

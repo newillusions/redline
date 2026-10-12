@@ -17,6 +17,8 @@ import type { CountSet, Markup } from "$lib/ipc";
 // COUNT_SYMBOLS is a runtime value consumed by CountSetPicker, so it must be present.
 vi.mock("$lib/ipc", () => ({
   exportMarkupList: vi.fn(async () => {}),
+  isMarkupLocked: () => false,
+  isMarkupContentsLocked: () => false,
   COUNT_SYMBOLS: ["Circle", "Square", "Triangle", "Diamond", "Cross", "Star", "Hexagon"],
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -179,5 +181,15 @@ describe("MeasurementPanel", () => {
     render(MeasurementPanel, { store, takeoffStore, docId: "d1" });
     await fireEvent.click(screen.getByRole("button", { name: /export xlsx/i }));
     expect(await screen.findByText("Exported 1 mark-up to /out/list.xlsx.")).toBeTruthy();
+  });
+
+  it("Resume on a legacy ungrouped count stamps count_group so every view shows one count", async () => {
+    store.seed([makeMeasurementMarkup("legacy", "MeasurementCount", 1, "ea", null, 1)]);
+    render(MeasurementPanel, { props: { store, takeoffStore, docId: "d1" } });
+    await tick();
+    await fireEvent.click(document.querySelector('[data-action="resume-count"]')!);
+    expect(store.getById("legacy")!.count_group).toBe("legacy");
+    expect(store.countRun?.groupId).toBe("legacy");
+    expect(store.activeTool).toBe("MeasurementCount");
   });
 });

@@ -18,7 +18,11 @@
   import { patchAddReply, patchDeleteReply } from "$lib/markup-properties";
   import { reviewSummary } from "$lib/markup-review";
 
-  const { store }: { store: MarkupStore } = $props();
+  import type { TakeoffStore } from "$lib/takeoff-store.svelte";
+  import CountControls from "./CountControls.svelte";
+  import PolylengthControls from "./PolylengthControls.svelte";
+
+  const { store, takeoffStore }: { store: MarkupStore; takeoffStore?: TakeoffStore } = $props();
 
   let identity = $state<UserRef | null>(null);
 
@@ -352,6 +356,11 @@
     <p class="panel-mode-hint muted">Defaults for new markups</p>
   {:else}
     <p class="panel-mode-hint selected-count">{selected.length} markup(s) selected</p>
+  {/if}
+
+  {#if mode === "selection"}
+    <CountControls {store} {identity} />
+    <PolylengthControls {store} {takeoffStore} {identity} />
   {/if}
 
   <!-- Appearance group -->

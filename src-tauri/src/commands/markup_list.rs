@@ -216,8 +216,27 @@ pub fn export_view_to(
     path: &Path,
     format: ExportFormat,
 ) -> Result<usize, String> {
+    export_view_with_scales(all, &[], ids, column_keys, path, format)
+}
+
+/// [`export_view_to`] that first recomputes scaled quantities from `raw_measure` under the
+/// document's current scales, so this export shows the same totals as the Quantities one.
+pub fn export_view_with_scales(
+    all: &[Markup],
+    scales: &[crate::takeoff::ScaleRecord],
+    ids: &[String],
+    column_keys: &[String],
+    path: &Path,
+    format: ExportFormat,
+) -> Result<usize, String> {
+    let mut recomputed = all.to_vec();
+    crate::takeoff::recompute_all(&mut recomputed, scales);
+    let all = &recomputed[..];
     let cols = parse_columns(column_keys)?;
-    let rows = pick(all, ids);
+    // A count item stands for its whole count: show the group total, not 1.
+    let picked = pick(all, ids);
+    let with_totals = crate::takeoff::count::with_group_totals(all, &picked);
+    let rows: Vec<&Markup> = with_totals.iter().collect();
     match format {
         ExportFormat::Csv => write_csv(&rows, &cols, path).map_err(|e| e.to_string())?,
         ExportFormat::Xlsx => write_xlsx(&rows, &cols, path).map_err(|e| e.to_string())?,
@@ -289,7 +308,9 @@ pub async fn export_markups_view(
     columns: Vec<String>,
 ) -> Result<usize, String> {
     let all = state.markups.list(&doc_id)?;
-    export_view_to(&all, &ids, &columns, &PathBuf::from(&path), format)
+    crate::commands::takeoff::ensure_scales_loaded(&state, &doc_id);
+    let scales = state.scales.lock().unwrap().list(&doc_id).to_vec();
+    export_view_with_scales(&all, &scales, &ids, &columns, &PathBuf::from(&path), format)
 }
 
 #[cfg(test)]
@@ -454,6 +475,7 @@ mod tests {
             depth: None,
             count_value: None,
             custom_columns: cc,
+            rise_drop: Vec::new(),
         });
         m.workflow.thread.push(Reply {
             id: Uuid::new_v4(),
@@ -512,6 +534,7 @@ mod tests {
             depth: None,
             count_value: None,
             custom_columns: cc,
+            rise_drop: Vec::new(),
         }
     }
 
@@ -629,6 +652,7 @@ mod tests {
             depth: None,
             count_value: None,
             custom_columns: cc,
+            rise_drop: Vec::new(),
         });
         let ids = vec![m.id().to_string()];
         let dir = tempdir().unwrap();
@@ -661,5 +685,56 @@ mod tests {
         .unwrap();
         assert_eq!(n, 1);
         assert!(out.metadata().unwrap().len() > 500);
+    }
+
+    #[test]
+    fn view_export_recomputes_like_the_quantities_export() {
+        use crate::markup::Measurement;
+        use crate::takeoff::{ScaleMethod, ScaleRecord, ScaleTarget};
+        let mut m = crate::markup::Markup::new(
+            crate::markup::MarkupType::MeasurementLength,
+            0,
+            crate::markup::MarkupGeometry::Polyline(vec![
+                crate::geometry::PdfPoint { x: 0.0, y: 0.0 },
+                crate::geometry::PdfPoint { x: 1000.0, y: 0.0 },
+            ]),
+            crate::markup::Appearance::default(),
+            crate::markup::UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: "T".into(),
+            },
+        );
+        m.measurement = Some(Measurement {
+            scale_ref: Some("old".into()),
+            raw_measure: 1000.0,
+            unit: "m".into(),
+            computed_quantity: 1.0, // stale: measured under the replaced scale
+            depth: None,
+            count_value: None,
+            custom_columns: Default::default(),
+            rise_drop: Vec::new(),
+        });
+        let scale = ScaleRecord::new(
+            ScaleTarget::DocumentDefault,
+            ScaleMethod::TwoPoint,
+            0.005,
+            "m".into(),
+            "new".into(),
+            2,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("v.csv");
+        let id = m.id().to_string();
+        export_view_with_scales(
+            &[m],
+            &[scale],
+            &[id],
+            &["measurement".to_string()],
+            &out,
+            ExportFormat::Csv,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("5.00 m"), "{text}");
     }
 }

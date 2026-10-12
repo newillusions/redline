@@ -144,6 +144,17 @@ fn type_from_tag(tag: &str) -> Option<MarkupType> {
     serde_json::from_str(&format!("\"{tag}\"")).ok()
 }
 
+/// Largest `/RLMeasure` JSON string the reader will parse (a hostile file could otherwise
+/// make serde allocate an arbitrarily large rise/drop list before it is bounded).
+const MAX_RLMEASURE_BYTES: usize = 2 * 1024 * 1024;
+
+/// A polylength: a `MeasurementLength` with three or more vertices. Written as the
+/// standard `/PolyLine` + `/IT /PolyLineDimension` so any viewer draws the whole path.
+fn is_polylength(t: MarkupType, g: &MarkupGeometry) -> bool {
+    matches!(t, MarkupType::MeasurementLength)
+        && matches!(g, MarkupGeometry::Polyline(p) if p.len() > 2)
+}
+
 /// PDF standard `/Subtype` for interop rendering.
 fn pdf_subtype(t: MarkupType) -> &'static str {
     match t {
@@ -523,7 +534,16 @@ impl Markup {
         let t = self.markup_type;
 
         d.set("Type", name("Annot"));
-        d.set("Subtype", name(pdf_subtype(t)));
+        let polylength = is_polylength(t, &self.geometry);
+        let subtype = if polylength {
+            "PolyLine"
+        } else {
+            pdf_subtype(t)
+        };
+        d.set("Subtype", name(subtype));
+        if polylength {
+            d.set("IT", name("PolyLineDimension"));
+        }
 
         // Bounding box + per-shape geometry. /Rect MUST equal the /AP /BBox for every
         // markup type (`appearance::ap_bbox` is the single shared source for both) so a
@@ -545,7 +565,7 @@ impl Markup {
         super::callout::write_keys(&mut d, self, bb);
         match &self.geometry {
             MarkupGeometry::Polyline(pts) => {
-                if matches!(pdf_subtype(t), "Line") && pts.len() >= 2 {
+                if matches!(subtype, "Line") && pts.len() >= 2 {
                     d.set("L", flatten(&pts[..2]));
                     // A standard PDF Line annotation is spec-defined as exactly 2 points
                     // (/L takes only 4 numbers), so any vertices beyond the first two have
@@ -843,6 +863,11 @@ impl Markup {
         if let Some(gid) = self.group_id {
             d.set("RLGroup", Object::string_literal(gid.to_string()));
         }
+        // Count group (docs/count-polylength.md): the run of count items this item belongs
+        // to. Private key; the item itself stays a plain Stamp-subtype annotation.
+        if let Some(cg) = self.count_group {
+            d.set("RLCountGroup", Object::string_literal(cg.to_string()));
+        }
 
         // Count set (spec §7): the set assignment + symbol + colour via private
         // /RLCountSet* keys. The colour is ALSO carried by the standard /C key
@@ -871,7 +896,15 @@ impl Markup {
         // MeasurementLength/Area/Perimeter/Volume/Count/Angle/Radius markup lost its
         // quantity data on save -> reopen.
         if let Some(meas) = &self.measurement {
-            if let Ok(json) = serde_json::to_string(meas) {
+            // Bound the rise/drop list before it is written, same as on read, so a save
+            // can never emit what the reader would refuse.
+            let mut meas = meas.clone();
+            if let MarkupGeometry::Polyline(pts) = &self.geometry {
+                meas.sanitise_rise_drop(pts.len());
+            } else {
+                meas.rise_drop.clear();
+            }
+            if let Ok(json) = serde_json::to_string(&meas) {
                 d.set("RLMeasure", Object::string_literal(json));
             }
         }
@@ -1114,6 +1147,17 @@ impl Markup {
             open: matches!(d.get(b"Open").ok(), Some(Object::Boolean(true))),
         });
 
+        let measurement = get_string(d, b"RLMeasure")
+            .filter(|s| s.len() <= MAX_RLMEASURE_BYTES)
+            .and_then(|s| serde_json::from_str::<Measurement>(&s).ok())
+            .map(|mut m| {
+                match &geometry {
+                    MarkupGeometry::Polyline(pts) => m.sanitise_rise_drop(pts.len()),
+                    _ => m.rise_drop.clear(),
+                }
+                m
+            });
+
         Markup {
             id,
             markup_type,
@@ -1160,9 +1204,10 @@ impl Markup {
                     status_history: Vec::new(),
                 }
             },
-            measurement: get_string(d, b"RLMeasure")
-                .and_then(|s| serde_json::from_str::<Measurement>(&s).ok()),
+            measurement,
             count_set,
+            count_group: get_string(d, b"RLCountGroup")
+                .and_then(|s| uuid::Uuid::parse_str(&s).ok()),
             // Not reconstructed on reopen - see the field doc comment in markup/mod.rs
             // (the appearance is already baked into the saved /AP /N stream by then).
             stamp_asset: None,

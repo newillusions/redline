@@ -14,6 +14,19 @@ use crate::AppState;
 // Scale commands
 // ---------------------------------------------------------------------------
 
+/// Make sure the document's scale records are in `state.scales`. They were only ever
+/// filled by `add_scale`, so a reopened document had the sidecar's scales on disk but none
+/// in memory (empty `list_scales`, exports recomputed under nothing). Loads the sidecar
+/// once per open; `close_document` clears the entry so a reopen loads it again.
+pub fn ensure_scales_loaded(state: &AppState, doc_id: &str) {
+    let path = state.markups.path(doc_id);
+    state
+        .scales
+        .lock()
+        .unwrap()
+        .ensure_loaded(doc_id, path.as_deref());
+}
+
 /// Add (or replace by applies_to target) a scale record for the document. Persists to sidecar.
 #[tauri::command]
 pub async fn add_scale(
@@ -46,7 +59,8 @@ pub async fn add_scale(
     meta.scales.push(rec.clone());
     save_meta(&pdf_path, &meta).map_err(|e| e.to_string())?;
 
-    // Update in-memory store
+    // Update in-memory store (load the sidecar first so earlier scales are not lost)
+    ensure_scales_loaded(&state, &doc_id);
     state.scales.lock().unwrap().add(&doc_id, rec.clone());
 
     Ok(rec)
@@ -58,6 +72,7 @@ pub async fn list_scales(
     state: State<'_, AppState>,
     doc_id: String,
 ) -> Result<Vec<ScaleRecord>, String> {
+    ensure_scales_loaded(&state, &doc_id);
     Ok(state.scales.lock().unwrap().list(&doc_id).to_vec())
 }
 
@@ -68,6 +83,7 @@ pub async fn delete_scale(
     doc_id: String,
     scale_id: String,
 ) -> Result<bool, String> {
+    ensure_scales_loaded(&state, &doc_id);
     let removed = state.scales.lock().unwrap().delete(&doc_id, &scale_id);
     if removed {
         if let Some(pdf_path) = state.markups.path(&doc_id) {
@@ -88,6 +104,7 @@ pub async fn list_applicable_scales(
     doc_id: String,
     page_idx: u32,
 ) -> Result<Vec<ScaleRecord>, String> {
+    ensure_scales_loaded(&state, &doc_id);
     let store = state.scales.lock().unwrap();
     let all = store.list(&doc_id);
     Ok(crate::takeoff::applicable_scales(all, page_idx)
@@ -106,6 +123,7 @@ pub async fn write_page_measure(
     page_idx: u32,
     scale_id: String,
 ) -> Result<(), String> {
+    ensure_scales_loaded(&state, &doc_id);
     let scale = {
         let store = state.scales.lock().unwrap();
         crate::takeoff::find_scale(store.list(&doc_id), &scale_id)
@@ -139,7 +157,9 @@ pub async fn export_markup_list(
     format: ExportFormat,
 ) -> Result<(), String> {
     let markups = state.markups.list(&doc_id)?;
-    export_markup_list_to(&markups, &PathBuf::from(&path), format)
+    ensure_scales_loaded(&state, &doc_id);
+    let scales = state.scales.lock().unwrap().list(&doc_id).to_vec();
+    export_markup_list_with_scales(&markups, &scales, &PathBuf::from(&path), format)
 }
 
 /// Core of [`export_markup_list`], extracted so it can be called with just a markup
@@ -151,9 +171,24 @@ pub fn export_markup_list_to(
     path: &std::path::Path,
     format: ExportFormat,
 ) -> Result<(), String> {
+    export_markup_list_with_scales(markups, &[], path, format)
+}
+
+/// [`export_markup_list_to`] that first recomputes every scaled quantity from its
+/// `raw_measure` under the document's current scales (so an export is never stale after
+/// a recalibration) and collapses each count group to one row carrying its total.
+pub fn export_markup_list_with_scales(
+    markups: &[Markup],
+    scales: &[crate::takeoff::ScaleRecord],
+    path: &std::path::Path,
+    format: ExportFormat,
+) -> Result<(), String> {
+    let mut rows = markups.to_vec();
+    crate::takeoff::recompute_all(&mut rows, scales);
+    let rows = crate::takeoff::count::collapse_groups(&rows);
     match format {
-        ExportFormat::Xlsx => export_xlsx(markups, path).map_err(|e| e.to_string()),
-        ExportFormat::Csv => export_csv(markups, path).map_err(|e| e.to_string()),
+        ExportFormat::Xlsx => export_xlsx(&rows, path).map_err(|e| e.to_string()),
+        ExportFormat::Csv => export_csv(&rows, path).map_err(|e| e.to_string()),
     }
 }
 
@@ -316,6 +351,7 @@ mod tests {
             depth: None,
             count_value: None,
             custom_columns: BTreeMap::new(),
+            rise_drop: Vec::new(),
         });
         export_csv(&[m], &out).unwrap();
         let mut rdr = csv::Reader::from_path(&out).unwrap();
@@ -342,6 +378,7 @@ mod tests {
             depth: None,
             count_value: None,
             custom_columns: BTreeMap::new(),
+            rise_drop: Vec::new(),
         });
         export_csv(&[m], &out).unwrap();
         let content = std::fs::read_to_string(&out).unwrap();
@@ -350,5 +387,109 @@ mod tests {
             "expected quantity 5.00 in CSV: {content}"
         );
         assert!(content.contains(",m,"), "expected unit m in CSV");
+    }
+
+    #[test]
+    fn csv_export_collapses_count_groups_and_recomputes_under_current_scale() {
+        use crate::markup::{Measurement, RiseDrop};
+        use crate::takeoff::{ScaleMethod, ScaleRecord, ScaleTarget};
+        use std::collections::BTreeMap;
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("q.csv");
+        let g = uuid::Uuid::new_v4();
+        let mut items = Vec::new();
+        for _ in 0..3 {
+            let mut c = sample_markup(crate::markup::MarkupType::MeasurementCount);
+            c.count_group = Some(g);
+            c.subject = Some("Type A".into());
+            c.measurement = Some(Measurement {
+                scale_ref: None,
+                raw_measure: 1.0,
+                unit: "ea".into(),
+                computed_quantity: 1.0,
+                depth: None,
+                count_value: Some(1),
+                custom_columns: BTreeMap::new(),
+                rise_drop: Vec::new(),
+            });
+            items.push(c);
+        }
+        // Polylength measured under a since-replaced scale (id "old"): 1000 pt + 2 m rise.
+        let mut l = sample_markup(crate::markup::MarkupType::MeasurementLength);
+        l.measurement = Some(Measurement {
+            scale_ref: Some("old".into()),
+            raw_measure: 1000.0,
+            unit: "m".into(),
+            computed_quantity: 1.0,
+            depth: None,
+            count_value: None,
+            custom_columns: BTreeMap::new(),
+            rise_drop: vec![RiseDrop {
+                segment: 0,
+                amount: 2.0,
+                unit: "m".into(),
+            }],
+        });
+        items.push(l);
+        let scale = ScaleRecord::new(
+            ScaleTarget::DocumentDefault,
+            ScaleMethod::TwoPoint,
+            0.005,
+            "m".into(),
+            "recal".into(),
+            2,
+        );
+        export_markup_list_with_scales(&items, &[scale], &out, ExportFormat::Csv).unwrap();
+        let mut rdr = csv::Reader::from_path(&out).unwrap();
+        let recs: Vec<_> = rdr.records().map(|r| r.unwrap()).collect();
+        assert_eq!(
+            recs.len(),
+            2,
+            "3 count items collapse to one row + the polylength"
+        );
+        assert_eq!(&recs[0][3], "Type A");
+        assert_eq!(&recs[0][8], "3.00", "group total");
+        assert_eq!(
+            &recs[1][8], "7.00",
+            "1000 x 0.005 + 2 m rise under the new scale"
+        );
+    }
+
+    #[test]
+    fn export_uses_the_new_scale_after_a_recalibration_of_the_same_target() {
+        use crate::markup::{Measurement, RiseDrop};
+        use crate::takeoff::{ScaleMethod, ScaleRecord, ScaleStore, ScaleTarget};
+        use std::collections::BTreeMap;
+        let mk = |ratio: f64| {
+            ScaleRecord::new(
+                ScaleTarget::DocumentDefault,
+                ScaleMethod::TwoPoint,
+                ratio,
+                "m".into(),
+                "s".into(),
+                2,
+            )
+        };
+        let mut store = ScaleStore::default();
+        store.add("d", mk(0.001));
+        store.add("d", mk(0.002)); // recalibrated: must replace, not shadow
+        assert_eq!(store.list("d").len(), 1);
+        let mut l = sample_markup(crate::markup::MarkupType::MeasurementLength);
+        l.measurement = Some(Measurement {
+            scale_ref: None,
+            raw_measure: 1000.0,
+            unit: "pt".into(),
+            computed_quantity: 0.0,
+            depth: None,
+            count_value: None,
+            custom_columns: BTreeMap::new(),
+            rise_drop: vec![RiseDrop { segment: 0, amount: 1.0, unit: "m".into() }],
+        });
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("q.csv");
+        export_markup_list_with_scales(&[l], store.list("d"), &out, ExportFormat::Csv).unwrap();
+        let mut rdr = csv::Reader::from_path(&out).unwrap();
+        let rec = rdr.records().next().unwrap().unwrap();
+        assert_eq!(&rec[8], "3.00", "1000 x 0.002 + 1 m rise under the NEW scale");
     }
 }

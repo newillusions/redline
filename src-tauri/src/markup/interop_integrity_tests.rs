@@ -1076,3 +1076,267 @@ fn source_ref_and_popup_never_come_from_input() {
     save_from_store(&mut doc, &store);
     assert_non_imported_intact(&doc, "after update");
 }
+
+// --- 6. count groups and polylength (docs/count-polylength.md) --------------------
+
+fn count_item(group: Option<uuid::Uuid>, x: f64, set: &CountSet) -> Markup {
+    let mut m = Markup::new(
+        MarkupType::MeasurementCount,
+        0,
+        MarkupGeometry::Point(pt(x, 30.0)),
+        Appearance::default(),
+        UserRef {
+            user_id: uuid::Uuid::new_v4(),
+            display_name: "Alice".into(),
+        },
+    );
+    m.count_set = Some(set.clone());
+    m.count_group = group;
+    m.subject = Some("Type A downlight".into());
+    m.measurement = Some(Measurement {
+        scale_ref: None,
+        raw_measure: 1.0,
+        unit: "ea".into(),
+        computed_quantity: 1.0,
+        depth: None,
+        count_value: Some(1),
+        custom_columns: Default::default(),
+        rise_drop: Vec::new(),
+    });
+    m
+}
+
+fn a_set() -> CountSet {
+    CountSet {
+        id: uuid::Uuid::new_v4(),
+        name: "Type A".into(),
+        color: "#e02424".into(),
+        symbol: CountSymbol::Circle,
+    }
+}
+
+#[test]
+fn count_groups_survive_three_cycles_with_stable_identity() {
+    let (mut doc, _page) = one_page_doc();
+    let set = a_set();
+    let g1 = uuid::Uuid::new_v4();
+    let g2 = uuid::Uuid::new_v4();
+    let items = vec![
+        count_item(Some(g1), 10.0, &set),
+        count_item(Some(g1), 20.0, &set),
+        count_item(Some(g2), 30.0, &set),
+        count_item(None, 40.0, &set),
+    ];
+    let ids: BTreeSet<String> = items.iter().map(|m| m.id().to_string()).collect();
+    write_markups(&mut doc, &items).unwrap();
+    doc = reload(&mut doc);
+    for cycle in 1..=3 {
+        let ms = read_markups(&doc).unwrap();
+        assert_eq!(ms.len(), 4, "cycle {cycle}");
+        let in_g1 = ms.iter().filter(|m| m.count_group == Some(g1)).count();
+        let in_g2 = ms.iter().filter(|m| m.count_group == Some(g2)).count();
+        let none = ms.iter().filter(|m| m.count_group.is_none()).count();
+        assert_eq!(
+            (in_g1, in_g2, none),
+            (2, 1, 1),
+            "cycle {cycle}: grouping preserved"
+        );
+        let got: BTreeSet<String> = ms.iter().map(|m| m.id().to_string()).collect();
+        assert_eq!(got, ids, "cycle {cycle}: ids stable");
+        write_markups(&mut doc, &ms).unwrap();
+        doc = reload(&mut doc);
+        assert_eq!(
+            count_of(&doc, "Stamp"),
+            4,
+            "cycle {cycle}: items stay Stamps"
+        );
+        assert_eq!(annots(&doc).len(), 4, "cycle {cycle}: no duplication");
+    }
+}
+
+#[test]
+fn a_hostile_count_group_value_is_ignored_not_fatal() {
+    let set = a_set();
+    let mut d = count_item(Some(uuid::Uuid::new_v4()), 5.0, &set).to_annotation_dict();
+    d.set("RLCountGroup", Object::string_literal("not-a-uuid"));
+    let back = Markup::from_annotation_dict(&d);
+    assert!(back.count_group.is_none());
+    d.set("RLCountGroup", Object::string_literal("x".repeat(100_000)));
+    assert!(Markup::from_annotation_dict(&d).count_group.is_none());
+}
+
+fn polylength(n: usize, rise: Vec<RiseDrop>) -> Markup {
+    let pts: Vec<PdfPoint> = (0..n)
+        .map(|i| pt(10.0 * i as f64, (i % 2) as f64 * 5.0))
+        .collect();
+    let mut m = Markup::new(
+        MarkupType::MeasurementLength,
+        0,
+        MarkupGeometry::Polyline(pts),
+        Appearance::default(),
+        UserRef {
+            user_id: uuid::Uuid::new_v4(),
+            display_name: "Alice".into(),
+        },
+    );
+    m.contents = Some("cable run".into());
+    m.measurement = Some(Measurement {
+        scale_ref: Some("sc".into()),
+        raw_measure: 100.0,
+        unit: "m".into(),
+        computed_quantity: 10.0,
+        depth: None,
+        count_value: None,
+        custom_columns: Default::default(),
+        rise_drop: rise,
+    });
+    m
+}
+
+fn rd(segment: u32, amount: f64) -> RiseDrop {
+    RiseDrop {
+        segment,
+        amount,
+        unit: "m".into(),
+    }
+}
+
+#[test]
+fn a_polylength_is_a_standard_polyline_dimension_and_keeps_rise_drop_over_three_cycles() {
+    let (mut doc, _page) = one_page_doc();
+    let m = polylength(4, vec![rd(0, 2.0), rd(2, -1.5)]);
+    let id = m.id();
+    write_markups(&mut doc, &[m]).unwrap();
+    doc = reload(&mut doc);
+    for cycle in 1..=3 {
+        let (_, d) = annots(&doc).into_iter().next().unwrap();
+        assert_eq!(subtype(&d), "PolyLine", "cycle {cycle}");
+        assert_eq!(
+            d.get(b"IT").unwrap().as_name().unwrap(),
+            b"PolyLineDimension",
+            "cycle {cycle}"
+        );
+        assert_eq!(
+            floats(&d, b"Vertices").len(),
+            8,
+            "cycle {cycle}: all 4 vertices written"
+        );
+        let ms = read_markups(&doc).unwrap();
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].id(), id, "cycle {cycle}");
+        assert_eq!(ms[0].markup_type, MarkupType::MeasurementLength);
+        let MarkupGeometry::Polyline(p) = &ms[0].geometry else {
+            panic!()
+        };
+        assert_eq!(p.len(), 4);
+        assert_eq!(
+            ms[0].measurement.as_ref().unwrap().rise_drop,
+            vec![rd(0, 2.0), rd(2, -1.5)],
+            "cycle {cycle}"
+        );
+        write_markups(&mut doc, &ms).unwrap();
+        doc = reload(&mut doc);
+        assert_eq!(annots(&doc).len(), 1, "cycle {cycle}: no duplication");
+    }
+}
+
+#[test]
+fn a_two_point_length_stays_a_standard_line() {
+    let (mut doc, _page) = one_page_doc();
+    write_markups(&mut doc, &[polylength(2, vec![rd(0, 1.0)])]).unwrap();
+    doc = reload(&mut doc);
+    let (_, d) = annots(&doc).into_iter().next().unwrap();
+    assert_eq!(subtype(&d), "Line");
+    assert!(d.get(b"IT").is_err());
+    let ms = read_markups(&doc).unwrap();
+    assert_eq!(
+        ms[0].measurement.as_ref().unwrap().rise_drop,
+        vec![rd(0, 1.0)]
+    );
+}
+
+#[test]
+fn hostile_rise_drop_is_bounded_on_read_and_write() {
+    // Out-of-range segment, non-finite, oversized, duplicate segment, unit too long.
+    let rise = vec![
+        rd(0, 1.0),
+        rd(0, 9.0),
+        rd(7, 1.0),
+        rd(1, f64::NAN),
+        rd(1, f64::INFINITY),
+        rd(1, 1e12),
+        RiseDrop {
+            segment: 1,
+            amount: 1.0,
+            unit: "x".repeat(100),
+        },
+        rd(1, 3.0),
+    ];
+    let m = polylength(4, rise.clone());
+    // Written bounded...
+    let d = m.to_annotation_dict();
+    let back = Markup::from_annotation_dict(&d);
+    assert_eq!(
+        back.measurement.as_ref().unwrap().rise_drop,
+        vec![rd(0, 1.0), rd(1, 3.0)]
+    );
+    // ...and read bounded even when a hostile writer bypassed the sanitiser: hand-craft JSON.
+    let mut meas = m.measurement.clone().unwrap();
+    meas.rise_drop = rise;
+    let mut d2 = m.to_annotation_dict();
+    d2.set(
+        "RLMeasure",
+        Object::string_literal(serde_json::to_string(&meas).unwrap()),
+    );
+    let back2 = Markup::from_annotation_dict(&d2);
+    assert_eq!(
+        back2.measurement.unwrap().rise_drop,
+        vec![rd(0, 1.0), rd(1, 3.0)]
+    );
+}
+
+#[test]
+fn an_oversized_rlmeasure_blob_is_refused_without_parsing() {
+    let m = polylength(3, vec![]);
+    let mut d = m.to_annotation_dict();
+    d.set(
+        "RLMeasure",
+        Object::string_literal(" ".repeat(3 * 1024 * 1024)),
+    );
+    assert!(Markup::from_annotation_dict(&d).measurement.is_none());
+}
+
+#[test]
+fn rise_drop_entries_are_capped() {
+    let many: Vec<RiseDrop> = (0..30_000u32).map(|i| rd(i, 1.0)).collect();
+    let mut meas = polylength(3, vec![]).measurement.unwrap();
+    meas.rise_drop = many;
+    meas.sanitise_rise_drop(30_001);
+    assert_eq!(meas.rise_drop.len(), MAX_RISE_DROP_ENTRIES);
+}
+
+#[test]
+fn foreign_bluebeam_count_and_rise_drop_keys_are_still_preserved_verbatim() {
+    let (mut doc, page) = one_page_doc();
+    let set = a_set();
+    let mut d = count_item(Some(uuid::Uuid::new_v4()), 10.0, &set).to_annotation_dict();
+    d.set("NumCounts", 7);
+    d.set("RiseDrop", Object::Array(vec![2.into(), 5.into()]));
+    d.set("BBMeasure", Object::Dictionary(dictionary! { "Q" => 1 }));
+    let oid = doc.add_object(d);
+    set_annots(&mut doc, page, &[oid]);
+    for cycle in 1..=3 {
+        let ms = read_markups(&doc).unwrap();
+        write_markups(&mut doc, &ms).unwrap();
+        doc = reload(&mut doc);
+        let (_, out) = annots(&doc).into_iter().next().unwrap();
+        assert_eq!(
+            out.get(b"NumCounts").unwrap().as_i64().unwrap(),
+            7,
+            "cycle {cycle}"
+        );
+        assert!(out.get(b"RiseDrop").is_ok(), "cycle {cycle}");
+        assert!(out.get(b"BBMeasure").is_ok(), "cycle {cycle}");
+        assert!(out.get(b"RLCountGroup").is_ok(), "cycle {cycle}");
+    }
+}

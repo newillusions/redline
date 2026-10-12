@@ -89,6 +89,8 @@
   import { patchGroup } from "$lib/markup-properties";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
   import { measureLength, measureArea, measurePerimeter, measureAngleDegrees, formatAngleLabel } from "$lib/measurement-tools";
+  import { polylengthPayload, recomputeAll, MAX_POLYLENGTH_VERTICES } from "$lib/polylength";
+  import { nextRun } from "$lib/count-groups";
   import { addScale, type CalloutProps, type MeasurementPayload, type SearchHit } from "$lib/ipc";
   import { pdfUserSpaceToScreen } from "$lib/viewport";
   import { getPageSnapTargets, findNearestSnap, type SnapTarget } from "$lib/snap";
@@ -234,6 +236,12 @@
 
   let lastFrameTs   = 0;           // rAF timestamp of previous pan frame
   let zoomStartTs   = 0;           // performance.now() at last zoom change (0 = settled)
+
+  // A run of Count clicks is one count: leaving the Count tool ends the run (the next
+  // visit starts a new count unless Resume re-arms one).
+  $effect(() => {
+    if (store.activeTool !== "MeasurementCount" && store.activeTool !== "hand") store.resetCountRun();
+  });
 
   // Poll process RSS only while the §20 overlay is visible. The readout shells out
   // per sample (`ps` / `tasklist`), so a standing 1 Hz poll is wasted work - and on
@@ -412,7 +420,8 @@
   const isCreateTool = (t = store.activeTool) =>
     isDrawTool(t) || isMcTool(t) || isInkTool(t) || isTextTool(t) ||
     t === "calibrate" || t === "MeasurementLength" || t === "MeasurementRadius" ||
-    CLOSED_MEASUREMENT_TOOLS.has(t) || t === "MeasurementCount" || t === "MeasurementAngle" ||
+    CLOSED_MEASUREMENT_TOOLS.has(t) || t === "MeasurementPolylength" ||
+    t === "MeasurementCount" || t === "MeasurementAngle" ||
     t === "placeTool" || t === "Note";
 
   /** True for the I-beam Select Text tool and the three text mark-up tools (Underline /
@@ -450,7 +459,7 @@
    */
   const SNAP_ELIGIBLE_TOOLS: ReadonlySet<string> = new Set([
     "calibrate", "Line", "Arrow", "Polyline", "Polygon", "Cloud", "CloudPlus",
-    "MeasurementLength", "MeasurementRadius", "MeasurementAngle",
+    "MeasurementLength", "MeasurementPolylength", "MeasurementRadius", "MeasurementAngle",
     "MeasurementArea", "MeasurementPerimeter", "MeasurementVolume",
   ]);
   /** Screen-pixel snap tolerance (converted to PDF points via SNAP_TOLERANCE_PX / zoom,
@@ -1361,7 +1370,9 @@
     if (e.key === "Enter") {
       // MeasurementArea / MeasurementPerimeter / MeasurementVolume finish via Enter.
       const enterTool = store.activeTool;
-      if (CLOSED_MEASUREMENT_TOOLS.has(enterTool) && identity && mcVerts.length >= 3) {
+      if (enterTool === "MeasurementPolylength") {
+        finishPolylength();
+      } else if (CLOSED_MEASUREMENT_TOOLS.has(enterTool) && identity && mcVerts.length >= 3) {
         const closedTool = enterTool as "MeasurementArea" | "MeasurementPerimeter" | "MeasurementVolume";
         const m = buildMarkup({
           markupType: closedTool,
@@ -1393,6 +1404,7 @@
     }
     if (e.key === "Escape") {
       resetMultiClick();
+      store.resetCountRun();
       cancelDraw();
       clearTextSelection();
       store.selectedIds = new Set();
@@ -1877,6 +1889,28 @@
   }
 
   /**
+   * Finish the Polylength tool: a MeasurementLength markup over 2+ clicked vertices
+   * (double-click or Enter). Fewer than 2 vertices is a no-op that keeps drawing.
+   */
+  function finishPolylength(): boolean {
+    if (!identity || mcVerts.length < 2) return false;
+    const pts = mcVerts.slice(0, MAX_POLYLENGTH_VERTICES);
+    const m = buildMarkup({
+      markupType: "MeasurementLength",
+      page: pageIndex,
+      geometry: polylineGeometry(pts),
+      appearance: store.draftAppearance,
+      identity,
+      now: new Date().toISOString(),
+      id: crypto.randomUUID(),
+    });
+    m.measurement = polylengthPayload(pts, takeoffStore.activeScale);
+    store.create(m);
+    resetMultiClick();
+    return true;
+  }
+
+  /**
    * Build the `MeasurementPayload` for a finished MeasurementArea / MeasurementPerimeter
    * / MeasurementVolume closed polygon. Shared by the Enter-to-finish keyboard handler
    * and the dblclick-to-finish pointer handler so the area/perimeter/volume math lives
@@ -2311,7 +2345,7 @@
     // --- CREATE tool branch ---
     if (!isCreateTool(tool) || !identity) return;
     // Multi-click tools handle gestures via click/dblclick, not pointer capture.
-    if (isMcTool(tool) || CLOSED_MEASUREMENT_TOOLS.has(tool)) {
+    if (isMcTool(tool) || CLOSED_MEASUREMENT_TOOLS.has(tool) || tool === "MeasurementPolylength") {
       // Cloud / Cloud+ : press-drag makes a rectangle cloud (committed on release); a plain
       // click is left to onOverlayClick (polygon vertices).
       if ((tool === "Cloud" || tool === "CloudPlus") && mcVerts.length === 0 && !cloudPlusVerts) {
@@ -2902,9 +2936,14 @@
       // The active set drives the marker colour (→ annotation /C) and symbol, so each
       // category renders distinctly and tallies separately.
       const set = store.activeCountSet;
-      const appearance = set
-        ? { ...store.draftAppearance, color: set.color }
-        : store.draftAppearance;
+      // Clicks in one run (same page and set, no Esc / tool change) are ONE count; a
+      // resumed count carries its label and colour on to the new item.
+      const run = nextRun(store.countRun, pageIndex, set?.id ?? null, () => crypto.randomUUID());
+      store.countRun = run;
+      const appearance = {
+        ...store.draftAppearance,
+        ...(run.color ?? set?.color ? { color: (run.color ?? set?.color)! } : {}),
+      };
       const m = buildMarkup({
         markupType: "MeasurementCount",
         page: pageIndex,
@@ -2915,8 +2954,30 @@
         id: crypto.randomUUID(),
         countSet: set,
       });
+      m.count_group = run.groupId;
+      if (run.subject) m.subject = run.subject;
       m.measurement = meas;
       store.create(m);
+      return;
+    }
+
+    // Polylength: click each vertex; double-click or Enter finishes (open path, 2+ vertices).
+    if (tool === "MeasurementPolylength" && identity) {
+      const p = localPdfFromMouse(e);
+      if (!p || mcVerts.length >= MAX_POLYLENGTH_VERTICES) return;
+      mcVerts = [...mcVerts, p];
+      const vertsForPreview = mcCursor ? [...mcVerts, mcCursor] : mcVerts;
+      if (vertsForPreview.length >= 2) {
+        previewMarkup = buildMarkup({
+          markupType: "MeasurementLength",
+          page: pageIndex,
+          geometry: polylineGeometry(vertsForPreview),
+          appearance: store.draftAppearance,
+          identity,
+          now: new Date().toISOString(),
+          id: "preview",
+        });
+      }
       return;
     }
 
@@ -3100,6 +3161,11 @@
     // finishing.
     if (mcVerts.length > 0) mcVerts = mcVerts.slice(0, -1);
 
+    if (tool === "MeasurementPolylength") {
+      finishPolylength();
+      return;
+    }
+
     // MeasurementArea / MeasurementPerimeter / MeasurementVolume: finish the closed
     // polygon and add the measurement payload. Same gesture as MeasurementArea always
     // was; only the raw_measure/unit/computed_quantity math differs per type (see
@@ -3130,7 +3196,8 @@
     const tool = store.activeTool;
     const isClosedMeasurementTool = CLOSED_MEASUREMENT_TOOLS.has(tool);
     const isAngleTool = tool === "MeasurementAngle";
-    if (!isMcTool(tool) && !isClosedMeasurementTool && !isAngleTool) return;
+    const isPolylengthTool = tool === "MeasurementPolylength";
+    if (!isMcTool(tool) && !isClosedMeasurementTool && !isAngleTool && !isPolylengthTool) return;
     if (mcVerts.length === 0 || !identity) return;
     const p = localPdfFromMouse(e);
     if (!p) return;
@@ -3139,7 +3206,9 @@
     const vertsForPreview = [...mcVerts, p];
     if (vertsForPreview.length >= 2) {
       previewMarkup = buildMarkup({
-        markupType: isClosedMeasurementTool || isAngleTool
+        markupType: isPolylengthTool
+          ? "MeasurementLength"
+          : isClosedMeasurementTool || isAngleTool
           ? (tool as "MeasurementArea" | "MeasurementPerimeter" | "MeasurementVolume" | "MeasurementAngle")
           : (mcType(tool)),
         page: pageIndex,
@@ -3552,6 +3621,10 @@
         try {
           const rec = await addScale(docInfo.doc_id, null, result.ratio, result.unit, result.label, result.precision);
           takeoffStore.addScale(rec);
+          // Bring existing measurements under the new calibration as ONE undo step.
+          if (identity) {
+            store.applyBatch(recomputeAll(store.markups, takeoffStore.scales, identity, new Date().toISOString()));
+          }
         } catch (e) {
           console.error("addScale failed:", e);
         }

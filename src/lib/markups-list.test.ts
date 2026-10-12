@@ -264,3 +264,17 @@ describe("5,000 mark-ups", () => {
     expect(ms1).toBeLessThan(1500);
   });
 });
+
+describe("count groups in the list (docs/count-polylength.md)", () => {
+  const item = (id: string, group: string | null) => {
+    const m = mk(id, { markup_type: "MeasurementCount" });
+    m.count_group = group;
+    m.measurement = { scale_ref: null, raw_measure: 1, unit: "ea", computed_quantity: 1, depth: null, count_value: 1, custom_columns: {} };
+    return m;
+  };
+  it("one row per count carries the group total; ungrouped items stay separate", () => {
+    const rows = buildRows([item("a", "G"), item("b", "G"), item("c", "G"), item("d", null)]);
+    expect(rows.map((r) => [r.id, r.measurement, r.measurementValue])).toEqual([["a", "3", 3], ["d", "1", 1]]);
+    expect(rows.map((r) => r.index)).toEqual([1, 2]);
+  });
+});

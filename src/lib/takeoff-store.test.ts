@@ -84,4 +84,20 @@ describe("TakeoffStore", () => {
     s.cancelCalibration();
     expect(s.calibrationState).toBeNull();
   });
+
+  it("a new calibration of the same target REPLACES the old record (as the backend does)", () => {
+    const s = new TakeoffStore();
+    s.addScale(makeScale("old", 0.001));
+    s.addScale(makeScale("new", 0.002));
+    expect(s.scales.map((r) => r.id)).toEqual(["new"]);
+    expect(s.activeScale?.id).toBe("new");
+  });
+
+  it("a page scale and the document default coexist", () => {
+    const s = new TakeoffStore();
+    s.addScale(makeScale("d"));
+    s.addScale({ ...makeScale("p"), applies_to: { kind: "Page", page: 2 } });
+    s.addScale({ ...makeScale("p2"), applies_to: { kind: "Page", page: 2 } });
+    expect(s.scales.map((r) => r.id).sort()).toEqual(["d", "p2"]);
+  });
 });

@@ -67,14 +67,46 @@ pub struct ScaleStore {
 }
 
 impl ScaleStore {
-    /// Add (or replace by id) a scale record for the given document.
+    /// Add a scale record for the given document. A record replaces any existing one with
+    /// the SAME id or the same `applies_to` target (a recalibration of the same page, or of
+    /// the document default, supersedes the old scale - as the sidecar and the frontend
+    /// store do), so there is never an old scale shadowing the new one.
     pub fn add(&mut self, doc_id: &str, rec: ScaleRecord) {
         let list = self.inner.entry(doc_id.to_string()).or_default();
-        if let Some(pos) = list.iter().position(|r| r.id == rec.id) {
-            list[pos] = rec;
-        } else {
-            list.push(rec);
+        list.retain(|r| r.id != rec.id && r.applies_to != rec.applies_to);
+        list.push(rec);
+    }
+
+    /// True once this document's scales have been loaded (even if it has none).
+    pub fn is_loaded(&self, doc_id: &str) -> bool {
+        self.inner.contains_key(doc_id)
+    }
+
+    /// Replace the document's scales wholesale (used to load the sidecar on open). Later
+    /// duplicates of the same target win, matching `add`.
+    pub fn seed(&mut self, doc_id: &str, recs: Vec<ScaleRecord>) {
+        self.inner.insert(doc_id.to_string(), Vec::new());
+        for r in recs {
+            self.add(doc_id, r);
         }
+    }
+
+    /// Load the document's scales from its sidecar if not loaded yet. A missing or
+    /// unreadable sidecar loads as "no scales" (it is retried after `clear`).
+    pub fn ensure_loaded(&mut self, doc_id: &str, pdf_path: Option<&std::path::Path>) {
+        if self.is_loaded(doc_id) {
+            return;
+        }
+        let recs = pdf_path
+            .and_then(|p| crate::sidecar::load_meta(p).ok())
+            .map(|m| m.scales)
+            .unwrap_or_default();
+        self.seed(doc_id, recs);
+    }
+
+    /// Forget the document's scales (on close); the sidecar remains the source of truth.
+    pub fn clear(&mut self, doc_id: &str) {
+        self.inner.remove(doc_id);
     }
 
     /// Return all scale records for the given document.
@@ -157,5 +189,71 @@ mod tests {
         store.add("doc1", rec);
         assert!(store.delete("doc1", &id));
         assert_eq!(store.list("doc1").len(), 0);
+    }
+
+    #[test]
+    fn add_replaces_a_record_for_the_same_target() {
+        let mut st = ScaleStore::default();
+        st.add("d", make_scale(ScaleTarget::DocumentDefault, 0.001));
+        st.add("d", make_scale(ScaleTarget::Page { page: 2 }, 0.5));
+        let b = make_scale(ScaleTarget::DocumentDefault, 0.002);
+        let b_id = b.id.clone();
+        st.add("d", b);
+        assert_eq!(st.list("d").len(), 2, "one default + one page scale");
+        assert_eq!(st.resolve("d", 0).unwrap().id, b_id, "the new default wins");
+        assert_eq!(st.resolve("d", 2).unwrap().ratio, 0.5);
+    }
+
+    #[test]
+    fn seed_loads_once_and_clear_forgets() {
+        let mut st = ScaleStore::default();
+        assert!(!st.is_loaded("d"));
+        st.seed("d", vec![]);
+        assert!(st.is_loaded("d"), "an empty sidecar still counts as loaded");
+        st.seed(
+            "d",
+            vec![
+                make_scale(ScaleTarget::DocumentDefault, 0.001),
+                make_scale(ScaleTarget::DocumentDefault, 0.003),
+            ],
+        );
+        assert_eq!(st.list("d").len(), 1);
+        assert_eq!(st.resolve("d", 0).unwrap().ratio, 0.003);
+        st.clear("d");
+        assert!(!st.is_loaded("d"));
+    }
+
+    #[test]
+    fn a_reopened_document_gets_its_sidecar_scales_back() {
+        use crate::sidecar::{load_meta, save_meta};
+        let dir = tempfile::tempdir().unwrap();
+        let pdf = dir.path().join("plan.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4").unwrap();
+        // Session 1: calibrate (add_scale persists to the sidecar and the in-memory store).
+        let mut meta = load_meta(&pdf).unwrap();
+        let rec = make_scale(ScaleTarget::DocumentDefault, 0.004);
+        meta.scales.push(rec.clone());
+        save_meta(&pdf, &meta).unwrap();
+        let mut s1 = ScaleStore::default();
+        s1.add("d1", rec.clone());
+        s1.clear("d1"); // close
+        // Session 2: fresh store, same file, new doc id.
+        let mut s2 = ScaleStore::default();
+        s2.ensure_loaded("d2", Some(&pdf));
+        assert_eq!(s2.list("d2"), std::slice::from_ref(&rec));
+        assert_eq!(s2.resolve("d2", 7).unwrap().ratio, 0.004);
+        // Loading is once-per-open: later add() is not clobbered by another ensure_loaded.
+        s2.add("d2", make_scale(ScaleTarget::Page { page: 1 }, 0.5));
+        s2.ensure_loaded("d2", Some(&pdf));
+        assert_eq!(s2.list("d2").len(), 2);
+    }
+
+    #[test]
+    fn ensure_loaded_without_a_sidecar_or_path_is_empty_not_an_error() {
+        let mut st = ScaleStore::default();
+        st.ensure_loaded("a", None);
+        st.ensure_loaded("b", Some(std::path::Path::new("/nonexistent/x.pdf")));
+        assert!(st.list("a").is_empty() && st.list("b").is_empty());
+        assert!(st.is_loaded("a") && st.is_loaded("b"));
     }
 }

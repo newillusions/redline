@@ -222,6 +222,16 @@ pub fn export_markup_schedule(
     store: &MarkupStore,
     p: ExportMarkupScheduleParams,
 ) -> Result<ExportMarkupScheduleResult, String> {
+    export_markup_schedule_with_scales(store, &[], p)
+}
+
+/// [`export_markup_schedule`] with the document's scales, so quantities are recomputed
+/// from `raw_measure` exactly as the `export_markup_list` command does.
+pub fn export_markup_schedule_with_scales(
+    store: &MarkupStore,
+    scales: &[crate::takeoff::ScaleRecord],
+    p: ExportMarkupScheduleParams,
+) -> Result<ExportMarkupScheduleResult, String> {
     let markups = store.list(&p.doc_id)?;
     let src_path = store
         .path(&p.doc_id)
@@ -239,7 +249,9 @@ pub fn export_markup_schedule(
         .ok_or_else(|| "source document has no parent directory".to_string())?;
     let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     let out_path = dir.join(format!("{stem}-markup-schedule-{timestamp}.{ext}"));
-    crate::commands::takeoff::export_markup_list_to(&markups, &out_path, p.format)?;
+    crate::commands::takeoff::export_markup_list_with_scales(
+        &markups, scales, &out_path, p.format,
+    )?;
     Ok(ExportMarkupScheduleResult {
         out_path: out_path.to_string_lossy().into_owned(),
     })

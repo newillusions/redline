@@ -13,6 +13,7 @@
   import { exportMarkupsView, getUserIdentity, isMarkupContentsLocked, isMarkupLocked } from "$lib/ipc";
   import type { MarkupStore } from "$lib/markup-store.svelte";
   import { boundsOf } from "$lib/markup-select";
+  import { expandCountSelection } from "$lib/count-groups";
   import { patchStatus } from "$lib/markup-properties";
   import { exportDoneMessage, exportFormatFromPath } from "$lib/doc-op-flow";
   import {
@@ -99,7 +100,7 @@
     fromList = true;
     // The viewport clears selection whenever the active tool is not "select".
     store.activeTool = "select";
-    store.selectedIds = ids;
+    store.selectedIds = expandCountSelection(store.markups, ids);
   }
 
   function jumpTo(m: Markup) {

@@ -324,6 +324,11 @@ export interface Markup {
   /** Count set this marker belongs to (MeasurementCount only). Absent/null for everything else. */
   count_set?: CountSet | null;
   /**
+   * The count (run of count items) this MeasurementCount item belongs to; items sharing a
+   * value are one count for totals, Resume, Split and Merge. Null/absent = a count of one.
+   */
+  count_group?: string | null;
+  /**
    * Snapshot of the placing Tool's backing visual asset (Stamp/StampDynamic only; mirrors
    * Rust `Markup.stamp_asset`). Set once at placement time so the backend can render the
    * real stamp graphic instead of the bordered-box fallback - see `StampAsset` below.
@@ -439,6 +444,15 @@ export interface ScaleRecord {
   precision: number;
 }
 
+/** A polylength rise/drop vertical run (mirrors Rust `RiseDrop`); both add to the length. */
+export interface RiseDrop {
+  /** Segment index: the segment from vertex `segment` to vertex `segment + 1`. */
+  segment: number;
+  /** Real-world amount in `unit` (rise positive, drop negative by convention). */
+  amount: number;
+  unit: string;
+}
+
 export interface MeasurementPayload {
   scale_ref: string | null;
   raw_measure: number;
@@ -447,6 +461,8 @@ export interface MeasurementPayload {
   depth: number | null;
   count_value: number | null;
   custom_columns: Record<string, string>;
+  /** Polylength rise/drop runs (docs/count-polylength.md); absent/empty otherwise. */
+  rise_drop?: RiseDrop[];
 }
 
 export type ExportFormat = "Xlsx" | "Csv";

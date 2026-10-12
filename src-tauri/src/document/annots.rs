@@ -987,6 +987,7 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
         }
     }
     crate::markup::replies::attach(&mut out, &markup_oids, &raw_replies);
+    crate::takeoff::count::cap_group_sizes(&mut out);
     Ok(out)
 }
 
@@ -2062,6 +2063,7 @@ pub(crate) mod tests {
                 depth,
                 count_value,
                 custom_columns: cols,
+                rise_drop: Vec::new(),
             }
         }
 

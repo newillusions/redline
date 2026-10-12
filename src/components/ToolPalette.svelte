@@ -41,6 +41,7 @@
     { kind: "Note", label: "🗒", title: "Sticky Note (N) - click to place, type the comment" },
     { kind: "calibrate", label: "⚖", title: "Calibrate Scale (two-click)" },
     { kind: "MeasurementLength", label: "↔", title: "Measure Length" },
+    { kind: "MeasurementPolylength", label: "⤳", title: "Measure Polylength (click each vertex, double-click or Enter to finish)" },
     { kind: "MeasurementArea", label: "⬛", title: "Measure Area" },
     { kind: "MeasurementCount", label: "⊕", title: "Count" },
     { kind: "MeasurementPerimeter", label: "⬡", title: "Measure Perimeter (click each vertex, double-click or Enter to finish)" },

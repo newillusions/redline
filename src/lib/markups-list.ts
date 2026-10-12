@@ -142,7 +142,31 @@ export function buildRow(m: Markup, index: number): ListRow {
 }
 
 export function buildRows(markups: readonly Markup[]): ListRow[] {
-  return markups.map((m, i) => buildRow(m, i + 1));
+  // A count is ONE row (docs/count-polylength.md): the first item of each `count_group`
+  // stands for the whole count and shows its total; ungrouped items are rows of their own.
+  const totals = new Map<string, number>();
+  for (const m of markups) {
+    if (m.markup_type === "MeasurementCount" && m.count_group) {
+      totals.set(m.count_group, (totals.get(m.count_group) ?? 0) + (m.measurement?.count_value ?? 1));
+    }
+  }
+  const seen = new Set<string>();
+  const rows: ListRow[] = [];
+  for (const m of markups) {
+    const g = m.markup_type === "MeasurementCount" ? m.count_group : null;
+    if (g) {
+      if (seen.has(g)) continue;
+      seen.add(g);
+      const row = buildRow(m, rows.length + 1);
+      const n = totals.get(g) ?? 1;
+      row.measurement = n.toFixed(0);
+      row.measurementValue = n;
+      rows.push(row);
+    } else {
+      rows.push(buildRow(m, rows.length + 1));
+    }
+  }
+  return rows;
 }
 
 /** Custom column names present in the document (sorted, capped). */

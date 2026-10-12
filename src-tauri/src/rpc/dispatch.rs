@@ -158,7 +158,13 @@ pub async fn dispatch(app: &AppHandle, req: RpcRequest) -> Result<Value, Value> 
         "export_markup_schedule" => {
             let p: tools::ExportMarkupScheduleParams = parse(req.params)?;
             let state = app.state::<AppState>();
-            to_value(tools::export_markup_schedule(&state.markups, p))
+            crate::commands::takeoff::ensure_scales_loaded(&state, &p.doc_id);
+            let scales = state.scales.lock().unwrap().list(&p.doc_id).to_vec();
+            to_value(tools::export_markup_schedule_with_scales(
+                &state.markups,
+                &scales,
+                p,
+            ))
         }
         "create_markup" => {
             let p: tools::CreateMarkupParams = parse(req.params)?;
