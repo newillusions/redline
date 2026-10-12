@@ -1174,6 +1174,8 @@ impl Markup {
             foreign_keys: super::foreign::capture(d),
             source_nm,
             source_rect,
+            source_ref: None,
+            source_popup: None,
         }
     }
 }

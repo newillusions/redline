@@ -567,6 +567,25 @@ pub struct Markup {
     /// icon box (see `appearance::interop_rect`). Set only by the PDF reader.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_rect: Option<[f64; 4]>,
+    /// Which annotation of the PDF this markup was read from (object id + `/NM`). A save
+    /// replaces or removes the original by this, never by `/NM` alone: two unrelated
+    /// annotations may share a name. Set only by the PDF reader; never serialised, so never
+    /// accepted from IPC / MCP input.
+    #[serde(skip)]
+    pub source_ref: Option<SourceRef>,
+    /// The source markup's own pop-up window, rebuilt on write as a fresh `/Popup`
+    /// annotation parented to the rewritten markup. Set only by the PDF reader; never
+    /// serialised.
+    #[serde(skip)]
+    pub source_popup: Option<PopupProps>,
+}
+
+/// The annotation a markup was read from: its indirect object id (`None` for an inline
+/// dictionary in `/Annots`) and its `/NM` at read time.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SourceRef {
+    pub oid: Option<lopdf::ObjectId>,
+    pub nm: Option<String>,
 }
 
 /// Default `/F` annotation flags for a markup redline creates itself: `4` (Print, bit 3
@@ -619,6 +638,8 @@ impl Markup {
             foreign_keys: Vec::new(),
             source_nm: None,
             source_rect: None,
+            source_ref: None,
+            source_popup: None,
         }
     }
 
@@ -633,6 +654,8 @@ impl Markup {
     pub fn has_reader_owned(&self) -> bool {
         self.source_nm.is_some()
             || self.source_rect.is_some()
+            || self.source_ref.is_some()
+            || self.source_popup.is_some()
             || self
                 .workflow
                 .thread
@@ -653,6 +676,8 @@ impl Markup {
     pub fn clear_reader_owned(&mut self) {
         self.source_nm = None;
         self.source_rect = None;
+        self.source_ref = None;
+        self.source_popup = None;
         for r in &mut self.workflow.thread {
             r.nm = None;
             r.extras = None;
@@ -670,6 +695,8 @@ impl Markup {
         self.clear_reader_owned();
         self.source_nm = existing.source_nm.clone();
         self.source_rect = existing.source_rect;
+        self.source_ref = existing.source_ref.clone();
+        self.source_popup = existing.source_popup.clone();
         let replies: std::collections::HashMap<Uuid, &Reply> =
             existing.workflow.thread.iter().map(|r| (r.id, r)).collect();
         for r in &mut self.workflow.thread {

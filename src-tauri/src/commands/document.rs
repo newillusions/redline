@@ -353,7 +353,7 @@ async fn save_inner(
         state.markups.seed_loaded(doc_id, loaded)?;
     }
     let markups = state.markups.list(doc_id)?;
-    let removed = state.markups.removed_names(doc_id);
+    let removed = state.markups.removed_sources(doc_id);
 
     // 1. Stage the complete rewritten file next to the destination. Encrypted source
     //    documents are refused inside save_with_markups (see its doc comment) - lopdf
@@ -441,7 +441,7 @@ async fn save_inner(
 fn apply_edit_and_save(
     src: &std::path::Path,
     markups: &[Markup],
-    removed: &std::collections::HashSet<String>,
+    removed: &std::collections::HashSet<crate::markup::SourceRef>,
     op: impl FnOnce(&mut lopdf::Document) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let mut doc =
@@ -508,7 +508,7 @@ pub(crate) async fn apply_page_edit(
         state.markups.seed_loaded(doc_id, loaded)?;
     }
     let markups = state.markups.list(doc_id)?;
-    let removed = state.markups.removed_names(doc_id);
+    let removed = state.markups.removed_sources(doc_id);
 
     // Apply the op + save in a blocking task.
     let src2 = src.clone();
@@ -614,7 +614,7 @@ fn extract_pages_to_new_file(
     src: &std::path::Path,
     dest: &std::path::Path,
     markups: &[Markup],
-    removed: &std::collections::HashSet<String>,
+    removed: &std::collections::HashSet<crate::markup::SourceRef>,
     page_indices: &[u32],
 ) -> anyhow::Result<()> {
     let mut doc =
@@ -685,7 +685,7 @@ pub async fn extract_pages(
         state.markups.seed_loaded(&doc_id, loaded)?;
     }
     let markups = state.markups.list(&doc_id)?;
-    let removed = state.markups.removed_names(&doc_id);
+    let removed = state.markups.removed_sources(&doc_id);
 
     tokio::task::spawn_blocking(move || {
         extract_pages_to_new_file(&src, &dest, &markups, &removed, &page_indices)

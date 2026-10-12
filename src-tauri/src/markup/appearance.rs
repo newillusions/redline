@@ -1462,6 +1462,8 @@ mod tests {
             foreign_keys: Vec::new(),
             source_nm: None,
             source_rect: None,
+            source_ref: None,
+            source_popup: None,
         }
     }
 

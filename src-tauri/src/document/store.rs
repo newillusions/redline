@@ -34,19 +34,19 @@ pub struct DocEntry {
     /// and - via `commands::docops` - flatten/optimize/redact), since all of those
     /// flush the current markup state to disk exactly like a save does.
     pub dirty: bool,
-    /// Markups deleted this session that carried reader-owned names (`source_nm`, reply and
+    /// Markups deleted this session that carried reader-owned fields (`source_ref`, `source_nm`, reply and
     /// state `nm`), keyed by markup id, so an undo (which re-sends the deleted markup as an
     /// add) gets back exactly the names the PDF reader produced for it - and only those:
     /// `add` never trusts names from its input. Holds only markups this store held, i.e.
     /// reader output for this document. Cleared when the document is closed or reloaded.
     pub tombstones: std::collections::HashMap<Uuid, Markup>,
-    /// Names (`/NM` values: the markup id and any original foreign `source_nm`) of markups
-    /// deleted since the document was loaded. A save passes them to
-    /// `annots::write_markups_removing`: a markup a foreign viewer (Revu, Acrobat) authored
-    /// has no `/RLType`, so absent from the model it would otherwise be kept as foreign and
-    /// the delete would never reach the file. Only names of markups this store held, never
-    /// input. An undo (`add` of the same id) takes them back out. Cleared with `tombstones`.
-    pub removed_names: std::collections::HashSet<String>,
+    /// The source annotations (object id + `/NM`) of markups deleted since the document was
+    /// loaded. A save passes them to `annots::write_markups_removing`: a markup a foreign
+    /// viewer (Revu, Acrobat) authored has no `/RLType`, so absent from the model it would
+    /// otherwise be kept as foreign and the delete would never reach the file. Only refs of
+    /// markups this store held, never input. An undo (`add` of the same id) takes them back
+    /// out. Cleared with `tombstones`.
+    pub removed_sources: std::collections::HashSet<crate::markup::SourceRef>,
 }
 
 /// One open document as reported by [`MarkupStore::list_open`] - the data
@@ -113,7 +113,7 @@ impl MarkupStore {
                 saving: false,
                 dirty: false,
                 tombstones: Default::default(),
-                removed_names: Default::default(),
+                removed_sources: Default::default(),
             },
         );
     }
@@ -231,9 +231,8 @@ impl MarkupStore {
         }
         // Back in the model: no longer a deletion. (The tombstone's names are the ones that
         // were recorded for it; `m` has just adopted exactly those.)
-        e.removed_names.remove(&m.id().to_string());
-        if let Some(nm) = &m.source_nm {
-            e.removed_names.remove(nm);
+        if let Some(r) = &m.source_ref {
+            e.removed_sources.remove(r);
         }
         e.markups.push(m);
         e.dirty = true;
@@ -283,9 +282,8 @@ impl MarkupStore {
         if existing.has_reader_owned() {
             e.tombstones.insert(id, existing.clone());
         }
-        e.removed_names.insert(id.to_string());
-        if let Some(nm) = &existing.source_nm {
-            e.removed_names.insert(nm.clone());
+        if let Some(r) = &existing.source_ref {
+            e.removed_sources.insert(r.clone());
         }
         e.markups.retain(|x| x.id() != id);
         e.dirty = true;
@@ -309,7 +307,7 @@ impl MarkupStore {
         merged.append(&mut e.markups);
         e.markups = merged;
         e.tombstones.clear();
-        e.removed_names.clear();
+        e.removed_sources.clear();
         e.loaded = true;
         Ok(e.markups.clone())
     }
@@ -334,14 +332,14 @@ impl MarkupStore {
         }
     }
 
-    /// Names of markups deleted since load, for `annots::write_markups_removing` (see
-    /// [`DocEntry::removed_names`]). Empty for an unknown doc.
-    pub fn removed_names(&self, doc_id: &str) -> std::collections::HashSet<String> {
+    /// Source annotations of markups deleted since load, for `annots::write_markups_removing`
+    /// (see [`DocEntry::removed_sources`]). Empty for an unknown doc.
+    pub fn removed_sources(&self, doc_id: &str) -> std::collections::HashSet<crate::markup::SourceRef> {
         self.docs
             .lock()
             .unwrap()
             .get(doc_id)
-            .map(|e| e.removed_names.clone())
+            .map(|e| e.removed_sources.clone())
             .unwrap_or_default()
     }
 

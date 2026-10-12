@@ -67,7 +67,7 @@ pub fn save_with_markups_removing(
     src: &Path,
     dest: &Path,
     markups: &[Markup],
-    removed: &HashSet<String>,
+    removed: &HashSet<crate::markup::SourceRef>,
 ) -> Result<()> {
     let mut doc = Document::load(src).with_context(|| format!("load {}", src.display()))?;
     if doc.is_encrypted() {

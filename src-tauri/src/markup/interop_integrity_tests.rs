@@ -131,7 +131,7 @@ fn through_json(m: &Markup, patch: impl FnOnce(&mut serde_json::Value)) -> Marku
 }
 
 fn save_from_store(doc: &mut Document, store: &MarkupStore) {
-    write_markups_removing(doc, &store.list("d").unwrap(), &store.removed_names("d")).unwrap();
+    write_markups_removing(doc, &store.list("d").unwrap(), &store.removed_sources("d")).unwrap();
     *doc = reload(doc);
 }
 
@@ -211,10 +211,10 @@ fn undoing_the_delete_restores_the_markup_once_with_its_original_names() {
     load_into(&store, &doc);
     let sq = find(&store, "square");
     store.delete("d", sq.id()).unwrap();
-    assert!(!store.removed_names("d").is_empty());
+    assert!(!store.removed_sources("d").is_empty());
     store.add("d", through_json(&sq, |_| {})).unwrap();
     assert!(
-        store.removed_names("d").is_empty(),
+        store.removed_sources("d").is_empty(),
         "an undone delete is not a deletion"
     );
     for cycle in 1..=3 {
@@ -246,7 +246,7 @@ fn deleting_an_acrobat_uuid_nm_markup_removes_it_and_its_reply_too() {
 }
 
 #[test]
-fn removed_names_only_ever_come_from_markups_the_store_held() {
+fn removed_sources_only_ever_come_from_markups_the_store_held() {
     let (mut doc, page) = one_page_doc();
     let link = doc.add_object(dictionary! {
         "Type" => "Annot", "Subtype" => "Link", "NM" => Object::string_literal("LINKNAMEFOREIGN01"),
@@ -258,7 +258,7 @@ fn removed_names_only_ever_come_from_markups_the_store_held() {
 
     // Deleting an id the store never held is refused and records nothing.
     assert!(store.delete("d", uuid::Uuid::new_v4()).is_err());
-    assert!(store.removed_names("d").is_empty());
+    assert!(store.removed_sources("d").is_empty());
 
     // A crafted markup claiming the Link's name: add clears the claim, so deleting it later
     // records its own id only.
@@ -268,22 +268,23 @@ fn removed_names_only_ever_come_from_markups_the_store_held() {
     let id = crafted.id();
     store.add("d", crafted).unwrap();
     store.delete("d", id).unwrap();
-    assert_eq!(
-        store.removed_names("d"),
-        HashSet::from([id.to_string()]),
-        "no foreign name recorded"
+    assert!(
+        store.removed_sources("d").is_empty(),
+        "the crafted markup has no source annotation, so nothing foreign is recorded"
     );
     save_from_store(&mut doc, &store);
     assert_eq!(count_of(&doc, "Link"), 1, "the Link survives");
 
     // A very large removal set is plain data: no panic, nothing else touched.
-    let big: HashSet<String> = (0..100_000).map(|i| format!("NAME{i:012}")).collect();
+    let big: HashSet<SourceRef> = (0..100_000)
+        .map(|i| SourceRef { oid: Some((i + 10_000, 0)), nm: Some(format!("NAME{i:012}")) })
+        .collect();
     write_markups_removing(&mut doc, &[], &big).unwrap();
     assert_eq!(count_of(&doc, "Link"), 1);
 }
 
 #[test]
-fn the_file_save_pipeline_applies_the_removed_names() {
+fn the_file_save_pipeline_applies_the_removed_sources() {
     let mut doc = revu_review();
     let dir = tempfile::tempdir().unwrap();
     let (src, dest) = (dir.path().join("in.pdf"), dir.path().join("out.pdf"));
@@ -295,7 +296,7 @@ fn the_file_save_pipeline_applies_the_removed_names() {
         &src,
         &dest,
         &store.list("d").unwrap(),
-        &store.removed_names("d"),
+        &store.removed_sources("d"),
     )
     .unwrap();
     let saved = Document::load(&dest).unwrap();
@@ -820,4 +821,258 @@ fn quadpoints_order_is_resolved_in_the_displayed_frame_on_rotated_pages() {
             assert_eq!(annots(&doc).len(), 2, "rotation {rotation} cycle {cycle}");
         }
     }
+}
+
+// --- 6. object identity: a shared /NM never lets a save touch a non-imported annotation ----
+
+const SHARED: &str = "SHAREDSHAREDSHAR";
+
+fn popup_for(doc: &mut Document, parent: ObjectId, rect: [i64; 4]) -> ObjectId {
+    let popup = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Popup", "F" => 28, "Open" => true,
+        "Rect" => rect.iter().map(|v| Object::Integer(*v)).collect::<Vec<_>>(),
+        "Parent" => Object::Reference(parent),
+    });
+    doc.get_dictionary_mut(parent)
+        .unwrap()
+        .set("Popup", Object::Reference(popup));
+    popup
+}
+
+fn file_attachment(doc: &mut Document, nm: &str) -> ObjectId {
+    doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "FileAttachment", "F" => 4,
+        "NM" => Object::string_literal(nm),
+        "Rect" => vec![200.into(), 10.into(), 220.into(), 30.into()],
+        "Contents" => Object::string_literal("attachment"),
+    })
+}
+
+/// A Revu square (own pop-up, reply, state) whose /NM is shared with three annotations
+/// redline never imports: a FileAttachment (own pop-up) named differently, a reply to that
+/// FileAttachment and a second FileAttachment, both named like the square.
+fn shared_nm_doc() -> Document {
+    let (mut doc, page) = one_page_doc();
+    let sq = square(&mut doc, SHARED, "square");
+    let sq_popup = popup_for(&mut doc, sq, [300, 300, 400, 400]);
+    let sq_reply = note_on(&mut doc, "SQREPLY00000001", sq, "square reply", vec![]);
+    let sq_state = state_on(&mut doc, "SQSTATE000000001", sq, "Accepted");
+    let fa = file_attachment(&mut doc, "FILEATTACH000001");
+    let fa_popup = popup_for(&mut doc, fa, [300, 100, 400, 200]);
+    let fa_reply = note_on(&mut doc, SHARED, fa, "attachment reply", vec![]);
+    let fa2 = file_attachment(&mut doc, SHARED);
+    set_annots(
+        &mut doc,
+        page,
+        &[sq, sq_popup, sq_reply, sq_state, fa, fa_popup, fa_reply, fa2],
+    );
+    doc
+}
+
+/// No dangling `/Popup` or `/Parent`, and no pop-up whose owner does not point back at it.
+fn assert_popups_consistent(doc: &Document, what: &str) {
+    let all = annots(doc);
+    let by_oid: std::collections::HashMap<ObjectId, &Dictionary> =
+        all.iter().filter_map(|(o, d)| o.map(|o| (o, d))).collect();
+    for (oid, d) in &all {
+        if let Ok(Object::Reference(p)) = d.get(b"Popup") {
+            let pd = by_oid.get(p).unwrap_or_else(|| panic!("{what}: dangling /Popup"));
+            assert_eq!(subtype(pd), "Popup", "{what}");
+            assert_eq!(pd.get(b"Parent").unwrap().as_reference().unwrap(), oid.unwrap(), "{what}");
+        }
+        if subtype(d) == "Popup" {
+            let parent = d.get(b"Parent").unwrap().as_reference().unwrap();
+            let owner = by_oid
+                .get(&parent)
+                .unwrap_or_else(|| panic!("{what}: orphaned pop-up"));
+            assert_eq!(
+                owner.get(b"Popup").unwrap().as_reference().unwrap(),
+                oid.unwrap(),
+                "{what}: the owner does not point at its pop-up"
+            );
+        }
+    }
+}
+
+/// The kept, non-imported annotations survive untouched: both FileAttachments, the reply to
+/// the first still answering it, and the first's pop-up still parented to it.
+fn assert_non_imported_intact(doc: &Document, what: &str) {
+    assert_eq!(count_of(doc, "FileAttachment"), 2, "{what}: FileAttachments");
+    let all = annots(doc);
+    let (fa_oid, fa) = all
+        .iter()
+        .find(|(_, d)| text(d, b"NM").as_deref() == Some("FILEATTACH000001"))
+        .map(|(o, d)| (o.unwrap(), d))
+        .unwrap();
+    assert_eq!(subtype(fa), "FileAttachment");
+    assert!(
+        all.iter().any(|(_, d)| subtype(d) == "Text"
+            && text(d, b"Contents").as_deref() == Some("attachment reply")
+            && text(d, b"NM").as_deref() == Some(SHARED)
+            && d.get(b"IRT").ok().and_then(|o| o.as_reference().ok()) == Some(fa_oid)),
+        "{what}: the reply to the FileAttachment"
+    );
+    let popup_ref = fa.get(b"Popup").unwrap().as_reference().unwrap();
+    assert!(
+        all.iter().any(|(o, d)| *o == Some(popup_ref)
+            && d.get(b"Parent").unwrap().as_reference().unwrap() == fa_oid),
+        "{what}: the FileAttachment's pop-up"
+    );
+}
+
+#[test]
+fn a_non_imported_annotation_sharing_an_imported_nm_survives_three_save_cycles() {
+    // A later session each time: fresh load of what was saved.
+    let mut doc = shared_nm_doc();
+    assert_eq!(annots(&doc).len(), 8);
+    for cycle in 1..=3 {
+        let store = new_store();
+        load_into(&store, &doc);
+        assert_eq!(store.list("d").unwrap().len(), 1, "only the square is imported");
+        save_from_store(&mut doc, &store);
+        assert_eq!(annots(&doc).len(), 8, "cycle {cycle}");
+        assert_eq!(count_of(&doc, "Square"), 1, "cycle {cycle}");
+        assert_non_imported_intact(&doc, &format!("cycle {cycle}"));
+        assert_popups_consistent(&doc, &format!("cycle {cycle}"));
+    }
+
+    // One session saving three times: the store keeps the object id of the original, which
+    // the first save replaced.
+    let mut doc = shared_nm_doc();
+    let store = new_store();
+    load_into(&store, &doc);
+    for cycle in 1..=3 {
+        save_from_store(&mut doc, &store);
+        assert_eq!(annots(&doc).len(), 8, "in-session cycle {cycle}");
+        assert_eq!(count_of(&doc, "Square"), 1, "in-session cycle {cycle}");
+        assert_non_imported_intact(&doc, &format!("in-session cycle {cycle}"));
+        assert_popups_consistent(&doc, &format!("in-session cycle {cycle}"));
+    }
+}
+
+#[test]
+fn deleting_an_imported_markup_removes_only_it_and_its_own_replies_states_and_popup() {
+    for in_session_resave in [false, true] {
+        let mut doc = shared_nm_doc();
+        let store = new_store();
+        load_into(&store, &doc);
+        if in_session_resave {
+            // The delete comes after a save that replaced the original.
+            save_from_store(&mut doc, &store);
+        }
+        store.delete("d", find(&store, "square").id()).unwrap();
+        for cycle in 1..=3 {
+            save_from_store(&mut doc, &store);
+            let what = format!("resave={in_session_resave} cycle {cycle}");
+            assert_eq!(count_of(&doc, "Square"), 0, "{what}");
+            // Left: FileAttachment x2, its reply, its pop-up. Gone: square, its reply, its
+            // state, its pop-up.
+            assert_eq!(annots(&doc).len(), 4, "{what}: {:?}", nm_set(&doc));
+            assert_non_imported_intact(&doc, &what);
+            assert_popups_consistent(&doc, &what);
+            assert!(!nm_set(&doc).contains("SQREPLY00000001"), "{what}");
+        }
+    }
+    // A fresh session after the delete is a stable no-op.
+    let mut doc = shared_nm_doc();
+    let store = new_store();
+    load_into(&store, &doc);
+    store.delete("d", find(&store, "square").id()).unwrap();
+    save_from_store(&mut doc, &store);
+    for cycle in 1..=2 {
+        let store = new_store();
+        load_into(&store, &doc);
+        assert!(store.list("d").unwrap().is_empty());
+        save_from_store(&mut doc, &store);
+        assert_eq!(annots(&doc).len(), 4, "reopen cycle {cycle}");
+        assert_non_imported_intact(&doc, &format!("reopen cycle {cycle}"));
+    }
+}
+
+#[test]
+fn undoing_the_delete_of_a_shared_nm_markup_restores_exactly_one_copy() {
+    let mut doc = shared_nm_doc();
+    let store = new_store();
+    load_into(&store, &doc);
+    let sq = find(&store, "square");
+    store.delete("d", sq.id()).unwrap();
+    save_from_store(&mut doc, &store);
+    store.add("d", through_json(&sq, |_| {})).unwrap();
+    for cycle in 1..=3 {
+        save_from_store(&mut doc, &store);
+        assert_eq!(count_of(&doc, "Square"), 1, "cycle {cycle}");
+        assert_eq!(annots(&doc).len(), 8, "cycle {cycle}");
+        assert_non_imported_intact(&doc, &format!("cycle {cycle}"));
+        assert_popups_consistent(&doc, &format!("cycle {cycle}"));
+    }
+}
+
+#[test]
+fn an_annotation_is_only_replaced_by_the_object_it_was_imported_from() {
+    // Same /NM and subtype as the imported square, but not the object the store read: kept.
+    let (mut doc, page) = one_page_doc();
+    let sq = square(&mut doc, SHARED, "imported");
+    let twin = square(&mut doc, SHARED, "not imported");
+    set_annots(&mut doc, page, &[sq]);
+    let store = new_store();
+    load_into(&store, &doc);
+    set_annots(&mut doc, page, &[sq, twin]); // appears after the load (another viewer)
+    for cycle in 1..=3 {
+        save_from_store(&mut doc, &store);
+        let contents: Vec<_> = annots(&doc)
+            .iter()
+            .filter_map(|(_, d)| text(d, b"Contents"))
+            .collect();
+        assert!(contents.contains(&"not imported".to_string()), "cycle {cycle}: {contents:?}");
+    }
+}
+
+#[test]
+fn a_foreign_markups_own_popup_is_kept_over_three_cycles() {
+    let (mut doc, page) = one_page_doc();
+    let sq = square(&mut doc, "RMCTWBEQGCYHWCHZ", "square");
+    let popup = popup_for(&mut doc, sq, [300, 300, 400, 400]);
+    set_annots(&mut doc, page, &[sq, popup]);
+    for cycle in 1..=3 {
+        let ms = read_markups(&doc).unwrap();
+        assert!(ms[0].source_popup.is_some(), "cycle {cycle}");
+        write_markups(&mut doc, &ms).unwrap();
+        doc = reload(&mut doc);
+        assert_eq!(count_of(&doc, "Popup"), 1, "cycle {cycle}: one pop-up, not 0 or 2");
+        assert_eq!(annots(&doc).len(), 2, "cycle {cycle}");
+        assert_popups_consistent(&doc, &format!("cycle {cycle}"));
+        let (_, p) = annots(&doc).into_iter().find(|(_, d)| subtype(d) == "Popup").unwrap();
+        assert_eq!(floats(&p, b"Rect"), vec![300.0, 300.0, 400.0, 400.0]);
+        assert!(matches!(p.get(b"Open"), Ok(Object::Boolean(true))));
+    }
+    // Deleting the markup takes its pop-up with it.
+    let store = new_store();
+    load_into(&store, &doc);
+    store.delete("d", find(&store, "square").id()).unwrap();
+    save_from_store(&mut doc, &store);
+    assert!(annots(&doc).is_empty());
+}
+
+#[test]
+fn source_ref_and_popup_never_come_from_input() {
+    let mut doc = shared_nm_doc();
+    let store = new_store();
+    load_into(&store, &doc);
+    let sq = find(&store, "square");
+    assert!(sq.source_ref.is_some() && sq.source_popup.is_some());
+    let json = serde_json::to_value(&sq).unwrap();
+    assert!(json.get("source_ref").is_none() && json.get("source_popup").is_none());
+
+    // An IPC update keeps the stored refs; an IPC add of a new markup gets none.
+    let edited = through_json(&sq, |v| v["contents"] = "edited".into());
+    assert!(edited.source_ref.is_none());
+    store.update("d", edited).unwrap();
+    assert_eq!(find(&store, "edited").source_ref, sq.source_ref);
+    let fresh = redline_markup(0);
+    let fresh_id = fresh.id();
+    store.add("d", fresh).unwrap();
+    let got = store.list("d").unwrap().into_iter().find(|m| m.id() == fresh_id).unwrap();
+    assert!(got.source_ref.is_none() && got.source_popup.is_none());
+    save_from_store(&mut doc, &store);
+    assert_non_imported_intact(&doc, "after update");
 }

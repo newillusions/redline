@@ -269,6 +269,15 @@ pub(crate) fn with_resolved_popup(doc: &lopdf::Document, mut d: Dictionary) -> D
     d
 }
 
+/// The pop-up window of the annotation `d` as it stands in `doc` (see [`with_resolved_popup`]);
+/// `None` when it has none, or it dangles / is not a pop-up / has a non-finite rectangle.
+pub(crate) fn popup_in(doc: &lopdf::Document, d: &Dictionary) -> Option<PopupProps> {
+    if !d.has(b"Popup") {
+        return None;
+    }
+    popup_of(&with_resolved_popup(doc, d.clone()))
+}
+
 /// What `d` carries beyond the modelled fields (see [`SourceExtras`]); `None` when nothing.
 fn capture_extras(d: &Dictionary, contents: &str) -> Option<SourceExtras> {
     let keys = foreign::capture_in(Scope::Reply, d);

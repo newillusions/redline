@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId};
 
 use crate::geometry::{display_to_true, true_to_display, PdfPoint};
-use crate::markup::{appearance, Markup, MarkupGeometry};
+use crate::markup::{appearance, Markup, MarkupGeometry, SourceRef};
 
 // ---------------------------------------------------------------------------
 // Rotation- and MediaBox-origin-aware coordinate conversion (interop fix, 2026-08-06
@@ -311,15 +311,36 @@ fn parent_ref(d: &Dictionary) -> Option<ObjectId> {
     }
 }
 
-/// True if redline owns this annotation (replace-on-save).
+/// The `/NM` of `d` as the reader and writer compare it (empty = none).
+fn nm_key(d: &Dictionary) -> Option<String> {
+    nm_of(d).filter(|s| !s.is_empty())
+}
+
+/// Where an imported markup came from, for [`SourceRef`] matching on save: the annotation's
+/// object id and `/NM` as they are in the loaded file. `None` when it has neither (nothing
+/// to match by).
+fn source_ref_of(oid: Option<ObjectId>, d: &Dictionary) -> Option<SourceRef> {
+    let nm = nm_key(d);
+    (oid.is_some() || nm.is_some()).then_some(SourceRef { oid, nm })
+}
+
+/// True if redline owns this annotation (replace-on-save): it is redline-authored (carries
+/// `/RLType`), or it is the exact annotation (object id AND `/NM`) a markup of the store
+/// was imported from. A `/NM` alone never makes an annotation ours - names are not unique
+/// across a PDF, and a non-imported annotation (a FileAttachment, a reply to one) sharing an
+/// imported markup's name must survive every save.
 ///
 /// INTENTIONAL ownership stance: any /RLType-bearing annotation is treated as
-/// redline-owned even when its /NM is NOT in the store id set. The store's view is
-/// authoritative on save - callers MUST load existing markups into the store before
-/// saving, or pre-existing redline annotations are (intentionally) replaced by the
-/// store's view. The command layer enforces load-before-save.
-fn is_managed(d: &Dictionary, ids: &std::collections::HashSet<String>) -> bool {
-    d.has(b"RLType") || nm_of(d).map(|nm| ids.contains(&nm)).unwrap_or(false)
+/// redline-owned even when it is not in the store. The store's view is authoritative on
+/// save - callers MUST load existing markups into the store before saving, or
+/// pre-existing redline annotations are (intentionally) replaced by the store's view. The
+/// command layer enforces load-before-save.
+fn is_managed(
+    oid: Option<ObjectId>,
+    d: &Dictionary,
+    sources: &std::collections::HashSet<SourceRef>,
+) -> bool {
+    d.has(b"RLType") || source_ref_of(oid, d).is_some_and(|r| sources.contains(&r))
 }
 
 /// Splice a `StampAsset::BluebeamFormXObject` graph into `doc` as real indirect objects,
@@ -444,7 +465,7 @@ pub(crate) fn build_isolated_form_xobject_pdf(
 fn owned_annotation_ids(
     doc: &Document,
     pages: &std::collections::BTreeMap<u32, ObjectId>,
-    ids: &std::collections::HashSet<String>,
+    sources: &std::collections::HashSet<SourceRef>,
 ) -> Result<std::collections::HashSet<ObjectId>> {
     let mut all: Vec<(Option<ObjectId>, Dictionary)> = Vec::new();
     for page_id in pages.values() {
@@ -463,7 +484,7 @@ fn owned_annotation_ids(
     }
     let mut owned: std::collections::HashSet<ObjectId> = all
         .iter()
-        .filter_map(|(oid, d)| oid.filter(|_| is_managed(d, ids)))
+        .filter_map(|(oid, d)| oid.filter(|_| is_managed(*oid, d, sources)))
         .collect();
     let mut work: Vec<ObjectId> = owned.iter().copied().collect();
     while let Some(parent) = work.pop() {
@@ -568,8 +589,8 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
     write_markups_removing(doc, markups, &std::collections::HashSet::new())
 }
 
-/// [`write_markups`] plus the names (`/NM` values) of markups the user deleted since they
-/// were loaded from this file (`MarkupStore::removed_names`). Those are still in the PDF and
+/// [`write_markups`] plus the names (`SourceRef`s) of markups the user deleted since they
+/// were loaded from this file (`MarkupStore::removed_sources`). Those are still in the PDF and
 /// carry no `/RLType` if a foreign viewer authored them, so without this they would be kept
 /// as "foreign" and the delete would silently not reach the saved file. They are treated as
 /// redline-owned for this save, so they and everything answering them (replies, states) are
@@ -577,16 +598,13 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
 pub(crate) fn write_markups_removing(
     doc: &mut Document,
     markups: &[Markup],
-    removed: &std::collections::HashSet<String>,
+    removed: &std::collections::HashSet<SourceRef>,
 ) -> Result<()> {
-    // Managed = redline-owned. Keyed by both the id and the original foreign /NM, so a
-    // Revu-authored markup (16-char /NM) is replaced on save rather than kept next to its
-    // rewritten copy.
-    let mut ids: std::collections::HashSet<String> = markups
-        .iter()
-        .flat_map(|m| [Some(m.id().to_string()), m.source_nm.clone()])
-        .flatten()
-        .collect();
+    // Managed = redline-owned: redline-authored (/RLType), or the very annotation (object id
+    // and /NM) a store markup was imported from, so a Revu-authored markup is replaced on
+    // save rather than kept next to its rewritten copy. Never matched by /NM alone.
+    let mut ids: std::collections::HashSet<SourceRef> =
+        markups.iter().filter_map(|m| m.source_ref.clone()).collect();
     ids.extend(removed.iter().cloned());
     let pages = doc.get_pages(); // 1-based page no -> page ObjectId
 
@@ -622,14 +640,14 @@ pub(crate) fn write_markups_removing(
             .iter()
             .filter(|(oid, d)| {
                 oid.is_some_and(|o| !owned.contains(&o))
-                    && !is_managed(d, &ids)
+                    && !is_managed(*oid, d, &ids)
                     && subtype(d).as_deref() != Some("Popup")
             })
             .filter_map(|(oid, _)| *oid)
             .collect();
         let mut keep = Vec::new();
         for (oid, dict) in annots {
-            if is_managed(&dict, &ids) || oid.is_some_and(|o| owned.contains(&o)) {
+            if is_managed(oid, &dict, &ids) || oid.is_some_and(|o| owned.contains(&o)) {
                 continue;
             }
             if oid.is_none()
@@ -731,6 +749,12 @@ pub(crate) fn write_markups_removing(
         );
         let parent_rect = rect_of(&dict);
         let aid = doc.add_object(Object::Dictionary(dict));
+        // The source markup's own pop-up: its original was dropped with the original markup
+        // (orphaned), so rebuild it parented to this fresh object.
+        let popup = m
+            .source_popup
+            .as_ref()
+            .and_then(|p| crate::markup::replies::add_popup(doc, aid, page_id, p));
         if let Some(gid) = m.group_id {
             group_members.entry(gid).or_default().push(aid);
         }
@@ -738,6 +762,7 @@ pub(crate) fn write_markups_removing(
             write_workflow_annots(doc, m, aid, page_id, parent_rect, &mut empty_ap);
         if let Some(entries) = kept.get_mut(&page_id) {
             entries.extend(workflow_annots.into_iter().map(Object::Reference));
+            entries.extend(popup.map(Object::Reference));
         }
         // Invariant: phase 1 inserted an entry for every page id in `pages`, and
         // `page_id` came from `pages`, so the lookup cannot miss.
@@ -892,6 +917,8 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
         {
             let mut m = Markup::from_annotation_dict(&dict);
             m.page = page_no_1based - 1;
+            m.source_ref = source_ref_of(c.oid, &dict);
+            m.source_popup = crate::markup::replies::popup_in(doc, &dict);
             // `/IRT`+`/RT /Group` (standards-based, externally visible) takes priority
             // over a bare `/RLGroup` fallback (a prior redline-only save with no group
             // link a foreign viewer can see) whenever both are present - see design doc
