@@ -655,6 +655,68 @@ impl RenderEngine {
         Ok(out)
     }
 
+    /// Re-load an open document with a layer view (see [`RenderCmd::SetLayerView`]). The new
+    /// document is loaded and probed BEFORE the old one is dropped, so a failure leaves the
+    /// current view untouched. Tiles of the document are evicted.
+    pub fn set_layer_view(
+        &mut self,
+        doc_id: &str,
+        view: Option<crate::layers::overlay::OverlayReader>,
+    ) -> Result<()> {
+        let (path, expect_pages) = {
+            let od = self
+                .documents
+                .get(doc_id)
+                .with_context(|| format!("unknown doc_id {doc_id}"))?;
+            (od.path.clone(), od.page_count)
+        };
+        let file_len = std::fs::metadata(&path)
+            .with_context(|| format!("Failed to stat PDF: {:?}", path))?
+            .len();
+        if file_len >= MMAP_LOAD_THRESHOLD {
+            anyhow::bail!("layer views are not available for files this large");
+        }
+        let (doc, backing): (PdfDocument<'static>, Option<Mmap>) = match view {
+            Some(reader) => {
+                let doc = self
+                    .pdfium
+                    .load_pdf_from_reader(reader, None)
+                    .context("Failed to open the PDF with the layer view")?;
+                // SAFETY: as in `load_doc` - the document borrows the engine's bindings,
+                // which outlive every OpenDoc, and owns its reader.
+                (unsafe { std::mem::transmute::<PdfDocument<'_>, PdfDocument<'static>>(doc) }, None)
+            }
+            None => Self::load_doc(&self.pdfium, &path, file_len, None)?,
+        };
+        let page_count = doc.pages().len() as u32;
+        if page_count != expect_pages {
+            anyhow::bail!("the layer view changed the page count");
+        }
+        doc.pages()
+            .get(0)
+            .context("the layer view's first page does not load")?;
+
+        if let Some(mut old) = self.documents.remove(doc_id) {
+            old.page_cache.clear();
+            drop(old);
+        }
+        let mut freed = 0usize;
+        self.tile_cache.retain(|k, v| {
+            if k.doc_id == doc_id {
+                freed += v.0.len();
+                false
+            } else {
+                true
+            }
+        });
+        self.tile_cache_bytes = self.tile_cache_bytes.saturating_sub(freed);
+        self.documents.insert(
+            doc_id.to_string(),
+            OpenDoc::new(doc, backing, path, page_count, self.max_loaded_pages),
+        );
+        Ok(())
+    }
+
     /// Close a document and evict its tiles from cache.
     pub fn close_document(&mut self, doc_id: &str) {
         if let Some(mut doc) = self.documents.remove(doc_id) {
@@ -1493,6 +1555,14 @@ pub enum RenderCmd {
         pixel_tolerance: u8,
         reply: oneshot::Sender<Result<crate::compare::PageDiffResult>>,
     },
+    /// Show `doc_id` with a layer (optional content) view: `Some(reader)` loads the same
+    /// file with an in-memory incremental update appended (`layers::overlay`), `None`
+    /// returns to the file as it is. The open document is kept when the load fails.
+    SetLayerView {
+        doc_id: String,
+        view: Option<crate::layers::overlay::OverlayReader>,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// A `Send + Sync` handle to the render thread.
@@ -1504,6 +1574,10 @@ pub enum RenderCmd {
 #[derive(Clone)]
 pub struct RenderHandle {
     tx: std::sync::Arc<std::sync::mpsc::SyncSender<RenderCmd>>,
+    /// Bumped whenever any document is opened or closed in the engine. A layer view lives in
+    /// the open document, so a reopen (save, page operation, restore) drops it: the layer
+    /// commands compare this to the value their view was applied at and re-apply.
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 // SAFETY: SyncSender is Send + Sync when the message type is Send.
@@ -1641,6 +1715,9 @@ impl RenderHandle {
                             );
                             let _ = reply.send(result);
                         }
+                        RenderCmd::SetLayerView { doc_id, view, reply } => {
+                            let _ = reply.send(engine.set_layer_view(&doc_id, view));
+                        }
                     }
                 }
 
@@ -1650,6 +1727,7 @@ impl RenderHandle {
 
         Ok(Self {
             tx: std::sync::Arc::new(tx),
+            generation: Default::default(),
         })
     }
 
@@ -1673,9 +1751,16 @@ impl RenderHandle {
                 reply: reply_tx,
             })
             .map_err(|_| anyhow::anyhow!("render thread gone"))?;
-        reply_rx
+        let out = reply_rx
             .await
-            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?;
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        out
+    }
+
+    /// See [`RenderHandle::generation`] (the field).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub async fn close_document(&self, doc_id: String) -> Result<()> {
@@ -1686,9 +1771,11 @@ impl RenderHandle {
                 reply: reply_tx,
             })
             .map_err(|_| anyhow::anyhow!("render thread gone"))?;
-        reply_rx
+        let out = reply_rx
             .await
-            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"));
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        out
     }
 
     pub async fn page_count(&self, doc_id: String) -> Result<Option<u32>> {
@@ -1898,6 +1985,21 @@ impl RenderHandle {
             .await
             .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
     }
+
+    /// Show a document with a layer view (`Some`) or as the file is (`None`).
+    pub async fn set_layer_view(
+        &self,
+        doc_id: String,
+        view: Option<crate::layers::overlay::OverlayReader>,
+    ) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(RenderCmd::SetLayerView { doc_id, view, reply: reply_tx })
+            .map_err(|_| anyhow::anyhow!("render thread gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
+    }
 }
 
 /// Send an init-error reply to any command that arrived before PDFium loaded.
@@ -1938,6 +2040,9 @@ fn send_init_error(cmd: RenderCmd, err: &anyhow::Error) {
             let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
         }
         RenderCmd::ComparePages { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+        }
+        RenderCmd::SetLayerView { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
         }
     }

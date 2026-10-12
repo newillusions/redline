@@ -50,6 +50,36 @@ beforeEach(() => {
   try { localStorage.clear(); } catch { /* ignore */ }
 });
 
+describe("MarkupsListPanel layer filter", () => {
+  it("appears only when mark-ups sit on layers, and limits the rows to the ticked layer", async () => {
+    render(MarkupsListPanel, { store: makeStore(data()), docId: "doc1" });
+    expect(screen.queryByTestId("ml-layer-filter")).toBeNull();
+    cleanup();
+    const layered = [
+      mk("a", { layer: "Lighting" }), mk("b", { layer: "Ceiling" }), mk("c"),
+    ];
+    render(MarkupsListPanel, { store: makeStore(layered), docId: "doc1" });
+    const menu = screen.getByTestId("ml-layer-filter");
+    expect(menu.textContent).toContain("Layer");
+    const box = [...menu.querySelectorAll("label")].find((l) => l.textContent?.includes("Lighting"))!.querySelector("input")!;
+    await fireEvent.click(box);
+    await tick();
+    expect(ids()).toEqual(["a"]);
+    expect(screen.getByText("1 of 3")).toBeTruthy();
+  });
+
+  it("two groups with the same name are two entries, told apart by number, and filter separately", async () => {
+    const on = (n: number) => ({ layer: "Lighting", optional_content: { Reference: [n, 0] as [number, number] } });
+    render(MarkupsListPanel, { store: makeStore([mk("a", on(11)), mk("b", on(12))]), docId: "doc1" });
+    const menu = screen.getByTestId("ml-layer-filter");
+    const labels = [...menu.querySelectorAll("label")].map((l) => l.textContent?.trim());
+    expect(labels).toEqual(["Lighting (#11)", "Lighting (#12)"]);
+    await fireEvent.click(menu.querySelectorAll("label input")[1]);
+    await tick();
+    expect(ids()).toEqual(["b"]);
+  });
+});
+
 describe("MarkupsListPanel", () => {
   it("lists every mark-up with the default columns", () => {
     render(MarkupsListPanel, { store: makeStore(data()), docId: "doc1" });

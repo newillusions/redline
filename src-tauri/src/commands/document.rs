@@ -185,6 +185,7 @@ pub async fn close_document(state: State<'_, AppState>, doc_id: String) -> Resul
         .await
         .map_err(|e| format!("{:#}", e))?;
     state.markups.remove(&doc_id);
+    state.layers.remove(&doc_id);
     // Scales live in the sidecar; forget the in-memory copy so a reopen reloads it.
     state.scales.lock().unwrap().clear(&doc_id);
     // Drop a stale `active_doc` pointing at a doc that no longer exists (MCP server

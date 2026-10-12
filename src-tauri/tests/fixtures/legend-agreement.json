@@ -27,7 +27,8 @@
       "color": "#ff0000",
       "set": "A",
       "count_value": 2,
-      "subject": "Downlight A"
+      "subject": "Downlight A",
+      "oc": 7
     },
     {
       "type": "MeasurementCount",
@@ -56,7 +57,8 @@
       "color": "#112233",
       "computed": 10.004,
       "unit": "m",
-      "subject": "Cable"
+      "subject": "Cable",
+      "oc": 7
     },
     {
       "type": "MeasurementLength",
@@ -69,7 +71,8 @@
       "type": "Cloud",
       "page": 0,
       "color": "#ff00ff",
-      "contents": "  revision A "
+      "contents": "  revision A ",
+      "oc": 7
     },
     {
       "type": "Cloud",
@@ -401,6 +404,64 @@
           "pages": "1",
           "matched": 1,
           "color": "#000000"
+        }
+      ]
+    },
+    {
+      "name": "limited to one layer: only mark-ups on that layer are counted, visibility is irrelevant",
+      "legend_page": 0,
+      "props": {
+        "scope": "AllPages",
+        "layer": 7,
+        "entries": [
+          {
+            "key": {
+              "markup_type": "MeasurementCount",
+              "count_set": "A",
+              "color": "#ff0000"
+            }
+          },
+          {
+            "key": {
+              "markup_type": "MeasurementLength",
+              "color": "#112233"
+            }
+          },
+          {
+            "key": {
+              "markup_type": "Cloud",
+              "color": "#ff00ff"
+            }
+          }
+        ]
+      },
+      "rows": [
+        {
+          "entry": 0,
+          "subject": "Downlight A",
+          "description": "",
+          "quantity_text": "2",
+          "unit": "ea",
+          "pages": "1",
+          "matched": 1
+        },
+        {
+          "entry": 1,
+          "subject": "Cable",
+          "description": "",
+          "quantity_text": "10.00",
+          "unit": "m",
+          "pages": "1",
+          "matched": 1
+        },
+        {
+          "entry": 2,
+          "subject": "Cloud",
+          "description": "revision A",
+          "quantity_text": "1",
+          "unit": "ea",
+          "pages": "1",
+          "matched": 1
         }
       ]
     }

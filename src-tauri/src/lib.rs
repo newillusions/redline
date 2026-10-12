@@ -26,6 +26,7 @@ use tauri::Manager;
 mod commands;
 pub mod document;
 pub mod geometry;
+pub mod layers;
 mod identity;
 pub mod license;
 #[cfg(feature = "ocr")]
@@ -85,6 +86,9 @@ pub struct AppState {
     /// and the MCP bridge's `close_document` dispatch arm both clear it when it matches
     /// the closed doc_id).
     pub active_doc: Mutex<Option<String>>,
+    /// Per-document layer (optional content) state: the view-overlay base read from the
+    /// file. See `commands::layers`.
+    pub layers: commands::layers::LayerSessions,
 }
 
 /// Resolve the bundled PDFium library path and export it via `PDFIUM_DYNAMIC_LIB_PATH`
@@ -343,6 +347,7 @@ pub fn run() {
                 toolchest,
                 sequence_counters: SequenceCounters::new(),
                 active_doc: Mutex::new(None),
+                layers: Default::default(),
             });
             // MCP companion bridge (design §2/§5) - started once, after AppState is
             // managed (the bridge dispatches into it), lives for the app's lifetime
@@ -362,6 +367,11 @@ pub fn run() {
             commands::document::open_document,
             commands::document::close_document,
             commands::document::set_active_document,
+            // Layers (optional content)
+            commands::layers::read_layers,
+            commands::layers::set_layer_view,
+            commands::layers::add_layer,
+            commands::layers::save_layers_default,
             commands::document::add_markup,
             commands::document::list_markups,
             commands::document::load_markups,

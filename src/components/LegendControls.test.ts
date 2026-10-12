@@ -7,6 +7,7 @@ import { MarkupStore } from "$lib/markup-store.svelte";
 import type { CountSet, Markup, UserRef } from "$lib/ipc";
 import { computeRows, legendFromCountSets, legendFromSelection, sanitizeLegend } from "$lib/legend";
 import { mk } from "$lib/markups-list.test-util";
+import { dropLayerStore, layerStoreFor } from "$lib/layers-store.svelte";
 
 vi.mock("$lib/ipc", () => ({
   isMarkupLocked: () => false,
@@ -122,6 +123,32 @@ describe("LegendControls: editing a selected legend", () => {
     await fireEvent.change(box, { target: { value: "nonsense" } });
     expect(container.textContent).toMatch(/Enter pages like/);
     expect(legendOf(store).legend!.scope).toEqual({ Pages: [[1, 3], [5, 5]] });
+  });
+
+  it("layer: limits the legend to one layer's mark-ups; hiding a layer in the view does not", async () => {
+    const ls = layerStoreFor("d");
+    ls.model = {
+      layers: [
+        { id: 21, gen: 0, name: "Lighting", default_on: true, locked: false, view_intent: true, usage_view_state: null },
+        { id: 22, gen: 0, name: "Ceiling", default_on: true, locked: false, view_intent: true, usage_view_state: null },
+      ],
+      tree: [], ocmds: [], rb_groups: [], has_ocproperties: true, truncated: false, layers_truncated: false, unlisted: 0,
+      view_supported: true, view_unsupported_reason: null, encrypted: false,
+    };
+    ls.status = "loaded";
+    const { store, container } = withLegend();
+    const sel = container.querySelector('select[data-testid="legend-layer"]') as HTMLSelectElement;
+    expect([...sel.options].map((o) => o.textContent)).toEqual(["All layers", "Lighting", "Ceiling"]);
+    const totalBefore = computeRows(0, sanitizeLegend(legendOf(store).legend), store.markups).length;
+    await fireEvent.change(sel, { target: { value: "21" } });
+    expect(legendOf(store).legend!.layer).toBe(21);
+    // Nothing in the fixture is on layer 21, so every row now counts zero.
+    const rows = computeRows(0, sanitizeLegend(legendOf(store).legend), store.markups);
+    expect(rows.every((r) => r.matched === 0)).toBe(true);
+    expect(totalBefore).toBeGreaterThan(0);
+    store.undo();
+    expect(legendOf(store).legend!.layer ?? null).toBeNull();
+    dropLayerStore("d");
   });
 
   it("row edits: subject and description overrides, hide and show, remove", async () => {

@@ -688,6 +688,18 @@ fn resolve_object(doc: &Document, r: ObjectId) -> Option<&Object> {
     doc.get_object(r).ok()
 }
 
+/// Remove a `/OC` reference that does not point at an optional content group or membership
+/// dictionary (the group was deleted, the model carries a stale number, or a hostile file
+/// pointed it at some other object): a viewer given such a reference may hide the annotation.
+/// Applies to preserved originals and rebuilt markups alike.
+fn drop_dangling_oc(doc: &Document, d: &mut Dictionary) {
+    if let Ok(Object::Reference(r)) = d.get(b"OC") {
+        if !crate::layers::is_oc_target(doc, *r) {
+            d.remove(b"OC");
+        }
+    }
+}
+
 /// The dictionary to write for `m` instead of a rebuilt one, when `m` is an unedited foreign
 /// markup: its original, re-sanitized here (the write boundary) and marked so the next save
 /// still manages the rewritten object. `None` = rebuild from the model.
@@ -707,11 +719,7 @@ fn preserved_original(doc: &Document, m: &Markup, page_id: ObjectId) -> Option<D
     if d.has(b"P") {
         d.set("P", Object::Reference(page_id));
     }
-    if let Ok(Object::Reference(r)) = d.get(b"OC") {
-        if doc.get_object(*r).is_err() {
-            d.remove(b"OC");
-        }
-    }
+    drop_dangling_oc(doc, &mut d);
     d.set(
         crate::markup::foreign::PRESERVED_MARKER,
         Object::Boolean(true),
@@ -897,6 +905,7 @@ pub(crate) fn write_markups_scaled(
             Some(orig) => orig,
             None => m.to_annotation_dict(),
         };
+        drop_dangling_oc(doc, &mut dict);
         if !dict.has(b"AP") {
             let ap_id = add_appearance(doc, m);
             dict.set(
@@ -1142,6 +1151,14 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
             ) && m.stamp_asset.is_none()
             {
                 m.stamp_asset = recover_stamp_asset(doc, &dict);
+            }
+            // A markup on a layer shows that group's CURRENT name (Markups List, exports), not a
+            // stale /RLLayer label from before the group was renamed. Done before the
+            // unedited-foreign baseline is stamped.
+            if let Some(crate::markup::OptionalContent::Reference(n, g)) = &m.optional_content {
+                if let Some(name) = crate::layers::name_of_oc(doc, *n, *g) {
+                    m.layer = Some(name);
+                }
             }
             out.push(m);
         }

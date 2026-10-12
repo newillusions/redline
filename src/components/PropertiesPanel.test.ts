@@ -42,6 +42,11 @@ vi.mock("$lib/ipc", () => ({
 
 import * as ipcMocks from "$lib/ipc";
 
+// Layers: only the read is mocked; documents have no layers unless a test says so.
+const layerIpc = vi.hoisted(() => ({ readLayers: vi.fn() }));
+vi.mock("$lib/layers", async (orig) => ({ ...(await orig<typeof import("$lib/layers")>()), ...layerIpc }));
+import { dropLayerStore } from "$lib/layers-store.svelte";
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -100,6 +105,9 @@ async function mountPanel(store: MarkupStore) {
 
 beforeEach(() => {
   vi.mocked(ipcMocks.getUserIdentity).mockResolvedValue(FAKE_IDENTITY);
+  layerIpc.readLayers.mockReset();
+  layerIpc.readLayers.mockRejectedValue(new Error("no layers in this test"));
+  dropLayerStore("doc1");
 });
 
 // ---------------------------------------------------------------------------
@@ -709,5 +717,82 @@ describe("text mark-up + sticky Note properties", () => {
     const { container } = await mountPanel(store);
     expect(container.querySelector("[data-field='fill_color']")).toBeTruthy();
     expect(container.querySelector("[data-field='line_style']")).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("Layer field when the document has layers", () => {
+  const MODEL = {
+    layers: [
+      { id: 11, gen: 0, name: "Lighting", default_on: true, locked: false, view_intent: true, usage_view_state: null },
+      { id: 12, gen: 0, name: "Ceiling", default_on: true, locked: false, view_intent: true, usage_view_state: null },
+    ],
+    tree: [], ocmds: [], rb_groups: [], has_ocproperties: true, truncated: false, layers_truncated: false, unlisted: 0,
+    view_supported: true, view_unsupported_reason: null, encrypted: false,
+  };
+
+  async function mountWithLayers(store: MarkupStore) {
+    layerIpc.readLayers.mockResolvedValue({ status: "Loaded", model: MODEL });
+    const view = await mountPanel(store);
+    await waitFor(() => expect(view.container.querySelector("select[data-field='layer-choice']")).toBeTruthy());
+    return view;
+  }
+
+  it("offers the document's layers instead of a free-text box, and assigns the /OC reference", async () => {
+    const store = makeStore();
+    store.seed([makeMarkup("m1")]);
+    store.selectedIds = new Set(["m1"]);
+    const { container } = await mountWithLayers(store);
+    expect(container.querySelector("input[data-field='layer']")).toBeNull();
+    const sel = container.querySelector("select[data-field='layer-choice']") as HTMLSelectElement;
+    expect([...sel.options].map((o) => o.textContent)).toEqual(["(none)", "Lighting", "Ceiling"]);
+    expect(sel.value).toBe("");
+
+    sel.value = "12";
+    await fireEvent.change(sel);
+    expect(store.markups[0].optional_content).toEqual({ Reference: [12, 0] });
+    expect(store.markups[0].layer).toBe("Ceiling");
+
+    store.undo();
+    await tick();
+    expect(store.markups[0].optional_content ?? null).toBeNull();
+    expect(store.markups[0].layer ?? null).toBeNull();
+  });
+
+  it("(none) clears both the reference and the name", async () => {
+    const store = makeStore();
+    const m = { ...makeMarkup("m1"), layer: "Lighting", optional_content: { Reference: [11, 0] as [number, number] } };
+    store.seed([m]);
+    store.selectedIds = new Set(["m1"]);
+    const { container } = await mountWithLayers(store);
+    const sel = container.querySelector("select[data-field='layer-choice']") as HTMLSelectElement;
+    expect(sel.value).toBe("11");
+    sel.value = "";
+    await fireEvent.change(sel);
+    expect(store.markups[0].optional_content).toBeNull();
+    expect(store.markups[0].layer).toBeNull();
+  });
+
+  it("a mark-up whose layer is only a label shows it, disabled, until a real layer is chosen", async () => {
+    const store = makeStore();
+    store.seed([{ ...makeMarkup("m1"), layer: "A-DOOR", optional_content: { Text: "A-DOOR" } }]);
+    store.selectedIds = new Set(["m1"]);
+    const { container } = await mountWithLayers(store);
+    const sel = container.querySelector("select[data-field='layer-choice']") as HTMLSelectElement;
+    expect(sel.value).toBe("other");
+    expect(sel.selectedOptions[0].textContent).toBe("A-DOOR");
+    expect(sel.selectedOptions[0].disabled).toBe(true);
+  });
+
+  it("a selection on different layers shows Mixed", async () => {
+    const store = makeStore();
+    store.seed([
+      { ...makeMarkup("m1"), layer: "Lighting", optional_content: { Reference: [11, 0] as [number, number] } },
+      { ...makeMarkup("m2"), layer: "Ceiling", optional_content: { Reference: [12, 0] as [number, number] } },
+    ]);
+    store.selectedIds = new Set(["m1", "m2"]);
+    const { container } = await mountWithLayers(store);
+    const sel = container.querySelector("select[data-field='layer-choice']") as HTMLSelectElement;
+    expect(sel.selectedOptions[0].textContent).toBe("Mixed");
   });
 });

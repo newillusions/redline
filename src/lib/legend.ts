@@ -12,6 +12,7 @@
  */
 import type { Appearance, CountSet, CountSymbol, Markup, MarkupType, UserRef } from "./ipc";
 import { bumpAudit, buildMarkup } from "./markup-tools";
+import { markupOcRef } from "./layers";
 
 export const MAX_ENTRIES = 256;
 export const MAX_ROWS = 512;
@@ -64,6 +65,9 @@ export interface LegendProps {
   show_title: boolean;
   show_headers: boolean;
   scope: LegendScope;
+  /** Count only mark-ups on this layer (the group's object number); null/absent = every layer.
+   *  Layer visibility never changes a legend; this filter does. */
+  layer?: number | null;
   columns: LegendColumn[];
   entries: LegendEntry[];
   auto_count_sets: boolean;
@@ -93,6 +97,7 @@ export function defaultLegendProps(): LegendProps {
     show_title: true,
     show_headers: true,
     scope: "CurrentPage",
+    layer: null,
     columns: ["Symbol", "Subject", "Quantity", "Unit"],
     entries: [],
     auto_count_sets: false,
@@ -186,6 +191,7 @@ export function sanitizeLegend(p: Partial<LegendProps> | null | undefined): Lege
     show_title: src.show_title ?? d.show_title,
     show_headers: src.show_headers ?? d.show_headers,
     scope,
+    layer: Number.isInteger(src.layer) && (src.layer as number) > 0 ? (src.layer as number) : null,
     columns: columns.length > 0 ? columns : d.columns,
     entries,
     auto_count_sets: src.auto_count_sets ?? d.auto_count_sets,
@@ -350,6 +356,7 @@ export function computeRows(legendPage: number, props: LegendProps, markups: rea
   const implicit = new Map<string, Markup[]>();
   for (const m of markups) {
     if (m.markup_type === "Legend" || !inScope(props.scope, legendPage, m.page)) continue;
+    if (props.layer != null && markupOcRef(m) !== props.layer) continue;
     let hit = -1;
     for (let i = 0; i < norms.length; i++) {
       if (matches(norms[i], m)) { hit = i; break; }

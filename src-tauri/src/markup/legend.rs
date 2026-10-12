@@ -148,6 +148,10 @@ pub struct LegendProps {
     pub show_title: bool,
     pub show_headers: bool,
     pub scope: LegendScope,
+    /// Count only mark-ups on this layer (the group's object number); `None` = every layer.
+    /// Layer VISIBILITY never changes a legend: this filter is the only way a layer does.
+    #[serde(default)]
+    pub layer: Option<u32>,
     pub columns: Vec<LegendColumn>,
     pub entries: Vec<LegendEntry>,
     /// Count sets nobody claimed become rows after the explicit entries.
@@ -166,6 +170,7 @@ impl Default for LegendProps {
             show_title: true,
             show_headers: true,
             scope: LegendScope::CurrentPage,
+            layer: None,
             columns: vec![
                 LegendColumn::Symbol,
                 LegendColumn::Subject,
@@ -291,6 +296,7 @@ impl LegendProps {
             show_title: self.show_title,
             show_headers: self.show_headers,
             scope,
+            layer: self.layer.filter(|n| *n > 0),
             columns,
             entries,
             auto_count_sets: self.auto_count_sets,
@@ -653,6 +659,12 @@ pub fn compute_rows(legend_page: u32, props: &LegendProps, markups: &[Markup]) -
     for m in markups {
         if m.markup_type == MarkupType::Legend || !in_scope(&props.scope, legend_page, m.page) {
             continue;
+        }
+        if let Some(layer) = props.layer {
+            if !matches!(m.optional_content, Some(crate::markup::OptionalContent::Reference(n, _)) if n == layer)
+            {
+                continue;
+            }
         }
         if let Some(i) = norms.iter().position(|n| n.matches(m)) {
             claimed[i].push(m);
@@ -1350,6 +1362,9 @@ mod tests {
                 m.appearance.fill = it["fill"].as_str().map(String::from);
                 m.subject = it["subject"].as_str().map(String::from);
                 m.contents = it["contents"].as_str().map(String::from);
+                m.optional_content = it["oc"]
+                    .as_u64()
+                    .map(|n| crate::markup::OptionalContent::Reference(n as u32, 0));
                 m.count_set = it["set"].as_str().map(|k| sets[k].clone());
                 if t == MarkupType::MeasurementCount || it["computed"].is_number() {
                     m.measurement = Some(Measurement {

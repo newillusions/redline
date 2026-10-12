@@ -88,6 +88,7 @@
     translateToolGeometry, extractPromptedLabels, toolPlacementDelta, shiftGeometry,
   } from "$lib/markup-tools";
   import { patchGroup } from "$lib/markup-properties";
+  import { layerStoreFor } from "$lib/layers-store.svelte";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
   import { measureLength, measureArea, measurePerimeter, measureAngleDegrees, formatAngleLabel } from "$lib/measurement-tools";
   import { polylengthPayload, recomputeAll, MAX_POLYLENGTH_VERTICES } from "$lib/polylength";
@@ -543,10 +544,18 @@
     return out;
   });
 
+  // Layers: mark-ups on a layer the view hides are not drawn or hit-tested. The view is
+  // display-only - lists, legends, counts and exports read store.markups, never this.
+  const layerView = $derived(layerStoreFor(docInfo.doc_id));
+  /** The mark-ups of the current page that the layer view shows. */
+  function shownOnPage(): Markup[] {
+    return store.markups.filter((m) => m.page === pageIndex && layerView.isShown(m));
+  }
+
   const pageShapes = $derived.by<SvgShape[]>(() => {
     const previewIds = new Set(dragPreview?.map((m) => m.id) ?? []);
     const committed = store.markups
-      .filter((m) => m.page === pageIndex && !previewIds.has(m.id))
+      .filter((m) => m.page === pageIndex && !previewIds.has(m.id) && layerView.isShown(m))
       .map((m) => markupToSvg(m, viewState, legendRows.get(m.id)));
     const preview = (dragPreview ?? [])
       .filter((m) => m.page === pageIndex)
@@ -597,7 +606,7 @@
   const angleLabels = $derived.by<{ id: string; x: number; y: number; text: string }[]>(() => {
     const labels: { id: string; x: number; y: number; text: string }[] = [];
     for (const m of store.markups) {
-      if (m.page !== pageIndex) continue;
+      if (m.page !== pageIndex || !layerView.isShown(m)) continue;
       const lbl = angleLabelFor(m);
       if (lbl) labels.push(lbl);
     }
@@ -610,7 +619,7 @@
 
   // Markups on the current page that are selected.
   const selectedOnPage = $derived(
-    store.selectedMarkups.filter((m) => m.page === pageIndex),
+    store.selectedMarkups.filter((m) => m.page === pageIndex && layerView.isShown(m)),
   );
 
   // Union bounds of the selection on this page (null when none). Tracks the live
@@ -2290,7 +2299,7 @@
       }
 
       // 2. Hit-test markups on this page (topmost wins).
-      const pageMarkups = store.markups.filter((m) => m.page === pageIndex);
+      const pageMarkups = shownOnPage();
       const hit = hitTest(pageMarkups, p, SELECT_GRAB_PX / zoom);
       if (hit !== null) {
         if (e.shiftKey) {
@@ -2651,7 +2660,7 @@
             minX: Math.min(p0.x, p1.x), minY: Math.min(p0.y, p1.y),
             maxX: Math.max(p0.x, p1.x), maxY: Math.max(p0.y, p1.y),
           };
-          const pageMarkups = store.markups.filter((mm) => mm.page === pageIndex);
+          const pageMarkups = shownOnPage();
           const ids = marqueeHits(pageMarkups, pdfBounds);
           if (marqueeAdditive) {
             const next = new Set(store.selectedIds);
@@ -3152,7 +3161,7 @@
     if (isSelectTool()) {
       const p = localPdfFromMouse(e);
       if (!p || !containerEl) return;
-      const pageMarkups = store.markups.filter((m) => m.page === pageIndex);
+      const pageMarkups = shownOnPage();
       const hit = hitTest(pageMarkups, p, SELECT_GRAB_PX / zoom);
       if (!hit) return;
       const m = store.getById(hit);
@@ -3254,6 +3263,23 @@
   // ---------------------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------------------
+  // Layers: read the file's layers once (small files; larger ones on request in the panel),
+  // and refetch the tiles whenever the rendered layer view changes.
+  $effect(() => {
+    const ls = layerView;
+    if (ls.status === "idle") void ls.load(false);
+  });
+  let seenLayerEpoch = 0;
+  $effect(() => {
+    const e = layerView.epoch;
+    if (e === seenLayerEpoch) return;
+    seenLayerEpoch = e;
+    untrack(() => {
+      invalidateTiles();
+      requestTiles();
+    });
+  });
+
   onMount(() => {
     if (containerEl) {
       resizeObserver = new ResizeObserver(onResize);

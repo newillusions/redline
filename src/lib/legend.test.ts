@@ -25,6 +25,8 @@ const fixture = JSON.parse(
 type Item = {
   type: Markup["markup_type"]; page: number; color: string; fill?: string; set?: string;
   count_value?: number; computed?: number; unit?: string; subject?: string; contents?: string;
+  /** Object number of the layer the mark-up is on (its /OC reference). */
+  oc?: number;
 };
 
 function sets(): Record<string, CountSet> {
@@ -46,6 +48,7 @@ function fromItem(it: Item, i: number): Markup {
     contents: it.contents ?? null,
     count_set: it.set ? sets()[it.set] : null,
     measurement: meas,
+    optional_content: it.oc ? { Reference: [it.oc, 0] } : null,
   } as Partial<Markup>);
 }
 

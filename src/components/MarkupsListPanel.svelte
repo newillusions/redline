@@ -76,6 +76,19 @@
   const cols = $derived(visibleColumns(effective));
   const authors = $derived([...new Set(allRows.map((r) => r.author))].sort());
   const types = $derived([...new Set(allRows.map((r) => r.typeLabel))].sort());
+  /** One entry per layer identity; groups that share a name are told apart by their number. */
+  const layerChoices = $derived.by(() => {
+    const byKey = new Map<string, string>();
+    for (const r of allRows) if (!byKey.has(r.layerKey)) byKey.set(r.layerKey, r.layer);
+    const count = new Map<string, number>();
+    for (const l of byKey.values()) count.set(l, (count.get(l) ?? 0) + 1);
+    return [...byKey]
+      .map(([key, name]) => ({
+        key,
+        label: name === "" ? "(none)" : (count.get(name) ?? 0) > 1 ? `${name} (#${key.slice(3)})` : name,
+      }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  });
   const rows = $derived(sortRows(filterRows(allRows, filter), sort));
   const items = $derived(displayItems(rows, expanded));
   const win = $derived(windowRange(scrollTop, viewportH || FALLBACK_VIEWPORT_H, ROW_H, items.length));
@@ -274,6 +287,17 @@
         {/each}
       </div>
     </details>
+    {#if layerChoices.length > 1 || (layerChoices.length === 1 && layerChoices[0].key !== "name:")}
+      <details class="ml-menu" data-testid="ml-layer-filter">
+        <summary>Layer{filter.layers.size ? ` (${filter.layers.size})` : ""}</summary>
+        <div class="ml-pop">
+          {#each layerChoices as lc (lc.key)}
+            <label><input type="checkbox" checked={filter.layers.has(lc.key)}
+              onchange={() => (filter = { ...filter, layers: toggleIn(filter.layers, lc.key) })} /> {lc.label}</label>
+          {/each}
+        </div>
+      </details>
+    {/if}
     <input
       class="ml-pages"
       type="text"

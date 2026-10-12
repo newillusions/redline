@@ -42,7 +42,13 @@ export function patchCalloutAutosize(m: Markup, on: boolean, by: UserRef, now: s
  */
 export function patchFields(
   m: Markup,
-  patch: { contents?: string | null; subject?: string | null; layer?: string | null },
+  patch: {
+    contents?: string | null;
+    subject?: string | null;
+    layer?: string | null;
+    /** Assign to a layer (or none): the `/OC` reference; set together with `layer` (its name). */
+    optional_content?: Markup["optional_content"];
+  },
   by: UserRef,
   now: string,
 ): Markup {
@@ -50,6 +56,7 @@ export function patchFields(
   if ("contents" in patch) updated.contents = patch.contents ?? null;
   if ("subject" in patch) updated.subject = patch.subject ?? null;
   if ("layer" in patch) updated.layer = patch.layer ?? null;
+  if ("optional_content" in patch) updated.optional_content = patch.optional_content ?? null;
   const fitted = "contents" in patch
     ? refitBox(updated, updated.appearance.font?.size_pt ?? DEFAULT_TEXT_FONT.size_pt)
     : updated;

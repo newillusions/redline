@@ -7,6 +7,7 @@
   import type { MarkupStore } from "$lib/markup-store.svelte";
   import type { Markup, UserRef } from "$lib/ipc";
   import { getPageSize } from "$lib/ipc";
+  import { layerStoreFor } from "$lib/layers-store.svelte";
   import {
     LEGEND_COLUMNS, addMarkupsToLegend, computeRows, formatPageSpec, legendFromSelection, parsePageSpec,
     patchLegend, patchRow, removeRow, sanitizeLegend, type LegendColumn, type LegendRow,
@@ -31,6 +32,13 @@
   let pageError = $state(false);
 
   const def = $derived(legend ? sanitizeLegend(legend.legend) : null);
+
+  // The layers a legend can be limited to (only when the document has layers).
+  const docLayers = $derived(layerStoreFor(store.docId).model?.layers ?? []);
+  function onLayerFilter(e: Event) {
+    const v = (e.target as HTMLSelectElement).value;
+    patch({ layer: v === "" ? null : Number(v) });
+  }
 
   // Rows for the editor: every entry (hidden ones included, so they can be shown again), then
   // the automatic count-set rows. An entry that splits into several rows (one per unit) is one
@@ -187,6 +195,20 @@
         <option value="Custom">Custom range</option>
       </select>
     </label>
+    {#if docLayers.length > 0 || def.layer != null}
+      <label class="field">Layer
+        <select aria-label="Layer" data-testid="legend-layer" value={def.layer == null ? "" : String(def.layer)}
+          onchange={onLayerFilter} disabled={!identity}>
+          <option value="">All layers</option>
+          {#each docLayers as l (l.id)}
+            <option value={String(l.id)}>{l.name}</option>
+          {/each}
+          {#if def.layer != null && !docLayers.some((l) => l.id === def.layer)}
+            <option value={String(def.layer)}>(missing layer)</option>
+          {/if}
+        </select>
+      </label>
+    {/if}
     {#if typeof def.scope === "object"}
       <input type="text" aria-label="Page range" placeholder="1-3, 5, 9" value={pageText}
         class:invalid={pageError} onchange={onPages} disabled={!identity} />

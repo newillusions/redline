@@ -6,6 +6,7 @@
  * Every string here comes from PDF mark-up data and is UNTRUSTED: it is only ever used as
  * text (never HTML) and all work is bounded (see the caps below).
  */
+import { markupOcRef } from "./layers";
 import type { Markup, MarkupStatus } from "./ipc";
 import { latestReviewChange, threadRows } from "./markup-review";
 
@@ -74,6 +75,9 @@ export interface ListRow {
   replies: number;
   colour: string;
   layer: string;
+  /** Identity of the layer for filtering: the group's object number (`oc:N`) when the mark-up
+   *  is on a group, else its label (`name:...`). Two groups with one name stay two entries. */
+  layerKey: string;
   measurement: string;
   measurementValue: number | null;
   statusBy: string;
@@ -133,6 +137,7 @@ export function buildRow(m: Markup, index: number): ListRow {
     replies: m.workflow.thread.length,
     colour: m.appearance.color,
     layer,
+    layerKey: markupOcRef(m) !== null ? `oc:${markupOcRef(m)}` : `name:${layer}`,
     measurement: text,
     measurementValue: value,
     statusBy: clip(change?.author.display_name),
@@ -273,16 +278,18 @@ export interface ListFilter {
   statuses: ReadonlySet<MarkupStatus>;
   authors: ReadonlySet<string>;
   types: ReadonlySet<string>;
+  /** Layer keys (`ListRow.layerKey`); `name:` with nothing after it is the mark-ups on no layer. */
+  layers: ReadonlySet<string>;
   /** Page spec such as `1-3, 7` (1-based). Empty = all pages. */
   pages: string;
 }
 
 export function emptyFilter(): ListFilter {
-  return { text: "", statuses: new Set(), authors: new Set(), types: new Set(), pages: "" };
+  return { text: "", statuses: new Set(), authors: new Set(), types: new Set(), layers: new Set(), pages: "" };
 }
 
 export function isFilterActive(f: ListFilter): boolean {
-  return f.text.trim() !== "" || f.statuses.size > 0 || f.authors.size > 0 || f.types.size > 0 || f.pages.trim() !== "";
+  return f.text.trim() !== "" || f.statuses.size > 0 || f.authors.size > 0 || f.types.size > 0 || f.layers.size > 0 || f.pages.trim() !== "";
 }
 
 /** Parse `1-3, 7` into inclusive ranges; invalid tokens are ignored, at most 50 tokens read. */
@@ -306,6 +313,7 @@ export function filterRows(rows: readonly ListRow[], f: ListFilter): ListRow[] {
     if (f.statuses.size > 0 && !f.statuses.has(r.status)) return false;
     if (f.authors.size > 0 && !f.authors.has(r.author)) return false;
     if (f.types.size > 0 && !f.types.has(r.typeLabel)) return false;
+    if (f.layers.size > 0 && !f.layers.has(r.layerKey)) return false;
     // A page spec with no valid token matches nothing (rather than silently everything).
     if (pageActive && !ranges.some(([a, b]) => r.page >= a && r.page <= b)) return false;
     if (needle && !r.haystack.includes(needle)) return false;

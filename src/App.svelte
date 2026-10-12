@@ -36,6 +36,8 @@
   import PasswordPromptDialog from "./components/PasswordPromptDialog.svelte";
   import DocOpDialog from "./components/DocOpDialog.svelte";
   import VersionPanel from "./components/VersionPanel.svelte";
+  import LayersPanel from "./components/LayersPanel.svelte";
+  import { dropLayerStore, layerStoreFor } from "$lib/layers-store.svelte";
   import ToolbarMenu from "./components/ToolbarMenu.svelte";
   import type { ToolbarMenuItem } from "./components/ToolbarMenu.svelte";
   import { openDocument, closeDocument, setActiveDocument, loadMarkups, listMarkups, listScales, saveDocument, saveDocumentAs, saveDocumentAsRebuild, canRebuildFromOriginal, reloadKeepingMarkups, isDiskChangedError, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, flattenDocument, optimizeDocument, redactDocument, snapshotVersion, exportMarkupList, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity, getPageCount, type ScaleRecord } from "$lib/ipc";
@@ -798,6 +800,7 @@
    */
   async function doCloseTab(docId: string) {
     tabStore.closeTab(docId);
+    dropLayerStore(docId);
     try {
       await closeDocument(docId);
     } catch {
@@ -992,6 +995,7 @@
       tab.store.seed(normaliseMeasurements(await listMarkups(tab.docId), tab.takeoffStore.scales));
       tab.store.dirty = report.applied > 0; // re-applied edits are still unsaved
       await handleThumbnailPageOp();
+      void layerStoreFor(tab.docId).reset(); // the file changed: its layers may have too
       reloadNonce += 1;
       docOpsStatus = `Reloaded the changed file and re-applied ${report.applied} of your edits.`;
       if (report.skipped.length > 0) {
@@ -1118,6 +1122,7 @@
       tab.store.seed(normaliseMeasurements(markups, tab.takeoffStore.scales));
       tab.store.clearDirty();
       await handleThumbnailPageOp();
+      void layerStoreFor(tab.docId).reset(); // the restored file has its own layers
       reloadNonce += 1;
       docOpsStatus = "Version restored from History.";
     } catch (e) {
@@ -1792,6 +1797,30 @@
               />
             {:else}
               <p class="panel-hint muted">Open a PDF to begin.</p>
+            {/if}
+          </Accordion>
+        </div>
+        <!-- Layers: the PDF's optional content groups. Show/hide is a view setting (not
+             written to the file); see docs/layers.md. -->
+        <div class="panel-section panel-section--secondary">
+          <Accordion
+            title="Layers"
+            storageKey="left-layers"
+            bodyClass="panel-body panel-body-flush"
+            testId="accordion-layers"
+          >
+            {#if activeTab}
+              {#key activeTab.docId}
+                <LayersPanel
+                  docId={activeTab.docId}
+                  sync={{
+                    flush: () => activeTab.store.flush(),
+                    clearDirty: () => activeTab.store.clearDirty(),
+                  }}
+                />
+              {/key}
+            {:else}
+              <p class="panel-hint muted">Open a PDF to see its layers.</p>
             {/if}
           </Accordion>
         </div>

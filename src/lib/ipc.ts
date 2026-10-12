@@ -340,7 +340,14 @@ export interface Markup {
   geometry: MarkupGeometry;
   appearance: Appearance;
   subject: string | null;
+  /** Layer name (display / exports). The assignment itself is `optional_content`. */
   layer: string | null;
+  /**
+   * The annotation's `/OC`: a reference to a layer (optional content group) or membership
+   * dictionary, or a plain layer name carried by a Tool Chest tool. Written by redline only
+   * as a reference to a group that exists. Absent/null = on no layer. See `lib/layers.ts`.
+   */
+  optional_content?: { Reference: [number, number] } | { Text: string } | null;
   contents: string | null;
   /** Flat group membership (G8). Markups sharing the same non-null group_id move together. */
   group_id: string | null;

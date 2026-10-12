@@ -56,6 +56,7 @@
     type PageLayout,
   } from "$lib/reading-mode";
   import { BoundedTileCache, DEFAULT_TILE_CACHE_CAP_BYTES } from "$lib/tile-cache";
+  import { layerStoreFor } from "$lib/layers-store.svelte";
 
   // ---------------------------------------------------------------------------
   // Props
@@ -166,15 +167,26 @@
   // ---------------------------------------------------------------------------
   const READING_LOOKAHEAD_PAGES = 1;
 
+  // Layers: the rendered view is shared with the single-page viewer (backend), so a change
+  // there drops these cached pages and refetches the window.
+  const layerView = $derived(layerStoreFor(docInfo.doc_id));
+  let lastLayerEpoch = 0;
+
   $effect(() => {
     if (layout.topsCss.length === 0 || containerHeight <= 0) return;
 
     const win = visiblePageRange(layout, scrollTop, containerHeight, READING_LOOKAHEAD_PAGES);
     const quantized = quantizeZoom(zoom, ZOOM_MIN, ZOOM_MAX);
     const zoomMillis = Math.round(quantized * 1000);
-    const signature = `${win.first}-${win.last}-${zoomMillis}`;
+    const layerEpoch = layerView.epoch;
+    const signature = `${win.first}-${win.last}-${zoomMillis}-${layerEpoch}`;
     if (signature === lastWindowSignature) return;
     lastWindowSignature = signature;
+    if (layerEpoch !== lastLayerEpoch) {
+      lastLayerEpoch = layerEpoch;
+      pageCache.clear();
+      pendingKeys.clear();
+    }
     renderWindow = win;
 
     const windowIndices: number[] = [];
@@ -210,6 +222,7 @@
     }
     if (pendingKeys.has(key)) return;
     pendingKeys.add(key);
+    const epochAtRequest = layerView.epoch;
     try {
       const dims = pageDims[pageIndex];
       if (!dims) return; // size not loaded yet — a later size-load pass will retry
@@ -230,7 +243,7 @@
       };
       // Stale guard: only surface this raster if the page is still in the window that
       // requested it (a slow fetch from a window the user has since scrolled past).
-      if (protectedKeys.has(key)) {
+      if (protectedKeys.has(key) && epochAtRequest === layerView.epoch) {
         pageCache.set(key, raster, protectedKeys);
         rasterByPage = { ...rasterByPage, [pageIndex]: raster };
       }

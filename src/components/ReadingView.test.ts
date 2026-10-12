@@ -11,6 +11,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, fireEvent, waitFor } from "@testing-library/svelte";
 import ReadingView from "./ReadingView.svelte";
+import { dropLayerStore, layerStoreFor } from "$lib/layers-store.svelte";
 
 vi.mock("$lib/ipc", () => ({
   getPageSize: vi.fn(),
@@ -283,5 +284,20 @@ describe("ReadingView — zoom controls", () => {
     const scrollEl = container.querySelector(".reading-scroll") as HTMLDivElement;
     const notCancelled = await fireEvent.wheel(scrollEl, { deltaY: 100 });
     expect(notCancelled).toBe(true);
+  });
+});
+
+describe("ReadingView — layers", () => {
+  it("refetches the pages when the rendered layer view changes", async () => {
+    dropLayerStore("d1");
+    const triggerResize = stubResizeObserver();
+    render(ReadingView, { props: { docInfo: FAKE_DOC } });
+    triggerResize(400, 800);
+    await waitFor(() => expect(vi.mocked(ipcMocks.renderTile)).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 20));
+    const before = vi.mocked(ipcMocks.renderTile).mock.calls.length;
+    layerStoreFor("d1").epoch += 1; // what LayerStore does after the backend applies a view
+    await waitFor(() => expect(vi.mocked(ipcMocks.renderTile).mock.calls.length).toBeGreaterThan(before));
+    dropLayerStore("d1");
   });
 });

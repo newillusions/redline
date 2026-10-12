@@ -42,6 +42,7 @@ No Bluebeam software was decompiled or instrumented. Revu's own legend file form
 | R4 | Creating: **from selection** (ad-hoc: one entry per distinct key among the selected markups) and **from count sets** (the tool-set analogue: one entry per count set, shown with 0 until its first marker; later sets are picked up automatically). Redline's Tool Chest tool sets are not used as legend sources yet. | L3, L4 |
 | R5 | Adding to an existing legend: Properties panel offers "Add to legend" for the selected markups. | L6 (UI placement is our choice) |
 | R6 | Scope: this page, all pages, or a page list (`1-3, 5, 9`; at most 50 tokens). "This page" is the page the legend sits on. The legend itself is never counted. | L10, L13 |
+| R6b | Layer: a legend can be limited to one layer (`layer`, the group's object number); only mark-ups whose `/OC` is that group are counted. Hiding or showing a layer in the view never changes a legend. Shared fixture case "limited to one layer" in both engines. Spec: `docs/layers.md`. | layers brief (2026-10-12) |
 | R7 | Columns, in order, any subset: **Symbol, Subject, Description, Quantity, Unit, Pages**. The Markups List's other columns are not offered (U for demand; follow-up). | L8 |
 | R8 | Subject: the row's override, else the subject of the first matching markup (so a rename in the Markups List shows), else the markup type or count-set name. Description: the row's override, else the first non-empty comment of a matching markup. Per-row override text, and Hide. | L8, L9 (default is **U**, our choice), L14 (hide is our choice) |
 | R9 | Quantity, **the same numbers as the Quantities panel, the Markups List and the exports**: count = sum of `count_value` over the claimed items (equals the sum of the count-group totals of #138); length, perimeter, area, volume = sum of `computed_quantity`; every other markup type = number of markups. Unit = the first claimed markup's measurement unit (`ea` for counts without one, and for non-measurements). Counts print as integers; measurements with 2 decimals (the Markups List formatting). | L1, L2, `docs/count-polylength.md` |
@@ -60,6 +61,7 @@ LegendProps {
   show_title: bool         // default true
   show_headers: bool       // default true
   scope: CurrentPage | AllPages | Pages([[from, to], ...])   // 1-based inclusive, <= 50 ranges
+  layer: Option<u32>       // count only mark-ups on this layer (group object number); None = all
   columns: [Symbol | Subject | Description | Quantity | Unit | Pages]   // ordered, distinct, 1..6
   entries: [LegendEntry]   // <= 256
   auto_count_sets: bool    // unclaimed count sets become rows after the explicit entries

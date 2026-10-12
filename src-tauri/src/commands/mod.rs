@@ -8,6 +8,7 @@ pub mod diag;
 pub mod docops;
 pub mod document;
 pub mod geometry;
+pub mod layers;
 pub mod license;
 pub mod markup_list;
 pub mod ocr;

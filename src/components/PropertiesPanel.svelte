@@ -17,6 +17,8 @@
   import type { MarkupWorkflow } from "$lib/ipc";
   import { patchAddReply, patchDeleteReply } from "$lib/markup-properties";
   import { reviewSummary } from "$lib/markup-review";
+  import { layerStoreFor } from "$lib/layers-store.svelte";
+  import { markupOcRef } from "$lib/layers";
 
   import type { TakeoffStore } from "$lib/takeoff-store.svelte";
   import CountControls from "./CountControls.svelte";
@@ -304,6 +306,35 @@
   function onLayerInput(e: Event) {
     const v = (e.target as HTMLInputElement).value;
     commitFieldPatch({ layer: v || null });
+  }
+
+  // Layers: when the document has layers, the Layer field is a choice of them (the mark-up
+  // gets that layer's /OC); otherwise it stays a free text label.
+  const layerStore = $derived(layerStoreFor(store.docId));
+  const docLayers = $derived(layerStore.model?.layers ?? []);
+  $effect(() => {
+    const ls = layerStore;
+    if (ls.status === "idle") void ls.load(false);
+  });
+  /** "" = none, a layer id, "mixed", or "other" (a label / membership dictionary the list lacks). */
+  function layerChoice(): string {
+    if (selected.length === 0) return "";
+    const picks = selected.map((m) => {
+      const ref = markupOcRef(m);
+      if (ref !== null) return docLayers.some((l) => l.id === ref) ? String(ref) : "other";
+      return m.layer || m.optional_content ? "other" : "";
+    });
+    return picks.every((p) => p === picks[0]) ? picks[0] : "mixed";
+  }
+  function onLayerChoice(e: Event) {
+    const v = (e.target as HTMLSelectElement).value;
+    if (v === "mixed" || v === "other") return;
+    if (v === "") {
+      commitFieldPatch({ layer: null, optional_content: null });
+      return;
+    }
+    const l = docLayers.find((x) => String(x.id) === v);
+    if (l) commitFieldPatch({ layer: l.name, optional_content: { Reference: [l.id, l.gen] } });
   }
 
   // Reply thread + status history (single selection). Replies persist as standard PDF
@@ -633,15 +664,36 @@
 
       <div class="prop-row">
         <label for="prop-layer" class="prop-label">Layer</label>
-        <input
-          id="prop-layer"
-          type="text"
-          data-field="layer"
-          value={layerValue()}
-          oninput={onLayerInput}
-          class="prop-text"
-          placeholder={layerValue() === "" && selected.length > 1 ? "Mixed" : ""}
-        />
+        {#if docLayers.length > 0}
+          <select
+            id="prop-layer"
+            data-field="layer-choice"
+            class="prop-select"
+            value={layerChoice()}
+            onchange={onLayerChoice}
+          >
+            <option value="">(none)</option>
+            {#each docLayers as l (l.id)}
+              <option value={String(l.id)}>{l.name}</option>
+            {/each}
+            {#if layerChoice() === "other"}
+              <option value="other" disabled>{layerValue() || "(other)"}</option>
+            {/if}
+            {#if layerChoice() === "mixed"}
+              <option value="mixed" disabled>Mixed</option>
+            {/if}
+          </select>
+        {:else}
+          <input
+            id="prop-layer"
+            type="text"
+            data-field="layer"
+            value={layerValue()}
+            oninput={onLayerInput}
+            class="prop-text"
+            placeholder={layerValue() === "" && selected.length > 1 ? "Mixed" : ""}
+          />
+        {/if}
       </div>
 
       <div class="prop-row">

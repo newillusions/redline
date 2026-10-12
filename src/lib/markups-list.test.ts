@@ -137,6 +137,18 @@ describe("filtering", () => {
     expect(filterRows(rows, { ...emptyFilter(), types: new Set(["Ellipse"]) }).map((r) => r.id)).toEqual(["c"]);
     expect(filterRows(rows, { ...emptyFilter(), authors: new Set(["Ann"]), statuses: new Set(["Rejected"]) }).map((r) => r.id)).toEqual(["b"]);
   });
+  it("by layer identity: groups with one name stay apart; label-only and no-layer are their own keys", () => {
+    const on = (n: number, name: string) => ({ layer: name, optional_content: { Reference: [n, 0] as [number, number] } });
+    const layered = buildRows([
+      mk("a", on(11, "Lighting")), mk("b", on(12, "Lighting")), mk("c"), mk("d", { layer: "A-DOOR" }),
+    ]);
+    expect(layered.map((r) => r.layerKey)).toEqual(["oc:11", "oc:12", "name:", "name:A-DOOR"]);
+    expect(isFilterActive({ ...emptyFilter(), layers: new Set(["oc:11"]) })).toBe(true);
+    expect(filterRows(layered, { ...emptyFilter(), layers: new Set(["oc:11"]) }).map((r) => r.id)).toEqual(["a"]);
+    expect(filterRows(layered, { ...emptyFilter(), layers: new Set(["oc:12", "name:"]) }).map((r) => r.id)).toEqual(["b", "c"]);
+    expect(filterRows(layered, { ...emptyFilter(), layers: new Set(["name:A-DOOR"]) }).map((r) => r.id)).toEqual(["d"]);
+    expect(filterRows(layered, { ...emptyFilter(), layers: new Set(["oc:11"]), types: new Set(["Ellipse"]) })).toHaveLength(0);
+  });
   it("by page spec", () => {
     expect(filterRows(rows, { ...emptyFilter(), pages: "1" }).map((r) => r.id)).toEqual(["b", "d"]);
     expect(filterRows(rows, { ...emptyFilter(), pages: "2-3, 10" }).map((r) => r.id)).toEqual(["a", "c"]);

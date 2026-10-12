@@ -17,6 +17,11 @@ pub async fn render_tile(
     state: State<'_, AppState>,
     req: TileRequest,
 ) -> Result<RenderedTile, String> {
+    // A layer view lives in the renderer's open document; re-apply it if a save or page
+    // operation reopened the document (no-op unless the user has a layer view).
+    if state.layers.has_view(&req.doc_id) {
+        crate::commands::layers::ensure_view(&state, &req.doc_id).await;
+    }
     state
         .render
         .render_tile(req)

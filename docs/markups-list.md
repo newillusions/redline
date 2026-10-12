@@ -48,6 +48,7 @@ Nothing here comes from decompiling or instrumenting Bluebeam software.
 |---|---|---|
 | "Filter List": pick a column, then criteria | V G-i9S5o-BDw@77-88, c16Kk8Cffcc@417-434 | Filter by Status, Author, Type (multi-tick each) and by page (`1-3, 7`). Facets combine with AND; ticks within one facet are OR |
 | Filter by status, e.g. rejected, on hold | V IfYMI1gVsvo@91-100 | Status facet |
+| Layers appear in the list so mark-ups can be organized and processed by layer | V support.bluebeam.com/user-manual/menus/window/pdf-layers.html | **Layer** facet (shown when any mark-up has a layer), on the Layer column's text (the layer's name, read from the group for mark-ups placed on a layer). Spec: `docs/layers.md` |
 | Free-text search box | V G-i9S5o-BDw@101-111 | Search matches subject, comments, author, type, layer and reply text, case-insensitive. Input capped at 200 characters |
 | A page spec with no valid token | U | Matches nothing (not everything) |
 | The count shows how many rows match | I | "N mark-ups" or "N of M" |

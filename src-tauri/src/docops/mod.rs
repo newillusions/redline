@@ -258,6 +258,7 @@ fn flatten_page(doc: &mut Document, page_id: ObjectId) -> Result<usize> {
         ap_n_id: ObjectId,  // /AP /N appearance stream to bake as Form XObject
         rect: [f64; 4],     // [x0 y0 x1 y1] annotation bounding box (page user space)
         bbox: [f64; 4],     // [bx0 by0 bx1 by1] appearance stream BBox
+        oc: Option<ObjectId>, // the annotation's layer (/OC), carried onto the baked content
     }
 
     let mut targets: Vec<Target> = Vec::new();
@@ -330,11 +331,19 @@ fn flatten_page(doc: &mut Document, page_id: ObjectId) -> Result<usize> {
             continue;
         }
 
+        // A mark-up on a layer flattens onto that layer (ISO 32000-1 8.11.3.3: a form XObject
+        // may carry /OC), so hiding the layer still hides it and it is not made permanent.
+        let oc = match annot_dict.get(b"OC") {
+            Ok(Object::Reference(r)) if matches!(doc.get_object(*r), Ok(Object::Dictionary(_))) => Some(*r),
+            _ => None,
+        };
+
         targets.push(Target {
             annot_id,
             ap_n_id,
             rect,
             bbox,
+            oc,
         });
     }
 
@@ -388,6 +397,13 @@ fn flatten_page(doc: &mut Document, page_id: ObjectId) -> Result<usize> {
 
     // 5. Register each appearance stream as a Form XObject in page /Resources.
     add_xobjects_to_page_resources(doc, page_id, &xobj_entries)?;
+
+    // The baked appearance of a mark-up on a layer is on that layer.
+    for t in &targets {
+        if let (Some(oc), Ok(Object::Stream(s))) = (t.oc, doc.get_object_mut(t.ap_n_id)) {
+            s.dict.set("OC", Object::Reference(oc));
+        }
+    }
 
     // 6. Remove the flattened annotations from page /Annots.
     let flattened_ids: HashSet<ObjectId> = targets.iter().map(|t| t.annot_id).collect();
@@ -1051,6 +1067,27 @@ mod tests {
             page.get(b"Annots").is_err(),
             "/Annots must be absent after all annotations are flattened"
         );
+    }
+
+    #[test]
+    fn flatten_keeps_a_markup_on_its_layer() {
+        let (mut doc, _page_id, annot_id) = doc_with_ap_annotation();
+        let ocg = doc.add_object(dictionary! { "Type" => "OCG", "Name" => Object::string_literal("Lighting") });
+        doc.get_dictionary_mut(annot_id).unwrap().set("OC", ocg);
+        let ap = doc.get_dictionary(annot_id).unwrap().get(b"AP").unwrap().as_dict().unwrap().get(b"N").unwrap().as_reference().unwrap();
+        assert_eq!(flatten_annotations(&mut doc).unwrap(), 1);
+        let Ok(Object::Stream(s)) = doc.get_object(ap) else { panic!("baked form") };
+        assert_eq!(s.dict.get(b"OC").ok().and_then(|o| o.as_reference().ok()), Some(ocg));
+    }
+
+    #[test]
+    fn flatten_does_not_carry_a_dangling_oc() {
+        let (mut doc, _page_id, annot_id) = doc_with_ap_annotation();
+        doc.get_dictionary_mut(annot_id).unwrap().set("OC", Object::Reference((999, 0)));
+        let ap = doc.get_dictionary(annot_id).unwrap().get(b"AP").unwrap().as_dict().unwrap().get(b"N").unwrap().as_reference().unwrap();
+        assert_eq!(flatten_annotations(&mut doc).unwrap(), 1);
+        let Ok(Object::Stream(s)) = doc.get_object(ap) else { panic!("baked form") };
+        assert!(!s.dict.has(b"OC"));
     }
 
     #[test]

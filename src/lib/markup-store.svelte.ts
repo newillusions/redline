@@ -8,6 +8,7 @@ import { isMarkupContentsLocked, isMarkupLocked, type Markup, type Appearance, t
 import { History, CreateCmd, UpdateCmd, DeleteCmd, type MarkupSink, type MirrorOp } from "./markup-commands";
 import type { CountRun } from "./count-groups";
 import { fitLegendGeometry } from "./legend";
+import { onNewMarkup } from "./layers-store.svelte";
 
 /**
  * Up-front lock refusal message for `m`, or `null` if unlocked. Checked BEFORE any
@@ -203,13 +204,13 @@ export class MarkupStore implements MarkupSink {
   }
 
   // --- Mutations (undoable + mirrored) ---
-  create(m: Markup) { this.dirty = true; this.enqueue(this.history.push(new CreateCmd(m))); this.historyVersion++; }
+  create(m: Markup) { m = onNewMarkup(this.docId, m); this.dirty = true; this.enqueue(this.history.push(new CreateCmd(m))); this.historyVersion++; }
 
   /** Create several markups as ONE undo frame (e.g. a Cloud+ : cloud and callout together). */
   createMany(ms: Markup[]) {
     if (ms.length === 0) return;
     this.dirty = true;
-    const ops = this.history.pushBatch(ms.map((m) => new CreateCmd(m)));
+    const ops = this.history.pushBatch(ms.map((m) => new CreateCmd(onNewMarkup(this.docId, m))));
     ops.forEach((op) => this.enqueue(op));
     this.historyVersion++;
   }
