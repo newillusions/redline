@@ -621,6 +621,30 @@ impl Markup {
                 d.set("QuadPoints", flatten_quads(quads));
             }
             MarkupGeometry::Rect { min, max } => {
+                // Text-markup subtypes REQUIRE /QuadPoints (ISO 32000-1 12.5.6.10): a strict
+                // reader (poppler) rejects a Highlight/Underline/StrikeOut/Squiggly without
+                // it. A drag-rectangle markup writes one quad covering the authored rect, in
+                // the TL, TR, BL, BR order used throughout this module. Our own reread keys
+                // off /RLGeom = "rect" first, so this does not change what comes back.
+                if matches!(
+                    t,
+                    MarkupType::Highlight
+                        | MarkupType::Underline
+                        | MarkupType::StrikeOut
+                        | MarkupType::Squiggly
+                ) {
+                    let (x0, x1) = (min.x.min(max.x), min.x.max(max.x));
+                    let (y0, y1) = (min.y.min(max.y), min.y.max(max.y));
+                    d.set(
+                        "QuadPoints",
+                        flatten_quads(&[[
+                            PdfPoint { x: x0, y: y1 },
+                            PdfPoint { x: x1, y: y1 },
+                            PdfPoint { x: x0, y: y0 },
+                            PdfPoint { x: x1, y: y0 },
+                        ]]),
+                    );
+                }
                 // Lossless authored geometry, independent of /Rect - see geometry_from_dict's
                 // "rect" arm doc comment for why /Rect alone is no longer sufficient (it is
                 // now `ap_bbox`, PADDED for every type `interop_rect` doesn't special-case).
@@ -1653,6 +1677,35 @@ mod tests {
 
         assert_eq!(get_name(&d, b"RLGeom").as_deref(), Some("quads"));
         assert_roundtrip(&m);
+    }
+
+    /// #149: the Highlight tool's drag-rectangle output (Rect geometry) must still carry the
+    /// standard /QuadPoints, in the TL, TR, BL, BR order, or strict readers (poppler: "Bad Annot
+    /// Text Markup QuadPoints") reject the annotation. The authored geometry, not the padded
+    /// /Rect, defines the quad, and a reread must still give back the same Rect geometry.
+    #[test]
+    fn rect_highlight_writes_quadpoints_from_authored_rect() {
+        for t in [
+            MarkupType::Highlight,
+            MarkupType::Underline,
+            MarkupType::StrikeOut,
+            MarkupType::Squiggly,
+        ] {
+            let geom = MarkupGeometry::Rect {
+                min: PdfPoint { x: 100.0, y: 200.0 },
+                max: PdfPoint { x: 300.0, y: 230.0 },
+            };
+            let m = fixture(geom, t);
+            let d = m.to_annotation_dict();
+            let qp = get_reals(&d, b"QuadPoints")
+                .unwrap_or_else(|| panic!("{t:?} with Rect geometry must emit /QuadPoints"));
+            assert_eq!(
+                qp,
+                vec![100.0, 230.0, 300.0, 230.0, 100.0, 200.0, 300.0, 200.0],
+                "{t:?}: TL, TR, BL, BR of the authored rect"
+            );
+            assert_roundtrip(&m);
+        }
     }
 
     #[test]
