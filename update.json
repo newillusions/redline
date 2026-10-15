@@ -1,15 +1,15 @@
 {
-  "version": "0.3.26",
-  "notes": "Release v0.3.26",
-  "pub_date": "2026-10-12T15:44:42Z",
+  "version": "0.3.27",
+  "notes": "Release v0.3.27",
+  "pub_date": "2026-10-15T06:29:47Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTbTN6SDFvSTVnWi94dDNUR3U1VnRia3dIQ1N2UXdnUlgvNjZrd3lod3AvRlZLa2dXOGp1ZGJNYUUxVWUrclFiblBabGUzLzlBR0RtMTFTamY2Z2lycUVFVE13cVJZMFF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODE4MzM0CWZpbGU6UmVkbGluZS5hcHAudGFyLmd6CmtUVVpwdlRwMkVVNE11SFgxbmowWU9jWVJDbTZRdDFuU05sSGZ3VDkvRjZNTHpkN1dhNU8vQklMcUhiZDFKbDU1ekd2Tld3VFRxZUkzdmJkS0p2TERBPT0K",
-      "url": "https://forge.mms.name/emittiv/redline/releases/download/v0.3.26/Redline_0.3.26_aarch64.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTbTN6SDFvSTVnWjAxSHNWc0sxT0o5TEdPbG9NTkFGa1VhRnVlZkhlZXh6MlVpUHdBMGJDVEd3cWQ3Q25vc2xPWWcxTlN6L2tEM2pHdVNYeHU4NFlGNUhXUU82dmh2SGcwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMDQ0NDk3CWZpbGU6UmVkbGluZS5hcHAudGFyLmd6Cm9MS0V1aGZMYkttL280MEQ2K2xNV094UVNTc2t3U09MVkl4QzNreDVtcmhJaEh6OU9qQmRaakhjVkJmNUphNHlUek1WaVVwdmUvRWRmbFFrdnZWTUFRPT0K",
+      "url": "https://forge.mms.name/emittiv/redline/releases/download/v0.3.27/Redline_0.3.27_aarch64.app.tar.gz"
     },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTbTN6SDFvSTVnWjZIRmpEVitQZkRYTG9vRDBZL0FCTXFEcmo1MExTZ3VtMTBIWis3L2xxa01QYmVmemdhZGlUaU5mS0w5d2VUWkNhWXl1dWptUHdjeTBLQ21DRzFmOFFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODE5ODYwCWZpbGU6UmVkbGluZV8wLjMuMjZfeDY0LXNldHVwLmV4ZQpzVGtwblZUYktZMCt0a3RTZEtWQnJtWk1YSGZseGh6VEpCanl1azcxMDZWRFlYNjFleFZpbUNxcnYvZEJYQ3FQU2QwWDFtQXN2R054US9VZU83YjFEZz09Cg==",
-      "url": "https://forge.mms.name/emittiv/redline/releases/download/v0.3.26/Redline_0.3.26_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTbTN6SDFvSTVnWjFETnJQaWdHTElmSVdzdjFkWHRWMWlybUxvSEJEL0ZSaW9rQzlXSDdkdzdadnZ4cXdUb3IyakxTUTdaRWpoK3NzMURLZUw0Z29WSmFzOUhHeGYzREFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMDQ1NzcwCWZpbGU6UmVkbGluZV8wLjMuMjdfeDY0LXNldHVwLmV4ZQpERnNBbFBIWlFIQmZWTmY0VGxQK1lJczFjZTBtbHBFb2pDOGFOY1l3UFhudmFKM1BWeDA0TmNIOFVXUzRrV3d0R0I4cTBHZVJFTmp6cFFvWEUvaEpBUT09Cg==",
+      "url": "https://forge.mms.name/emittiv/redline/releases/download/v0.3.27/Redline_0.3.27_x64-setup.exe"
     }
   }
 }
