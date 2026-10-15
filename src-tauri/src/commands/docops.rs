@@ -55,7 +55,8 @@ pub struct OptimizeReport {
 /// # Errors
 ///
 /// Returns an error string if the document is not open, the lopdf parse fails,
-/// or the atomic save/rename fails.
+/// the lopdf parse fails, a page's content cannot be decoded (nothing is written), or the
+/// atomic save/rename fails.
 #[tauri::command]
 pub async fn flatten_document(state: State<'_, AppState>, doc_id: String) -> Result<usize, String> {
     // `apply_page_edit`'s `op` closure is `FnOnce(&mut Document) -> anyhow::Result<()>` -
@@ -78,12 +79,10 @@ pub async fn flatten_document(state: State<'_, AppState>, doc_id: String) -> Res
 ///
 /// Two modes, used together in the toolbar "Apply Redactions" flow:
 ///
-/// 1. **`regions`** (explicit coordinates): each `RedactRegion` overlays a 1×1 solid-black
-///    DeviceGray Image XObject scaled to fill the region rectangle.  Pass an empty slice
-///    when this mode is not needed.
+/// 1. **`regions`** (explicit coordinates): the content under each `RedactRegion` is deleted
+///    from the page and a solid-black box is drawn. Pass an empty slice when not needed.
 /// 2. **`apply_annots`**: when `true`, scan every page for `/Subtype /Redact` annotations,
-///    apply the same Image XObject overlay for each one, and remove the consumed annotations
-///    from `/Annots`.
+///    redact each one's rect the same way, and remove the consumed annotations from `/Annots`.
 ///
 /// Both modes run in a single `apply_page_edit` pass so the file is written once.
 ///
@@ -109,7 +108,26 @@ pub async fn redact_document(
         }
         Ok(())
     })
+    .await?;
+    // Redaction deletes annotations from the file. The in-memory markup store still holds
+    // them, and the next save would write them back (re-leaking their text): drop every
+    // store markup that no longer exists in the redacted file.
+    let path = state
+        .markups
+        .path(&doc_id)
+        .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+    let password = state.markups.password(&doc_id);
+    let on_disk = tokio::task::spawn_blocking(move || {
+        crate::document::save::load_markups_from(&path, password.as_deref())
+    })
     .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| {
+        format!("redaction was written, but the markup list could not be refreshed ({e:#}); reopen the document")
+    })?;
+    let keep: std::collections::HashSet<uuid::Uuid> = on_disk.iter().map(|m| m.id()).collect();
+    state.markups.purge_missing(&doc_id, &keep);
+    Ok(())
 }
 
 /// Optimize the open document (prune unused objects, compress streams, and — when
@@ -476,6 +494,65 @@ mod tests {
                 .len()
                 < 20_000_000
         );
+    }
+
+    /// The exact write path `redact_document` uses: a redaction that cannot be fully
+    /// applied must return Err and leave the file byte-for-byte unchanged.
+    #[test]
+    fn redaction_with_a_residual_errors_and_leaves_the_file_unchanged() {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let font = doc.add_object(
+            dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" },
+        );
+        let form = doc.add_object(Stream::new(
+            dictionary! { "Type" => "XObject", "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 300.into(), 200.into()],
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } } },
+            b"BT /F1 12 Tf 20 150 Td (PINNED) Tj ET".to_vec(),
+        ));
+        let content = doc.add_object(Stream::new(dictionary! {}, b"/Fm Do".to_vec()));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 200.into()],
+            "Contents" => content,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Fm" => form } },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(
+                dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 },
+            ),
+        );
+        // The same form is also reachable from a catalog key the redactor cannot rewrite.
+        let cat = doc
+            .add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id, "Extra" => form });
+        doc.trailer.set("Root", cat);
+        let p = scratch("residual.pdf");
+        doc.save(&p).unwrap();
+        let before = std::fs::read(&p).unwrap();
+        let r = apply_edit_and_save_inner(
+            &p,
+            &[],
+            &Default::default(),
+            &[],
+            |d| {
+                crate::docops::redact_regions(
+                    d,
+                    &[crate::docops::RedactRegion {
+                        page_index: 0,
+                        x: 10.0,
+                        y: 140.0,
+                        width: 280.0,
+                        height: 30.0,
+                    }],
+                )
+            },
+            false,
+        );
+        let e = r.expect_err("must be Err, never Ok");
+        assert!(format!("{e:#}").contains("redaction refused"), "{e:#}");
+        assert_eq!(std::fs::read(&p).unwrap(), before, "file must be unchanged");
     }
 
     /// Real-PDF measurement: `REDLINE_REDUCE_PDFS="a.pdf|b.pdf" cargo test --lib real_pdfs -- --ignored --nocapture`

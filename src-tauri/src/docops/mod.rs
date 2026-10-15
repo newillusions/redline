@@ -34,30 +34,30 @@
 //!
 //! Deep image downsampling is out of scope for the v1 baseline (spec §8).
 //!
-//! # Redact (v1 — lopdf)
+//! # Redact (lopdf, content-stream removal)
 //!
 //! `redact_regions(doc, regions)` / `redact_annotations(doc)`:
 //!
-//! - **`redact_regions`**: for each `RedactRegion`, adds a 1×1 DeviceGray Image XObject
-//!   (solid black pixel) to the page's `/Resources` and appends a content-stream snippet
-//!   that scales it via `cm` to fill the region rectangle.  Called by
-//!   `LopdfDocOps::redact` (bytes interface) and by the `redact_document` Tauri command.
-//! - **`redact_annotations`**: scans every page for `/Subtype /Redact` annotations,
-//!   delegates to `redact_regions`, then removes the consumed annotations from `/Annots`.
-//!   Called by the toolbar "Apply Redactions" command.
+//! - **`redact_regions`**: for each page with regions, `redact_content::strip_page_regions`
+//!   first DELETES what is painted inside the regions from the page content (text glyphs,
+//!   path segments, image pixels, form XObject content, inline images, shadings,
+//!   `/ActualText`, and annotations under the region), then a solid black Image XObject is
+//!   drawn over each region as the visible mark. Orphaned original streams are pruned so the
+//!   removed bytes are not left in the saved file. If a page cannot be decoded the call
+//!   fails and the document is left unchanged for that page.
+//! - **`redact_annotations`**: scans every page for `/Subtype /Redact` annotations, applies
+//!   the same removal + mark for each rect, then removes the consumed annotations.
 //!
-//! **Why Image XObject and not a vector black rectangle?**  PDF text-extraction tools
-//! see through vector shapes (fill operators, coloured rectangles) and can still recover
-//! the underlying text.  A raster Image XObject is opaque to extractors — the pixels
-//! replace the logical text layer.  This is the "rasterize-region safe floor" described
-//! in spec §8.  True vector redaction (removing content-stream operators outright)
-//! requires a mature engine (MuPDF / Apryse) behind the `DocOps` trait.
+//! Verified by `tests/redact_true_removal.rs` (pdftotext must not return the redacted text).
+//! Known limits: see `redact_content.rs` (fonts without width data lose the whole show
+//! operation on the touched line; document Info and XMP metadata are deleted).
 
 use anyhow::{Context, Result};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
 use std::collections::HashSet;
 
 pub mod image_ops;
+pub mod redact_content;
 pub use image_ops::{ImageOptimizeStats, ImageQualityPreset};
 
 // ---------------------------------------------------------------------------
@@ -73,8 +73,7 @@ pub trait DocOps: Send + Sync {
     /// Note: deep image downsampling is out of scope for the v1 free baseline.
     fn optimize(&self, pdf_bytes: &[u8], level: u8) -> Result<Vec<u8>>;
 
-    /// Rasterize-the-region redaction (safe v1 floor — not a drawn black box).
-    /// True vector redaction only via a mature engine behind this trait.
+    /// Remove the content under each region from the page stream, then draw a black box.
     fn redact(&self, pdf_bytes: &[u8], regions: &[RedactRegion]) -> Result<Vec<u8>>;
 }
 
@@ -308,10 +307,10 @@ fn flatten_page(doc: &mut Document, page_id: ObjectId) -> Result<usize> {
 
     // 2. Inspect each annotation and build the list of what can be flattened.
     struct Target {
-        annot_id: ObjectId, // indirect annotation object to remove from /Annots
-        ap_n_id: ObjectId,  // /AP /N appearance stream to bake as Form XObject
-        rect: [f64; 4],     // [x0 y0 x1 y1] annotation bounding box (page user space)
-        bbox: [f64; 4],     // [bx0 by0 bx1 by1] appearance stream BBox
+        annot_id: ObjectId,   // indirect annotation object to remove from /Annots
+        ap_n_id: ObjectId,    // /AP /N appearance stream to bake as Form XObject
+        rect: [f64; 4],       // [x0 y0 x1 y1] annotation bounding box (page user space)
+        bbox: [f64; 4],       // [bx0 by0 bx1 by1] appearance stream BBox
         oc: Option<ObjectId>, // the annotation's layer (/OC), carried onto the baked content
     }
 
@@ -388,7 +387,9 @@ fn flatten_page(doc: &mut Document, page_id: ObjectId) -> Result<usize> {
         // A mark-up on a layer flattens onto that layer (ISO 32000-1 8.11.3.3: a form XObject
         // may carry /OC), so hiding the layer still hides it and it is not made permanent.
         let oc = match annot_dict.get(b"OC") {
-            Ok(Object::Reference(r)) if matches!(doc.get_object(*r), Ok(Object::Dictionary(_))) => Some(*r),
+            Ok(Object::Reference(r)) if matches!(doc.get_object(*r), Ok(Object::Dictionary(_))) => {
+                Some(*r)
+            }
             _ => None,
         };
 
@@ -696,16 +697,9 @@ fn remove_page_annots(
 // Core redact logic (pub so commands::docops can call it directly)
 // ---------------------------------------------------------------------------
 
-/// Apply solid-black Image XObject redaction for the given explicit regions.
-///
-/// For each `RedactRegion` a 1×1 DeviceGray Image XObject (solid black pixel) is added
-/// to the page `/Resources` and a content-stream snippet is appended that scales the
-/// image via `cm` to fill the region rectangle.  As a raster Image XObject, this prevents
-/// text-extraction tools from recovering content below the painted area — unlike a vector
-/// black rectangle, which PDF extractors see through.
-///
-/// The underlying content-stream operators are not removed; true vector redaction requires
-/// a mature engine behind the `DocOps` trait (spec §8).
+/// Redact the given explicit regions: delete the underlying page content (see
+/// `redact_content`), then paint a solid-black 1×1 DeviceGray Image XObject scaled to each
+/// region as the visible mark.
 ///
 /// Called by both:
 /// - `LopdfDocOps::redact` (bytes interface, for the trait / library use)
@@ -724,26 +718,32 @@ pub fn redact_regions(doc: &mut Document, regions: &[RedactRegion]) -> Result<()
 
     // Collect pages first to release the immutable borrow before mutating.
     let pages: Vec<(u32, ObjectId)> = doc.get_pages().into_iter().collect();
+    let mut reports = Vec::new();
     for (page_num_1based, page_id) in pages {
         let page_index = page_num_1based - 1;
         if let Some(page_regions) = by_page.get(&page_index) {
-            redact_page(doc, page_id, page_regions)?;
+            reports.push(redact_page(doc, page_id, page_regions)?);
         }
     }
-    Ok(())
+    // Drop the originals (content streams, images, forms), purge dangling references and
+    // verify nothing that held the redacted content is still reachable.
+    redact_content::finalize(doc, &reports)
 }
 
-/// Scan all pages for `/Subtype /Redact` annotations, overlay each one's rect with a
-/// solid-black Image XObject, and remove the redact annotations from `/Annots`.
+/// Scan all pages for `/Subtype /Redact` annotations, redact each one's rect (content
+/// removal + black mark), and remove the redact annotations from `/Annots`.
 ///
 /// Called by `commands::docops::redact_document` (the toolbar "Apply Redactions" path).
 pub fn redact_annotations(doc: &mut Document) -> Result<()> {
     // Collect page ids first to release the immutable borrow before mutating.
     let page_ids: Vec<ObjectId> = doc.get_pages().values().cloned().collect();
+    let mut reports = Vec::new();
     for page_id in page_ids {
-        redact_annotations_on_page(doc, page_id)?;
+        if let Some(r) = redact_annotations_on_page(doc, page_id)? {
+            reports.push(r);
+        }
     }
-    Ok(())
+    redact_content::finalize(doc, &reports)
 }
 
 /// Apply Image XObject overlays to a single page for the given region slices.
@@ -752,7 +752,18 @@ pub fn redact_annotations(doc: &mut Document) -> Result<()> {
 /// 1. A `solid_black_image_xobject` object registered in the document.
 /// 2. An entry `RLR{i}` in the page `/Resources /XObject` dict.
 /// 3. A `q {w} 0 0 {h} {x} {y} cm /RLR{i} Do Q` operator appended to `/Contents`.
-fn redact_page(doc: &mut Document, page_id: ObjectId, regions: &[&RedactRegion]) -> Result<()> {
+fn redact_page(
+    doc: &mut Document,
+    page_id: ObjectId,
+    regions: &[&RedactRegion],
+) -> Result<redact_content::StripReport> {
+    // Remove the underlying content first; the black box below is only the visible mark.
+    let rects: Vec<redact_content::Rect> = regions
+        .iter()
+        .map(|r| redact_content::Rect::new(r.x, r.y, r.width, r.height))
+        .collect();
+    let report = redact_content::strip_page_regions(doc, page_id, &rects)
+        .context("redaction could not remove the underlying content; nothing was changed")?;
     // Add one Image XObject per region and record its object id.
     let mut image_ids: Vec<ObjectId> = Vec::with_capacity(regions.len());
     for _ in regions {
@@ -783,12 +794,15 @@ fn redact_page(doc: &mut Document, page_id: ObjectId, regions: &[&RedactRegion])
     append_to_page_contents(doc, page_id, overlay_id)?;
     add_xobjects_to_page_resources(doc, page_id, &xobj_entries)?;
 
-    Ok(())
+    Ok(report)
 }
 
 /// Process `/Subtype /Redact` annotations on a single page: overlay their rects with
 /// solid-black Image XObjects, then remove them from `/Annots`.
-fn redact_annotations_on_page(doc: &mut Document, page_id: ObjectId) -> Result<()> {
+fn redact_annotations_on_page(
+    doc: &mut Document,
+    page_id: ObjectId,
+) -> Result<Option<redact_content::StripReport>> {
     // -----------------------------------------------------------------------
     // Read phase — collect Redact annotation rects as owned data.
     // -----------------------------------------------------------------------
@@ -801,15 +815,15 @@ fn redact_annotations_on_page(doc: &mut Document, page_id: ObjectId) -> Result<(
                 let rid = *r;
                 match doc.get_object(rid).and_then(|o| o.as_array()) {
                     Ok(a) => a.clone(),
-                    Err(_) => return Ok(()),
+                    Err(_) => return Ok(None),
                 }
             }
-            _ => return Ok(()), // no /Annots on this page
+            _ => return Ok(None), // no /Annots on this page
         }
     };
 
     if annots_array.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     struct RedactTarget {
@@ -852,7 +866,7 @@ fn redact_annotations_on_page(doc: &mut Document, page_id: ObjectId) -> Result<(
     }
 
     if targets.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     // -----------------------------------------------------------------------
@@ -871,7 +885,7 @@ fn redact_annotations_on_page(doc: &mut Document, page_id: ObjectId) -> Result<(
         .collect();
 
     let region_refs: Vec<&RedactRegion> = regions.iter().collect();
-    redact_page(doc, page_id, &region_refs)?;
+    let report = redact_page(doc, page_id, &region_refs)?;
 
     // -----------------------------------------------------------------------
     // Remove the consumed Redact annotations from /Annots.
@@ -880,14 +894,13 @@ fn redact_annotations_on_page(doc: &mut Document, page_id: ObjectId) -> Result<(
     let redact_ids: HashSet<ObjectId> = targets.iter().map(|t| t.annot_id).collect();
     remove_page_annots(doc, page_id, &redact_ids)?;
 
-    Ok(())
+    Ok(Some(report))
 }
 
 /// A 1×1 DeviceGray Image XObject that renders as solid black.
 ///
 /// Scaled via the `cm` operator to fill the target region in page user space.
-/// As a raster Image XObject, this prevents text-extraction tools from recovering
-/// content beneath it — unlike a vector fill operator, which extractors see through.
+/// The content underneath has already been deleted by `redact_content`; this is the mark.
 fn solid_black_image_xobject() -> Stream {
     Stream::new(
         dictionary! {
@@ -1126,21 +1139,52 @@ mod tests {
     #[test]
     fn flatten_keeps_a_markup_on_its_layer() {
         let (mut doc, _page_id, annot_id) = doc_with_ap_annotation();
-        let ocg = doc.add_object(dictionary! { "Type" => "OCG", "Name" => Object::string_literal("Lighting") });
+        let ocg = doc.add_object(
+            dictionary! { "Type" => "OCG", "Name" => Object::string_literal("Lighting") },
+        );
         doc.get_dictionary_mut(annot_id).unwrap().set("OC", ocg);
-        let ap = doc.get_dictionary(annot_id).unwrap().get(b"AP").unwrap().as_dict().unwrap().get(b"N").unwrap().as_reference().unwrap();
+        let ap = doc
+            .get_dictionary(annot_id)
+            .unwrap()
+            .get(b"AP")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"N")
+            .unwrap()
+            .as_reference()
+            .unwrap();
         assert_eq!(flatten_annotations(&mut doc).unwrap(), 1);
-        let Ok(Object::Stream(s)) = doc.get_object(ap) else { panic!("baked form") };
-        assert_eq!(s.dict.get(b"OC").ok().and_then(|o| o.as_reference().ok()), Some(ocg));
+        let Ok(Object::Stream(s)) = doc.get_object(ap) else {
+            panic!("baked form")
+        };
+        assert_eq!(
+            s.dict.get(b"OC").ok().and_then(|o| o.as_reference().ok()),
+            Some(ocg)
+        );
     }
 
     #[test]
     fn flatten_does_not_carry_a_dangling_oc() {
         let (mut doc, _page_id, annot_id) = doc_with_ap_annotation();
-        doc.get_dictionary_mut(annot_id).unwrap().set("OC", Object::Reference((999, 0)));
-        let ap = doc.get_dictionary(annot_id).unwrap().get(b"AP").unwrap().as_dict().unwrap().get(b"N").unwrap().as_reference().unwrap();
+        doc.get_dictionary_mut(annot_id)
+            .unwrap()
+            .set("OC", Object::Reference((999, 0)));
+        let ap = doc
+            .get_dictionary(annot_id)
+            .unwrap()
+            .get(b"AP")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"N")
+            .unwrap()
+            .as_reference()
+            .unwrap();
         assert_eq!(flatten_annotations(&mut doc).unwrap(), 1);
-        let Ok(Object::Stream(s)) = doc.get_object(ap) else { panic!("baked form") };
+        let Ok(Object::Stream(s)) = doc.get_object(ap) else {
+            panic!("baked form")
+        };
         assert!(!s.dict.has(b"OC"));
     }
 
@@ -1985,9 +2029,11 @@ mod tests {
         let redact_annot_id = doc.add_object(Object::Dictionary(dictionary! {
             "Type" => "Annot",
             "Subtype" => "Redact",
+            // Clear of the Square's /Rect (10..110): annotations under a redaction are
+            // removed with it, this test is about annotations that are not.
             "Rect" => vec![
-                Object::Real(10.0_f32), Object::Real(10.0_f32),
-                Object::Real(80.0_f32), Object::Real(40.0_f32),
+                Object::Real(300.0_f32), Object::Real(300.0_f32),
+                Object::Real(380.0_f32), Object::Real(340.0_f32),
             ],
         }));
         {
@@ -2008,6 +2054,29 @@ mod tests {
             Object::Reference(r) => assert_eq!(*r, square_annot_id),
             _ => panic!("expected reference to square annot"),
         }
+    }
+
+    #[test]
+    fn redact_removes_annotations_under_the_region() {
+        // The Square (10..110) overlaps the region, so its /Contents / appearance would
+        // otherwise leak the redacted content.
+        let (mut doc, page_id, _square) = doc_with_ap_annotation();
+        redact_regions(
+            &mut doc,
+            &[RedactRegion {
+                page_index: 0,
+                x: 20.0,
+                y: 20.0,
+                width: 30.0,
+                height: 30.0,
+            }],
+        )
+        .unwrap();
+        let page = doc.get_dictionary(page_id).unwrap();
+        assert!(
+            page.get(b"Annots").is_err(),
+            "overlapped annotation must be removed"
+        );
     }
 
     // -----------------------------------------------------------------------

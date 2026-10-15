@@ -154,7 +154,7 @@ Validate the importer early against a library of real-world `.btx` files and sta
 - **v1 baseline (free):**
   - flatten — merge annotation appearance streams into page content
   - optimize — strip unused objects + recompress streams (`lopdf`); *note: deep image downsampling is out of scope for the free baseline*
-  - redact — **rasterize-the-region fallback** (safe, removes underlying data, lossy/non-searchable in that region)
+  - redact — **content-stream removal** (2026-10-15): text glyphs, path segments, image pixels, form XObjects, inline images, shadings and annotations inside the region are deleted from the page content, then a black box is drawn. Verified with `pdftotext` (src-tauri/tests/redact_true_removal.rs). Limits: fonts without `/Widths` and non-Identity-H Type0 fonts lose the whole show operation on the touched line; the structure tree, document Info, XMP and all bookmarks are deleted and form-field values/appearances repeating removed text are cleared (matched ignoring case and punctuation, verified after clearing; a field value with no textual or numeric overlap with the redacted region is inherently undetectable and left) (refusing when removed text is undecodable and field values exist); the call refuses (nothing written) if any original holding the content is still reachable
 - **Pluggable backend (later):** MuPDF (commercial license) or Apryse Advanced for true vector redaction + high-quality image-downsampling optimization. Slots in behind the same trait; no caller changes.
 
 > Rationale: true redaction and deep file-size reduction (image downsampling) are correctness-/liability-sensitive and painful to hand-roll. The trait keeps v1 at zero cost while making the upgrade a drop-in.
@@ -176,7 +176,7 @@ Open multiple PDFs and navigate them as one ordered **Set** (a plan issue / draw
 ## 11. Key risks & mitigations
 
 - **Large-file performance (DEEP-DIVE REQUIRED — explore early, before building on top)** → Large drawing sets are in scope **from the outset**, so the memory + rendering strategy must be proven early in the dev process, not deferred. Approach: tiled render + bounded tile cache + streaming (never fully load 100s-MB files into memory). Treat as a **dedicated M1 spike**: on the largest *real* plan sets, measure peak memory, tile-render latency at each zoom level, and cache-eviction behavior — and prove the budget holds — *before* layering markup/takeoff on top. Make-or-break gate. (Tracked as a KB task assigned to redline; concrete acceptance criteria in §20.)
-- **Redaction correctness** → never ship a drawn "black box"; rasterize fallback is the v1 safe floor; real redaction only via mature engine
+- **Redaction correctness** → never ship a drawn "black box" alone; v1 removes the underlying content from the page stream (`docops/redact_content.rs`) and fails closed (error, file unchanged) when a page cannot be decoded
 - **Annotation round-trip fidelity** → serialize to standard PDF annotations; verify in Bluebeam/Acrobat
 - **Compare alignment accuracy** → start manual; validate on real plan revisions
 - **Snapping needs vector geometry** → vector-snap precision works on vector PDFs (CAD/Revit exports); scanned/raster plans have no geometry to snap to (Bluebeam shares this limit) → fall back to calibrated manual placement. **Raster corner/edge-detection snapping is explicitly post-v1** (decided 2026-06-06, §12/§14); the v1 scanned-plan story is OCR-for-search + manual placement.

@@ -604,6 +604,16 @@ impl MarkupStore {
         Ok(())
     }
 
+    /// Drop every in-memory markup whose id is not in `keep`. Used after redaction, which
+    /// deletes annotations from the file: a stale store copy would otherwise be written
+    /// back (re-leaking the redacted content) by the next save.
+    pub fn purge_missing(&self, doc_id: &str, keep: &std::collections::HashSet<Uuid>) {
+        let mut g = self.docs.lock().unwrap();
+        if let Some(e) = g.get_mut(doc_id) {
+            e.markups.retain(|m| keep.contains(&m.id()));
+        }
+    }
+
     /// Reorder markups (Arrange: bring to front / send to back / forward / backward). The
     /// store's order IS the z-order and the order they are written to the page's `/Annots`.
     ///
