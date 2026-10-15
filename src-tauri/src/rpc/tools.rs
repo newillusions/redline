@@ -455,8 +455,35 @@ pub struct ReduceFileSizeParams {
     pub doc_id: String,
     #[serde(default)]
     pub level: Option<u8>,
+    /// Omitted = `balanced` (same as the GUI default). `"none"` skips raster recompression.
     #[serde(default)]
-    pub image_preset: Option<crate::docops::ImageQualityPreset>,
+    pub image_preset: Option<ReducePreset>,
+}
+
+/// Accepts the lowercase names and the capitalised ones the tool schema used to advertise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum ReducePreset {
+    #[serde(rename = "high", alias = "High")]
+    High,
+    #[serde(rename = "balanced", alias = "Balanced")]
+    Balanced,
+    #[serde(rename = "small", alias = "Small")]
+    Small,
+    #[serde(rename = "none", alias = "None")]
+    None,
+}
+
+impl ReducePreset {
+    /// Map the optional tool parameter to the pipeline's preset: omitted -> Balanced.
+    pub fn resolve(p: Option<ReducePreset>) -> Option<crate::docops::ImageQualityPreset> {
+        use crate::docops::ImageQualityPreset as Q;
+        match p.unwrap_or(ReducePreset::Balanced) {
+            ReducePreset::High => Some(Q::High),
+            ReducePreset::Balanced => Some(Q::Balanced),
+            ReducePreset::Small => Some(Q::Small),
+            ReducePreset::None => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +828,19 @@ mod phase2b_param_tests {
             "MCP compare_pages summary must not carry the base64 PNG overlay"
         );
         assert_eq!(v["changed_pct"], 0.0);
+    }
+
+    #[test]
+    fn mcp_preset_accepts_schema_values_and_defaults_to_balanced() {
+        for (v, want) in [("high", Some(crate::docops::ImageQualityPreset::High)), ("High", Some(crate::docops::ImageQualityPreset::High)), ("balanced", Some(crate::docops::ImageQualityPreset::Balanced)), ("Small", Some(crate::docops::ImageQualityPreset::Small)), ("none", None)] {
+            let p: ReduceFileSizeParams = serde_json::from_value(serde_json::json!({"doc_id":"d","image_preset":v})).unwrap();
+            assert_eq!(ReducePreset::resolve(p.image_preset), want, "{v}");
+        }
+        let p: ReduceFileSizeParams = serde_json::from_value(serde_json::json!({"doc_id":"d"})).unwrap();
+        assert_eq!(ReducePreset::resolve(p.image_preset), Some(crate::docops::ImageQualityPreset::Balanced));
+        // The engine-level enum accepts both spellings too.
+        let q: crate::docops::ImageQualityPreset = serde_json::from_value(serde_json::json!("Balanced")).unwrap();
+        assert_eq!(q, crate::docops::ImageQualityPreset::Balanced);
     }
 
     #[test]

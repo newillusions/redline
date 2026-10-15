@@ -624,6 +624,7 @@ fn apply_edit_and_save(
 
 /// [`apply_edit_and_save`] with the document's scales, so legend tables are computed from
 /// quantities recomputed under them (see `annots::write_markups_scaled`).
+#[cfg(test)]
 pub(crate) fn apply_edit_and_save_scaled(
     src: &std::path::Path,
     markups: &[Markup],
@@ -631,6 +632,21 @@ pub(crate) fn apply_edit_and_save_scaled(
     scales: &[crate::takeoff::ScaleRecord],
     op: impl FnOnce(&mut lopdf::Document) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    apply_edit_and_save_inner(src, markups, removed, scales, op, false).map(|_| ())
+}
+
+/// [`apply_edit_and_save_scaled`] that can refuse to replace the file: with
+/// `only_if_smaller` the rewritten file is renamed over `src` only when it is strictly
+/// smaller than `src`, otherwise the temp file is discarded and `Ok(false)` returned
+/// (the original is untouched). Returns `Ok(true)` when the file was replaced.
+pub(crate) fn apply_edit_and_save_inner(
+    src: &std::path::Path,
+    markups: &[Markup],
+    removed: &std::collections::HashSet<crate::markup::SourceRef>,
+    scales: &[crate::takeoff::ScaleRecord],
+    op: impl FnOnce(&mut lopdf::Document) -> anyhow::Result<()>,
+    only_if_smaller: bool,
+) -> anyhow::Result<bool> {
     let mut doc =
         lopdf::Document::load(src).with_context(|| format!("load {}", src.display()))?;
     // Page ops rewrite the file the same way save_with_markups does (full lopdf
@@ -653,15 +669,22 @@ pub(crate) fn apply_edit_and_save_scaled(
         std::process::id(),
         uuid::Uuid::new_v4().simple()
     ));
-    let result = (|| -> anyhow::Result<()> {
+    let result = (|| -> anyhow::Result<bool> {
         let f = doc
             .save(&tmp)
             .with_context(|| format!("write {}", tmp.display()))?;
         f.sync_all().context("fsync temp")?;
+        if only_if_smaller {
+            let new_len = f.metadata().context("stat temp")?.len();
+            let old_len = std::fs::metadata(src).context("stat source")?.len();
+            if new_len >= old_len {
+                return Ok(false);
+            }
+        }
         std::fs::rename(&tmp, src).context("atomic rename")?;
-        Ok(())
+        Ok(true)
     })();
-    if result.is_err() {
+    if !matches!(result, Ok(true)) {
         let _ = std::fs::remove_file(&tmp);
     }
     result
@@ -690,6 +713,21 @@ pub(crate) async fn apply_page_edit_keeping_history(
     op: impl FnOnce(&mut lopdf::Document) -> anyhow::Result<()> + Send + 'static,
     keep_nav_history: bool,
 ) -> Result<(), String> {
+    apply_page_edit_opts(state, doc_id, op, keep_nav_history, false)
+        .await
+        .map(|_| ())
+}
+
+/// [`apply_page_edit_keeping_history`] with `only_if_smaller` (see
+/// [`apply_edit_and_save_inner`]). Returns `Ok(false)` when the rewrite was discarded: the
+/// file on disk, the render engine and the markup dirty state are then all untouched.
+pub(crate) async fn apply_page_edit_opts(
+    state: &State<'_, AppState>,
+    doc_id: &str,
+    op: impl FnOnce(&mut lopdf::Document) -> anyhow::Result<()> + Send + 'static,
+    keep_nav_history: bool,
+    only_if_smaller: bool,
+) -> Result<bool, String> {
     let src = state
         .markups
         .path(doc_id)
@@ -719,12 +757,15 @@ pub(crate) async fn apply_page_edit_keeping_history(
 
     // Apply the op + save in a blocking task.
     let src2 = src.clone();
-    tokio::task::spawn_blocking(move || {
-        apply_edit_and_save_scaled(&src2, &markups, &removed, &scales, op)
+    let written = tokio::task::spawn_blocking(move || {
+        apply_edit_and_save_inner(&src2, &markups, &removed, &scales, op, only_if_smaller)
     })
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("{e:#}"))?;
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))?;
+    if !written {
+        return Ok(false);
+    }
 
     // Reload the render engine so new page geometry is reflected in tile renders.
     state
@@ -749,7 +790,7 @@ pub(crate) async fn apply_page_edit_keeping_history(
     if !keep_nav_history {
         state.nav_history.lock().unwrap().remove(doc_id);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Rotate a page by `degrees` (multiple of 90, incremental/cumulative).

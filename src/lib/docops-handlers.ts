@@ -77,3 +77,53 @@ export function formatBytes(bytes: number): string {
   } while (Math.abs(value) >= 1024 && unitIndex < units.length - 1);
   return `${value.toFixed(1)} ${units[unitIndex]}`;
 }
+
+/** Subset of the backend `OptimizeReport` the summary line needs (structural, so this file
+ *  stays free of ipc imports). */
+export interface OptimiseReportLike {
+  bytes_before: number;
+  bytes_after: number;
+  outcome?: "reduced" | "no_gain";
+  image_stats: {
+    images_total: number;
+    images_recompressed: number;
+    images_downsampled: number;
+    skip_reasons?: Record<string, number>;
+    streams_recompressed?: number;
+  };
+}
+
+const SKIP_REASON_LABELS: Record<string, string> = {
+  "image-mask": "1-bit image masks",
+  "filter-unsupported": "unsupported image encodings (e.g. CCITT, JBIG2, LZW)",
+  "colorspace-unsupported": "unsupported colour spaces",
+  "not-smaller": "already compact (re-encoding was not smaller)",
+};
+
+/**
+ * The Optimise result line. "Reduced" only when the byte delta is real; otherwise it says
+ * the file was left unchanged and why, never "already optimal" for a file that merely
+ * contains content the optimiser cannot shrink.
+ */
+export function optimiseSummary(report: OptimiseReportLike): string {
+  const saved = report.bytes_before - report.bytes_after;
+  const { images_recompressed, images_downsampled, images_total, skip_reasons } = report.image_stats;
+  const imageNote =
+    images_total > 0 && images_recompressed > 0
+      ? ` (${images_recompressed} of ${images_total} image${images_total === 1 ? "" : "s"} recompressed, ${images_downsampled} downsampled)`
+      : "";
+  if (report.outcome === "reduced" && saved > 0) {
+    return `Optimise complete - file size reduced from ${formatBytes(report.bytes_before)} to ${formatBytes(report.bytes_after)} (saved ${formatBytes(saved)})${imageNote}.`;
+  }
+  const reasons = Object.entries(skip_reasons ?? {})
+    .filter(([, n]) => n > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, n]) => `${n} ${SKIP_REASON_LABELS[k] ?? k}`);
+  const why =
+    reasons.length > 0
+      ? ` Images left alone: ${reasons.join("; ")}.`
+      : images_total === 0
+        ? " The file has no raster images; its remaining content (vector drawing data, fonts) is already compressed."
+        : "";
+  return `No size reduction - the optimiser could not make this file smaller, so it was left unchanged (${formatBytes(report.bytes_before)}).${why}`;
+}

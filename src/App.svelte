@@ -80,7 +80,7 @@
     resolveSearchShortcut,
     resolveViewerModeToggleShortcut,
   } from "$lib/keyboard-shortcuts";
-  import { runDocOpAndReseed, formatBytes } from "$lib/docops-handlers";
+  import { runDocOpAndReseed, optimiseSummary } from "$lib/docops-handlers";
   import {
     baseName,
     samePath,
@@ -1204,17 +1204,7 @@
         { loadMarkups },
         () => optimizeDocument(docId, 2, imageQualityPreset),
       );
-      const saved = report.bytes_before - report.bytes_after;
-      const { images_recompressed, images_downsampled, images_total } = report.image_stats;
-      const imageNote =
-        images_total > 0
-          ? images_recompressed > 0
-            ? ` (${images_recompressed} of ${images_total} image${images_total === 1 ? "" : "s"} recompressed, ${images_downsampled} downsampled)`
-            : ` (0 of ${images_total} image${images_total === 1 ? "" : "s"} could be recompressed further)`
-          : "";
-      return saved > 0
-        ? `Optimise complete - file size reduced from ${formatBytes(report.bytes_before)} to ${formatBytes(report.bytes_after)} (saved ${formatBytes(saved)})${imageNote}.`
-        : `Optimise complete - the file was already optimal; no size reduction${imageNote}.`;
+      return optimiseSummary(report);
     }
     await runDocOpAndReseed(docId, store, { loadMarkups }, () => redactDocument(docId, [], true));
     return "Apply Redactions complete.";

@@ -290,7 +290,7 @@ mod tests {
             );
         }
         let guarded = doc
-            .split("pub(crate) async fn apply_page_edit_keeping_history")
+            .split("pub(crate) async fn apply_page_edit_opts")
             .nth(1)
             .and_then(|rest| rest.split("\n}\n").next())
             .unwrap();
@@ -298,7 +298,7 @@ mod tests {
             .find("ensure_source_unchanged(")
             .expect("guard present");
         let write_at = guarded
-            .find("apply_edit_and_save_scaled(")
+            .find("apply_edit_and_save_inner(")
             .expect("write present");
         assert!(
             guard_at < write_at,

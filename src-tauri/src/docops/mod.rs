@@ -194,10 +194,64 @@ pub fn optimize_in_place_with_images(
         Some(preset) => image_ops::optimize_images_in_place(doc, preset)?,
         None => ImageOptimizeStats::default(),
     };
+    let mut image_stats = image_stats;
     if level >= 2 {
         doc.compress();
+        let (n, saved) = recompress_flate_streams(doc);
+        image_stats.streams_recompressed = n;
+        image_stats.stream_bytes_saved = saved;
     }
     Ok(image_stats)
+}
+
+/// Re-deflate every plain-Flate stream at maximum compression and keep the result when it
+/// is smaller. `Document::compress` only deflates streams with no filter, so already
+/// compressed CAD-plot content streams (the bulk of a vector drawing) were never touched.
+/// Streams with `/DecodeParms` (predictors) or any other filter chain are left alone.
+/// Returns `(streams rewritten, bytes saved)`.
+pub fn recompress_flate_streams(doc: &mut Document) -> (u32, u64) {
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::io::Write;
+    let mut count = 0u32;
+    let mut saved = 0u64;
+    // Bounded work: each stream is inflated under a size cap (decompression bombs are
+    // skipped) and the run stops once the total decoded volume reaches the budget.
+    let mut decoded_total = 0u64;
+    for obj in doc.objects.values_mut() {
+        let Object::Stream(s) = obj else { continue };
+        if s.dict.has(b"DecodeParms") || s.dict.has(b"DP") {
+            continue;
+        }
+        let is_plain_flate = match s.dict.get(b"Filter") {
+            Ok(Object::Name(n)) => n == b"FlateDecode",
+            Ok(Object::Array(a)) => {
+                a.len() == 1 && matches!(&a[0], Object::Name(n) if n == b"FlateDecode")
+            }
+            _ => false,
+        };
+        if !is_plain_flate || s.content.len() < 64 {
+            continue;
+        }
+        if decoded_total >= image_ops::MAX_TOTAL_DECODED_BYTES {
+            break;
+        }
+        let Ok(raw) = s.decompressed_content_with_limit(image_ops::MAX_STREAM_DECODED_BYTES)
+        else {
+            continue;
+        };
+        decoded_total += raw.len() as u64;
+        let mut enc = ZlibEncoder::new(Vec::with_capacity(s.content.len()), Compression::best());
+        if enc.write_all(&raw).is_err() {
+            continue;
+        }
+        let Ok(new) = enc.finish() else { continue };
+        if new.len() < s.content.len() {
+            saved += (s.content.len() - new.len()) as u64;
+            s.set_content(new);
+            count += 1;
+        }
+    }
+    (count, saved)
 }
 
 // ---------------------------------------------------------------------------

@@ -85,12 +85,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub enum ImageQualityPreset {
     /// Minimal quality loss: 300 DPI effective resolution cap, JPEG quality 90.
     /// Close to Bluebeam's "High Quality (Print)" preset.
+    #[serde(alias = "High")]
     High,
     /// Default trade-off: 200 DPI, JPEG quality 75. Matches Bluebeam's mid-slider
     /// "Standard" behaviour for on-screen/plan-review use.
+    #[serde(alias = "Balanced")]
     Balanced,
     /// Aggressive size reduction: 150 DPI, JPEG quality 50. For distribution copies
     /// where file size matters more than print fidelity.
+    #[serde(alias = "Small")]
     Small,
 }
 
@@ -138,6 +141,14 @@ pub struct ImageOptimizeStats {
     /// Why each passed-through image was skipped, keyed by reason, for diagnostics and
     /// the measurement table (e.g. `"colorspace-unsupported" -> 92`).
     pub skip_reasons: BTreeMap<String, u32>,
+    /// Non-image-pipeline: Flate streams re-deflated at maximum level that came out
+    /// smaller (content streams, fonts, already-compressed image streams).
+    pub streams_recompressed: u32,
+    /// Running estimate of decoded bytes materialised this run (work-budget accounting).
+    #[serde(skip)]
+    pub decoded_bytes: u64,
+    /// Bytes saved by the re-deflate pass.
+    pub stream_bytes_saved: u64,
 }
 
 impl ImageOptimizeStats {
@@ -302,11 +313,26 @@ fn color_class_of(doc: &Document, dict: &Dictionary) -> Option<ColorClass> {
     color_class_of_object(doc, cs)
 }
 
-fn inflate(bytes: &[u8]) -> Option<Vec<u8>> {
+/// Hard bounds so a crafted or merely enormous PDF cannot exhaust memory or CPU.
+/// Anything over a bound is skipped and reported (`too-large` / `work-budget`), never decoded.
+pub(crate) const MAX_IMAGE_PIXELS: u64 = 100_000_000;
+/// Largest single decoded stream (bytes) any optimiser pass will materialise.
+pub(crate) const MAX_STREAM_DECODED_BYTES: usize = 256 * 1024 * 1024;
+/// Total decoded bytes one optimise run may materialise across all streams/images.
+pub(crate) const MAX_TOTAL_DECODED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Content-stream operations the placement walker will visit in one run.
+const MAX_WALK_OPS: u64 = 20_000_000;
+
+/// Inflate at most `limit` bytes; `None` when the stream is bad or would exceed the limit
+/// (decompression bomb).
+fn inflate(bytes: &[u8], limit: usize) -> Option<Vec<u8>> {
     use std::io::Read;
-    let mut decoder = flate2::read::ZlibDecoder::new(bytes);
+    let decoder = flate2::read::ZlibDecoder::new(bytes);
     let mut out = Vec::new();
-    decoder.read_to_end(&mut out).ok()?;
+    decoder.take(limit as u64 + 1).read_to_end(&mut out).ok()?;
+    if out.len() > limit {
+        return None;
+    }
     Some(out)
 }
 
@@ -325,11 +351,22 @@ fn decode_pixels(
         FilterKind::Jpeg | FilterKind::JpegDoubleWrapped => {
             let jpeg_bytes = match filter_kind {
                 FilterKind::Jpeg => stream.content.clone(),
-                FilterKind::JpegDoubleWrapped => inflate(&stream.content)?,
+                FilterKind::JpegDoubleWrapped => {
+                    inflate(&stream.content, MAX_STREAM_DECODED_BYTES)?
+                }
                 FilterKind::Raw => unreachable!(),
             };
-            let dynimg =
-                image::load_from_memory_with_format(&jpeg_bytes, image::ImageFormat::Jpeg).ok()?;
+            // Bound the decoder's own allocation before it trusts the header's dimensions.
+            let mut reader = image::ImageReader::with_format(
+                std::io::Cursor::new(&jpeg_bytes),
+                image::ImageFormat::Jpeg,
+            );
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(width);
+            limits.max_image_height = Some(height);
+            limits.max_alloc = Some(MAX_STREAM_DECODED_BYTES as u64);
+            reader.limits(limits);
+            let dynimg = reader.decode().ok()?;
             if dynimg.width() != width || dynimg.height() != height {
                 return None; // dict/pixel-data disagreement — don't guess, skip.
             }
@@ -346,7 +383,13 @@ fn decode_pixels(
             })
         }
         FilterKind::Raw => {
-            let bytes = stream.get_plain_content().ok()?;
+            let bytes = if stream.dict.has(b"Filter") {
+                stream
+                    .decompressed_content_with_limit(MAX_STREAM_DECODED_BYTES)
+                    .ok()?
+            } else {
+                stream.content.clone()
+            };
             let components: usize = match color_class {
                 ColorClass::Gray => 1,
                 ColorClass::Rgb => 3,
@@ -457,7 +500,15 @@ fn process_one_image(
             .ok()
             .and_then(|o| o.as_i64().ok());
         let (width, height) = match (width, height) {
-            (Some(w), Some(h)) if w > 0 && h > 0 => (w as u32, h as u32),
+            (Some(w), Some(h)) if w > 0 && h > 0 => {
+                if (w as u64).saturating_mul(h as u64) > MAX_IMAGE_PIXELS
+                    || w > u32::MAX as i64
+                    || h > u32::MAX as i64
+                {
+                    return Err("too-large");
+                }
+                (w as u32, h as u32)
+            }
             _ => return Err("missing-dimensions"),
         };
 
@@ -493,6 +544,14 @@ fn process_one_image(
             return;
         }
     };
+
+    // ---- Work budget: stop decoding once the run has materialised enough. ----
+    let est = (plan.width as u64) * (plan.height as u64) * 3;
+    if stats.decoded_bytes.saturating_add(est) > MAX_TOTAL_DECODED_BYTES {
+        stats.record_skip("work-budget");
+        return;
+    }
+    stats.decoded_bytes += est;
 
     // ---- Decode. ----
     let pixels = {
@@ -762,6 +821,7 @@ fn walk_content(
     base_ctm: Matrix,
     placements: &mut HashMap<ObjectId, (f64, f64)>,
     depth: u8,
+    budget: &mut u64,
 ) {
     if depth > 6 {
         return;
@@ -771,6 +831,10 @@ fn walk_content(
     let mut ctm = base_ctm;
 
     for op in ops {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
         match op.operator.as_str() {
             "q" => stack.push(ctm),
             "Q" => {
@@ -818,7 +882,13 @@ fn walk_content(
                             .ok()
                             .and_then(|o| resolve_dict(doc, o))
                             .unwrap_or_else(|| resources.clone());
-                        if let Ok(bytes) = s.get_plain_content() {
+                        let bytes = if s.dict.has(b"Filter") {
+                            s.decompressed_content_with_limit(MAX_STREAM_DECODED_BYTES)
+                                .ok()
+                        } else {
+                            Some(s.content.clone())
+                        };
+                        if let Some(bytes) = bytes {
                             if let Ok(form_content) = Content::decode(&bytes) {
                                 walk_content(
                                     doc,
@@ -827,6 +897,7 @@ fn walk_content(
                                     form_ctm,
                                     placements,
                                     depth + 1,
+                                    budget,
                                 );
                             }
                         }
@@ -844,9 +915,16 @@ fn walk_content(
 fn collect_image_placements(doc: &Document) -> HashMap<ObjectId, (f64, f64)> {
     let mut placements = HashMap::new();
     let page_ids: Vec<ObjectId> = doc.get_pages().values().cloned().collect();
+    let mut budget = MAX_WALK_OPS;
     for page_id in page_ids {
+        if budget == 0 {
+            break;
+        }
         let resources = page_resources(doc, page_id);
-        let Ok(content) = doc.get_and_decode_page_content(page_id) else {
+        let Ok(raw) = doc.get_page_content_with_limit(page_id, MAX_STREAM_DECODED_BYTES) else {
+            continue;
+        };
+        let Ok(content) = Content::decode(&raw) else {
             continue;
         };
         walk_content(
@@ -856,6 +934,7 @@ fn collect_image_placements(doc: &Document) -> HashMap<ObjectId, (f64, f64)> {
             Matrix::identity(),
             &mut placements,
             0,
+            &mut budget,
         );
     }
     placements

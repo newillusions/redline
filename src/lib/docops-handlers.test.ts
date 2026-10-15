@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi } from "vitest";
-import { runDocOpAndReseed, formatBytes } from "./docops-handlers";
+import { runDocOpAndReseed, formatBytes, optimiseSummary } from "./docops-handlers";
 import type { Markup } from "./ipc";
 
 function markup(id: string): Markup {
@@ -116,5 +116,48 @@ describe("formatBytes", () => {
 
   it("renders GiB for very large values", () => {
     expect(formatBytes(2 * 1024 * 1024 * 1024)).toBe("2.0 GiB");
+  });
+});
+
+describe("optimiseSummary", () => {
+  const stats = { images_total: 0, images_recompressed: 0, images_downsampled: 0 };
+
+  it("reports a reduction only when the outcome is reduced and bytes dropped", () => {
+    const msg = optimiseSummary({
+      bytes_before: 10_485_760,
+      bytes_after: 5_242_880,
+      outcome: "reduced",
+      image_stats: { ...stats, images_total: 4, images_recompressed: 3, images_downsampled: 2 },
+    });
+    expect(msg).toContain("reduced from 10.0 MiB to 5.0 MiB");
+    expect(msg).toContain("3 of 4 images recompressed");
+  });
+
+  it("never says 'already optimal' when nothing shrank; names the images it skipped", () => {
+    const msg = optimiseSummary({
+      bytes_before: 4_019_386,
+      bytes_after: 4_019_386,
+      outcome: "no_gain",
+      image_stats: { ...stats, images_total: 1570, skip_reasons: { "image-mask": 1570 } },
+    });
+    expect(msg).not.toMatch(/already optimal/i);
+    expect(msg).toContain("left unchanged");
+    expect(msg).toContain("1570 1-bit image masks");
+  });
+
+  it("a file the pipeline would have grown is reported as unchanged, not as success", () => {
+    const msg = optimiseSummary({
+      bytes_before: 3_880_790,
+      bytes_after: 3_880_790,
+      outcome: "no_gain",
+      image_stats: { ...stats, images_total: 33, skip_reasons: { "not-smaller": 32 } },
+    });
+    expect(msg).toContain("No size reduction");
+    expect(msg).toContain("already compact");
+  });
+
+  it("explains vector-only files", () => {
+    const msg = optimiseSummary({ bytes_before: 100_000, bytes_after: 100_000, outcome: "no_gain", image_stats: stats });
+    expect(msg).toContain("no raster images");
   });
 });

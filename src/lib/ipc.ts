@@ -877,6 +877,9 @@ export interface ImageOptimizeStats {
   image_bytes_before: number;
   image_bytes_after: number;
   skip_reasons: Record<string, number>;
+  /** Flate streams re-deflated at maximum level that came out smaller. */
+  streams_recompressed?: number;
+  stream_bytes_saved?: number;
 }
 
 /** File size before/after an `optimizeDocument` call (bytes), plus the image breakdown. */
@@ -884,6 +887,11 @@ export interface OptimizeReport {
   bytes_before: number;
   bytes_after: number;
   image_stats: ImageOptimizeStats;
+  /**
+   * `"reduced"`: the file was rewritten and is smaller. `"no_gain"`: the rewrite was not
+   * smaller, so the original file was kept untouched (`bytes_after === bytes_before`).
+   */
+  outcome?: "reduced" | "no_gain";
 }
 
 /**

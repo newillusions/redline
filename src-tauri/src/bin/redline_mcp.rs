@@ -495,13 +495,13 @@ fn tool_defs() -> Value {
         },
         {
             "name": "reduce_file_size",
-            "description": "Reduce the open document's file size: prune unreferenced objects, compress streams, and optionally recompress raster images at a quality preset (High/Balanced/Small).",
+            "description": "Reduce the open document's file size: prune unreferenced objects, re-deflate streams at maximum compression, and recompress raster images (JPEG/Flate, 8-bit Gray/RGB) at a quality preset (default balanced). WRITES THE PDF FILE ON DISK IMMEDIATELY, but only when the result is strictly smaller: otherwise the original is kept and the result says outcome=\"no_gain\" with bytes_after==bytes_before. Check `outcome` and `bytes_before`/`bytes_after`; image_stats.skip_reasons says why images were left alone. Vector CAD plots are mostly already-compressed content, so expect only a few percent; CCITT/JBIG2/mask/indexed images are not recompressed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "doc_id": {"type": "string"},
                     "level": {"type": "integer", "enum": [0, 1, 2], "description": "0=no-op, 1=prune only, 2=prune+compress (default)."},
-                    "image_preset": {"type": "string", "enum": ["High", "Balanced", "Small"], "description": "Omit to skip raster recompression entirely."}
+                    "image_preset": {"type": "string", "enum": ["high", "balanced", "small", "none"], "description": "Raster recompression preset. Omit for balanced (200 DPI / JPEG q75); \"none\" skips image work."}
                 },
                 "required": ["doc_id"]
             }

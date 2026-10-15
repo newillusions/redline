@@ -12,7 +12,7 @@
 use serde::Serialize;
 use tauri::State;
 
-use crate::commands::document::apply_page_edit;
+use crate::commands::document::{apply_page_edit, apply_page_edit_opts};
 use crate::docops::{
     flatten_annotations, optimize_in_place_with_images, redact_annotations, redact_regions,
     ImageOptimizeStats, ImageQualityPreset, RedactRegion,
@@ -32,6 +32,10 @@ pub struct OptimizeReport {
     pub bytes_before: u64,
     pub bytes_after: u64,
     pub image_stats: ImageOptimizeStats,
+    /// `"reduced"`: the file was rewritten and is smaller. `"no_gain"`: the rewrite was not
+    /// smaller than the original, so the original file was kept untouched
+    /// (`bytes_after == bytes_before`). Never "optimised" without a real byte reduction.
+    pub outcome: &'static str,
 }
 
 /// Flatten all annotation appearance streams in the open document into page content.
@@ -152,25 +156,353 @@ pub async fn optimize_document(
 
     let image_stats = std::sync::Arc::new(std::sync::Mutex::new(ImageOptimizeStats::default()));
     let image_stats_write = std::sync::Arc::clone(&image_stats);
-    apply_page_edit(&state, &doc_id, move |doc| {
-        let stats = optimize_in_place_with_images(doc, level, image_preset)?;
-        *image_stats_write
-            .lock()
-            .expect("image_stats mutex poisoned") = stats;
-        Ok(())
-    })
+    let written = apply_page_edit_opts(
+        &state,
+        &doc_id,
+        move |doc| {
+            let stats = optimize_in_place_with_images(doc, level, image_preset)?;
+            *image_stats_write
+                .lock()
+                .expect("image_stats mutex poisoned") = stats;
+            Ok(())
+        },
+        false,
+        true,
+    )
     .await?;
     let image_stats = image_stats
         .lock()
         .expect("image_stats mutex poisoned")
         .clone();
 
-    let bytes_after = std::fs::metadata(&path)
+    build_report(&path, bytes_before, image_stats, written)
+}
+
+/// Assemble the report from the measured file sizes: `bytes_after` is re-read from disk and
+/// `outcome` says "reduced" only when the file was rewritten (which requires it to be
+/// smaller), so the label always agrees with the byte delta.
+fn build_report(
+    path: &std::path::Path,
+    bytes_before: u64,
+    image_stats: ImageOptimizeStats,
+    written: bool,
+) -> Result<OptimizeReport, String> {
+    let bytes_after = std::fs::metadata(path)
         .map(|m| m.len())
         .map_err(|e| format!("stat {}: {e}", path.display()))?;
     Ok(OptimizeReport {
         bytes_before,
         bytes_after,
         image_stats,
+        outcome: if written { "reduced" } else { "no_gain" },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::document::apply_edit_and_save_inner;
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    /// Run the exact optimize pipeline (+ never-grow guard) on a file and report.
+    fn run(path: &std::path::Path, preset: Option<ImageQualityPreset>) -> OptimizeReport {
+        let before = std::fs::metadata(path).unwrap().len();
+        let stats = std::sync::Arc::new(std::sync::Mutex::new(ImageOptimizeStats::default()));
+        let sw = std::sync::Arc::clone(&stats);
+        let written = apply_edit_and_save_inner(
+            path,
+            &[],
+            &Default::default(),
+            &[],
+            move |doc| {
+                *sw.lock().unwrap() = optimize_in_place_with_images(doc, 2, preset)?;
+                Ok(())
+            },
+            true,
+        )
+        .unwrap();
+        let stats = stats.lock().unwrap().clone();
+        build_report(path, before, stats, written).unwrap()
+    }
+
+    /// The reported outcome must always agree with the measured byte delta.
+    fn assert_honest(r: &OptimizeReport) {
+        match r.outcome {
+            "reduced" => assert!(r.bytes_after < r.bytes_before, "{r:?}"),
+            "no_gain" => assert_eq!(r.bytes_after, r.bytes_before, "{r:?}"),
+            other => panic!("unknown outcome {other}"),
+        }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("redline-reduce-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join(name)
+    }
+
+    fn save_doc(name: &str, content: Vec<u8>, images: Vec<Stream>) -> std::path::PathBuf {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let mut xo = lopdf::Dictionary::new();
+        for (i, img) in images.into_iter().enumerate() {
+            let id = doc.add_object(img);
+            xo.set(format!("Im{i}"), id);
+        }
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => content_id,
+            "Resources" => dictionary! { "XObject" => xo },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(
+                dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 },
+            ),
+        );
+        let cat = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", cat);
+        let p = scratch(name);
+        doc.save(&p).unwrap();
+        p
+    }
+
+    fn rgb_image(w: u32, h: u32, jpeg_q: Option<u8>) -> Stream {
+        let mut px = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                px.extend_from_slice(&[
+                    (x * 255 / w) as u8,
+                    (y * 255 / h) as u8,
+                    ((x ^ y) & 0xff) as u8,
+                ]);
+            }
+        }
+        let mut dict = dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => w as i64, "Height" => h as i64,
+            "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+        };
+        let data = match jpeg_q {
+            Some(q) => {
+                let mut out = Vec::new();
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, q)
+                    .encode(&px, w, h, image::ExtendedColorType::Rgb8)
+                    .unwrap();
+                dict.set("Filter", "DCTDecode");
+                out
+            }
+            None => px,
+        };
+        Stream::new(dict, data)
+    }
+
+    /// Drawing-style content: many short vector ops, stored Flate at the fastest level so
+    /// there is something for the max-level re-deflate to win back (as for plotter output).
+    fn vector_content() -> Vec<u8> {
+        let mut s = String::new();
+        for i in 0..40_000u32 {
+            let x = (i * 37 % 600) as f32 + (i % 7) as f32 * 0.25;
+            let y = (i * 91 % 780) as f32 + (i % 5) as f32 * 0.5;
+            s.push_str(&format!(
+                "{x:.2} {y:.2} m {:.2} {:.2} l S\n",
+                x + 3.5,
+                y + (i % 11) as f32
+            ));
+        }
+        s.into_bytes()
+    }
+
+    fn fast_flate(data: &[u8]) -> Stream {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+        let mut e = ZlibEncoder::new(Vec::new(), Compression::fast());
+        e.write_all(data).unwrap();
+        Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            e.finish().unwrap(),
+        )
+    }
+
+    #[test]
+    fn image_heavy_pdf_reports_reduced_and_matches_bytes() {
+        let p = save_doc(
+            "heavy.pdf",
+            b"q 500 0 0 500 20 20 cm /Im0 Do Q".to_vec(),
+            vec![rgb_image(1800, 1800, None)],
+        );
+        let r = run(&p, Some(ImageQualityPreset::Balanced));
+        println!(
+            "image-heavy: {} -> {} ({})",
+            r.bytes_before, r.bytes_after, r.outcome
+        );
+        assert_eq!(r.outcome, "reduced");
+        assert!(r.bytes_after * 2 < r.bytes_before, "{r:?}");
+        assert!(r.image_stats.images_recompressed >= 1);
+        assert_honest(&r);
+    }
+
+    #[test]
+    fn vector_plot_reports_only_what_the_bytes_show() {
+        // Content stored as fast-Flate (already compressed, not touched by lopdf compress()).
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let content_id = doc.add_object(fast_flate(&vector_content()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => content_id,
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(
+                dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 },
+            ),
+        );
+        let cat = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", cat);
+        let p = scratch("vector.pdf");
+        doc.save(&p).unwrap();
+        let r = run(&p, Some(ImageQualityPreset::Balanced));
+        println!(
+            "vector: {} -> {} ({}) streams_recompressed={}",
+            r.bytes_before, r.bytes_after, r.outcome, r.image_stats.streams_recompressed
+        );
+        assert_eq!(
+            r.outcome, "reduced",
+            "max-level re-deflate must win bytes back"
+        );
+        assert!(r.image_stats.streams_recompressed >= 1);
+        assert_honest(&r);
+        // Running again has nothing left to win: must say so and leave the file alone.
+        let again = run(&p, Some(ImageQualityPreset::Balanced));
+        assert_eq!(again.outcome, "no_gain", "{again:?}");
+        assert_honest(&again);
+    }
+
+    #[test]
+    fn already_jpeg_file_never_grows_and_says_no_gain() {
+        let p = save_doc(
+            "jpeg.pdf",
+            b"q 200 0 0 200 20 20 cm /Im0 Do Q".to_vec(),
+            vec![rgb_image(300, 300, Some(30))],
+        );
+        let r = run(&p, Some(ImageQualityPreset::Balanced));
+        println!(
+            "already-jpeg: {} -> {} ({})",
+            r.bytes_before, r.bytes_after, r.outcome
+        );
+        assert!(
+            r.bytes_after <= r.bytes_before,
+            "file must never grow: {r:?}"
+        );
+        assert_honest(&r);
+    }
+
+    /// Zlib stream of `mib` MiB of zeros, built without holding the plaintext.
+    fn zero_bomb(mib: usize) -> Vec<u8> {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+        let chunk = vec![0u8; 1024 * 1024];
+        let mut e = ZlibEncoder::new(Vec::new(), Compression::fast());
+        for _ in 0..mib {
+            e.write_all(&chunk).unwrap();
+        }
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn decompression_bomb_stream_is_skipped_not_inflated() {
+        // 300 MiB of zeros in ~300 KB: over the 256 MiB per-stream cap.
+        let bomb = zero_bomb(300);
+        assert!(bomb.len() < 20_000_000);
+        let mut doc = Document::with_version("1.7");
+        let id = doc.add_object(Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            bomb.clone(),
+        ));
+        let started = std::time::Instant::now();
+        let (n, saved) = crate::docops::recompress_flate_streams(&mut doc);
+        assert_eq!((n, saved), (0, 0), "bomb must be left alone");
+        assert_eq!(
+            doc.get_object(id).unwrap().as_stream().unwrap().content,
+            bomb
+        );
+        assert!(started.elapsed().as_secs() < 30, "bounded work");
+    }
+
+    #[test]
+    fn oversized_and_bomb_images_are_skipped_with_a_reason() {
+        let mut doc = Document::with_version("1.7");
+        // Declared 50000 x 50000 = 2.5 Gpx with a few bytes of data.
+        let huge = doc.add_object(Stream::new(
+            dictionary! { "Type" => "XObject", "Subtype" => "Image", "Width" => 50000, "Height" => 50000,
+                "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8 },
+            vec![0u8; 16],
+        ));
+        // Plausible dimensions but a 300 MiB inflate behind them.
+        let bomb = doc.add_object(Stream::new(
+            dictionary! { "Type" => "XObject", "Subtype" => "Image", "Width" => 4000, "Height" => 4000,
+                "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8, "Filter" => "FlateDecode" },
+            zero_bomb(300),
+        ));
+        let stats = crate::docops::image_ops::optimize_images_in_place(
+            &mut doc,
+            ImageQualityPreset::Balanced,
+        )
+        .unwrap();
+        assert_eq!(stats.images_recompressed, 0);
+        assert_eq!(stats.skip_reasons.get("too-large"), Some(&1), "{stats:?}");
+        assert_eq!(
+            stats.skip_reasons.get("decode-failed"),
+            Some(&1),
+            "{stats:?}"
+        );
+        assert_eq!(
+            doc.get_object(huge)
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .content
+                .len(),
+            16
+        );
+        assert!(
+            doc.get_object(bomb)
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .content
+                .len()
+                < 20_000_000
+        );
+    }
+
+    /// Real-PDF measurement: `REDLINE_REDUCE_PDFS="a.pdf|b.pdf" cargo test --lib real_pdfs -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_pdfs_outcome_matches_bytes() {
+        let Ok(list) = std::env::var("REDLINE_REDUCE_PDFS") else {
+            return;
+        };
+        for src in list.split('|') {
+            let p = scratch("real.pdf");
+            std::fs::copy(src, &p).unwrap();
+            let r = run(&p, Some(ImageQualityPreset::Balanced));
+            let pct =
+                (r.bytes_after as f64 - r.bytes_before as f64) / r.bytes_before as f64 * 100.0;
+            println!(
+                "REAL {src}: {} -> {} ({:+.2}%) outcome={} streams={} images {}/{}",
+                r.bytes_before,
+                r.bytes_after,
+                pct,
+                r.outcome,
+                r.image_stats.streams_recompressed,
+                r.image_stats.images_recompressed,
+                r.image_stats.images_total
+            );
+            assert_honest(&r);
+            assert!(r.bytes_after <= r.bytes_before);
+        }
+    }
 }

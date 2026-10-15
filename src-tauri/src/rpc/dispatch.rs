@@ -227,7 +227,7 @@ pub async fn dispatch(app: &AppHandle, req: RpcRequest) -> Result<Value, Value> 
                 state,
                 p.doc_id,
                 p.level.unwrap_or(2),
-                p.image_preset,
+                tools::ReducePreset::resolve(p.image_preset),
             )
             .await;
             to_value(result)
