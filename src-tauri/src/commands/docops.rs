@@ -109,24 +109,8 @@ pub async fn redact_document(
         Ok(())
     })
     .await?;
-    // Redaction deletes annotations from the file. The in-memory markup store still holds
-    // them, and the next save would write them back (re-leaking their text): drop every
-    // store markup that no longer exists in the redacted file.
-    let path = state
-        .markups
-        .path(&doc_id)
-        .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
-    let password = state.markups.password(&doc_id);
-    let on_disk = tokio::task::spawn_blocking(move || {
-        crate::document::save::load_markups_from(&path, password.as_deref())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| {
-        format!("redaction was written, but the markup list could not be refreshed ({e:#}); reopen the document")
-    })?;
-    let keep: std::collections::HashSet<uuid::Uuid> = on_disk.iter().map(|m| m.id()).collect();
-    state.markups.purge_missing(&doc_id, &keep);
+    // The page-edit path read the redacted file back and dropped every store markup it no
+    // longer holds, so the next save cannot write redacted annotations (and their text) back.
     Ok(())
 }
 

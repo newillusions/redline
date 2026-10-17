@@ -89,6 +89,12 @@ describe("ipc invoke argument keys (Tauri v2 camelCase)", () => {
     expect(ipc.isDiskChangedError("swap failed: permission denied")).toBe(false);
   });
 
+  it("also recognises the needs-a-reload refusal, so the recovery dialog opens", () => {
+    const msg = "This document needs a reload: its file was just rewritten but redline could not refresh";
+    expect(ipc.isDiskChangedError(msg)).toBe(true);
+    expect(ipc.isDiskChangedError(new Error(msg))).toBe(true);
+  });
+
   it("save_unprotected_copy → docId / destPath", async () => {
     await ipc.saveUnprotectedCopy("d1", "/tmp/x_unprotected.pdf");
     expect(mockInvoke).toHaveBeenCalledWith("save_unprotected_copy", {

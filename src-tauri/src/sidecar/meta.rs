@@ -72,6 +72,47 @@ pub fn save_meta(pdf_path: &Path, meta: &SidecarMeta) -> io::Result<()> {
     std::fs::rename(tmp, dest)
 }
 
+/// Write `scales` as the scale records of the sidecar for `pdf_path`, keeping whatever else
+/// that sidecar already holds (version history). Save As uses it to carry the calibration
+/// to the new file.
+pub fn save_scales(pdf_path: &Path, scales: &[ScaleRecord]) -> io::Result<()> {
+    let mut meta = load_meta(pdf_path)?;
+    meta.scales = scales.to_vec();
+    save_meta(pdf_path, &meta)
+}
+
+/// What [`stage_scales`] replaced, so a later failure can put it back.
+pub struct ScalesUndo {
+    pdf_path: PathBuf,
+    /// The previous `meta.json` bytes, or `None` if there was no sidecar file.
+    previous: Option<Vec<u8>>,
+}
+
+impl ScalesUndo {
+    /// Restore the sidecar as it was before [`stage_scales`] (best effort).
+    pub fn undo(self) {
+        let meta = sidecar_dir(&self.pdf_path).join("meta.json");
+        match self.previous {
+            Some(bytes) => {
+                let _ = std::fs::write(&meta, bytes);
+            }
+            None => {
+                let _ = std::fs::remove_file(&meta);
+                let _ = std::fs::remove_dir(sidecar_dir(&self.pdf_path)); // only if empty
+            }
+        }
+    }
+}
+
+/// [`save_scales`] that remembers what it replaced. Save As writes the calibration BEFORE the
+/// new file is swapped in, so a sidecar failure aborts the save with nothing changed, and a
+/// failed swap can [`ScalesUndo::undo`] it.
+pub fn stage_scales(pdf_path: &Path, scales: &[ScaleRecord]) -> io::Result<ScalesUndo> {
+    let previous = std::fs::read(sidecar_dir(pdf_path).join("meta.json")).ok();
+    save_scales(pdf_path, scales)?;
+    Ok(ScalesUndo { pdf_path: pdf_path.to_path_buf(), previous })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +159,64 @@ mod tests {
         let pdf = Path::new("/work/plans-L3.pdf");
         let sd = sidecar_dir(pdf);
         assert_eq!(sd.file_name().unwrap(), "plans-L3.pdf.redline");
+    }
+
+    #[test]
+    fn save_scales_creates_the_destination_sidecar_and_keeps_its_history() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.pdf");
+        let dest = dir.path().join("b.pdf");
+        let scale = crate::takeoff::ScaleRecord::new(
+            ScaleTarget::DocumentDefault,
+            ScaleMethod::Preset,
+            0.001,
+            "m".into(),
+            "1:1000".into(),
+            2,
+        );
+        // A Save As over a file that already has history keeps that history.
+        let mut existing = load_meta(&dest).unwrap();
+        existing.next_version_seq = 7;
+        save_meta(&dest, &existing).unwrap();
+
+        save_scales(&dest, std::slice::from_ref(&scale)).unwrap();
+        let got = load_meta(&dest).unwrap();
+        assert_eq!(got.scales.len(), 1);
+        assert_eq!(got.scales[0].id, scale.id);
+        assert_eq!(got.next_version_seq, 7);
+        assert!(load_meta(&src).unwrap().scales.is_empty(), "the source sidecar is untouched");
+    }
+
+    fn scale(label: &str) -> crate::takeoff::ScaleRecord {
+        crate::takeoff::ScaleRecord::new(
+            ScaleTarget::DocumentDefault,
+            ScaleMethod::Preset,
+            0.001,
+            "m".into(),
+            label.into(),
+            2,
+        )
+    }
+
+    #[test]
+    fn stage_scales_fails_cleanly_when_the_sidecar_cannot_be_written() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("b.pdf");
+        // A plain file where the sidecar directory must go.
+        std::fs::write(sidecar_dir(&dest), b"in the way").unwrap();
+        assert!(stage_scales(&dest, &[scale("1:100")]).is_err());
+    }
+
+    #[test]
+    fn undoing_a_staged_sidecar_restores_what_was_there() {
+        let dir = tempdir().unwrap();
+        let fresh = dir.path().join("fresh.pdf");
+        stage_scales(&fresh, &[scale("1:100")]).unwrap().undo();
+        assert!(!sidecar_dir(&fresh).join("meta.json").exists(), "a new sidecar is removed again");
+
+        let old = dir.path().join("old.pdf");
+        save_scales(&old, &[scale("old")]).unwrap();
+        stage_scales(&old, &[scale("new")]).unwrap().undo();
+        assert_eq!(load_meta(&old).unwrap().scales[0].label, "old");
     }
 }

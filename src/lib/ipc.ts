@@ -38,10 +38,20 @@ export const ERR_WRONG_PASSWORD = "WRONG_PASSWORD";
  */
 export const ERR_DISK_CHANGED_MARKER = "changed on disk by another program";
 
-/** True if `e` (a rejected IPC value or Error) is the changed-on-disk refusal. */
+/**
+ * Text of the "needs a reload" refusal (`ERR_NEEDS_RELOAD` in `src-tauri/src/document/store.rs`)
+ * - keep in sync. Raised when a page operation rewrote the file but redline could not refresh
+ * what it holds; recovery is the same dialog (reload and keep my mark-ups).
+ */
+export const ERR_NEEDS_RELOAD_MARKER = "needs a reload";
+
+/**
+ * True if `e` (a rejected IPC value or Error) is a refusal the stale-file dialog recovers
+ * from: the file changed on disk under redline, or redline's copy no longer matches the file.
+ */
 export function isDiskChangedError(e: unknown): boolean {
   const text = e instanceof Error ? e.message : String(e);
-  return text.includes(ERR_DISK_CHANGED_MARKER);
+  return text.includes(ERR_DISK_CHANGED_MARKER) || text.includes(ERR_NEEDS_RELOAD_MARKER);
 }
 
 /** What "reload and keep my mark-ups" did (`recover::ReloadReport`). */

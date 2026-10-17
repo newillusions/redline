@@ -21,7 +21,7 @@ describe("StaleFileDialog", () => {
   it("names the file and says nothing was lost", () => {
     const { getByText, getByRole } = render(StaleFileDialog, { props: props() });
     expect(getByRole("dialog")).toBeTruthy();
-    expect(getByText(/plan\.pdf was changed by another program/)).toBeTruthy();
+    expect(getByText(/plan\.pdf no longer matches what redline has loaded/)).toBeTruthy();
     expect(getByText(/not lost/)).toBeTruthy();
   });
 

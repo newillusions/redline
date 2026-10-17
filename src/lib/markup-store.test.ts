@@ -90,6 +90,20 @@ describe("MarkupStore", () => {
     expect(s.mirrorError).toContain("boom");
   });
 
+  it("a change refused because a save or page operation holds the document says so and is retried", async () => {
+    const ipc = fakeIpc();
+    ipc.add.mockRejectedValueOnce("save already in progress");
+    const s = new MarkupStore("doc1", ipc);
+    s.create(mk("a"));
+    await expect(s.flush()).rejects.toBeTruthy();
+    expect(s.mirrorError).toMatch(/busy saving or editing pages/i);
+    expect(s.mirrorError).not.toMatch(/Sync failed/);
+    // The op stays queued: the next flush (before save) sends it once the document is free.
+    await s.flush();
+    expect(ipc.add).toHaveBeenCalledTimes(2);
+    expect(s.mirrorError).toBeNull();
+  });
+
   it("a markup_locked-shaped rejection discards the op and keeps draining later ops (does not freeze the queue)", async () => {
     // Exercises runDrain's defense-in-depth backstop directly (the "MarkupStore lock
     // guard" describe block below covers the up-front check that normally prevents a

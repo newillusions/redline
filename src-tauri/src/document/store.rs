@@ -34,6 +34,15 @@ pub struct DocEntry {
     /// and - via `commands::docops` - flatten/optimize/redact), since all of those
     /// flush the current markup state to disk exactly like a save does.
     pub dirty: bool,
+    /// Bumped by every change to the markup set (everything that sets `dirty`). A write
+    /// snapshots it ([`MarkupStore::write_snapshot`]) and only clears `dirty` if it is still
+    /// the same when the write finishes: an edit made while the file was being written is not
+    /// on disk and must stay unsaved.
+    pub revision: u64,
+    /// Set when a write reached the file but the render engine or the markup read-back
+    /// then failed: the store no longer describes the file, so a further write would undo
+    /// the change. [`MarkupStore::write_snapshot`] refuses until a reload succeeds.
+    pub needs_reload: bool,
     /// Markups deleted this session that carried reader-owned fields (`source_ref`, `source_nm`, reply and
     /// state `nm`), keyed by markup id, so an undo (which re-sends the deleted markup as an
     /// add) gets back exactly the names the PDF reader produced for it - and only those:
@@ -240,6 +249,17 @@ impl MtimeCache {
     }
 }
 
+/// Refusal while the store no longer describes the file (a write reached it but the refresh
+/// failed). The frontend matches "needs a reload" (`ERR_NEEDS_RELOAD_MARKER` in ipc.ts, keep
+/// in sync) and opens the same recovery dialog as a changed-on-disk refusal; "Reload and keep
+/// my mark-ups" is the way out.
+pub const ERR_NEEDS_RELOAD: &str = "This document needs a reload: its file was just rewritten but \
+redline could not refresh what it holds. Nothing was saved. Use \"Reload and keep my mark-ups\" \
+(or close and reopen the PDF) before saving again.";
+
+/// The refusal for an edit or a second write while the write slot is held.
+const BUSY: &str = "save already in progress";
+
 /// Thread-safe store shared via Tauri `AppState`.
 #[derive(Debug, Default)]
 pub struct MarkupStore {
@@ -263,6 +283,8 @@ impl MarkupStore {
                 loaded: false,
                 saving: false,
                 dirty: false,
+                revision: 0,
+                needs_reload: false,
                 tombstones: Default::default(),
                 removed_sources: Default::default(),
             },
@@ -381,6 +403,124 @@ impl MarkupStore {
         }
     }
 
+    /// The markups and deleted-source refs a write will put on disk, with the revision they
+    /// were read at, taken under one lock so they are mutually consistent. Pass it back to
+    /// [`Self::finish_write`] / [`Self::finish_page_op`] when the write has succeeded.
+    pub fn write_snapshot(&self, doc_id: &str) -> Result<WriteSnapshot, String> {
+        let g = self.docs.lock().unwrap();
+        let e = g
+            .get(doc_id)
+            .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+        if e.needs_reload {
+            return Err(ERR_NEEDS_RELOAD.to_string());
+        }
+        Ok(WriteSnapshot {
+            markups: e.markups.clone(),
+            removed: e.removed_sources.clone(),
+            revision: e.revision,
+        })
+    }
+
+    /// Record that `snap` is now the file: like `clear_dirty` + `rebaseline_after_write`, but
+    /// an edit made since the snapshot (the revision moved) is not on disk, so it stays
+    /// unsaved: the document stays dirty and the baseline is the snapshot, not the live set.
+    pub fn finish_write(&self, doc_id: &str, snap: &WriteSnapshot) {
+        self.commit_write(doc_id, snap, None);
+    }
+
+    /// [`Self::finish_write`] for a page operation. The operation rewrote the page tree
+    /// (reorder, delete, insert) or removed annotations from the file (flatten, redact), so
+    /// the store is brought in line with the file, `on_disk` being the markups read back from
+    /// it: each markup takes the page it now sits on, and one that was in the snapshot but is
+    /// no longer in the file (flattened, redacted, on a deleted page) is dropped. Without
+    /// this the next save writes the old page index and undoes or misplaces the operation.
+    /// Markups added after the snapshot are kept as they are.
+    pub fn finish_page_op(&self, doc_id: &str, snap: &WriteSnapshot, on_disk: &[Markup]) {
+        self.commit_write(doc_id, snap, Some(on_disk));
+    }
+
+    fn commit_write(&self, doc_id: &str, snap: &WriteSnapshot, on_disk: Option<&[Markup]>) {
+        let mut g = self.docs.lock().unwrap();
+        let Some(e) = g.get_mut(doc_id) else { return };
+        let mut written = snap.markups.clone();
+        if let Some(on_disk) = on_disk {
+            // Where each snapshot markup now sits. Matched by id; a foreign annotation read
+            // back under a different id (no usable /NM) is matched by its object id instead.
+            // Objects are not renumbered by a page op (`prune_objects` removes, it does not
+            // renumber), so an object id still names the same annotation.
+            let by_id: HashMap<Uuid, u32> = on_disk.iter().map(|m| (m.id(), m.page)).collect();
+            let by_oid: HashMap<lopdf::ObjectId, u32> = on_disk
+                .iter()
+                .filter_map(|m| Some((m.source_ref.as_ref()?.oid?, m.page)))
+                .collect();
+            let pages: HashMap<Uuid, u32> = snap
+                .markups
+                .iter()
+                .filter_map(|m| {
+                    let page = by_id.get(&m.id()).or_else(|| {
+                        by_oid.get(&m.source_ref.as_ref()?.oid?)
+                    })?;
+                    Some((m.id(), *page))
+                })
+                .collect();
+            let snapped: std::collections::HashSet<Uuid> =
+                snap.markups.iter().map(|m| m.id()).collect();
+            e.markups.retain(|m| pages.contains_key(&m.id()) || !snapped.contains(&m.id()));
+            for m in e.markups.iter_mut() {
+                if let Some(&p) = pages.get(&m.id()) {
+                    m.page = p;
+                }
+            }
+            written.retain(|m| pages.contains_key(&m.id()));
+            for m in written.iter_mut() {
+                m.page = pages[&m.id()];
+            }
+        }
+        let drop_inline = |m: &mut Markup| {
+            if m.source_ref.as_ref().is_some_and(|r| r.oid.is_none()) {
+                m.source_ref = None;
+            }
+        };
+        e.markups.iter_mut().for_each(drop_inline);
+        e.tombstones.values_mut().for_each(drop_inline);
+        written.iter_mut().for_each(drop_inline);
+        e.keys.clear();
+        if e.revision == snap.revision {
+            e.removed_sources.clear();
+            e.baseline = fingerprints(&e.markups);
+            e.dirty = false;
+        } else {
+            // Deletions made after the snapshot are not in the file; keep them. An object id
+            // names the same annotation only because a page op does not renumber objects
+            // (`prune_objects` removes unreferenced ones, it does not renumber).
+            e.removed_sources.retain(|r| !snap.removed.contains(r) && r.oid.is_some());
+            e.baseline = fingerprints(&written);
+            e.dirty = true;
+        }
+    }
+
+    /// A write reached the file but the document could not be refreshed from it (see
+    /// [`DocEntry::needs_reload`]).
+    pub fn mark_needs_reload(&self, doc_id: &str) {
+        if let Some(e) = self.docs.lock().unwrap().get_mut(doc_id) {
+            e.needs_reload = true;
+            // The write took the store's markups to the file, so nothing is unsaved relative
+            // to it. Without this a reload would diff against the pre-write baseline and
+            // re-apply stale page indices or resurrect what the write removed (flatten).
+            e.baseline = fingerprints(&e.markups);
+            e.removed_sources.clear();
+            e.dirty = false;
+        }
+    }
+
+    /// Claim the document's write slot for the lifetime of the returned guard (released on
+    /// every exit path, including `?` and a dropped future). Errors if a save, page
+    /// operation or reload already holds it.
+    pub fn save_guard(&self, doc_id: &str) -> Result<SaveGuard<'_>, String> {
+        self.begin_save(doc_id)?;
+        Ok(SaveGuard { store: self, doc_id: doc_id.to_string() })
+    }
+
     /// Err([`ERR_DISK_CHANGED`]) if the file registered for `doc_id` is no longer the one
     /// redline opened or last wrote. A different size is a change. A different modified time
     /// alone (a touch, a sync client) is a change only if the content hash differs too; an
@@ -489,6 +629,8 @@ impl MarkupStore {
         e.removed_sources = removed;
         e.loaded = true;
         e.dirty = report.applied > 0;
+        e.revision += 1;
+        e.needs_reload = false;
         e.disk_stamp = txn.snapshot.stamp;
         e.original = txn.snapshot.original;
         drop(g);
@@ -517,6 +659,11 @@ impl MarkupStore {
         self.docs.lock().unwrap().get(doc_id).and_then(|e| e.original.as_ref().map(|c| c.to_path_buf()))
     }
 
+    /// True if a write reached the file but the refresh failed (see [`DocEntry::needs_reload`]).
+    pub fn needs_reload(&self, doc_id: &str) -> bool {
+        self.docs.lock().unwrap().get(doc_id).is_some_and(|e| e.needs_reload)
+    }
+
     /// True if the PDF's existing annotations have been loaded into the store.
     pub fn is_loaded(&self, doc_id: &str) -> bool {
         self.docs
@@ -533,6 +680,9 @@ impl MarkupStore {
         let e = g
             .get_mut(doc_id)
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+        if e.saving {
+            return Err(BUSY.to_string());
+        }
         if e.markups.iter().any(|x| x.id() == m.id()) {
             return Err(format!("duplicate markup id {}", m.id()));
         }
@@ -550,6 +700,7 @@ impl MarkupStore {
         }
         e.markups.push(m);
         e.dirty = true;
+        e.revision += 1;
         Ok(())
     }
 
@@ -566,6 +717,9 @@ impl MarkupStore {
         let e = g
             .get_mut(doc_id)
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+        if e.saving {
+            return Err(BUSY.to_string());
+        }
         let slot = e
             .markups
             .iter_mut()
@@ -576,6 +730,7 @@ impl MarkupStore {
         m.adopt_reader_owned_from(slot);
         *slot = m;
         e.dirty = true;
+        e.revision += 1;
         Ok(())
     }
 
@@ -587,6 +742,9 @@ impl MarkupStore {
         let e = g
             .get_mut(doc_id)
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+        if e.saving {
+            return Err(BUSY.to_string());
+        }
         let existing = e
             .markups
             .iter()
@@ -601,6 +759,7 @@ impl MarkupStore {
         }
         e.markups.retain(|x| x.id() != id);
         e.dirty = true;
+        e.revision += 1;
         Ok(())
     }
 
@@ -648,6 +807,7 @@ impl MarkupStore {
             e.markups[slot] = m;
         }
         e.dirty = true;
+        e.revision += 1;
         Ok(())
     }
 
@@ -664,6 +824,7 @@ impl MarkupStore {
         let changed = crate::takeoff::recompute_all(&mut e.markups, scales);
         if changed > 0 {
             e.dirty = true;
+            e.revision += 1;
         }
         changed
     }
@@ -750,7 +911,7 @@ impl MarkupStore {
             .get_mut(doc_id)
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
         if e.saving {
-            return Err("save already in progress".to_string());
+            return Err(BUSY.to_string());
         }
         e.saving = true;
         Ok(())
@@ -816,6 +977,25 @@ impl MarkupStore {
                 }
             }
         }
+    }
+}
+
+/// What a write puts on disk (see [`MarkupStore::write_snapshot`]).
+pub struct WriteSnapshot {
+    pub markups: Vec<Markup>,
+    pub removed: std::collections::HashSet<crate::markup::SourceRef>,
+    revision: u64,
+}
+
+/// Holds a document's write slot; releases it on drop (see [`MarkupStore::save_guard`]).
+pub struct SaveGuard<'a> {
+    store: &'a MarkupStore,
+    doc_id: String,
+}
+
+impl Drop for SaveGuard<'_> {
+    fn drop(&mut self) {
+        self.store.end_save(&self.doc_id);
     }
 }
 
@@ -1069,6 +1249,99 @@ mod tests {
 
         // Unknown doc errors.
         assert!(s.begin_save("nope").is_err());
+    }
+
+    #[test]
+    fn an_edit_during_a_write_stays_unsaved_after_it() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        s.add("d1", markup()).unwrap();
+        let first = s.list("d1").unwrap()[0].id();
+        let snap = s.write_snapshot("d1").unwrap();
+        // Edits are refused while the slot is held, but the revision still guards the
+        // window between the snapshot and the slot (e.g. a measurement recompute).
+        let late = markup();
+        s.add("d1", late.clone()).unwrap();
+        s.finish_write("d1", &snap);
+        assert!(s.is_dirty("d1"), "the late edit is not on disk");
+        let g = s.docs.lock().unwrap();
+        let e = g.get("d1").unwrap();
+        assert!(!e.baseline.contains_key(&late.id()), "so it is not part of the baseline");
+        assert!(e.baseline.contains_key(&first));
+    }
+
+    #[test]
+    fn a_write_with_no_edit_during_it_leaves_the_document_clean() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        s.add("d1", markup()).unwrap();
+        let snap = s.write_snapshot("d1").unwrap();
+        s.finish_write("d1", &snap);
+        assert!(!s.is_dirty("d1"));
+    }
+
+    #[test]
+    fn save_guard_excludes_a_second_writer_and_releases_on_drop() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let g = s.save_guard("d1").unwrap();
+        assert_eq!(s.save_guard("d1").err().as_deref(), Some("save already in progress"));
+        drop(g);
+        assert!(s.save_guard("d1").is_ok());
+    }
+
+    #[test]
+    fn edits_are_refused_while_the_write_slot_is_held() {
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let m = markup();
+        s.add("d1", m.clone()).unwrap();
+        let guard = s.save_guard("d1").unwrap();
+        let busy = Err("save already in progress".to_string());
+        assert_eq!(s.add("d1", markup()), busy);
+        assert_eq!(s.update("d1", m.clone()), busy);
+        assert_eq!(s.delete("d1", m.id()), busy);
+        assert_eq!(s.list("d1").unwrap().len(), 1, "nothing changed");
+        drop(guard);
+        assert!(s.add("d1", markup()).is_ok());
+    }
+
+    #[test]
+    fn a_document_that_could_not_be_refreshed_after_a_write_refuses_to_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pdf");
+        std::fs::write(&p, b"%PDF-1.4").unwrap();
+        let s = MarkupStore::default();
+        s.register("d1", p.clone(), None);
+        s.seed_loaded("d1", vec![]).unwrap();
+        s.mark_needs_reload("d1");
+        let err = s.write_snapshot("d1").err().expect("must refuse");
+        assert_eq!(err, ERR_NEEDS_RELOAD);
+        assert!(err.contains("needs a reload"), "the frontend matches this marker");
+        // A reload that succeeds clears it.
+        let txn = s.begin_reload("d1").unwrap();
+        s.commit_reload("d1", txn, vec![], 1).unwrap();
+        assert!(s.write_snapshot("d1").is_ok());
+    }
+
+    #[test]
+    fn a_page_op_matches_an_annotation_whose_id_changed_by_its_object_id() {
+        // A foreign annotation read back under a different id (no usable /NM) is still the
+        // same annotation: it must follow its sheet, not be dropped as flattened.
+        let s = MarkupStore::default();
+        s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
+        let oid = (42, 0);
+        let mut m = markup();
+        m.source_ref = Some(crate::markup::SourceRef { oid: Some(oid), nm: None, loc: None });
+        s.seed_loaded("d1", vec![m.clone()]).unwrap(); // `add` would drop reader-owned fields
+        let snap = s.write_snapshot("d1").unwrap();
+        let mut back = markup(); // a fresh random id, as an unnamed annotation reads
+        back.page = 2;
+        back.source_ref = Some(crate::markup::SourceRef { oid: Some(oid), nm: None, loc: None });
+        s.finish_page_op("d1", &snap, std::slice::from_ref(&back));
+        let kept = s.list("d1").unwrap();
+        assert_eq!(kept.len(), 1, "not dropped");
+        assert_eq!((kept[0].id(), kept[0].page), (m.id(), 2), "keeps its id, takes the new page");
     }
 
     #[test]

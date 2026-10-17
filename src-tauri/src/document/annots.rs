@@ -1385,7 +1385,7 @@ pub(crate) mod tests {
 
     /// Same shape as `one_page_doc` but with three page objects in Kids / Count = 3.
     /// Returns the page ObjectIds in page order (index 0..=2).
-    fn three_page_doc() -> (Document, Vec<lopdf::ObjectId>) {
+    pub(crate) fn three_page_doc() -> (Document, Vec<lopdf::ObjectId>) {
         let mut doc = Document::with_version("1.5");
         let pages_id = doc.new_object_id();
         let mut page_ids = Vec::new();

@@ -353,7 +353,9 @@ pub async fn save_document_as_rebuild(
 /// can run (no copy for a file over the size cap, or when the copy could not be made).
 #[tauri::command]
 pub fn can_rebuild_from_original(state: State<'_, AppState>, doc_id: String) -> bool {
-    state.markups.original_copy(&doc_id).is_some_and(|p| p.exists())
+    // A document awaiting a reload cannot rebuild: the private copy predates the last write.
+    !state.markups.needs_reload(&doc_id)
+        && state.markups.original_copy(&doc_id).is_some_and(|p| p.exists())
 }
 
 /// Reload and keep my mark-ups: recovery for a PDF another program changed since redline
@@ -492,8 +494,8 @@ async fn save_inner(
             .map_err(|e| format!("{e:#}"))?;
         state.markups.seed_loaded_with(doc_id, loaded, snapshot)?;
     }
-    let markups = state.markups.list(doc_id)?;
-    let removed = state.markups.removed_sources(doc_id);
+    let snap = state.markups.write_snapshot(doc_id)?;
+    let (markups, removed) = (snap.markups.clone(), snap.removed.clone());
 
     // Annotation matching and preserved originals use the loaded file's object ids: refuse
     // any write (in place or Save As, which reads the same source) once another program has
@@ -538,14 +540,40 @@ async fn save_inner(
             .map_err(|e| format!("{e:#}"))?;
     }
 
+    // Scale calibration lives in the sidecar next to the PDF, not in the PDF: a Save As must
+    // write it for the new path or the copy reopens uncalibrated. Done BEFORE the swap so a
+    // sidecar failure aborts the whole Save As with nothing changed (the frontend treats an
+    // Err as "nothing was saved": it keeps the old path and the dirty flag), and a failed
+    // swap puts the old sidecar back.
+    let sidecar_undo = if new_path.is_some() {
+        let scales = state.scales.lock().unwrap().list(doc_id).to_vec();
+        match crate::sidecar::stage_scales(&dest, &scales) {
+            Ok(undo) => Some(undo),
+            Err(e) => {
+                let _ = std::fs::remove_file(&staged);
+                return Err(format!(
+                    "Could not save the scale calibration next to {}: {e}. Nothing was saved.",
+                    dest.display()
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     // 2. Release the file from the render engine, swap, reopen under the same doc_id.
-    state
-        .render
-        .close_document(doc_id.to_string())
-        .await
-        .map_err(|e| format!("{e:#}"))?;
+    if let Err(e) = state.render.close_document(doc_id.to_string()).await {
+        let _ = std::fs::remove_file(&staged);
+        if let Some(u) = sidecar_undo {
+            u.undo();
+        }
+        return Err(format!("{e:#}"));
+    }
     if let Err(e) = std::fs::rename(&staged, &dest) {
         let _ = std::fs::remove_file(&staged);
+        if let Some(u) = sidecar_undo {
+            u.undo();
+        }
         // Try to restore the render doc on the ORIGINAL path before failing.
         let _ = state
             .render
@@ -563,18 +591,18 @@ async fn save_inner(
     // load_markups re-parses rather than returning the pre-save snapshot.
     state.markups.invalidate_cache(&dest);
     if new_path.is_some() {
-        state.markups.set_path(doc_id, dest)?;
+        state.markups.set_path(doc_id, dest.clone())?;
     }
-    // The current markup state is now on disk - clear dirty (MCP server design, Phase
-    // 2a `close_document`/`list_open_documents`; see `DocEntry::dirty`'s doc comment).
-    state.markups.clear_dirty(doc_id);
     if rebuild {
         state.markups.forget_source(doc_id);
         // The rebuilt file is the PDF as it was opened: navigation undo entries described
         // the file as edited since, so they no longer apply.
         state.nav_history.lock().unwrap().remove(doc_id);
     }
-    state.markups.rebaseline_after_write(doc_id);
+    // The snapshot is now the file: clean unless something was edited while it was written
+    // (MCP server design, Phase 2a `close_document`/`list_open_documents`; see
+    // `DocEntry::dirty`'s doc comment).
+    state.markups.finish_write(doc_id, &snap);
     Ok(())
 }
 
@@ -728,6 +756,10 @@ pub(crate) async fn apply_page_edit_opts(
     keep_nav_history: bool,
     only_if_smaller: bool,
 ) -> Result<bool, String> {
+    // Hold the document's write slot for the whole transaction (write, render swap, store
+    // update): a save, another page op or a reload racing this one would otherwise read the
+    // half-updated file or store. Released on every exit path.
+    let _write_slot = state.markups.save_guard(doc_id)?;
     let src = state
         .markups
         .path(doc_id)
@@ -750,13 +782,13 @@ pub(crate) async fn apply_page_edit_opts(
     // The write below re-baselines the disk stamp (`invalidate_cache`), so verify it first:
     // a page op over a file another program changed would write stale object ids.
     ensure_source_unchanged(&state.markups, doc_id, was_loaded)?;
-    let markups = state.markups.list(doc_id)?;
-    let removed = state.markups.removed_sources(doc_id);
+    let snap = state.markups.write_snapshot(doc_id)?;
     crate::commands::takeoff::ensure_scales_loaded(state, doc_id);
     let scales = state.scales.lock().unwrap().list(doc_id).to_vec();
 
     // Apply the op + save in a blocking task.
     let src2 = src.clone();
+    let (markups, removed) = (snap.markups.clone(), snap.removed.clone());
     let written = tokio::task::spawn_blocking(move || {
         apply_edit_and_save_inner(&src2, &markups, &removed, &scales, op, only_if_smaller)
     })
@@ -767,26 +799,49 @@ pub(crate) async fn apply_page_edit_opts(
         return Ok(false);
     }
 
-    // Reload the render engine so new page geometry is reflected in tile renders.
-    state
-        .render
-        .close_document(doc_id.to_string())
-        .await
-        .map_err(|e| format!("{e:#}"))?;
-    state
-        .render
-        .open_document(src.clone(), doc_id.to_string(), password)
-        .await
-        .and_then(|outcome| outcome.into_page_count())
-        .map_err(|e| format!("reopen after page op: {e:#}"))?;
-    state.markups.invalidate_cache(&src);
+    // Reload the render engine so new page geometry is reflected in tile renders, then read
+    // the file back. The file is already rewritten, so a failure in either step leaves the
+    // store describing the OLD file: mark the document so no further write goes out until it
+    // is reloaded (a save would undo this change, or re-write what flatten/redact removed).
+    let refreshed: Result<Vec<Markup>, String> = async {
+        state
+            .render
+            .close_document(doc_id.to_string())
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        state
+            .render
+            .open_document(src.clone(), doc_id.to_string(), password)
+            .await
+            .and_then(|outcome| outcome.into_page_count())
+            .map_err(|e| format!("reopen after page op: {e:#}"))?;
+        state.markups.invalidate_cache(&src);
+        let (p, pw) = (src.clone(), state.markups.password(doc_id));
+        tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("the change was written, but the markup list could not be refreshed ({e:#}); reopen the document"))
+    }
+    .await;
+    let on_disk = match refreshed {
+        Ok(v) => v,
+        Err(e) => {
+            state.markups.mark_needs_reload(doc_id);
+            state.nav_history.lock().unwrap().remove(doc_id);
+            return Err(e);
+        }
+    };
     // Every caller of apply_page_edit (rotate/delete/reorder/insert, and - via
     // commands::docops - flatten/optimize/redact) writes the current markup state to
     // disk exactly like a save does (apply_edit_and_save calls write_markups before
-    // `op` runs) - clear dirty here too, not just in save_inner (MCP server design,
-    // Phase 2a; see DocEntry::dirty's doc comment).
-    state.markups.clear_dirty(doc_id);
-    state.markups.rebaseline_after_write(doc_id);
+    // `op` runs), so the document is clean afterwards (MCP server design, Phase 2a; see
+    // DocEntry::dirty's doc comment) - except for an edit made while this ran.
+    //
+    // The op also changed what the file holds: reorder/delete/insert moved pages, flatten
+    // and redact removed annotations. Bring the store in line with the file, or the next
+    // save writes the old page indices (misplacing or undoing the op) and re-adds what was
+    // flattened or redacted.
+    state.markups.finish_page_op(doc_id, &snap, &on_disk);
     if !keep_nav_history {
         state.nav_history.lock().unwrap().remove(doc_id);
     }
@@ -1375,5 +1430,212 @@ mod tests {
         }
         // A document whose markups were never loaded reads them fresh: nothing stale.
         assert_eq!(ensure_source_unchanged(&store, "d", false), Ok(()));
+    }
+
+    // ---- Codex review R1-R3: the store must follow the file through a page operation ----
+
+    /// Open `path` in a fresh store as the command layer does: registered, loaded, then
+    /// `m` added as an unsaved edit.
+    fn store_with(path: &std::path::Path, m: Markup) -> crate::document::store::MarkupStore {
+        let store = crate::document::store::MarkupStore::default();
+        store.register("d", path.to_path_buf(), None);
+        let loaded = crate::document::save::load_markups_from(path, None).unwrap();
+        store.seed_loaded("d", loaded).unwrap();
+        store.add("d", m).unwrap();
+        store
+    }
+
+    /// Run `op` over the store's current markups exactly as `apply_page_edit_opts` does, and
+    /// finish with the store brought in line with the file.
+    fn page_op(
+        store: &crate::document::store::MarkupStore,
+        path: &std::path::Path,
+        resync: bool,
+        op: impl FnOnce(&mut lopdf::Document) -> anyhow::Result<()>,
+    ) {
+        let snap = store.write_snapshot("d").unwrap();
+        apply_edit_and_save(path, &snap.markups, &snap.removed, op).unwrap();
+        if resync {
+            let on_disk = crate::document::save::load_markups_from(path, None).unwrap();
+            store.finish_page_op("d", &snap, &on_disk);
+        } else {
+            store.finish_write("d", &snap);
+        }
+    }
+
+    /// The pages (by index) that carry the redline markup after the NEXT save.
+    fn pages_after_next_save(
+        store: &crate::document::store::MarkupStore,
+        path: &std::path::Path,
+    ) -> Vec<u32> {
+        let out = path.with_extension("next.pdf");
+        let snap = store.write_snapshot("d").unwrap();
+        crate::document::save::save_with_markups_scaled(path, &out, &snap.markups, &snap.removed, &[])
+            .unwrap();
+        let mut pages: Vec<u32> = crate::document::save::load_markups_from(&out, None)
+            .unwrap()
+            .iter()
+            .map(|m| m.page)
+            .collect();
+        pages.sort_unstable();
+        pages
+    }
+
+    #[test]
+    fn reorder_then_next_save_keeps_the_markup_on_its_sheet() {
+        use crate::document::page_ops::{self, tests::n_page_doc};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reorder.pdf");
+        n_page_doc(3).0.save(&path).unwrap();
+        let m = redline_markup(0);
+        let store = store_with(&path, m.clone());
+
+        // Without the resync the store still says page 0: the next save moves the markup to
+        // whatever sheet now sits first (the Codex R2 probe).
+        page_op(&store, &path, false, |d| page_ops::reorder_pages(d, vec![1, 2, 0]));
+        assert_eq!(pages_after_next_save(&store, &path), vec![0], "premise: the stale store misplaces it");
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = dir2.path().join("reorder.pdf");
+        n_page_doc(3).0.save(&path2).unwrap();
+        let store = store_with(&path2, m);
+        page_op(&store, &path2, true, |d| page_ops::reorder_pages(d, vec![1, 2, 0]));
+        assert_eq!(store.list("d").unwrap()[0].page, 2, "the sheet moved from 0 to 2");
+        assert_eq!(pages_after_next_save(&store, &path2), vec![2]);
+        assert!(!store.is_dirty("d"));
+    }
+
+    #[test]
+    fn delete_page_drops_its_markups_and_shifts_the_rest() {
+        use crate::document::page_ops::{self, tests::n_page_doc};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delete.pdf");
+        n_page_doc(3).0.save(&path).unwrap();
+        let store = store_with(&path, redline_markup(0));
+        let on_p2 = redline_markup(2);
+        store.add("d", on_p2.clone()).unwrap();
+
+        page_op(&store, &path, true, |d| page_ops::delete_page(d, 0));
+        let left = store.list("d").unwrap();
+        assert_eq!(left.len(), 1, "the markup on the deleted sheet is gone");
+        assert_eq!((left[0].id(), left[0].page), (on_p2.id(), 1));
+        assert_eq!(pages_after_next_save(&store, &path), vec![1]);
+    }
+
+    #[test]
+    fn flatten_then_next_save_does_not_resurrect_the_annotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flatten-store.pdf");
+        let (mut doc, _) = one_page_doc();
+        doc.save(&path).unwrap();
+        let store = store_with(&path, redline_markup(0));
+
+        page_op(&store, &path, true, |d| flatten_annotations(d).map(|_| ()));
+        assert!(store.list("d").unwrap().is_empty(), "baked into the page, no longer a markup");
+        assert_eq!(pages_after_next_save(&store, &path), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn a_markup_added_during_the_page_op_is_refused_not_misplaced() {
+        use crate::document::page_ops::{self, tests::n_page_doc};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.pdf");
+        n_page_doc(2).0.save(&path).unwrap();
+        let store = store_with(&path, redline_markup(0));
+        // What apply_page_edit_opts does: hold the slot across the write.
+        let slot = store.save_guard("d").unwrap();
+        let snap = store.write_snapshot("d").unwrap();
+        assert_eq!(
+            store.add("d", redline_markup(1)),
+            Err("save already in progress".to_string()),
+            "an edit during the write is refused: its page index could not be remapped"
+        );
+        apply_edit_and_save(&path, &snap.markups, &snap.removed, |d| page_ops::reorder_pages(d, vec![1, 0]))
+            .unwrap();
+        let on_disk = crate::document::save::load_markups_from(&path, None).unwrap();
+        store.finish_page_op("d", &snap, &on_disk);
+        drop(slot);
+        assert_eq!(store.list("d").unwrap().len(), 1);
+        assert_eq!(store.list("d").unwrap()[0].page, 1, "the original markup moved with its sheet");
+        assert!(!store.is_dirty("d"));
+    }
+
+    /// A Square annotation with no /NM, as a generator that omits names writes it.
+    fn add_unnamed_foreign_square(doc: &mut lopdf::Document, page: lopdf::ObjectId) {
+        use lopdf::{dictionary, Object};
+        let annot = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Square",
+            "Rect" => vec![10.into(), 10.into(), 60.into(), 40.into()],
+            "C" => vec![1.0.into(), 0.0.into(), 0.0.into()],
+            "Contents" => Object::string_literal("foreign"),
+        });
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", Object::Array(vec![annot.into()]));
+    }
+
+    #[test]
+    fn an_unnamed_foreign_annotation_survives_page_ops_on_the_right_page() {
+        use crate::document::page_ops::{self, tests::n_page_doc};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foreign.pdf");
+        let (mut doc, pages) = n_page_doc(3);
+        add_unnamed_foreign_square(&mut doc, pages[0]);
+        doc.save(&path).unwrap();
+
+        let store = crate::document::store::MarkupStore::default();
+        store.register("d", path.clone(), None);
+        let loaded = crate::document::save::load_markups_from(&path, None).unwrap();
+        assert_eq!(loaded.len(), 1, "precondition: the foreign annotation is imported");
+        store.seed_loaded("d", loaded).unwrap();
+
+        page_op(&store, &path, true, |d| page_ops::rotate_page(d, 0, 90));
+        assert_eq!(store.list("d").unwrap().len(), 1, "survives a rotate");
+
+        page_op(&store, &path, true, |d| page_ops::reorder_pages(d, vec![1, 2, 0]));
+        let kept = store.list("d").unwrap();
+        assert_eq!(kept.len(), 1, "survives a reorder");
+        assert_eq!(kept[0].page, 2, "and follows its sheet");
+        assert_eq!(pages_after_next_save(&store, &path), vec![2]);
+    }
+
+    #[test]
+    fn reload_after_a_failed_refresh_does_not_resurrect_a_flattened_markup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flatten-reload.pdf");
+        let (mut doc, _) = one_page_doc();
+        doc.save(&path).unwrap();
+        let store = store_with(&path, redline_markup(0));
+        // The flatten reached the file, then the read-back failed (no finish_page_op).
+        let snap = store.write_snapshot("d").unwrap();
+        apply_edit_and_save(&path, &snap.markups, &snap.removed, |d| flatten_annotations(d).map(|_| ())).unwrap();
+        store.mark_needs_reload("d");
+
+        let txn = store.begin_reload("d").unwrap();
+        let loaded = crate::document::save::load_markups_from(&path, None).unwrap();
+        store.commit_reload("d", txn, loaded, 1).unwrap();
+        assert!(store.list("d").unwrap().is_empty(), "the flattened markup stays gone");
+        assert!(!store.is_dirty("d"));
+        assert_eq!(pages_after_next_save(&store, &path), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn reload_after_a_failed_refresh_keeps_the_markup_on_its_reordered_sheet() {
+        use crate::document::page_ops::{self, tests::n_page_doc};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reorder-reload.pdf");
+        n_page_doc(3).0.save(&path).unwrap();
+        let store = store_with(&path, redline_markup(0));
+        let snap = store.write_snapshot("d").unwrap();
+        apply_edit_and_save(&path, &snap.markups, &snap.removed, |d| page_ops::reorder_pages(d, vec![1, 2, 0])).unwrap();
+        store.mark_needs_reload("d");
+
+        let txn = store.begin_reload("d").unwrap();
+        let loaded = crate::document::save::load_markups_from(&path, None).unwrap();
+        store.commit_reload("d", txn, loaded, 3).unwrap();
+        assert_eq!(store.list("d").unwrap().len(), 1);
+        assert_eq!(store.list("d").unwrap()[0].page, 2, "the sheet moved from 0 to 2");
+        assert_eq!(pages_after_next_save(&store, &path), vec![2]);
     }
 }

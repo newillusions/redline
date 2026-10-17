@@ -397,7 +397,12 @@ export class MarkupStore implements MarkupSink {
         else if (op.kind === "reorder") await this.ipc.reorder?.(this.docId, op.ids);
         else await this.ipc.remove(this.docId, op.id);
       } catch (e) {
-        this.mirrorError = `Sync failed: ${e instanceof Error ? e.message : String(e)}`;
+        const text = e instanceof Error ? e.message : String(e);
+        // The backend refuses edits while a save or page operation holds the document. The op
+        // stays queued (below) and goes out on the next flush, so say so rather than "failed".
+        this.mirrorError = text.includes("save already in progress")
+          ? "The document is busy saving or editing pages. Your change will sync when it finishes."
+          : `Sync failed: ${text}`;
         if (isDefinitiveRejection(e)) {
           // Can never succeed by retrying - discard and keep draining the rest of the
           // queue rather than freezing every later op behind this one forever.

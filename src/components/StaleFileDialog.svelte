@@ -1,7 +1,8 @@
 <script lang="ts">
   /**
-   * StaleFileDialog - shown when a save is refused because another program changed the
-   * PDF on disk after redline opened it. The user's mark-ups are still in memory; this
+   * StaleFileDialog - shown when a save is refused because the PDF changed on disk after
+   * redline opened it (another program), or because redline's copy no longer matches a file
+   * it just rewrote (needs a reload). The user's mark-ups are still in memory; this
    * offers the two ways to keep them (neither writes over the changed file):
    *   - Save As (rebuild): write them to a NEW file built from the bytes redline loaded.
    *   - Reload and keep my mark-ups: re-read the changed file and re-apply the edits.
@@ -38,10 +39,10 @@
   open
   class="stale-prompt"
   aria-modal="true"
-  aria-label="The PDF changed on disk"
+  aria-label="The PDF no longer matches"
   onkeydown={handleKeyDown}
 >
-  <p class="prompt-message">{filename} was changed by another program.</p>
+  <p class="prompt-message">{filename} no longer matches what redline has loaded (it changed on disk).</p>
   <p class="prompt-hint">
     Nothing was saved, so your mark-ups are not lost. Saving over the changed file could
     duplicate or remove annotations, so choose how to keep them:
