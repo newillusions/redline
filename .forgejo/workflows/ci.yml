@@ -1,22 +1,60 @@
 name: CI
 
 # Rule 13.1.6 - push limited to main and version tags; pull_request only targets main.
+# Docs-only changes skip the whole workflow (paths-ignore). Forgejo reports no status for
+# a skipped workflow; redline's main has no branch protection / required checks
+# (verified 2026-10-17 via list_branch_protections), so merges stay possible. If a
+# required check is ever added, replace paths-ignore with an always-running `changes` job.
 on:
   push:
     branches: [main]
     tags: ['v*']
+    paths-ignore: ['**.md', 'docs/**']
   pull_request:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded PR runs only; never cancel a main push or tag run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # NOTE ON `permissions:` - deliberately absent. Forgejo ignores the key
 # ("Certain subkeys on the job key in workflow files are ignored, like permissions, and
 # continue-on-error." - forgejo.org/docs/latest/user/actions/github-actions/).
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # changes - decides whether the heavy `ocr` job is needed. Always runs.
+  # ocr runs on pushes to main / tags, and on PRs only when OCR-related paths change.
+  # ---------------------------------------------------------------------------
+  changes:
+    runs-on: rust-1.89
+    timeout-minutes: 5
+    outputs:
+      ocr: ${{ steps.filter.outputs.ocr }}
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Detect OCR-related changes
+        id: filter
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "ocr=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch -q origin "${{ github.base_ref }}"
+          CHANGED="$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")"
+          echo "$CHANGED"
+          if echo "$CHANGED" | grep -Eq '^(src-tauri/src/ocr/|src-tauri/src/commands/ocr\.rs|src-tauri/src/lib\.rs|src-tauri/src/bin/ocr_|src-tauri/tests/ocr_|src-tauri/Cargo\.toml|Cargo\.(toml|lock)|tools/fixtures/ocr/|scripts/fetch-pdfium\.sh|\.forgejo/workflows/ci\.yml)'; then
+            echo "ocr=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ocr=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # ---------------------------------------------------------------------------
   # test-rust - compiles and runs pull-request-controlled Rust.
   #
@@ -31,6 +69,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-rust:
     runs-on: rust-1.89
+    timeout-minutes: 30
     steps:
       # Rule 13.1.4 - fully qualified URL plus a 40-character commit SHA, tag in the
       # trailing comment. Verified via `git ls-remote https://data.forgejo.org/actions/checkout v4.4.0`.
@@ -43,7 +82,13 @@ jobs:
       # need. libayatana-appindicator3-dev intentionally omitted (Ubuntu-only; tray-icon
       # feature not enabled) - unchanged from the Dockerfile.
       - name: Install Tauri + leptess system deps
+        # Baked into emittiv/rust-ci since the ci-diet change; this install is the
+        # fallback for runners still on an older image and a no-op otherwise.
         run: |
+          if dpkg -s pkg-config libssl-dev libwebkit2gtk-4.1-dev build-essential wget file libxdo-dev librsvg2-dev clang libtesseract-dev libleptonica-dev tesseract-ocr-eng > /dev/null 2>&1; then
+            echo "system deps already baked into the runner image"
+            exit 0
+          fi
           apt-get update -qq
           apt-get install -y -qq \
             pkg-config \
@@ -80,12 +125,20 @@ jobs:
   # no shared image to opt a build-arg into - this job simply runs the extra steps.
   # ---------------------------------------------------------------------------
   ocr:
+    needs: changes
+    if: needs.changes.outputs.ocr == 'true'
     runs-on: rust-1.89
+    timeout-minutes: 40
     steps:
       - uses: https://data.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Tauri + leptess system deps
+        # Baked into emittiv/rust-ci since the ci-diet change; fallback for older images.
         run: |
+          if dpkg -s pkg-config libssl-dev libwebkit2gtk-4.1-dev build-essential wget file libxdo-dev librsvg2-dev clang libtesseract-dev libleptonica-dev tesseract-ocr-eng fonts-liberation > /dev/null 2>&1; then
+            echo "system deps already baked into the runner image"
+            exit 0
+          fi
           apt-get update -qq
           apt-get install -y -qq \
             pkg-config \
@@ -136,6 +189,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: https://data.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
