@@ -552,6 +552,9 @@
    *  the status banner the user is actually looking at. */
   let isOcrRunning = $state(false);
   let ocrRunningDocId = $state<string | null>(null);
+  /** Set after an OCR run left pages alone because they already had text: drives the
+   *  "OCR anyway" button in the status banner so the skip is never a dead end. */
+  let ocrAnywayOffer = $state<{ docId: string; store: MarkupStore } | null>(null);
   /** Compression/quality control for the Optimize action (spec §8 image downsampling) -
    *  Bluebeam-style preset: High (minimal loss) / Balanced (default) / Small (aggressive). */
   let imageQualityPreset = $state<ImageQualityPreset>("balanced");
@@ -1357,10 +1360,11 @@
    * auto-OCR-on-open must be able to run against a just-opened document that isn't
    * necessarily the currently focused tab (e.g. several PDFs opened at once via drag-drop).
    */
-  async function runOcrForDoc(docId: string, store: MarkupStore) {
+  async function runOcrForDoc(docId: string, store: MarkupStore, force = false) {
     if (isOcrRunning) return;
     openError = null;
     docOpsStatus = null;
+    ocrAnywayOffer = null;
     isOcrRunning = true;
     ocrRunningDocId = docId;
     try {
@@ -1368,16 +1372,19 @@
         docId,
         store,
         { loadMarkups },
-        () => runOcrDocument(docId),
+        () => runOcrDocument(docId, undefined, force),
       );
+      const skipped = report.pages_skipped_existing_text;
       const skippedNote =
-        report.pages_skipped_existing_text > 0
-          ? ` (${report.pages_skipped_existing_text} page${report.pages_skipped_existing_text === 1 ? "" : "s"} already had text, skipped)`
+        skipped > 0
+          ? ` (${skipped} page${skipped === 1 ? "" : "s"} already had text, skipped)`
           : "";
       docOpsStatus =
         report.pages_ocred === 0
           ? `OCR: no pages needed scanning${skippedNote || " - document is empty"}.`
           : `OCR complete - ${report.pages_ocred} page${report.pages_ocred === 1 ? "" : "s"} scanned, ${report.lines_embedded} line${report.lines_embedded === 1 ? "" : "s"} embedded${skippedNote}.`;
+      // A forced run already ignored native text, so only a normal run offers the override.
+      if (!force && skipped > 0) ocrAnywayOffer = { docId, store };
     } catch (e) {
       openError = `OCR failed: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
@@ -1390,6 +1397,12 @@
   async function handleRunOcr() {
     if (!activeTab || isOcrRunning) return;
     await runOcrForDoc(activeTab.docId, activeTab.store);
+  }
+
+  /** "OCR anyway": also OCR pages that carry native text (never stacks on Redline's own layer). */
+  async function handleRunOcrAnyway() {
+    if (!activeTab || isOcrRunning) return;
+    await runOcrForDoc(activeTab.docId, activeTab.store, true);
   }
 
   // ---------------------------------------------------------------------------
@@ -1480,6 +1493,13 @@
         title: "Recognise scanned text and embed it as an invisible, searchable layer",
         disabled: !activeTab || isOcrRunning || isSaving,
         onselect: () => void handleRunOcr(),
+      },
+      {
+        id: "ocr-anyway",
+        label: "OCR anyway (include pages with text)",
+        title: "OCR every page, even ones that already carry native text such as a print footer. Pages Redline has already OCR'd are left alone.",
+        disabled: !activeTab || isOcrRunning || isSaving,
+        onselect: () => void handleRunOcrAnyway(),
       },
       {
         id: "unprotected",
@@ -1833,7 +1853,12 @@
   {/if}
 
   {#if docOpsStatus}
-    <div class="docops-status-banner">{docOpsStatus}</div>
+    <div class="docops-status-banner" role="status">
+      <span>{docOpsStatus}</span>
+      {#if ocrAnywayOffer !== null && ocrAnywayOffer.docId === activeTab?.docId}
+        <button class="btn-toolbar" disabled={isOcrRunning} onclick={handleRunOcrAnyway}>OCR anyway</button>
+      {/if}
+    </div>
   {/if}
 
   <!-- Main 3-column body -->
@@ -2452,6 +2477,9 @@
     font-size: var(--font-size-sm);
     padding: var(--space-2) var(--space-4);
     flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
   }
 
   /* --- Body row (3 columns) --- */

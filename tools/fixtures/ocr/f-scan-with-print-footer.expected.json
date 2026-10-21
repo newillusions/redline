@@ -1,0 +1,14 @@
+{
+  "description": "Plain horizontal scan with an incidental native 'Page 1 of 1' print footer",
+  "render_dpi": 300.0,
+  "lines": [
+    {
+      "text": "FLOOR PLAN LEVEL 2",
+      "orientation": "horizontal"
+    },
+    {
+      "text": "SCALE 1 TO 100",
+      "orientation": "horizontal"
+    }
+  ]
+}

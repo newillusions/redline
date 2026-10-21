@@ -371,6 +371,16 @@ describe("docops ipc invoke argument keys (Tauri v2 camelCase)", () => {
     expect(mockInvokeDocops).toHaveBeenCalledWith("run_ocr_document", {
       docId: "d1",
       minConfidence: undefined,
+      force: undefined,
+    });
+  });
+
+  it("runOcrDocument with force → docId / force:true (the 'OCR anyway' action)", async () => {
+    await ipc.runOcrDocument("d1", undefined, true);
+    expect(mockInvokeDocops).toHaveBeenCalledWith("run_ocr_document", {
+      docId: "d1",
+      minConfidence: undefined,
+      force: true,
     });
   });
 
@@ -379,6 +389,7 @@ describe("docops ipc invoke argument keys (Tauri v2 camelCase)", () => {
     expect(mockInvokeDocops).toHaveBeenCalledWith("run_ocr_document", {
       docId: "d1",
       minConfidence: 0.6,
+      force: undefined,
     });
   });
 });

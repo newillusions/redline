@@ -141,12 +141,18 @@ fn build_source_pdf(page_w: f64, page_h: f64, specs: &[TextSpec]) -> Vec<u8> {
 
 /// Build a single-page, image-only "flattened scan" PDF: one JPEG Image
 /// XObject sized to fill `(page_w, page_h)` exactly, no text layer at all.
+///
+/// With `footer`, the page also carries that string as real native text near the bottom
+/// edge, like the "Page 1 of 1" a "Print to PDF" driver stamps over a scan. It is a
+/// separate content stream drawn after the image and is not part of the rasterised pixels,
+/// so it never enters the OCR ground truth.
 fn build_flattened_pdf(
     page_w: f64,
     page_h: f64,
     jpeg_bytes: Vec<u8>,
     img_w: u32,
     img_h: u32,
+    footer: Option<&str>,
 ) -> Vec<u8> {
     let mut doc = Document::with_version("1.7");
     let pages_id = doc.new_object_id();
@@ -161,11 +167,37 @@ fn build_flattened_pdf(
         "Filter" => "DCTDecode",
     };
     let img_id = doc.add_object(Stream::new(img_dict, jpeg_bytes));
-    let resources = dictionary! {
+    let mut resources = dictionary! {
         "XObject" => Object::Dictionary(dictionary! { "Im0" => Object::Reference(img_id) }),
     };
     let cm = format!("q {:.2} 0 0 {:.2} 0 0 cm /Im0 Do Q", page_w, page_h);
-    let content_id = doc.add_object(Stream::new(Dictionary::new(), cm.into_bytes()));
+    let image_content_id = doc.add_object(Stream::new(Dictionary::new(), cm.into_bytes()));
+    let content_id: Object = match footer {
+        None => Object::Reference(image_content_id),
+        Some(text) => {
+            let font_id = doc.add_object(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type1",
+                "BaseFont" => "Helvetica",
+                "Encoding" => "WinAnsiEncoding",
+            });
+            resources.set(
+                "Font",
+                Object::Dictionary(dictionary! { "F1" => Object::Reference(font_id) }),
+            );
+            let footer_content = format!(
+                "BT /F1 9 Tf {:.2} 18 Td ({}) Tj ET\n",
+                page_w / 2.0 - 25.0,
+                pdf_escape(text)
+            );
+            let footer_id =
+                doc.add_object(Stream::new(Dictionary::new(), footer_content.into_bytes()));
+            Object::Array(vec![
+                Object::Reference(image_content_id),
+                Object::Reference(footer_id),
+            ])
+        }
+    };
     let page_id = doc.add_object(dictionary! {
         "Type" => "Page",
         "Parent" => pages_id,
@@ -173,7 +205,7 @@ fn build_flattened_pdf(
             0.0.into(), 0.0.into(), (page_w as f32).into(), (page_h as f32).into(),
         ],
         "Resources" => Object::Dictionary(resources),
-        "Contents" => Object::Reference(content_id),
+        "Contents" => content_id,
     });
     doc.objects.insert(
         pages_id,
@@ -258,6 +290,8 @@ struct Fixture {
     page_h: f64,
     dpi: f32,
     specs: Vec<TextSpec>,
+    /// Native footer text stamped over the flattened scan (see `build_flattened_pdf`).
+    footer: Option<&'static str>,
 }
 
 fn fixtures() -> Vec<Fixture> {
@@ -276,6 +310,7 @@ fn fixtures() -> Vec<Fixture> {
                 TextSpec { text: "DRAWN BY MR CHECKED BY JR", x: 72.0, y: 580.0, font_size: 14.0, rotate_deg: 0.0, orientation: "horizontal" },
                 TextSpec { text: "NORTH", x: 72.0, y: 540.0, font_size: 14.0, rotate_deg: 0.0, orientation: "horizontal" },
             ],
+            footer: None,
         },
         // (b) a page with a 90-degree rotated dimension string.
         Fixture {
@@ -288,6 +323,7 @@ fn fixtures() -> Vec<Fixture> {
                 TextSpec { text: "D1", x: 40.0, y: 370.0, font_size: 12.0, rotate_deg: 0.0, orientation: "horizontal" },
                 TextSpec { text: "DIM 3650 MM", x: 200.0, y: 100.0, font_size: 16.0, rotate_deg: 90.0, orientation: "vertical" },
             ],
+            footer: None,
         },
         // (c) mixed horizontal callouts + vertical text on one sheet — the
         // exact requirement-2 case the scoping doc calls out.
@@ -304,6 +340,7 @@ fn fixtures() -> Vec<Fixture> {
                 TextSpec { text: "DIM 5000 MM", x: 650.0, y: 40.0, font_size: 14.0, rotate_deg: 90.0, orientation: "vertical" },
                 TextSpec { text: "DIM 3200 MM", x: 600.0, y: 40.0, font_size: 14.0, rotate_deg: 90.0, orientation: "vertical" },
             ],
+            footer: None,
         },
         // (d) a dense A0-style sheet, for latency. Physical page size matches
         // the real A0-class corpus tier already used by bench/RUNBOOK-S20.md
@@ -324,6 +361,7 @@ fn fixtures() -> Vec<Fixture> {
             page_h: 2384.0,
             dpi: 150.0,
             specs: dense_a0_specs(),
+            footer: None,
         },
         // (e) a small-font title-block crop.
         Fixture {
@@ -339,6 +377,23 @@ fn fixtures() -> Vec<Fixture> {
                 TextSpec { text: "REV A", x: 10.0, y: 55.0, font_size: 6.0, rotate_deg: 0.0, orientation: "horizontal" },
                 TextSpec { text: "DRAWN MR", x: 10.0, y: 40.0, font_size: 6.0, rotate_deg: 0.0, orientation: "horizontal" },
             ],
+            footer: None,
+        },
+        // (f) a raster scan carrying incidental native text: the "Page 1 of 1" footer a
+        // "Print to PDF" driver stamps over the image. The footer is real vector text, not
+        // part of the raster, so the OCR ground truth below does not list it. Used by
+        // `commands::ocr` tests to prove such a page is still selected for OCR.
+        Fixture {
+            name: "f-scan-with-print-footer",
+            description: "Plain horizontal scan with an incidental native 'Page 1 of 1' print footer",
+            page_w: 612.0,
+            page_h: 792.0,
+            dpi: 300.0,
+            specs: vec![
+                TextSpec { text: "FLOOR PLAN LEVEL 2", x: 72.0, y: 700.0, font_size: 14.0, rotate_deg: 0.0, orientation: "horizontal" },
+                TextSpec { text: "SCALE 1 TO 100", x: 72.0, y: 660.0, font_size: 14.0, rotate_deg: 0.0, orientation: "horizontal" },
+            ],
+            footer: Some("Page 1 of 1"),
         },
     ]
 }
@@ -384,7 +439,7 @@ fn main() {
     for fx in fixtures() {
         let source_bytes = build_source_pdf(fx.page_w, fx.page_h, &fx.specs);
         let (jpeg, img_w, img_h) = rasterize_source_pdf(&mut engine, &source_bytes, fx.dpi);
-        let flattened = build_flattened_pdf(fx.page_w, fx.page_h, jpeg, img_w, img_h);
+        let flattened = build_flattened_pdf(fx.page_w, fx.page_h, jpeg, img_w, img_h, fx.footer);
 
         let pdf_path = out_dir.join(format!("{}.pdf", fx.name));
         fs::write(&pdf_path, &flattened).expect("write flattened fixture pdf");

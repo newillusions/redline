@@ -42,12 +42,31 @@ use tauri::{AppHandle, State};
 
 use crate::AppState;
 
-/// Minimum non-whitespace character count across a sampled page's extracted text to call
-/// it "has a text layer" — a single stray space/control character surviving a scan
-/// artifact must not count as "already searchable". Shared between `document_needs_ocr`
-/// (the auto-OCR-on-open heuristic) and `run_ocr_document`'s own already-has-text guard
-/// (see `pages_needing_ocr`'s doc comment) so both agree on what "has text" means.
-const MIN_TEXT_CHARS: usize = 8;
+/// Minimum non-whitespace character count on a page for its native text to count as a
+/// real text layer rather than incidental print furniture.
+///
+/// A raster scan routinely carries a little genuine native text: the footer a
+/// "Print to PDF" driver stamps ("Page 1 of 1" = 8 chars, which cleared the old floor of
+/// 8 and made OCR refuse the page), a Bates number, a print date line ("Printed
+/// 2026-10-21 Page 1 of 3" = 25 chars). Those are all well under 40. A page that is
+/// actually searchable (a title block, a schedule, a paragraph, any CAD sheet) carries
+/// far more than 40 characters, so a floor of 40 separates the two without needing
+/// glyph geometry, which lopdf's text extraction does not expose. Trade-off: a native
+/// page with under 40 characters in total is treated as scan-like and gets an invisible
+/// OCR layer added over it, which is harmless, whereas the reverse mistake (a scan that
+/// cannot be OCR'd) is a dead end. The explicit "OCR anyway" action (`force`) covers any
+/// page this floor still skips.
+///
+/// Shared between `document_needs_ocr` (the auto-OCR-on-open heuristic) and
+/// `run_ocr_document`'s already-has-text guard through [`has_real_text_layer`], so both
+/// agree on what "has text" means.
+const MIN_TEXT_CHARS: usize = 40;
+
+/// `true` if `text` (one page's extracted text) is a real text layer, not incidental
+/// footer/header/stamp text. The single definition both OCR guards use.
+fn has_real_text_layer(text: &str) -> bool {
+    text.chars().filter(|c| !c.is_whitespace()).count() >= MIN_TEXT_CHARS
+}
 
 /// How many leading pages `document_needs_ocr` samples — enough to catch a scanned cover
 /// sheet followed by native-text pages (or vice versa) without paying the extraction cost
@@ -58,11 +77,11 @@ const SAMPLE_PAGES: usize = 3;
 /// no-text-layer test the auto-OCR-on-open setting uses to decide whether to trigger OCR
 /// after a document opens (spec requirement 3). Pure logic, unit-tested directly; the
 /// command wrapper below only supplies the real per-page text.
-fn pages_lack_text(pages: &[(u64, String)], sample_pages: usize, min_chars: usize) -> bool {
+fn pages_lack_text(pages: &[(u64, String)], sample_pages: usize) -> bool {
     !pages
         .iter()
         .take(sample_pages)
-        .any(|(_, text)| text.chars().filter(|c| !c.is_whitespace()).count() >= min_chars)
+        .any(|(_, text)| has_real_text_layer(text))
 }
 
 /// `true` if none of the first `SAMPLE_PAGES` pages of the open document `doc_id` have
@@ -84,7 +103,7 @@ pub async fn document_needs_ocr(
     tokio::task::spawn_blocking(move || {
         let pages =
             crate::search::indexer::extract_pdf_text(&path).map_err(|e| format!("{e:#}"))?;
-        Ok(pages_lack_text(&pages, SAMPLE_PAGES, MIN_TEXT_CHARS))
+        Ok(pages_lack_text(&pages, SAMPLE_PAGES))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -104,9 +123,14 @@ fn pages_needing_ocr(page_count: u32, existing_text_pages: &HashSet<u32>) -> Vec
         .collect()
 }
 
-/// 0-based indices of pages that must NOT be OCR'd again: pages with extractable text
-/// (native content or a prior OCR pass) plus pages carrying a Redline OCR layer even if
-/// that layer's text is too short or too unreadable to clear `MIN_TEXT_CHARS`.
+/// 0-based indices of pages that must NOT be OCR'd again: pages with a real text layer
+/// (native content or a prior OCR pass, see [`has_real_text_layer`]) plus pages carrying a
+/// Redline OCR layer even if that layer's text is too short or too unreadable to clear
+/// `MIN_TEXT_CHARS`.
+///
+/// With `force` (the explicit "OCR anyway" action) native text no longer protects a page:
+/// only Redline's own single layer does, so it is never stacked, while a scan with
+/// incidental or unwanted native text is OCR'd regardless.
 ///
 /// A page carrying MORE than one Redline layer is deliberately NOT in the set: files OCR'd
 /// by v0.3.24 and earlier stacked a duplicate layer on every re-run, and re-OCR'ing such a
@@ -118,14 +142,19 @@ fn pages_needing_ocr(page_count: u32, existing_text_pages: &HashSet<u32>) -> Vec
 fn pages_already_ocred(
     text_pages: &[(u64, String)],
     layer_counts: &std::collections::BTreeMap<u32, usize>,
+    force: bool,
 ) -> HashSet<u32> {
-    let mut done: HashSet<u32> = text_pages
-        .iter()
-        .filter(|(_, text)| text.chars().filter(|c| !c.is_whitespace()).count() >= MIN_TEXT_CHARS)
-        // extract_pdf_text's page_num is 1-based; this module's page indices are 0-based
-        // throughout (matches render_page_full).
-        .map(|(page_num_1based, _)| page_num_1based.saturating_sub(1) as u32)
-        .collect();
+    let mut done: HashSet<u32> = if force {
+        HashSet::new()
+    } else {
+        text_pages
+            .iter()
+            .filter(|(_, text)| has_real_text_layer(text))
+            // extract_pdf_text's page_num is 1-based; this module's page indices are
+            // 0-based throughout (matches render_page_full).
+            .map(|(page_num_1based, _)| page_num_1based.saturating_sub(1) as u32)
+            .collect()
+    };
     done.extend(layer_counts.keys().copied());
     for (page, count) in layer_counts {
         if *count > 1 {
@@ -133,6 +162,21 @@ fn pages_already_ocred(
         }
     }
     done
+}
+
+/// 0-based pages of `doc` that OCR will process: every page not protected by
+/// [`pages_already_ocred`]. The whole of `run_ocr_document`'s page selection, split out so
+/// it can be exercised against a real (in-memory) document.
+#[cfg(feature = "ocr")]
+fn pages_to_ocr_in_doc(doc: &mut lopdf::Document, page_count: u32, force: bool) -> Vec<u32> {
+    // Layer detection reads stream bytes directly, so it still sees Redline's own layer
+    // on scans whose NUL-padded streams defeat text extraction.
+    let layer_counts = crate::ocr::writer::ocr_layer_counts(doc);
+    let text_pages = crate::search::indexer::extract_doc_text(doc);
+    pages_needing_ocr(
+        page_count,
+        &pages_already_ocred(&text_pages, &layer_counts, force),
+    )
 }
 
 /// Per-page progress, emitted on the `"ocr-progress"` Tauri event as `run_ocr_document`
@@ -159,6 +203,8 @@ pub struct OcrProgressEvent {
 pub struct OcrRunReport {
     pub pages_total: u32,
     pub pages_ocred: u32,
+    /// Pages left alone because they already carry a real text layer or Redline's own OCR
+    /// layer. Non-zero on a normal run is the cue to offer the "OCR anyway" action.
     pub pages_skipped_existing_text: u32,
     pub pages_with_text_embedded: u32,
     pub lines_embedded: usize,
@@ -174,6 +220,10 @@ pub struct OcrRunReport {
 ///
 /// `min_confidence` defaults to `ocr::writer::DEFAULT_MIN_CONFIDENCE` when omitted.
 ///
+/// `force` (default false) is the explicit "OCR anyway" action: pages with native text are
+/// OCR'd too. Pages carrying exactly one Redline OCR layer are still skipped, so a layer is
+/// never stacked.
+///
 /// # Errors
 /// Returns an error string if `doc_id` is unknown, OCR isn't compiled into this build, the
 /// Tesseract engine fails to load, recognition fails on any page, or the atomic save
@@ -185,14 +235,15 @@ pub async fn run_ocr_document(
     state: State<'_, AppState>,
     doc_id: String,
     min_confidence: Option<f32>,
+    force: Option<bool>,
 ) -> Result<OcrRunReport, String> {
     #[cfg(feature = "ocr")]
     {
-        run_ocr_document_impl(app, state, doc_id, min_confidence).await
+        run_ocr_document_impl(app, state, doc_id, min_confidence, force.unwrap_or(false)).await
     }
     #[cfg(not(feature = "ocr"))]
     {
-        let _ = (app, state, doc_id, min_confidence);
+        let _ = (app, state, doc_id, min_confidence, force);
         Err(
             "OCR is not available in this build — the `ocr` feature was not compiled into \
              this release."
@@ -207,6 +258,7 @@ async fn run_ocr_document_impl(
     state: State<'_, AppState>,
     doc_id: String,
     min_confidence: Option<f32>,
+    force: bool,
 ) -> Result<OcrRunReport, String> {
     use tauri::Emitter as _;
     use tauri::Manager as _;
@@ -231,7 +283,7 @@ async fn run_ocr_document_impl(
         .map_err(|e| format!("{e:#}"))?
         .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
 
-    let existing_text_pages: HashSet<u32> = {
+    let pages_to_ocr: Vec<u32> = {
         let path = path.clone();
         tokio::task::spawn_blocking(move || {
             // A scan failure must not block OCR entirely - treat it as "no existing text
@@ -239,19 +291,13 @@ async fn run_ocr_document_impl(
             // don't-abort-the-whole-document posture rather than erroring the whole run
             // over a pre-check that isn't the actual operation.
             let Ok(mut doc) = lopdf::Document::load(&path) else {
-                return HashSet::new();
+                return (0..page_count).collect();
             };
-            // Layer detection reads stream bytes directly, so it still sees Redline's own
-            // layer on scans whose NUL-padded streams defeat text extraction.
-            let layer_counts = crate::ocr::writer::ocr_layer_counts(&doc);
-            let text_pages = crate::search::indexer::extract_doc_text(&mut doc);
-            pages_already_ocred(&text_pages, &layer_counts)
+            pages_to_ocr_in_doc(&mut doc, page_count, force)
         })
         .await
         .map_err(|e| e.to_string())?
     };
-
-    let pages_to_ocr = pages_needing_ocr(page_count, &existing_text_pages);
     let pages_skipped_existing_text = page_count - pages_to_ocr.len() as u32;
 
     if pages_to_ocr.is_empty() {
@@ -357,7 +403,30 @@ async fn run_ocr_document_impl(
 mod tests {
     use super::*;
 
-    // --- pages_lack_text ---------------------------------------------------
+    const REAL_TEXT: &str = "ROOM 101 OFFICE PLAN LEVEL 2 SCALE 1 TO 100 DRAWN BY MR";
+
+    // --- has_real_text_layer / pages_lack_text -----------------------------
+
+    #[test]
+    fn incidental_print_furniture_is_not_a_text_layer() {
+        // The repro shape: a Print-to-PDF footer, plus the usual stamp variants.
+        for footer in [
+            "Page 1 of 1",
+            "Page 12 of 140",
+            "Printed 2026-10-21 Page 1 of 3",
+            "BATES 000123",
+        ] {
+            assert!(
+                !has_real_text_layer(footer),
+                "{footer:?} must be incidental"
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_of_real_text_is_a_text_layer() {
+        assert!(has_real_text_layer(REAL_TEXT));
+    }
 
     #[test]
     fn pages_lack_text_true_when_all_sampled_pages_are_empty() {
@@ -366,13 +435,13 @@ mod tests {
             (2, "   \n\t  ".to_string()),
             (3, "".to_string()),
         ];
-        assert!(pages_lack_text(&pages, 3, MIN_TEXT_CHARS));
+        assert!(pages_lack_text(&pages, 3));
     }
 
     #[test]
     fn pages_lack_text_false_when_any_sampled_page_has_real_text() {
-        let pages = vec![(1, "".to_string()), (2, "ROOM 101 OFFICE PLAN".to_string())];
-        assert!(!pages_lack_text(&pages, 3, MIN_TEXT_CHARS));
+        let pages = vec![(1, "".to_string()), (2, REAL_TEXT.to_string())];
+        assert!(!pages_lack_text(&pages, 3));
     }
 
     #[test]
@@ -381,28 +450,27 @@ mod tests {
         let pages = vec![
             (1, "".to_string()),
             (2, "".to_string()),
-            (3, "ROOM 101 OFFICE PLAN".to_string()),
+            (3, REAL_TEXT.to_string()),
         ];
-        assert!(pages_lack_text(&pages, 2, MIN_TEXT_CHARS));
+        assert!(pages_lack_text(&pages, 2));
     }
 
     #[test]
     fn pages_lack_text_a_stray_whitespace_scan_artifact_does_not_count_as_text() {
         let pages = vec![(1, " \u{a0} \n ".to_string())];
-        assert!(pages_lack_text(&pages, 3, MIN_TEXT_CHARS));
+        assert!(pages_lack_text(&pages, 3));
     }
 
     #[test]
-    fn pages_lack_text_below_min_chars_does_not_count_as_text() {
-        // 3 non-whitespace chars, under the 8-char floor — a stray OCR/scan artifact,
-        // not a real text layer.
-        let pages = vec![(1, "1.2".to_string())];
-        assert!(pages_lack_text(&pages, 3, MIN_TEXT_CHARS));
+    fn pages_lack_text_a_footer_only_scan_lacks_text() {
+        // Regression: "Page 1 of 1" (8 chars) used to clear the floor and suppress OCR.
+        let pages = vec![(1, "Page 1 of 1".to_string())];
+        assert!(pages_lack_text(&pages, 3));
     }
 
     #[test]
     fn pages_lack_text_true_for_an_empty_document() {
-        assert!(pages_lack_text(&[], 3, MIN_TEXT_CHARS));
+        assert!(pages_lack_text(&[], 3));
     }
 
     // --- pages_needing_ocr --------------------------------------------------
@@ -448,9 +516,16 @@ mod tests {
 
         #[test]
         fn a_page_with_text_is_done() {
-            let text = vec![(1, "ROOM SCHEDULE".to_string()), (2, String::new())];
-            let done = pages_already_ocred(&text, &BTreeMap::new());
+            let text = vec![(1, REAL_TEXT.to_string()), (2, String::new())];
+            let done = pages_already_ocred(&text, &BTreeMap::new(), false);
             assert_eq!(done, [0].into_iter().collect());
+        }
+
+        #[test]
+        fn a_footer_only_page_is_not_done() {
+            let text = vec![(1, "Page 1 of 1".to_string())];
+            let done = pages_already_ocred(&text, &BTreeMap::new(), false);
+            assert!(done.is_empty());
         }
 
         #[test]
@@ -458,19 +533,84 @@ mod tests {
             // The NUL-padded-scan case: lopdf extracted zero chars but the layer is there.
             let text = vec![(1, String::new()), (2, String::new())];
             let layers: BTreeMap<u32, usize> = [(0, 1), (1, 1)].into_iter().collect();
-            let done = pages_already_ocred(&text, &layers);
+            let done = pages_already_ocred(&text, &layers, false);
             assert_eq!(done, [0, 1].into_iter().collect());
         }
 
         #[test]
         fn a_page_with_duplicate_layers_is_redone_so_the_writer_can_collapse_them() {
-            let text = vec![
-                (1, "ROOM SCHEDULE".to_string()),
-                (2, "ROOM SCHEDULE".to_string()),
-            ];
+            let text = vec![(1, REAL_TEXT.to_string()), (2, REAL_TEXT.to_string())];
             let layers: BTreeMap<u32, usize> = [(0, 2), (1, 1)].into_iter().collect();
-            let done = pages_already_ocred(&text, &layers);
+            let done = pages_already_ocred(&text, &layers, false);
             assert_eq!(done, [1].into_iter().collect());
+        }
+
+        #[test]
+        fn force_ignores_native_text_but_never_stacks_on_a_single_redline_layer() {
+            let text = vec![
+                (1, REAL_TEXT.to_string()),
+                (2, REAL_TEXT.to_string()),
+                (3, REAL_TEXT.to_string()),
+            ];
+            // page 1: native text only; page 2: one Redline layer; page 3: duplicate layers.
+            let layers: BTreeMap<u32, usize> = [(1, 1), (2, 2)].into_iter().collect();
+            let done = pages_already_ocred(&text, &layers, true);
+            assert_eq!(done, [1].into_iter().collect());
+        }
+
+        // --- pages_to_ocr_in_doc: the repro shape against a real document ---
+
+        #[test]
+        fn raster_scan_with_a_page_footer_is_selected_for_ocr() {
+            let mut doc =
+                crate::search::indexer::test_support::scan_with_text_doc(&["Page 1 of 1"]);
+            // The footer must really be extractable, or this would pass vacuously.
+            let extracted = crate::search::indexer::extract_doc_text(&mut doc);
+            assert!(extracted[0].1.contains("Page 1 of 1"), "got {extracted:?}");
+            assert_eq!(pages_to_ocr_in_doc(&mut doc, 1, false), vec![0]);
+        }
+
+        #[test]
+        fn native_text_page_is_skipped_unless_forced() {
+            let mut doc = crate::search::indexer::test_support::scan_with_text_doc(&[
+                "Page 1 of 1",
+                REAL_TEXT,
+            ]);
+            assert_eq!(pages_to_ocr_in_doc(&mut doc, 2, false), vec![0]);
+            assert_eq!(pages_to_ocr_in_doc(&mut doc, 2, true), vec![0, 1]);
+        }
+
+        #[test]
+        fn a_page_already_carrying_redlines_layer_is_skipped_even_when_forced() {
+            let mut doc =
+                crate::search::indexer::test_support::scan_with_text_doc(&["Page 1 of 1"]);
+            let lines = vec![crate::ocr::OcrLine {
+                text: "HELLO WORLD".to_string(),
+                confidence: Some(0.95),
+                corners_pdf: [(50.0, 712.0), (300.0, 712.0), (300.0, 700.0), (50.0, 700.0)],
+                bbox_pdf: (50.0, 700.0, 300.0, 712.0),
+            }];
+            crate::ocr::writer::write_pages_text_layers(
+                &mut doc,
+                &[(0, lines)],
+                crate::ocr::writer::DEFAULT_MIN_CONFIDENCE,
+            )
+            .unwrap();
+            assert!(pages_to_ocr_in_doc(&mut doc, 1, false).is_empty());
+            assert!(pages_to_ocr_in_doc(&mut doc, 1, true).is_empty());
+        }
+
+        #[test]
+        fn the_committed_print_footer_scan_fixture_is_selected_for_ocr() {
+            // tools/fixtures/ocr/f-scan-with-print-footer.pdf: raster page + native
+            // "Page 1 of 1" footer, built by `gen-ocr-fixtures` (the repro shape).
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../tools/fixtures/ocr/f-scan-with-print-footer.pdf");
+            let mut doc = lopdf::Document::load(&path).unwrap();
+            let extracted = crate::search::indexer::extract_doc_text(&mut doc);
+            assert!(extracted[0].1.contains("Page 1 of 1"), "got {extracted:?}");
+            assert!(pages_lack_text(&extracted, SAMPLE_PAGES));
+            assert_eq!(pages_to_ocr_in_doc(&mut doc, 1, false), vec![0]);
         }
     }
 }

@@ -346,6 +346,43 @@ pub(crate) mod test_support {
         doc.trailer.set("Root", catalog_id);
         (doc, page_ids)
     }
+
+    /// Like [`nul_padded_scan_doc`] but each page also carries native `texts[i]` as real
+    /// Helvetica text near the bottom edge: the shape of a raster scan produced by a
+    /// "Print to PDF" driver, which stamps its own page footer over the image. The first
+    /// content stream is the image, the second the footer text (no NUL padding, so
+    /// extraction sees the text directly).
+    pub fn scan_with_text_doc(texts: &[&str]) -> Document {
+        let (mut doc, page_ids) = nul_padded_scan_doc(texts.len());
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        for (page_id, text) in page_ids.iter().zip(texts) {
+            let escaped = text
+                .replace('\\', "\\\\")
+                .replace('(', "\\(")
+                .replace(')', "\\)");
+            let footer = format!("BT /F1 9 Tf 270 20 Td ({escaped}) Tj ET\n");
+            let footer_id = doc.add_object(Stream::new(dictionary! {}, footer.into_bytes()));
+            let page = doc
+                .get_object_mut(*page_id)
+                .and_then(Object::as_dict_mut)
+                .expect("page dict");
+            let image_stream = page.get(b"Contents").cloned().expect("contents");
+            page.set(
+                "Contents",
+                Object::Array(vec![image_stream, Object::Reference(footer_id)]),
+            );
+            let resources = page
+                .get_mut(b"Resources")
+                .and_then(Object::as_dict_mut)
+                .expect("resources");
+            resources.set("Font", dictionary! { "F1" => Object::Reference(font_id) });
+        }
+        doc
+    }
 }
 
 #[cfg(test)]

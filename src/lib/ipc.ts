@@ -1018,9 +1018,13 @@ export interface OcrProgressEvent {
 }
 
 /**
- * Run OCR over every page of the open document `docId` that doesn't already have
- * extractable text, and embed the recognized lines as an invisible searchable text layer
+ * Run OCR over every page of the open document `docId` that doesn't already have a real
+ * text layer (a few characters of print footer or page stamp do not count), and embed the recognized lines as an invisible searchable text layer
  * (Phase 2c-i). Emits `"ocr-progress"` events (`OcrProgressEvent`) as each page finishes.
+ *
+ * `force` is the explicit "OCR anyway" action: pages carrying native text are OCR'd too.
+ * Pages that already carry Redline's own single OCR layer are skipped either way, so a
+ * layer is never stacked.
  *
  * The Tauri backend atomically rewrites the file and reloads the render engine, so
  * in-document search finds the new text immediately — no reopen needed.
@@ -1032,8 +1036,9 @@ export interface OcrProgressEvent {
 export async function runOcrDocument(
   docId: string,
   minConfidence?: number,
+  force?: boolean,
 ): Promise<OcrRunReport> {
-  return invoke<OcrRunReport>("run_ocr_document", { docId, minConfidence });
+  return invoke<OcrRunReport>("run_ocr_document", { docId, minConfidence, force });
 }
 
 // ---------------------------------------------------------------------------
