@@ -257,6 +257,9 @@ pub fn insert_blank_page(doc: &mut Document, at: u32, width: f32, height: f32) -
             Object::Real(height),
         ],
         "Contents" => content_id,
+        // Required by ISO 32000-1 7.7.3.3. Empty and direct, so it also shadows any
+        // inheritable /Resources on the Pages node.
+        "Resources" => Object::Dictionary(lopdf::Dictionary::new()),
     }));
 
     // Read existing Kids, splice the new page in at the correct position.
@@ -561,6 +564,27 @@ pub(crate) mod tests {
     // ------------------------------------------------------------------
     // insert_blank_page tests
     // ------------------------------------------------------------------
+
+    /// #149: a page dictionary must carry /Resources (ISO 32000-1 7.7.3.3, required, possibly
+    /// inherited). An inserted blank page has no content, but strict parsers still warn when
+    /// the key is absent, so it gets an empty direct dictionary that also shadows any
+    /// inheritable /Resources on the Pages node (the blank page must not pick up fonts).
+    #[test]
+    fn insert_blank_page_has_a_resources_dictionary() {
+        let (mut doc, _) = one_page_doc();
+        insert_blank_page(&mut doc, 1, 612.0, 792.0).unwrap();
+        let id = doc.get_pages()[&2];
+        let page = doc.get_dictionary(id).unwrap();
+        let res = page.get(b"Resources").expect("blank page needs /Resources");
+        let res = match res {
+            Object::Reference(r) => doc.get_object(*r).unwrap().clone(),
+            o => o.clone(),
+        };
+        assert!(
+            matches!(&res, Object::Dictionary(d) if d.is_empty()),
+            "expected an empty resources dict, got {res:?}"
+        );
+    }
 
     #[test]
     fn insert_blank_page_increments_count() {
