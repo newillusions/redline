@@ -125,7 +125,7 @@ fn map_geometry(g: &MarkupGeometry, f: impl Fn(PdfPoint) -> PdfPoint) -> MarkupG
 /// per ISO 32000-1 §7.7.3.4, and several real-world producers only set it once on the
 /// Pages root for a uniform-size document). The spec allows either diagonal corner pair
 /// in either order, so the origin is `min(x0,x1)`/`min(y0,y1)`, not necessarily entries 0/1.
-fn true_media_box(doc: &Document, page_id: ObjectId) -> Result<(f64, f64, f64, f64)> {
+pub(crate) fn true_media_box(doc: &Document, page_id: ObjectId) -> Result<(f64, f64, f64, f64)> {
     let mut current = Some(page_id);
     let mut hops = 0u8;
     while let Some(id) = current {

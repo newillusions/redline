@@ -8,7 +8,7 @@
  * generating the full set of granular IPC ops. A single push() records a 1-command frame
  * and behaves identically to the old single-command API from the caller's perspective.
  */
-import type { Markup } from "./ipc";
+import type { Markup, ScaleRecord } from "./ipc";
 
 /** The mutable markup collection a command acts on (the reactive store implements this). */
 export interface MarkupSink {
@@ -18,6 +18,8 @@ export interface MarkupSink {
   getById(id: string): Markup | undefined;
   /** Z-order (Arrange): see `refillOrder`. Optional so a plain sink needs no ordering. */
   reorder?(ids: string[]): void;
+  /** Scale change (measurement viewports): put `rec`, or remove scale `id` when null. */
+  putScale?(id: string, rec: ScaleRecord | null): void;
 }
 
 /** A backend mirror operation implied by a command (1:1 with the granular IPC ops). */
@@ -25,7 +27,8 @@ export type MirrorOp =
   | { kind: "add"; markup: Markup }
   | { kind: "update"; markup: Markup }
   | { kind: "delete"; id: string }
-  | { kind: "reorder"; ids: string[] };
+  | { kind: "reorder"; ids: string[] }
+  | { kind: "scale"; id: string; record: ScaleRecord | null };
 
 export interface Command {
   apply(sink: MarkupSink): MirrorOp;
@@ -48,6 +51,19 @@ export class DeleteCmd implements Command {
   constructor(private readonly markup: Markup) {}
   apply(sink: MarkupSink): MirrorOp { sink.removeById(this.markup.id); return { kind: "delete", id: this.markup.id }; }
   invert(sink: MarkupSink): MirrorOp { sink.insert(this.markup); return { kind: "add", markup: this.markup }; }
+}
+
+/**
+ * A measurement-viewport change in the same undo history as the markups it affects:
+ * `before` null = created, `after` null = removed outright, a retired `after` = deleted (kept
+ * so its measurements keep their values). Replays through `sink.putScale` and the backend's
+ * `put_scale`.
+ */
+export class ScaleCmd implements Command {
+  constructor(private readonly before: ScaleRecord | null, private readonly after: ScaleRecord | null) {}
+  private get id(): string { return (this.after ?? this.before)!.id; }
+  apply(sink: MarkupSink): MirrorOp { sink.putScale?.(this.id, this.after); return { kind: "scale", id: this.id, record: this.after }; }
+  invert(sink: MarkupSink): MirrorOp { sink.putScale?.(this.id, this.before); return { kind: "scale", id: this.id, record: this.before }; }
 }
 
 /**

@@ -4,7 +4,7 @@
  * agree). `raw_measure` stays the scale-independent path length in PDF points;
  * `computed_quantity = raw * ratio + sum(|rise/drop| converted to the scale unit)`.
  */
-import type { Markup, MeasurementPayload, PdfPoint, RiseDrop, ScaleRecord, UserRef } from "./ipc";
+import type { BBox, Markup, MeasurementPayload, PdfPoint, RiseDrop, ScaleRecord, ScaleTarget, UserRef } from "./ipc";
 import { bumpAudit } from "./markup-tools";
 import { measureLength } from "./measurement-tools";
 
@@ -48,11 +48,11 @@ export function isKnownLengthUnit(u: string): boolean {
 
 /**
  * The scale a measurement belongs to: its own `scale_ref` when that scale still exists
- * (a deliberately pinned scale is never re-pointed), else the page's effective scale.
+ * (a deliberately pinned scale is never re-pointed), else the scale under its first point.
  */
 export function scaleFor(m: Markup, scales: ScaleRecord[]): ScaleRecord | null {
   const ref = m.measurement?.scale_ref;
-  return (ref ? scales.find((s) => s.id === ref) : undefined) ?? effectiveScale(scales, m.page);
+  return (ref ? scales.find((s) => s.id === ref) : undefined) ?? scaleAt(scales, m.page, measurementAnchor(m));
 }
 
 /**
@@ -123,7 +123,7 @@ export function recomputeMeasurement(m: Markup, scale: ScaleRecord): Markup {
   return { ...m, measurement: { ...meas, computed_quantity: quantity, unit, scale_ref: scale.id } };
 }
 
-/** The scale that applies to a page: page-specific first, else the document default. */
+/** The scale that applies to a page outside its viewports: page-specific first, else the document default. */
 export function effectiveScale(scales: ScaleRecord[], page: number): ScaleRecord | null {
   return (
     scales.find((s) => s.applies_to.kind === "Page" && s.applies_to.page === page) ??
@@ -132,11 +132,75 @@ export function effectiveScale(scales: ScaleRecord[], page: number): ScaleRecord
   );
 }
 
+/** True when `p` lies inside (or on the edge of) the rectangle `b`. */
+export function bboxContains(b: BBox, p: PdfPoint): boolean {
+  return p.x >= Math.min(b[0], b[2]) && p.x <= Math.max(b[0], b[2]) &&
+    p.y >= Math.min(b[1], b[3]) && p.y <= Math.max(b[1], b[3]);
+}
+
+/** The viewports of `page`, in drawing order (mirrors Rust; the list order is the drawing order). */
+export function viewportsOn(scales: ScaleRecord[], page: number): ScaleRecord[] {
+  return scales.filter((s) => !s.retired && s.applies_to.kind === "Viewport" && s.applies_to.page === page);
+}
+
 /**
- * Before/after pairs bringing every scaled measurement under the scale that applies to
- * its page. A measurement taken under a different scale that still exists keeps it (the
- * user chose it); one with no scale or a replaced/dangling `scale_ref` is recomputed.
- * Unchanged markups are omitted.
+ * The viewport scale on `page` containing `p`. Where viewports overlap the LAST-drawn one
+ * wins (ISO 32000-1 §12.9: "examined, starting with the last one and iterating in reverse").
+ */
+export function viewportAt(scales: ScaleRecord[], page: number, p: PdfPoint): ScaleRecord | null {
+  for (let i = scales.length - 1; i >= 0; i--) {
+    const t = scales[i].applies_to;
+    if (!scales[i].retired && t.kind === "Viewport" && t.page === page && bboxContains(t.bbox, p)) return scales[i];
+  }
+  return null;
+}
+
+/**
+ * The scale for a measurement starting at `firstPoint` on `page`: the viewport containing
+ * the point, else the page scale, else the document default (Rust `takeoff::scale_at`).
+ */
+export function scaleAt(scales: ScaleRecord[], page: number, firstPoint: PdfPoint | null): ScaleRecord | null {
+  return (firstPoint ? viewportAt(scales, page, firstPoint) : null) ?? effectiveScale(scales, page);
+}
+
+/**
+ * The point that picks a measurement's scale: its FIRST point (ISO 32000-1 §12.9 NOTE 1 - a
+ * measurement spanning viewports uses the viewport of its first point). Mirrors Rust
+ * `takeoff::measurement_anchor`.
+ */
+export function measurementAnchor(m: Markup): PdfPoint | null {
+  const g = m.geometry;
+  if ("Point" in g) return g.Point;
+  if ("Rect" in g) return g.Rect.min;
+  if ("Polyline" in g) return g.Polyline[0] ?? null;
+  if ("Ink" in g) return g.Ink[0]?.[0] ?? null;
+  return null;
+}
+
+/** True when `a` and `b` are the same slot a recalibration replaces (Rust `ScaleTarget::same_slot`). */
+export function sameSlot(a: ScaleTarget, b: ScaleTarget): boolean {
+  if (a.kind === "Viewport" && b.kind === "Viewport") return a.viewport_id === b.viewport_id;
+  if (a.kind === "Page" && b.kind === "Page") return a.page === b.page;
+  return a.kind === "DocumentDefault" && b.kind === "DocumentDefault";
+}
+
+/** True when `s` can apply to a measurement on `page` starting at `anchor` (Rust `applies_here`). */
+function appliesHere(s: ScaleRecord, page: number, anchor: PdfPoint | null): boolean {
+  if (s.retired) return false; // a deleted viewport: its measurements keep their values
+  const t = s.applies_to;
+  if (t.kind === "DocumentDefault") return true;
+  if (t.kind === "Page") return t.page === page;
+  return t.page === page && anchor !== null && bboxContains(t.bbox, anchor);
+}
+
+/**
+ * Before/after pairs bringing every scaled measurement up to date (mirrors Rust
+ * `takeoff::recompute_all`). A measurement keeps the scale it was taken under while that
+ * scale exists and still applies where it lies (the default, its page's scale, or a
+ * viewport containing its first point), and is recomputed under it - so a recalibration,
+ * which keeps the scale's id, updates it. One pinned to a scale that does not apply there
+ * (picked deliberately, or a viewport moved off it) is left alone. One with no scale or a
+ * deleted one goes under the scale at its first point. Unchanged markups are omitted.
  */
 export function recomputeAll(
   markups: Markup[],
@@ -147,10 +211,12 @@ export function recomputeAll(
   const out: { before: Markup; after: Markup }[] = [];
   for (const m of markups) {
     if (!m.measurement) continue;
-    const scale = effectiveScale(scales, m.page);
-    if (!scale) continue;
+    const anchor = measurementAnchor(m);
     const ref = m.measurement.scale_ref;
-    if (ref && ref !== scale.id && scales.some((s) => s.id === ref)) continue;
+    const own = ref ? scales.find((s) => s.id === ref) : undefined;
+    if (own && !appliesHere(own, m.page, anchor)) continue;
+    const scale = own ?? scaleAt(scales, m.page, anchor);
+    if (!scale) continue;
     const next = recomputeMeasurement(m, scale);
     if (next === m) continue;
     const a = next.measurement!;
@@ -172,6 +238,42 @@ export function normaliseMeasurements(markups: Markup[], scales: ScaleRecord[]):
   if (pairs.length === 0) return markups;
   const after = new Map(pairs.map((p) => [p.before.id, { ...p.after, audit: p.before.audit }]));
   return markups.map((m) => after.get(m.id) ?? m);
+}
+
+/**
+ * Explicit "re-apply scale" for one viewport (the only way a measurement taken under
+ * another scale moves to a viewport): before/after pairs putting every measurement on the
+ * viewport's page whose first point resolves to that viewport under it. As one batch, it
+ * is a single undo step.
+ */
+export function reapplyViewport(
+  markups: Markup[],
+  scales: ScaleRecord[],
+  viewportScaleId: string,
+  by: UserRef,
+  now: string,
+): { before: Markup; after: Markup }[] {
+  const vp = scales.find((s) => s.id === viewportScaleId);
+  if (!vp || vp.retired || vp.applies_to.kind !== "Viewport") return [];
+  const page = vp.applies_to.page;
+  const out: { before: Markup; after: Markup }[] = [];
+  for (const m of markups) {
+    if (!m.measurement || m.page !== page) continue;
+    const a = measurementAnchor(m);
+    if (!a || viewportAt(scales, page, a)?.id !== vp.id) continue;
+    const next = recomputeMeasurement(m, vp);
+    if (next === m) continue;
+    const x = next.measurement!;
+    const y = m.measurement;
+    if (x.computed_quantity === y.computed_quantity && x.unit === y.unit && x.scale_ref === y.scale_ref) continue;
+    out.push({ before: m, after: bumpAudit(next, by, now) });
+  }
+  return out;
+}
+
+/** How many measurements are taken under `scaleId` (shown before deleting a viewport). */
+export function measurementsUsing(markups: Markup[], scaleId: string): number {
+  return markups.filter((m) => m.measurement?.scale_ref === scaleId).length;
 }
 
 export type EditResult = { ok: true; markup: Markup } | { ok: false; error: string };

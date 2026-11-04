@@ -4,8 +4,8 @@
  * MirrorOp is drained through an ordered FIFO to the Rust store (the save buffer) via the
  * injected IPC. flush() awaits a full drain — App.svelte calls it before save_document.
  */
-import { isMarkupContentsLocked, isMarkupLocked, type Markup, type Appearance, type CountSet, type CountSymbol, type Tool } from "./ipc";
-import { History, CreateCmd, UpdateCmd, DeleteCmd, ReorderCmd, refillOrder, type MarkupSink, type MirrorOp } from "./markup-commands";
+import { isMarkupContentsLocked, isMarkupLocked, type Markup, type Appearance, type CountSet, type CountSymbol, type ScaleRecord, type Tool } from "./ipc";
+import { History, CreateCmd, UpdateCmd, DeleteCmd, ReorderCmd, ScaleCmd, refillOrder, type Command, type MarkupSink, type MirrorOp } from "./markup-commands";
 import type { CountRun } from "./count-groups";
 import { fitLegendGeometry } from "./legend";
 import { onNewMarkup } from "./layers-store.svelte";
@@ -70,6 +70,8 @@ export interface MarkupIpc {
   remove(doc_id: string, id: string): Promise<void>;
   /** Z-order (Arrange). Optional so an ipc stub that predates it still type-checks. */
   reorder?(doc_id: string, ids: string[]): Promise<void>;
+  /** Scale put/remove replayed by undo/redo of viewport changes (`ScaleCmd`). */
+  putScale?(doc_id: string, id: string, record: ScaleRecord | null): Promise<void>;
 }
 
 export type ToolKind =
@@ -85,6 +87,11 @@ export type ToolKind =
   | "selectText"
   // M3 measurement tools:
   | "calibrate"
+  // Measurement viewport: drag a rectangle, then name it and give it a scale
+  // (docs/measurement-viewports.md). "viewportRedraw" (not in the palette) redraws the
+  // viewport `TakeoffStore.redrawViewportId`; leaving it cancels the redraw.
+  | "viewport"
+  | "viewportRedraw"
   | "MeasurementLength"
   // Multi-click length: click each vertex, double-click or Enter to finish. Creates a
   // MeasurementLength markup with 2+ vertices (docs/count-polylength.md).
@@ -200,6 +207,31 @@ export class MarkupStore implements MarkupSink {
     this.selectedIds = next;
   }
   getById(id: string) { return this.markups.find((x) => x.id === id); }
+  /** `MarkupSink.putScale`: hand a replayed scale change to the owner (`onScale`). */
+  putScale(id: string, rec: ScaleRecord | null) { this.onScale?.(id, rec); }
+
+  /**
+   * Set by the owner (App): applies a scale change replayed by a `ScaleCmd` (do, undo, redo)
+   * to the document's TakeoffStore. The backend gets the same change through `ipc.putScale`.
+   */
+  onScale: ((id: string, rec: ScaleRecord | null) => void) | null = null;
+
+  /**
+   * A viewport change (create: `before` null; edit; delete: `after` retired) and the
+   * measurement updates it implies, as ONE undo frame - undo restores the viewport AND the
+   * quantities together, so no measurement is left pointing at a scale that is gone.
+   */
+  applyScaleChange(before: ScaleRecord | null, after: ScaleRecord | null, pairs: { before: Markup; after: Markup }[] = []): void {
+    const allowed = pairs.filter((p) => lockRefusalMessage(p.before) === null);
+    if (allowed.length < pairs.length) {
+      const locked = pairs.filter((p) => lockRefusalMessage(p.before) !== null);
+      this.mirrorError = `${locked.length} locked markup(s) skipped: ${locked.map((p) => p.before.id).join(", ")}`;
+    }
+    const cmds: Command[] = [new ScaleCmd(before, after), ...allowed.map(({ before: b, after: a }) => new UpdateCmd(b, a))];
+    this.dirty = true;
+    this.history.pushBatch(cmds).forEach((op) => this.enqueue(op));
+    this.historyVersion++;
+  }
   reorder(ids: string[]) { this.markups = refillOrder(this.markups, ids); }
 
   /** Mark the document as clean (call after a successful save). */
@@ -414,6 +446,7 @@ export class MarkupStore implements MarkupSink {
         if (op.kind === "add") await this.ipc.add(this.docId, op.markup);
         else if (op.kind === "update") await this.ipc.update(this.docId, op.markup);
         else if (op.kind === "reorder") await this.ipc.reorder?.(this.docId, op.ids);
+        else if (op.kind === "scale") await this.ipc.putScale?.(this.docId, op.id, op.record);
         else await this.ipc.remove(this.docId, op.id);
       } catch (e) {
         const text = e instanceof Error ? e.message : String(e);

@@ -52,30 +52,315 @@ pub async fn add_scale(
         None => ScaleTarget::DocumentDefault,
     };
     let rec = ScaleRecord::new(
-        applies_to.clone(),
+        applies_to,
         ScaleMethod::TwoPoint,
         ratio,
         unit,
         label,
         precision,
     );
-
-    // Persist to sidecar
-    let pdf_path = state.markups.path(&doc_id).ok_or("unknown doc")?;
-    let mut meta = load_meta(&pdf_path).map_err(|e| e.to_string())?;
-    // Replace if same applies_to target already exists
-    meta.scales.retain(|r| r.applies_to != applies_to);
-    meta.scales.push(rec.clone());
-    save_meta(&pdf_path, &meta).map_err(|e| e.to_string())?;
-
-    // Update in-memory store (load the sidecar first so earlier scales are not lost)
-    ensure_scales_loaded(&state, &doc_id);
-    state.scales.lock().unwrap().add(&doc_id, rec.clone());
+    let rec = store_scale(&state, &doc_id, rec)?;
     // Bring the stored measurements under the new scale, as the GUI does on a calibration, so
     // an MCP `add_scale` cannot leave stale quantities for a later save or export.
     recompute_stored_measurements(&state.markups, &state.scales.lock().unwrap(), &doc_id);
 
     Ok(rec)
+}
+
+/// Persist `rec` (sidecar first, then the in-memory store), replacing the record in the same
+/// slot ([`ScaleTarget::same_slot`]) in place. A recalibration of an existing slot keeps
+/// that slot's scale id, so the measurements taken under it follow the new calibration
+/// (`recompute_all`) instead of falling back to whatever scale lies under them - a
+/// measurement inside a viewport that was taken under the page scale stays under it.
+fn store_scale(
+    state: &AppState,
+    doc_id: &str,
+    mut rec: ScaleRecord,
+) -> Result<ScaleRecord, String> {
+    ensure_scales_loaded(state, doc_id);
+    if let Some(old) = state
+        .scales
+        .lock()
+        .unwrap()
+        .list(doc_id)
+        .iter()
+        .find(|r| r.applies_to.same_slot(&rec.applies_to))
+    {
+        rec.id = old.id.clone();
+    }
+    let pdf_path = state.markups.path(doc_id).ok_or("unknown doc")?;
+    let mut meta = load_meta(&pdf_path).map_err(|e| e.to_string())?;
+    crate::takeoff::scale::replace_or_push(&mut meta.scales, rec.clone());
+    save_meta(&pdf_path, &meta).map_err(|e| e.to_string())?;
+    state.scales.lock().unwrap().add(doc_id, rec.clone());
+    Ok(rec)
+}
+
+/// Create a measurement viewport: a named rectangle on one page with its own scale
+/// (`bbox` in page space, the space markup geometry uses). Measurements whose first point
+/// falls inside it use its scale from now on; measurements already on the page keep the
+/// scale they were taken under (re-apply is an explicit action in the UI). Persists to the
+/// sidecar; written to the PDF as a `/VP` viewport on the next save.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn add_viewport(
+    state: State<'_, AppState>,
+    doc_id: String,
+    page: u32,
+    name: String,
+    bbox: crate::takeoff::BBox,
+    ratio: f64,
+    unit: String,
+    label: String,
+    precision: u8,
+    two_point: bool,
+) -> Result<ScaleRecord, String> {
+    let rec = viewport_record(
+        page,
+        uuid::Uuid::new_v4().to_string(),
+        &name,
+        bbox,
+        ratio,
+        unit,
+        label,
+        precision,
+        two_point,
+    )?;
+    store_scale(&state, &doc_id, rec)
+}
+
+/// Edit a viewport: rename it, move or resize its rectangle (to another page too, with
+/// `page`), and/or recalibrate it. Its
+/// scale id is kept, so measurements taken under it follow a recalibration; a move or
+/// resize changes no stored measurement (one now outside keeps the viewport's scale until
+/// the user re-applies scales).
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn update_viewport(
+    state: State<'_, AppState>,
+    doc_id: String,
+    scale_id: String,
+    page: Option<u32>,
+    name: Option<String>,
+    bbox: Option<crate::takeoff::BBox>,
+    ratio: Option<f64>,
+    unit: Option<String>,
+    label: Option<String>,
+    precision: Option<u8>,
+    two_point: Option<bool>,
+) -> Result<ScaleRecord, String> {
+    ensure_scales_loaded(&state, &doc_id);
+    let old = state
+        .scales
+        .lock()
+        .unwrap()
+        .list(&doc_id)
+        .iter()
+        .find(|r| r.id == scale_id)
+        .cloned()
+        .ok_or_else(|| format!("scale {scale_id} not found for doc {doc_id}"))?;
+    let ScaleTarget::Viewport {
+        page: old_page,
+        viewport_id,
+        name: old_name,
+        bbox: old_bbox,
+    } = &old.applies_to
+    else {
+        return Err(format!("scale {scale_id} is not a viewport"));
+    };
+    let mut rec = viewport_record(
+        page.unwrap_or(*old_page),
+        viewport_id.clone(),
+        name.as_deref().unwrap_or(old_name),
+        bbox.unwrap_or(*old_bbox),
+        ratio.unwrap_or(old.ratio),
+        unit.unwrap_or_else(|| old.unit.clone()),
+        label.unwrap_or_else(|| old.label.clone()),
+        precision.unwrap_or(old.precision),
+        two_point.unwrap_or(old.method == ScaleMethod::TwoPoint),
+    )?;
+    rec.id = old.id.clone();
+    let rec = store_scale(&state, &doc_id, rec)?;
+    if ratio.is_some() {
+        recompute_stored_measurements(&state.markups, &state.scales.lock().unwrap(), &doc_id);
+    }
+    Ok(rec)
+}
+
+/// Validate and build a viewport scale record.
+#[allow(clippy::too_many_arguments)]
+fn viewport_record(
+    page: u32,
+    viewport_id: String,
+    name: &str,
+    bbox: crate::takeoff::BBox,
+    ratio: f64,
+    unit: String,
+    label: String,
+    precision: u8,
+    two_point: bool,
+) -> Result<ScaleRecord, String> {
+    let bbox = crate::takeoff::scale::normalise_bbox(bbox);
+    if !bbox.iter().all(|v| v.is_finite()) || bbox[2] - bbox[0] < 1.0 || bbox[3] - bbox[1] < 1.0 {
+        return Err("a viewport needs a rectangle at least 1 pt wide and high".into());
+    }
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return Err("a viewport scale needs a positive ratio".into());
+    }
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("a viewport needs a name".into());
+    }
+    Ok(ScaleRecord::new(
+        ScaleTarget::Viewport {
+            page,
+            viewport_id,
+            name: name.to_string(),
+            bbox,
+        },
+        if two_point {
+            ScaleMethod::TwoPoint
+        } else {
+            ScaleMethod::Preset
+        },
+        ratio,
+        unit,
+        label,
+        precision,
+    ))
+}
+
+/// Import the rectilinear `/VP` viewports read from the document's PDF (another
+/// application's calibrations - Revu, Acrobat - or redline's own after a lost sidecar) as
+/// scales; see [`crate::takeoff::plan_viewport_import`]. Persists what it adds to the
+/// sidecar (only when something is new). Returns how many scales were added.
+pub fn import_pdf_viewports(
+    state: &AppState,
+    doc_id: &str,
+    found: &[crate::takeoff::PdfViewport],
+) -> Result<usize, String> {
+    if found.is_empty() {
+        return Ok(0);
+    }
+    ensure_scales_loaded(state, doc_id);
+    let (records, keys) = {
+        let store = state.scales.lock().unwrap();
+        crate::takeoff::plan_viewport_import(store.list(doc_id), store.seen(doc_id), found)
+    };
+    if records.is_empty() && keys.is_empty() {
+        return Ok(0);
+    }
+    // In memory first: even if the sidecar cannot be written (a read-only folder), the PDF's
+    // own viewport scales apply for this session - measuring must not silently fall back
+    // to the page scale. The failure is reported to the user, never swallowed.
+    {
+        let mut store = state.scales.lock().unwrap();
+        for r in &records {
+            store.add(doc_id, r.clone());
+        }
+        store.add_seen(doc_id, &keys);
+    }
+    let persisted = (|| -> Result<(), String> {
+        let pdf_path = state.markups.path(doc_id).ok_or("unknown doc")?;
+        let mut meta = load_meta(&pdf_path).map_err(|e| e.to_string())?;
+        for r in &records {
+            crate::takeoff::scale::replace_or_push(&mut meta.scales, r.clone());
+        }
+        meta.pdf_viewports_seen.extend(keys.iter().cloned());
+        save_meta(&pdf_path, &meta).map_err(|e| e.to_string())
+    })();
+    if let Err(e) = persisted {
+        let msg = format!(
+            "The PDF's {} measurement viewport scale(s) are in use, but could not be saved next to the file ({e}). They will be read from the PDF again next time.",
+            records.len()
+        );
+        state
+            .scales
+            .lock()
+            .unwrap()
+            .push_notice(doc_id, msg.clone());
+        return Err(msg);
+    }
+    Ok(records.len())
+}
+
+/// Take the document's queued scale notices (e.g. an import that could not be saved), for
+/// the frontend to show. Clears them.
+#[tauri::command]
+pub async fn take_scale_notices(
+    state: State<'_, AppState>,
+    doc_id: String,
+) -> Result<Vec<String>, String> {
+    Ok(state.scales.lock().unwrap().take_notices(&doc_id))
+}
+
+/// Put a scale record exactly as given (insert, or replace the one with its id in place), or
+/// with `record: None` remove the scale `scale_id` outright. Persists to the sidecar; never
+/// recomputes measurements - the caller sends those changes in the same undo step. This is
+/// what the frontend's undo/redo of viewport changes (create, edit, delete) replays.
+#[tauri::command]
+pub async fn put_scale(
+    state: State<'_, AppState>,
+    doc_id: String,
+    scale_id: String,
+    record: Option<ScaleRecord>,
+) -> Result<(), String> {
+    ensure_scales_loaded(&state, &doc_id);
+    if let Some(r) = &record {
+        if r.id != scale_id {
+            return Err(format!("scale id mismatch: {} vs {scale_id}", r.id));
+        }
+        if !r.ratio.is_finite() || r.ratio <= 0.0 {
+            return Err("a scale needs a positive ratio".into());
+        }
+    }
+    let pdf_path = state.markups.path(&doc_id).ok_or("unknown doc")?;
+    let mut meta = load_meta(&pdf_path).map_err(|e| e.to_string())?;
+    match &record {
+        Some(r) => crate::takeoff::scale::replace_or_push(&mut meta.scales, r.clone()),
+        None => meta.scales.retain(|r| r.id != scale_id),
+    }
+    save_meta(&pdf_path, &meta).map_err(|e| e.to_string())?;
+    let mut store = state.scales.lock().unwrap();
+    match record {
+        Some(r) => store.add(&doc_id, r),
+        None => {
+            store.delete(&doc_id, &scale_id);
+        }
+    }
+    Ok(())
+}
+
+/// After a page operation rewrote the PDF (with the viewports synced to `/VP` just before
+/// it), point every viewport scale at where its `/VP` entry now is: a reorder moves it to
+/// another page index, a rotation changes its page-space rectangle, and a deleted page takes
+/// its viewports with it. Page and document-default scales are not touched.
+pub fn follow_viewports_after_page_op(
+    state: &AppState,
+    doc_id: &str,
+    found: &[crate::takeoff::PdfViewport],
+) -> Result<(), String> {
+    ensure_scales_loaded(state, doc_id);
+    let (before, seen_before) = {
+        let store = state.scales.lock().unwrap();
+        (store.list(doc_id).to_vec(), store.seen(doc_id).to_vec())
+    };
+    let (after, seen) = crate::takeoff::measure::follow_viewports(&before, &seen_before, found);
+    if after == before && seen == seen_before {
+        return Ok(());
+    }
+    {
+        let mut store = state.scales.lock().unwrap();
+        store.seed(doc_id, after.clone());
+        store.set_seen(doc_id, seen.clone());
+    }
+    if let Some(pdf_path) = state.markups.path(doc_id) {
+        let mut meta = load_meta(&pdf_path).map_err(|e| e.to_string())?;
+        meta.scales = after;
+        meta.pdf_viewports_seen = seen;
+        save_meta(&pdf_path, &meta).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// List all scale records for the document.
@@ -96,6 +381,24 @@ pub async fn delete_scale(
     scale_id: String,
 ) -> Result<bool, String> {
     ensure_scales_loaded(&state, &doc_id);
+    // A viewport is retired, not removed: the measurements taken under it keep their values
+    // (never silently recalculated) and the delete can be undone.
+    let viewport = state
+        .scales
+        .lock()
+        .unwrap()
+        .list(&doc_id)
+        .iter()
+        .find(|r| r.id == scale_id && matches!(r.applies_to, ScaleTarget::Viewport { .. }))
+        .cloned();
+    if let Some(mut v) = viewport {
+        if v.retired {
+            return Ok(false);
+        }
+        v.retired = true;
+        store_scale(&state, &doc_id, v)?;
+        return Ok(true);
+    }
     let removed = state.scales.lock().unwrap().delete(&doc_id, &scale_id);
     if removed {
         if let Some(pdf_path) = state.markups.path(&doc_id) {

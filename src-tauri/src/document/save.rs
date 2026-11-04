@@ -28,9 +28,18 @@ use crate::markup::Markup;
 /// password, both correctly error rather than silently reading garbled ciphertext -
 /// verified in the encrypted-PDF test suite below.
 pub fn load_markups_from(path: &Path, password: Option<&str>) -> Result<Vec<Markup>> {
+    load_markups_and_viewports_from(path, password).map(|(m, _)| m)
+}
+
+/// [`load_markups_from`] that also returns the rectilinear `/VP` measurement viewports of
+/// every page (one parse for both; see `takeoff::read_viewports`).
+pub fn load_markups_and_viewports_from(
+    path: &Path,
+    password: Option<&str>,
+) -> Result<(Vec<Markup>, Vec<crate::takeoff::PdfViewport>)> {
     let doc = Document::load_with_password(path, password.unwrap_or(""))
         .map_err(|e| anyhow::anyhow!("could not open {} (wrong password?): {e}", path.display()))?;
-    read_markups(&doc)
+    Ok((read_markups(&doc)?, crate::takeoff::read_viewports(&doc)))
 }
 
 /// Load `src`, replace its managed annotations with `markups`, atomically produce
@@ -81,6 +90,20 @@ pub fn save_with_markups_scaled(
     removed: &HashSet<crate::markup::SourceRef>,
     scales: &[crate::takeoff::ScaleRecord],
 ) -> Result<()> {
+    save_with_markups_synced(src, dest, markups, removed, scales, None)
+}
+
+/// [`save_with_markups_scaled`] that, given the document's imported `/VP` keys
+/// (`viewports_seen`), also writes its measurement viewports to the pages' `/VP` arrays
+/// (`takeoff::sync_viewports`). `None` leaves `/VP` as the source file has it.
+pub fn save_with_markups_synced(
+    src: &Path,
+    dest: &Path,
+    markups: &[Markup],
+    removed: &HashSet<crate::markup::SourceRef>,
+    scales: &[crate::takeoff::ScaleRecord],
+    viewports_seen: Option<&[crate::takeoff::ViewportKey]>,
+) -> Result<()> {
     let mut doc = Document::load(src).with_context(|| format!("load {}", src.display()))?;
     if doc.is_encrypted() {
         anyhow::bail!(
@@ -89,6 +112,9 @@ pub fn save_with_markups_scaled(
         );
     }
     write_markups_scaled(&mut doc, markups, removed, scales)?;
+    if let Some(seen) = viewports_seen {
+        crate::takeoff::sync_viewports(&mut doc, scales, seen)?;
+    }
 
     let dir = dest.parent().context("dest has no parent dir")?;
     let tmp = dir.join(format!(
@@ -185,6 +211,62 @@ mod tests {
         assert_eq!(got[0].id(), m.id());
         // Source untouched.
         assert!(load_markups_from(&src, None).unwrap().is_empty());
+    }
+
+    /// Measurement viewports: a save writes them to /VP (the synced variant only), the
+    /// markups and the viewports come back from one parse, and the unsynced variant leaves
+    /// /VP as the source has it.
+    #[test]
+    fn a_synced_save_writes_the_viewports_and_a_reload_reads_them_back() {
+        use crate::takeoff::{ScaleMethod, ScaleRecord, ScaleTarget};
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.pdf");
+        let (mut doc, _) = one_page_doc();
+        doc.save(&src).unwrap();
+        let vp = ScaleRecord::new(
+            ScaleTarget::Viewport {
+                page: 0,
+                viewport_id: "v1".into(),
+                name: "Detail".into(),
+                bbox: [50.0, 60.0, 250.0, 260.0],
+            },
+            ScaleMethod::Preset,
+            0.007,
+            "m".into(),
+            "1:20".into(),
+            2,
+        );
+        let m = redline_markup(0);
+        let plain = dir.path().join("plain.pdf");
+        save_with_markups_scaled(
+            &src,
+            &plain,
+            std::slice::from_ref(&m),
+            &HashSet::new(),
+            std::slice::from_ref(&vp),
+        )
+        .unwrap();
+        assert!(load_markups_and_viewports_from(&plain, None)
+            .unwrap()
+            .1
+            .is_empty());
+
+        let dest = dir.path().join("out.pdf");
+        save_with_markups_synced(
+            &src,
+            &dest,
+            std::slice::from_ref(&m),
+            &HashSet::new(),
+            std::slice::from_ref(&vp),
+            Some(&[]),
+        )
+        .unwrap();
+        let (markups, viewports) = load_markups_and_viewports_from(&dest, None).unwrap();
+        assert_eq!(markups.len(), 1);
+        assert_eq!(viewports.len(), 1);
+        assert_eq!(viewports[0].redline_id.as_deref(), Some("v1"));
+        assert_eq!(viewports[0].name.as_deref(), Some("Detail"));
+        assert!((viewports[0].ratio - 0.007).abs() < 1e-8);
     }
 
     /// Arrange: the store's order is the z-order and is exactly the order the markups are

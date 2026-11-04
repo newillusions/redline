@@ -95,6 +95,7 @@
     { kind: "Callout", label: "💬", title: "Callout" },
     { kind: "Note", label: "🗒", title: "Sticky Note - click to place, type the comment" },
     { kind: "calibrate", label: "⚖", title: "Calibrate Scale (two-click)" },
+    { kind: "viewport", label: "⛶", title: "Viewport - drag an area with its own scale (e.g. a 1:20 detail on a 1:100 plan)" },
     { kind: "MeasurementLength", label: "↔", title: "Measure Length" },
     { kind: "MeasurementPolylength", label: "⤳", title: "Measure Polylength (click each vertex, double-click or Enter to finish)" },
     { kind: "MeasurementArea", label: "⬛", title: "Measure Area" },

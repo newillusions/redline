@@ -499,9 +499,18 @@ export async function getUserIdentity(): Promise<UserRef> {
 // Takeoff / scale types (mirrors Rust src-tauri/src/takeoff/scale.rs)
 // ---------------------------------------------------------------------------
 
+/** A rectangle `[x0, y0, x1, y1]` in page space (the space markup geometry uses). */
+export type BBox = [number, number, number, number];
+
 export type ScaleTarget =
   | { kind: "Page"; page: number }
-  | { kind: "DocumentDefault" };
+  | { kind: "DocumentDefault" }
+  /**
+   * A measurement viewport: a named region of one page with its own scale (PDF `/VP`,
+   * ISO 32000-1 §12.9). Measurements whose FIRST point is inside use its scale; where
+   * viewports overlap the last-drawn one wins. docs/measurement-viewports.md.
+   */
+  | { kind: "Viewport"; page: number; viewport_id: string; name: string; bbox: BBox };
 
 export type ScaleMethod = "TwoPoint" | "Preset";
 
@@ -514,6 +523,11 @@ export interface ScaleRecord {
   unit: string;
   label: string;
   precision: number;
+  /**
+   * A deleted viewport, kept so the measurements taken under it keep their values (and the
+   * delete can be undone). Never picked for a new measurement, listed, or written to the PDF.
+   */
+  retired?: boolean;
 }
 
 /** A polylength rise/drop vertical run (mirrors Rust `RiseDrop`); both add to the length. */
@@ -560,6 +574,60 @@ export async function addScale(
     label,
     precision,
   });
+}
+
+/**
+ * Create a measurement viewport (a named rectangle on `page` with its own scale). Persisted
+ * to the sidecar; written to the PDF's `/VP` on the next save.
+ */
+export async function addViewport(
+  doc_id: string,
+  v: { page: number; name: string; bbox: BBox; ratio: number; unit: string; label: string; precision: number; twoPoint: boolean },
+): Promise<ScaleRecord> {
+  return invoke<ScaleRecord>("add_viewport", {
+    docId: doc_id,
+    page: v.page,
+    name: v.name,
+    bbox: v.bbox,
+    ratio: v.ratio,
+    unit: v.unit,
+    label: v.label,
+    precision: v.precision,
+    twoPoint: v.twoPoint,
+  });
+}
+
+/** Rename, move/resize and/or recalibrate a viewport (its scale id is kept). */
+export async function updateViewport(
+  doc_id: string,
+  scale_id: string,
+  changes: { page?: number; name?: string; bbox?: BBox; ratio?: number; unit?: string; label?: string; precision?: number; twoPoint?: boolean },
+): Promise<ScaleRecord> {
+  return invoke<ScaleRecord>("update_viewport", {
+    docId: doc_id,
+    scaleId: scale_id,
+    page: changes.page ?? null,
+    name: changes.name ?? null,
+    bbox: changes.bbox ?? null,
+    ratio: changes.ratio ?? null,
+    unit: changes.unit ?? null,
+    label: changes.label ?? null,
+    precision: changes.precision ?? null,
+    twoPoint: changes.twoPoint ?? null,
+  });
+}
+
+/**
+ * Put a scale record exactly as given (insert or replace by id), or with `record` null remove
+ * the scale outright. No recompute: undo/redo of viewport changes replays through this.
+ */
+export async function putScale(doc_id: string, scale_id: string, record: ScaleRecord | null): Promise<void> {
+  return invoke<void>("put_scale", { docId: doc_id, scaleId: scale_id, record });
+}
+
+/** Take (and clear) the document's queued scale notices, e.g. viewports that could not be saved. */
+export async function takeScaleNotices(doc_id: string): Promise<string[]> {
+  return invoke<string[]>("take_scale_notices", { docId: doc_id });
 }
 
 /** List all scale records for the document. */

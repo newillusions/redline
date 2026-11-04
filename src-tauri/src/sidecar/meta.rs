@@ -36,6 +36,10 @@ pub struct SidecarMeta {
     /// Version snapshot records, oldest-first. Added in M4 S2.
     #[serde(default)]
     pub versions: Vec<VersionRecord>,
+    /// `/VP` viewport entries of the PDF already imported as scales (measurement viewports):
+    /// never imported twice, and replaced by the scales' own entries on save.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pdf_viewports_seen: Vec<crate::takeoff::ViewportKey>,
 }
 
 /// Return the sidecar directory path for the given PDF path: `<file>.redline/`.
@@ -54,6 +58,7 @@ pub fn load_meta(pdf_path: &Path) -> io::Result<SidecarMeta> {
             scales: vec![],
             next_version_seq: 0,
             versions: vec![],
+            pdf_viewports_seen: vec![],
         });
     }
     let s = std::fs::read_to_string(&path)?;
@@ -141,6 +146,7 @@ mod tests {
             scales: vec![],
             next_version_seq: 0,
             versions: vec![],
+            pdf_viewports_seen: vec![],
         };
         meta.scales.push(crate::takeoff::ScaleRecord::new(
             ScaleTarget::DocumentDefault,

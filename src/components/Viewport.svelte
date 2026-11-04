@@ -96,10 +96,12 @@
   import { measureLength, measureArea, measurePerimeter, measureAngleDegrees, formatAngleLabel } from "$lib/measurement-tools";
   import { polylengthPayload, recomputeAll, MAX_POLYLENGTH_VERTICES } from "$lib/polylength";
   import { nextRun } from "$lib/count-groups";
-  import { addScale, type CalloutProps, type MeasurementPayload, type SearchHit } from "$lib/ipc";
+  import { addScale, addViewport, updateViewport, type BBox, type CalloutProps, type MeasurementPayload, type SearchHit } from "$lib/ipc";
   import { pdfUserSpaceToScreen } from "$lib/viewport";
   import { getPageSnapTargets, findNearestSnap, type SnapTarget } from "$lib/snap";
   import CalibrationDialog from "./CalibrationDialog.svelte";
+  import ViewportDialog from "./ViewportDialog.svelte";
+  import { commitViewportChange, reportViewportError } from "$lib/viewport-actions";
   import StampPromptDialog from "./StampPromptDialog.svelte";
   import { toolForKeyEvent, TOOL_KEY_BINDINGS } from "$lib/tool-keys";
   import ArrangeBar from "./ArrangeBar.svelte";
@@ -326,6 +328,25 @@
   /** Screen px within which a click on the first vertex closes the polygon. */
   const CLOUD_CLOSE_PX = 8;
 
+  // --- Measurement viewport tool (docs/measurement-viewports.md) ---
+  /** Press point of a viewport rectangle drag, and the live rectangle while dragging. */
+  let viewportDragStart: { x: number; y: number } | null = null;
+  let viewportDraft = $state<BBox | null>(null);
+  /** A drawn rectangle waiting for the name/scale dialog. */
+  let pendingViewport = $state<{ page: number; bbox: BBox } | null>(null);
+  // A Redraw is armed only while its tool is active: switching tools (palette, keys,
+  // Escape) cancels it, so a later New viewport never moves the old one.
+  $effect(() => {
+    if (store.activeTool !== "viewportRedraw" && takeoffStore.redrawViewportId !== null) {
+      takeoffStore.redrawViewportId = null;
+    }
+  });
+  /** Viewport outlines are shown while a measurement, calibration or viewport tool is active. */
+  const showViewports = $derived(
+    store.activeTool === "viewport" || store.activeTool === "viewportRedraw" || store.activeTool === "calibrate" ||
+    store.activeTool.startsWith("Measurement"),
+  );
+
   // --- Multi-click state ---
   let mcVerts = $state<{ x: number; y: number }[]>([]);
   let mcCursor = $state<{ x: number; y: number } | null>(null);
@@ -462,7 +483,7 @@
     t === "calibrate" || t === "MeasurementLength" || t === "MeasurementRadius" ||
     CLOSED_MEASUREMENT_TOOLS.has(t) || t === "MeasurementPolylength" ||
     t === "MeasurementCount" || t === "MeasurementAngle" ||
-    t === "placeTool" || t === "Note";
+    t === "placeTool" || t === "Note" || t === "viewport" || t === "viewportRedraw";
 
   /** True for the I-beam Select Text tool and the three text mark-up tools (Underline /
    *  StrikeOut / Squiggly): all share one drag-over-text gesture (hit-test chars, live
@@ -2244,7 +2265,7 @@
       now: new Date().toISOString(),
       id: crypto.randomUUID(),
     });
-    m.measurement = polylengthPayload(pts, takeoffStore.activeScale);
+    m.measurement = polylengthPayload(pts, takeoffStore.scaleAt(pageIndex, pts[0]));
     store.create(m);
     resetMultiClick();
     return true;
@@ -2260,7 +2281,8 @@
     tool: "MeasurementArea" | "MeasurementPerimeter" | "MeasurementVolume",
     verts: PdfPoint[],
   ): MeasurementPayload {
-    const scale = takeoffStore.activeScale;
+    // The scale under the FIRST vertex (a viewport there, else the page scale).
+    const scale = takeoffStore.scaleAt(pageIndex, verts[0]);
     if (tool === "MeasurementPerimeter") {
       const raw = measurePerimeter(verts);
       return {
@@ -2669,6 +2691,18 @@
       return;
     }
 
+    // --- VIEWPORT tool: drag a rectangle (docs/measurement-viewports.md) ---
+    if (tool === "viewport" || tool === "viewportRedraw") {
+      const p = localPdf(e);
+      if (!p) return;
+      viewportDragStart = p;
+      viewportDraft = null;
+      (e.target as Element).setPointerCapture(e.pointerId);
+      e.stopPropagation();
+      e.preventDefault();
+      return;
+    }
+
     // --- CALIBRATE tool branch ---
     if (tool === "calibrate") {
       const p = localPdf(e);
@@ -2731,6 +2765,12 @@
 
   function onOverlayPointerMove(e: PointerEvent) {
     const tool = store.activeTool;
+
+    if (viewportDragStart) {
+      const p = localPdf(e);
+      if (p) viewportDraft = [viewportDragStart.x, viewportDragStart.y, p.x, p.y];
+      return;
+    }
 
     if (cloudDragStart && identity) {
       const p = localPdf(e);
@@ -2850,6 +2890,29 @@
   function onOverlayPointerUp(e: PointerEvent) {
     previewMarkup = null; // clear the live preview unconditionally (no ghost on early-return)
     const tool = store.activeTool;
+
+    if (viewportDragStart) {
+      const start = viewportDragStart;
+      viewportDragStart = null;
+      viewportDraft = null;
+      const p = localPdf(e);
+      // A click (no real drag) makes nothing.
+      if (!p || Math.abs(p.x - start.x) * zoom < CLOUD_DRAG_PX || Math.abs(p.y - start.y) * zoom < CLOUD_DRAG_PX) return;
+      const bbox: BBox = [Math.min(start.x, p.x), Math.min(start.y, p.y), Math.max(start.x, p.x), Math.max(start.y, p.y)];
+      const redraw = tool === "viewportRedraw" ? takeoffStore.redrawViewportId : null;
+      const old = redraw ? takeoffStore.scales.find((x) => x.id === redraw) ?? null : null;
+      if (old) {
+        // Redraw: the new rectangle - on THIS page - replaces the viewport's (one undo step).
+        takeoffStore.redrawViewportId = null;
+        store.activeTool = "hand";
+        void updateViewport(docInfo.doc_id, old.id, { bbox, page: pageIndex })
+          .then((rec) => commitViewportChange(store, takeoffStore, old, rec, identity))
+          .catch((err) => reportViewportError("Redrawing the viewport", err));
+      } else {
+        pendingViewport = { page: pageIndex, bbox };
+      }
+      return;
+    }
 
     if (cloudDragStart) {
       const start = cloudDragStart;
@@ -3022,7 +3085,7 @@
       if (!p || (p.x === start.x && p.y === start.y)) return;
       const pts = [start, p];
       const raw = measureLength(pts);
-      const scale = takeoffStore.activeScale;
+      const scale = takeoffStore.scaleAt(pageIndex, start);
       const meas: MeasurementPayload = {
         scale_ref: scale?.id ?? null,
         raw_measure: raw,
@@ -3276,7 +3339,7 @@
     if (tool === "MeasurementCount" && identity) {
       const p = localPdfFromMouse(e);
       if (!p) return;
-      const scale = takeoffStore.activeScale;
+      const scale = takeoffStore.scaleAt(pageIndex, p);
       const meas: MeasurementPayload = {
         scale_ref: scale?.id ?? null,
         raw_measure: 1,
@@ -4014,6 +4077,29 @@
       />
     {/each}
 
+    <!-- Measurement viewports on this page (docs/measurement-viewports.md): dashed outline +
+         name and scale, shown while a measuring tool is active; the live rectangle while
+         drawing one. Decorative only (pointer-events none). -->
+    {#if showViewports}
+      {#each takeoffStore.viewportsOn(pageIndex) as v (v.id)}
+        {#if v.applies_to.kind === "Viewport"}
+          {@const b = v.applies_to.bbox}
+          {@const a = pdfUserSpaceToScreen(b[0], b[1], viewState)}
+          {@const c = pdfUserSpaceToScreen(b[2], b[3], viewState)}
+          <g class="viewport-outline" data-viewport={v.applies_to.viewport_id} pointer-events="none">
+            <rect x={Math.min(a.x, c.x)} y={Math.min(a.y, c.y)} width={Math.abs(c.x - a.x)} height={Math.abs(c.y - a.y)} />
+            <text x={Math.min(a.x, c.x) + 4} y={Math.min(a.y, c.y) + 14}>{v.applies_to.name} - {v.label}</text>
+          </g>
+        {/if}
+      {/each}
+    {/if}
+    {#if viewportDraft}
+      {@const a = pdfUserSpaceToScreen(viewportDraft[0], viewportDraft[1], viewState)}
+      {@const c = pdfUserSpaceToScreen(viewportDraft[2], viewportDraft[3], viewState)}
+      <rect class="viewport-draft" x={Math.min(a.x, c.x)} y={Math.min(a.y, c.y)}
+        width={Math.abs(c.x - a.x)} height={Math.abs(c.y - a.y)} pointer-events="none" />
+    {/if}
+
     <!-- Search hit highlights (M4 S3). Semi-transparent rects over matched text.
          Active hit uses a stronger fill for the "you are here" indicator. -->
     {#each pageSearchHits as r (r.idx)}
@@ -4046,17 +4132,29 @@
       pixelDist={calibDialogDist}
       onConfirm={async (result) => {
         showCalibDialog = false;
+        const target = takeoffStore.calibrationState?.params.viewport;
         takeoffStore.cancelCalibration();
-        // Persist the new scale via IPC and add it to the store.
+        // Persist the new scale via IPC and add it to the store: a viewport's own scale when
+        // calibrating one (new or existing), else the document's.
         try {
-          const rec = await addScale(docInfo.doc_id, null, result.ratio, result.unit, result.label, result.precision);
-          takeoffStore.addScale(rec);
-          // Bring existing measurements under the new calibration as ONE undo step.
-          if (identity) {
-            store.applyBatch(recomputeAll(store.markups, takeoffStore.scales, identity, new Date().toISOString()));
+          if (target) {
+            // A viewport's own scale (new or recalibrated): one undo step with its measurements.
+            const cal = { ratio: result.ratio, unit: result.unit, label: result.label, precision: result.precision, twoPoint: true };
+            const old = target.kind === "existing" ? takeoffStore.scales.find((x) => x.id === target.scaleId) ?? null : null;
+            const rec = target.kind === "new"
+              ? await addViewport(docInfo.doc_id, { page: target.page, name: target.name, bbox: target.bbox, ...cal })
+              : await updateViewport(docInfo.doc_id, target.scaleId, cal);
+            commitViewportChange(store, takeoffStore, old, rec, identity);
+          } else {
+            const rec = await addScale(docInfo.doc_id, null, result.ratio, result.unit, result.label, result.precision);
+            takeoffStore.addScale(rec);
+            // Bring existing measurements under the new calibration as ONE undo step.
+            if (identity) {
+              store.applyBatch(recomputeAll(store.markups, takeoffStore.scales, identity, new Date().toISOString()));
+            }
           }
         } catch (e) {
-          console.error("addScale failed:", e);
+          reportViewportError(target ? "Calibrating the viewport" : "Setting the scale", e);
         }
         store.activeTool = "hand";
       }}
@@ -4064,6 +4162,34 @@
         showCalibDialog = false;
         takeoffStore.cancelCalibration();
         store.activeTool = "hand";
+      }}
+    />
+  {/if}
+
+  <!-- Measurement viewport: name + scale for a freshly drawn rectangle. "Calibrate" hands
+       over to the normal two-point calibration, which then creates the viewport. -->
+  {#if pendingViewport}
+    <ViewportDialog
+      initialName={`Viewport ${takeoffStore.viewports.length + 1}`}
+      onCancel={() => { pendingViewport = null; }}
+      onConfirm={async (r) => {
+        const pv = pendingViewport;
+        pendingViewport = null;
+        if (!pv) return;
+        if (r.mode === "calibrate") {
+          takeoffStore.startCalibration({ page: pv.page, appliesToPage: null, viewport: { kind: "new", page: pv.page, name: r.name, bbox: pv.bbox } });
+          store.activeTool = "calibrate";
+          return;
+        }
+        if (r.mode !== "preset") return;
+        try {
+          const rec = await addViewport(docInfo.doc_id, { page: pv.page, name: r.name, bbox: pv.bbox, ratio: r.ratio, unit: r.unit, label: r.label, precision: r.precision, twoPoint: false });
+          // One undo step: the viewport plus any unscaled measurement in it taking its scale.
+          // Measurements taken under another scale keep it (Re-apply is explicit).
+          commitViewportChange(store, takeoffStore, null, rec, identity);
+        } catch (err) {
+          reportViewportError("Creating the viewport", err);
+        }
       }}
     />
   {/if}
@@ -4426,6 +4552,22 @@
     fill: var(--color-primary);
     fill-opacity: 0.3;
     stroke: none;
+  }
+
+  /* Measurement viewports: dashed outline with a name/scale tag. */
+  .viewport-outline rect, .viewport-draft {
+    fill: rgba(37 99 235 / 0.06);
+    stroke: #2563eb;
+    stroke-width: 1.5;
+    stroke-dasharray: 6 4;
+  }
+  .viewport-outline text {
+    fill: #2563eb;
+    font-size: 12px;
+    font-family: var(--font-ui, sans-serif);
+    paint-order: stroke;
+    stroke: var(--color-bg, #fff);
+    stroke-width: 3px;
   }
 
   /* Search hit highlights (M4 S3). Semi-transparent yellow fill, no stroke. */

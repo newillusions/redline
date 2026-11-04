@@ -4,6 +4,11 @@
 //! measurement types with raw_measure (scale-independent, PDF user space) + recompute
 //! invariant on recalibration, quantity rollups, Markup List export (XLSX/CSV).
 //!
+//! Measurement viewports (UX benchmark must-fix 7): named page regions with their own
+//! scale, stored as `ScaleTarget::Viewport` records and written to the PDF as standard
+//! `/VP` viewport dictionaries (ISO 32000-1 §12.9) - see `scale` (selection rule) and
+//! `measure` (PDF read/write). docs/measurement-viewports.md.
+//!
 //! M4 S1 additions: preset-scale picker helpers + PDF /Measure viewport dict write
 //! (spec §12.7) live in `measure`. Additional geometry tools (perimeter/volume/
 //! angle/radius/area-with-cutouts) live in `crate::geometry`.
@@ -18,8 +23,13 @@ pub mod measure;
 pub mod scale;
 
 pub use math::{
-    compute_area, compute_length, convert_length, recompute_all, recompute_markup,
-    recompute_measurement, rise_drop_total,
+    compute_area, compute_length, convert_length, measurement_anchor, recompute_all,
+    recompute_markup, recompute_measurement, rise_drop_total,
 };
-pub use measure::{applicable_scales, find_scale, write_measure_dict};
-pub use scale::{ScaleMethod, ScaleRecord, ScaleStore, ScaleTarget};
+pub use measure::{
+    applicable_scales, find_scale, plan_viewport_import, read_viewports, sync_viewports,
+    write_measure_dict, PdfViewport, ViewportKey,
+};
+pub use scale::{
+    page_scale, scale_at, viewport_at, BBox, ScaleMethod, ScaleRecord, ScaleStore, ScaleTarget,
+};

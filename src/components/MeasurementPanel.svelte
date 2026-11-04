@@ -15,7 +15,12 @@
   import type { MarkupStore } from "$lib/markup-store.svelte";
   import type { TakeoffStore } from "$lib/takeoff-store.svelte";
   import type { Markup, UserRef } from "$lib/ipc";
-  import { exportMarkupList, getPageSize, getUserIdentity, type ExportFormat } from "$lib/ipc";
+  import { exportMarkupList, getPageSize, getUserIdentity, updateViewport, type ExportFormat, type ScaleRecord } from "$lib/ipc";
+  import { measurementsUsing, reapplyViewport } from "$lib/polylength";
+  import { commitViewportChange, reportViewportError } from "$lib/viewport-actions";
+  import type { ViewportDialogResult } from "$lib/scale-presets";
+  import ConfirmDialog from "./ConfirmDialog.svelte";
+  import ViewportDialog from "./ViewportDialog.svelte";
   import { legendFromCountSets } from "$lib/legend";
   import { onMount } from "svelte";
   import { countSubtotalsByPage } from "$lib/measurement-tools";
@@ -133,6 +138,81 @@
   }
 
   const scale = $derived(takeoffStore.activeScale);
+
+  // --- Measurement viewports (docs/measurement-viewports.md) ---
+  const viewports = $derived(takeoffStore.viewports);
+  let viewportMessage = $state<string | null>(null);
+  let editingViewport = $state<ScaleRecord | null>(null);
+  let deletingViewport = $state<ScaleRecord | null>(null);
+
+  function vpName(v: ScaleRecord): string {
+    return v.applies_to.kind === "Viewport" ? v.applies_to.name : v.label;
+  }
+
+  /** The scale a measurement row was taken under: a viewport shows its name too. */
+  function scaleCell(m: Markup): string {
+    const ref = m.measurement?.scale_ref;
+    if (!ref) return "raw";
+    const s = takeoffStore.scales.find((x) => x.id === ref);
+    if (!s) return "-";
+    return s.applies_to.kind === "Viewport" ? `${s.applies_to.name} (${s.label})` : s.label;
+  }
+
+  async function applyViewportEdit(v: ScaleRecord, r: ViewportDialogResult) {
+    editingViewport = null;
+    viewportMessage = null;
+    try {
+      if (r.mode === "preset") {
+        const rec = await updateViewport(docId, v.id, {
+          name: r.name, ratio: r.ratio, unit: r.unit, label: r.label, precision: r.precision, twoPoint: false,
+        });
+        // One undo step: the new scale and the measurements taken under it.
+        commitViewportChange(store, takeoffStore, v, rec, identity);
+      } else {
+        if (r.name !== vpName(v)) {
+          commitViewportChange(store, takeoffStore, v, await updateViewport(docId, v.id, { name: r.name }), identity);
+        }
+        if (r.mode === "calibrate" && v.applies_to.kind === "Viewport") {
+          takeoffStore.startCalibration({
+            page: v.applies_to.page, appliesToPage: null, viewport: { kind: "existing", scaleId: v.id },
+          });
+          store.activeTool = "calibrate";
+          viewportMessage = `Click two points of a known length to calibrate ${r.name}.`;
+        }
+      }
+    } catch (e) {
+      reportViewportError("Changing the viewport", e);
+    }
+  }
+
+  function redrawViewport(v: ScaleRecord) {
+    // The redraw tool: leaving it (any other tool, Escape) cancels the redraw.
+    store.activeTool = "viewportRedraw";
+    takeoffStore.redrawViewportId = v.id;
+    viewportMessage = `Drag the new area for ${vpName(v)} (on any page). Its measurements keep their values.`;
+  }
+
+  /** Explicit action: measurements inside the viewport are put under its scale. */
+  function reapply(v: ScaleRecord) {
+    if (!identity) return;
+    const pairs = reapplyViewport(store.markups, takeoffStore.scales, v.id, identity, new Date().toISOString());
+    store.applyBatch(pairs);
+    viewportMessage = pairs.length === 0
+      ? `Every measurement inside ${vpName(v)} already uses its scale.`
+      : `${pairs.length} measurement${pairs.length === 1 ? "" : "s"} inside ${vpName(v)} now use${pairs.length === 1 ? "s" : ""} its scale.`;
+  }
+
+  /**
+   * Delete = retire: the viewport disappears (from the page, the list and the PDF on the next
+   * save) but the measurements taken under it keep their values. One undo step; Ctrl+Z brings
+   * it back.
+   */
+  function confirmDeleteViewport(v: ScaleRecord) {
+    deletingViewport = null;
+    viewportMessage = null;
+    commitViewportChange(store, takeoffStore, v, { ...v, retired: true }, identity);
+  }
+
   const scaleLabel = $derived(scale ? `${scale.label} (${scale.unit})` : "No scale set");
 
   let exportError = $state<string | null>(null);
@@ -180,6 +260,58 @@
     <div class="export-error">{exportError}</div>
   {/if}
 
+  <section class="viewports" aria-label="Viewports">
+    <div class="viewports-head">
+      <span class="section-title">Viewports</span>
+      <button type="button" class="row-action" data-action="new-viewport"
+        title="Drag an area of the sheet that has its own scale"
+        onclick={() => { store.activeTool = "viewport"; }}>New viewport</button>
+    </div>
+    {#if viewports.length === 0}
+      <p class="empty-hint">No viewports. Use one where part of a sheet has its own scale, such as a 1:20 detail on a 1:100 plan.</p>
+    {:else}
+      <table class="quantity-table" aria-label="Measurement viewports">
+        <thead><tr><th>Name</th><th>Page</th><th>Scale</th><th></th></tr></thead>
+        <tbody>
+          {#each viewports as v (v.id)}
+            {#if v.applies_to.kind === "Viewport"}
+              <tr data-viewport={v.applies_to.viewport_id}>
+                <td>{v.applies_to.name}</td>
+                <td class="num-col">{v.applies_to.page + 1}</td>
+                <td>{v.label} <span class="scale-cell">({v.unit})</span></td>
+                <td class="actions-cell">
+                  <button type="button" class="row-action" data-action="edit-viewport" onclick={() => (editingViewport = v)}>Edit</button>
+                  <button type="button" class="row-action" data-action="redraw-viewport" onclick={() => redrawViewport(v)}>Redraw</button>
+                  <button type="button" class="row-action" data-action="reapply-viewport"
+                    title="Put the measurements that start inside this area under its scale"
+                    onclick={() => reapply(v)} disabled={!identity}>Re-apply</button>
+                  <button type="button" class="row-action" data-action="delete-viewport" onclick={() => (deletingViewport = v)}>Delete</button>
+                </td>
+              </tr>
+            {/if}
+          {/each}
+        </tbody>
+      </table>
+    {/if}
+    {#if viewportMessage}<div class="export-ok" role="status">{viewportMessage}</div>{/if}
+  </section>
+
+  {#if editingViewport}
+    <ViewportDialog title="Edit Viewport" initialName={vpName(editingViewport)} allowKeep
+      onCancel={() => (editingViewport = null)}
+      onConfirm={(r) => { if (editingViewport) void applyViewportEdit(editingViewport, r); }} />
+  {/if}
+  {#if deletingViewport}
+    {@const dv = deletingViewport}
+    {@const n = measurementsUsing(store.markups, dv.id)}
+    <ConfirmDialog title="Delete viewport"
+      message={`Delete the viewport "${vpName(dv)}"?`}
+      hint={n === 0 ? "You can undo this." : `${n} measurement${n === 1 ? "" : "s"} taken under it keep${n === 1 ? "s its" : " their"} current value${n === 1 ? "" : "s"} (${dv.label}); use Re-apply on another viewport to change them. You can undo this.`}
+      confirmLabel="Delete"
+      onCancel={() => (deletingViewport = null)}
+      onConfirm={() => { if (deletingViewport) void confirmDeleteViewport(deletingViewport); }} />
+  {/if}
+
   <CountSetPicker {store} />
 
   {#if countMessage}<div class="export-error" role="status">{countMessage}</div>{/if}
@@ -214,7 +346,7 @@
             </td>
             <td>{m.measurement?.unit ?? "-"}</td>
             <td class="scale-cell">
-              {m.measurement?.scale_ref ? (scale?.label ?? "-") : "raw"}
+              {scaleCell(m)}
             </td>
             <td class="actions-cell">
               {#if group}
@@ -287,6 +419,10 @@
 
 <style>
   .actions-cell { white-space: nowrap; }
+  .viewports { display: flex; flex-direction: column; gap: var(--space-1); flex-shrink: 0; }
+  .viewports-head { display: flex; align-items: center; justify-content: space-between; }
+  .section-title { font-size: var(--font-size-sm); font-weight: 600; color: var(--color-text); }
+  .row-action:disabled { opacity: 0.45; cursor: not-allowed; }
   .row-action {
     font-size: var(--font-size-xs);
     padding: 0 var(--space-2);

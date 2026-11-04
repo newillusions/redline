@@ -22,6 +22,23 @@ describe("ipc invoke argument keys (Tauri v2 camelCase)", () => {
     mockInvoke.mockResolvedValue(undefined as never);
   });
 
+  it("add_viewport / update_viewport → docId / scaleId / twoPoint (measurement viewports)", async () => {
+    await ipc.addViewport("d1", { page: 2, name: "A", bbox: [1, 2, 3, 4], ratio: 0.01, unit: "m", label: "1:20", precision: 2, twoPoint: true });
+    expect(mockInvoke).toHaveBeenCalledWith("add_viewport", {
+      docId: "d1", page: 2, name: "A", bbox: [1, 2, 3, 4], ratio: 0.01, unit: "m", label: "1:20", precision: 2, twoPoint: true,
+    });
+    await ipc.updateViewport("d1", "s1", { bbox: [5, 6, 7, 8] });
+    expect(mockInvoke).toHaveBeenCalledWith("update_viewport", {
+      docId: "d1", scaleId: "s1", page: null, name: null, bbox: [5, 6, 7, 8], ratio: null, unit: null, label: null, precision: null, twoPoint: null,
+    });
+    await ipc.updateViewport("d1", "s1", { bbox: [5, 6, 7, 8], page: 2 });
+    expect(mockInvoke).toHaveBeenLastCalledWith("update_viewport", expect.objectContaining({ page: 2 }));
+    await ipc.putScale("d1", "s1", null);
+    expect(mockInvoke).toHaveBeenCalledWith("put_scale", { docId: "d1", scaleId: "s1", record: null });
+    await ipc.takeScaleNotices("d1");
+    expect(mockInvoke).toHaveBeenCalledWith("take_scale_notices", { docId: "d1" });
+  });
+
   it("get_page_size → docId / pageIndex", async () => {
     await ipc.getPageSize("d1", 3);
     expect(mockInvoke).toHaveBeenCalledWith("get_page_size", { docId: "d1", pageIndex: 3 });

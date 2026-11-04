@@ -427,6 +427,10 @@ pub fn run() {
             // Takeoff commands (M4 S1 — preset picker + /Measure write)
             commands::takeoff::list_applicable_scales,
             commands::takeoff::write_page_measure,
+            commands::takeoff::add_viewport,
+            commands::takeoff::update_viewport,
+            commands::takeoff::put_scale,
+            commands::takeoff::take_scale_notices,
             // Text search commands (M4 S3)
             commands::text::search_document,
             // Text selection commands (I-beam tool: text selection + text-anchored highlight)

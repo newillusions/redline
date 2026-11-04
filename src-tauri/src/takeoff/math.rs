@@ -3,8 +3,8 @@
 //! Recomputing: raw × ratio → computed_quantity in `unit`.
 
 use crate::geometry::PdfPoint;
-use crate::markup::{Markup, MarkupType, Measurement, RiseDrop};
-use crate::takeoff::scale::{ScaleRecord, ScaleTarget};
+use crate::markup::{Markup, MarkupGeometry, MarkupType, Measurement, RiseDrop};
+use crate::takeoff::scale::{bbox_contains, scale_at, ScaleRecord, ScaleTarget};
 
 /// Compute the length between sequential polyline vertices (sum of segment lengths),
 /// in PDF user space (points). Returns the raw_measure.
@@ -128,36 +128,65 @@ pub fn recompute_markup(m: &mut Markup, scale: &ScaleRecord) {
     meas.scale_ref = Some(scale.id.clone());
 }
 
-/// Recompute every scaled measurement in `markups` under the scale that applies to its
-/// page (page-specific first, else document default). Pages with no applicable scale are
-/// left as they are. A measurement taken under a DIFFERENT scale that still exists (the
-/// user deliberately picked it) keeps its scale; one whose `scale_ref` is empty or points
-/// at a scale that was replaced by a recalibration is brought under the page's scale.
-/// Returns how many markups were updated.
+/// The point that picks a measurement's scale: its FIRST point (ISO 32000-1 §12.9 NOTE 1:
+/// a measurement spanning viewports uses the viewport of its first point). `None` for a
+/// geometry without one (text quads), which then uses the page scale.
+pub fn measurement_anchor(m: &Markup) -> Option<PdfPoint> {
+    match &m.geometry {
+        MarkupGeometry::Point(p) => Some(*p),
+        MarkupGeometry::Rect { min, .. } => Some(*min),
+        MarkupGeometry::Polyline(v) => v.first().copied(),
+        MarkupGeometry::Ink(strokes) => strokes.first().and_then(|s| s.first()).copied(),
+        MarkupGeometry::Quads(_) => None,
+    }
+}
+
+/// True when `scale` is one that can apply to a measurement on `page` starting at `anchor`:
+/// the document default, this page's scale, or a viewport on this page containing the point.
+fn applies_here(scale: &ScaleRecord, page: u32, anchor: Option<PdfPoint>) -> bool {
+    if scale.retired {
+        // A deleted viewport: its measurements keep the values they were taken with.
+        return false;
+    }
+    match &scale.applies_to {
+        ScaleTarget::DocumentDefault => true,
+        ScaleTarget::Page { page: p } => *p == page,
+        ScaleTarget::Viewport { page: p, bbox, .. } => {
+            *p == page && anchor.is_some_and(|a| bbox_contains(bbox, a))
+        }
+    }
+}
+
+/// Recompute every scaled measurement in `markups`. A measurement keeps the scale it was
+/// taken under (`scale_ref`) while that scale still exists and still applies where it lies
+/// (the default, its page's scale, or a viewport containing its first point): it is
+/// recomputed under that scale, so a recalibration - which keeps the scale's id - updates
+/// it. A measurement pinned to a scale that does not apply there (the user deliberately
+/// picked it, or the viewport was moved off it) is left exactly as it is. One with no scale
+/// or a deleted one is brought under [`scale_at`] its first point. Returns how many
+/// markups actually changed.
 pub fn recompute_all(markups: &mut [Markup], scales: &[ScaleRecord]) -> usize {
     let mut n = 0;
     for m in markups.iter_mut() {
-        if m.measurement.is_none() {
+        let Some(meas) = m.measurement.as_ref() else {
             continue;
-        }
-        let scale = scales
-            .iter()
-            .find(|s| matches!(s.applies_to, ScaleTarget::Page { page } if page == m.page))
-            .or_else(|| {
-                scales
-                    .iter()
-                    .find(|s| matches!(s.applies_to, ScaleTarget::DocumentDefault))
-            });
-        if let Some(scale) = scale {
-            let pinned_elsewhere = m
-                .measurement
-                .as_ref()
-                .and_then(|x| x.scale_ref.as_deref())
-                .is_some_and(|id| id != scale.id && scales.iter().any(|s| s.id == id));
-            if pinned_elsewhere {
-                continue;
-            }
-            recompute_markup(m, scale);
+        };
+        let anchor = measurement_anchor(m);
+        let own = meas
+            .scale_ref
+            .as_deref()
+            .and_then(|id| scales.iter().find(|s| s.id == id));
+        let scale = match own {
+            Some(s) if applies_here(s, m.page, anchor) => s,
+            Some(_) => continue,
+            None => match scale_at(scales, m.page, anchor) {
+                Some(s) => s,
+                None => continue,
+            },
+        };
+        let before = m.measurement.clone();
+        recompute_markup(m, scale);
+        if m.measurement != before {
             n += 1;
         }
     }
@@ -385,5 +414,119 @@ mod tests {
         recompute_markup(&mut l, &bad);
         assert_eq!(c.measurement.unwrap().computed_quantity, 42.0);
         assert_eq!(l.measurement.unwrap().computed_quantity, 9.0);
+    }
+
+    fn length_at(page: u32, start: (f64, f64), raw: f64, scale_ref: Option<&str>) -> Markup {
+        let mut m = length_markup(page, raw, scale_ref);
+        m.geometry = crate::markup::MarkupGeometry::Polyline(vec![
+            pt(start.0, start.1),
+            pt(start.0 + raw, start.1),
+        ]);
+        m.measurement.as_mut().unwrap().rise_drop.clear();
+        m
+    }
+
+    fn detail(ratio: f64, bbox: [f64; 4]) -> ScaleRecord {
+        scale(
+            "vp",
+            ScaleTarget::Viewport {
+                page: 0,
+                viewport_id: "v".into(),
+                name: "Detail".into(),
+                bbox,
+            },
+            ratio,
+            "m",
+        )
+    }
+
+    #[test]
+    fn a_new_measurement_scale_is_picked_by_its_first_point() {
+        let scales = vec![
+            scale("d", ScaleTarget::DocumentDefault, 0.01, "m"),
+            detail(0.001, [0.0, 0.0, 100.0, 100.0]),
+        ];
+        // Starts inside the detail, ends far outside it: the detail's scale (first point).
+        let mut ms = vec![
+            length_at(0, (50.0, 50.0), 1000.0, None),
+            length_at(0, (500.0, 500.0), 1000.0, None),
+        ];
+        recompute_all(&mut ms, &scales);
+        let m0 = ms[0].measurement.as_ref().unwrap();
+        assert_eq!(m0.scale_ref.as_deref(), Some("vp"));
+        assert!((m0.computed_quantity - 1.0).abs() < 1e-9);
+        let m1 = ms[1].measurement.as_ref().unwrap();
+        assert_eq!(m1.scale_ref.as_deref(), Some("d"));
+        assert!((m1.computed_quantity - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn existing_measurements_keep_their_values_when_a_viewport_appears_over_them() {
+        // Taken under the default before the viewport existed.
+        let mut ms = vec![length_at(0, (50.0, 50.0), 1000.0, Some("d"))];
+        ms[0].measurement.as_mut().unwrap().computed_quantity = 10.0;
+        let scales = vec![
+            scale("d", ScaleTarget::DocumentDefault, 0.01, "m"),
+            detail(0.001, [0.0, 0.0, 100.0, 100.0]),
+        ];
+        assert_eq!(recompute_all(&mut ms, &scales), 0, "nothing changes");
+        let m = ms[0].measurement.as_ref().unwrap();
+        assert_eq!(m.scale_ref.as_deref(), Some("d"));
+        assert_eq!(m.computed_quantity, 10.0);
+
+        // Recalibrating the default (same id, new ratio) still updates it - the viewport
+        // under it does not take it over.
+        let scales = vec![
+            scale("d", ScaleTarget::DocumentDefault, 0.02, "m"),
+            detail(0.001, [0.0, 0.0, 100.0, 100.0]),
+        ];
+        assert_eq!(recompute_all(&mut ms, &scales), 1);
+        let m = ms[0].measurement.as_ref().unwrap();
+        assert_eq!(m.scale_ref.as_deref(), Some("d"));
+        assert!((m.computed_quantity - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_viewport_moved_off_a_measurement_does_not_recompute_it_and_a_deleted_one_falls_back() {
+        let mut ms = vec![length_at(0, (50.0, 50.0), 1000.0, Some("vp"))];
+        ms[0].measurement.as_mut().unwrap().computed_quantity = 1.0;
+        let d = scale("d", ScaleTarget::DocumentDefault, 0.01, "m");
+        // Moved away: the measurement keeps its value and its scale.
+        let moved = vec![d.clone(), detail(0.005, [300.0, 300.0, 400.0, 400.0])];
+        assert_eq!(recompute_all(&mut ms, &moved), 0);
+        assert_eq!(ms[0].measurement.as_ref().unwrap().computed_quantity, 1.0);
+        // Recalibrated in place: follows the new ratio.
+        let recal = vec![d.clone(), detail(0.002, [0.0, 0.0, 100.0, 100.0])];
+        recompute_all(&mut ms, &recal);
+        assert!((ms[0].measurement.as_ref().unwrap().computed_quantity - 2.0).abs() < 1e-9);
+        // Deleted (an explicit user action): falls back to the scale under its first point.
+        recompute_all(&mut ms, std::slice::from_ref(&d));
+        let m = ms[0].measurement.as_ref().unwrap();
+        assert_eq!(m.scale_ref.as_deref(), Some("d"));
+        assert!((m.computed_quantity - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn deleting_a_viewport_retires_it_and_its_measurements_keep_their_values() {
+        // Review of PR #166 (finding 5): a deleted viewport must not silently recompute the
+        // measurements taken under it - not now, not at the next save or export.
+        let mut ms = vec![length_at(0, (50.0, 50.0), 1000.0, Some("vp"))];
+        ms[0].measurement.as_mut().unwrap().computed_quantity = 1.0;
+        let mut retired = detail(0.001, [0.0, 0.0, 100.0, 100.0]);
+        retired.retired = true;
+        let scales = vec![scale("d", ScaleTarget::DocumentDefault, 0.01, "m"), retired];
+        assert_eq!(recompute_all(&mut ms, &scales), 0);
+        let m = ms[0].measurement.as_ref().unwrap();
+        assert_eq!(
+            (m.scale_ref.as_deref(), m.computed_quantity),
+            (Some("vp"), 1.0)
+        );
+        // ... and a new measurement there takes the page scale, not the retired viewport.
+        let mut fresh = vec![length_at(0, (50.0, 50.0), 1000.0, None)];
+        recompute_all(&mut fresh, &scales);
+        assert_eq!(
+            fresh[0].measurement.as_ref().unwrap().scale_ref.as_deref(),
+            Some("d")
+        );
     }
 }

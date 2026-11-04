@@ -6,7 +6,9 @@ use tauri::{Manager, State};
 
 use crate::document::known_passwords;
 use crate::document::page_ops;
-use crate::document::save::{load_markups_from, save_decrypted_copy, save_with_markups_scaled};
+use crate::document::save::{
+    load_markups_and_viewports_from, save_decrypted_copy, save_with_markups_synced,
+};
 use crate::document::{new_doc_id, DocumentInfo, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD};
 use crate::markup::Markup;
 use crate::render::OpenOutcome;
@@ -286,6 +288,27 @@ pub async fn list_markups(
     state.markups.list(&doc_id)
 }
 
+/// Parse the PDF's annotations (lopdf, in a blocking task) and import its `/VP` measurement
+/// viewports as scales in the same pass (`commands::takeoff::import_pdf_viewports`). A
+/// failed import (an unwritable sidecar) is logged and never fails the load.
+async fn parse_and_import(
+    state: &AppState,
+    doc_id: &str,
+    path: PathBuf,
+    password: Option<String>,
+) -> Result<Vec<Markup>, String> {
+    let (markups, viewports) = tokio::task::spawn_blocking(move || {
+        load_markups_and_viewports_from(&path, password.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))?;
+    if let Err(e) = crate::commands::takeoff::import_pdf_viewports(state, doc_id, &viewports) {
+        log::warn!("importing the PDF's measurement viewports failed: {e}");
+    }
+    Ok(markups)
+}
+
 /// Read existing annotations from the PDF into the store (call after open; lopdf runs
 /// in a blocking task). Merges beneath unsaved in-memory markups; store wins on id.
 #[tauri::command]
@@ -311,12 +334,8 @@ pub async fn load_markups(
     // Slow path: full lopdf parse (blocking; tens of seconds on large files).
     let path_for_parse = path.clone();
     let password = state.markups.password(&doc_id);
-    let loaded = tokio::task::spawn_blocking(move || {
-        load_markups_from(&path_for_parse, password.as_deref())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| format!("{e:#}"))?;
+    let doc_for_import = doc_id.clone();
+    let loaded = parse_and_import(&state, &doc_for_import, path_for_parse, password).await?;
     // Populate the cache so the next reopen of this unmodified file returns immediately.
     state.markups.cache_loaded(path, loaded.clone());
     state.markups.seed_loaded_with(&doc_id, loaded, snapshot)
@@ -400,11 +419,7 @@ async fn reload_keeping_inner(
     // render all live in locals until every step has succeeded. Any failure returns here with
     // the old stamp, copy and markups untouched, so the stale-file refusal still applies.
     let txn = state.markups.begin_reload(doc_id)?;
-    let (p, pw) = (path.clone(), password.clone());
-    let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("{e:#}"))?;
+    let loaded = parse_and_import(state, doc_id, path.clone(), password.clone()).await?;
 
     // The render engine still shows the old file.
     state
@@ -494,12 +509,7 @@ async fn save_inner(
     let was_loaded = state.markups.is_loaded(doc_id);
     if !was_loaded {
         let snapshot = state.markups.begin_first_load(doc_id);
-        let p = src.clone();
-        let pw = password.clone();
-        let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| format!("{e:#}"))?;
+        let loaded = parse_and_import(state, doc_id, src.clone(), password.clone()).await?;
         state.markups.seed_loaded_with(doc_id, loaded, snapshot)?;
     }
     let snap = state.markups.write_snapshot(doc_id)?;
@@ -538,12 +548,24 @@ async fn save_inner(
     let staged = dest.with_extension("pdf.redline-staged");
     // Legend tables are computed from quantities under the document's current scales (the
     // recompute the exports run first), so load them like an export does.
+    // The measurement viewports go into the pages' /VP arrays (ISO 32000-1 §12.9) so other
+    // applications read them; the sidecar stays the source of truth.
     crate::commands::takeoff::ensure_scales_loaded(state, doc_id);
-    let scales = state.scales.lock().unwrap().list(doc_id).to_vec();
+    let (scales, seen) = {
+        let store = state.scales.lock().unwrap();
+        (store.list(doc_id).to_vec(), store.seen(doc_id).to_vec())
+    };
     {
         let staged = staged.clone();
         tokio::task::spawn_blocking(move || {
-            save_with_markups_scaled(&write_src, &staged, &markups, &removed, &scales)
+            save_with_markups_synced(
+                &write_src,
+                &staged,
+                &markups,
+                &removed,
+                &scales,
+                Some(&seen),
+            )
         })
         .await
         .map_err(|e| e.to_string())?
@@ -780,12 +802,7 @@ pub(crate) async fn apply_page_edit_opts(
     let was_loaded = state.markups.is_loaded(doc_id);
     if !was_loaded {
         let snapshot = state.markups.begin_first_load(doc_id);
-        let p = src.clone();
-        let pw = password.clone();
-        let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| format!("{e:#}"))?;
+        let loaded = parse_and_import(state, doc_id, src.clone(), password.clone()).await?;
         state.markups.seed_loaded_with(doc_id, loaded, snapshot)?;
     }
     // The write below re-baselines the disk stamp (`invalidate_cache`), so verify it first:
@@ -793,11 +810,20 @@ pub(crate) async fn apply_page_edit_opts(
     ensure_source_unchanged(&state.markups, doc_id, was_loaded)?;
     let snap = state.markups.write_snapshot(doc_id)?;
     crate::commands::takeoff::ensure_scales_loaded(state, doc_id);
-    let scales = state.scales.lock().unwrap().list(doc_id).to_vec();
+    let (scales, seen) = {
+        let store = state.scales.lock().unwrap();
+        (store.list(doc_id).to_vec(), store.seen(doc_id).to_vec())
+    };
 
-    // Apply the op + save in a blocking task.
+    // Apply the op + save in a blocking task. The measurement viewports are written to /VP
+    // first (as a save does), so a page op moves them with their pages.
     let src2 = src.clone();
     let (markups, removed) = (snap.markups.clone(), snap.removed.clone());
+    let sync_scales = scales.clone();
+    let op = move |doc: &mut lopdf::Document| {
+        crate::takeoff::sync_viewports(doc, &sync_scales, &seen)?;
+        op(doc)
+    };
     let written = tokio::task::spawn_blocking(move || {
         apply_edit_and_save_inner(&src2, &markups, &removed, &scales, op, only_if_smaller)
     })
@@ -812,7 +838,7 @@ pub(crate) async fn apply_page_edit_opts(
     // the file back. The file is already rewritten, so a failure in either step leaves the
     // store describing the OLD file: mark the document so no further write goes out until it
     // is reloaded (a save would undo this change, or re-write what flatten/redact removed).
-    let refreshed: Result<Vec<Markup>, String> = async {
+    let refreshed: Result<(Vec<Markup>, Vec<crate::takeoff::PdfViewport>), String> = async {
         state
             .render
             .close_document(doc_id.to_string())
@@ -826,12 +852,22 @@ pub(crate) async fn apply_page_edit_opts(
             .map_err(|e| format!("reopen after page op: {e:#}"))?;
         state.markups.invalidate_cache(&src);
         let (p, pw) = (src.clone(), state.markups.password(doc_id));
-        tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
+        tokio::task::spawn_blocking(move || load_markups_and_viewports_from(&p, pw.as_deref()))
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| format!("the change was written, but the markup list could not be refreshed ({e:#}); reopen the document"))
     }
     .await;
+    // The op moved the /VP entries with their pages (written just before it): follow them,
+    // so each viewport scale stays on its page (and in the right place on a rotated one).
+    let refreshed = refreshed.map(|(markups, viewports)| {
+        if let Err(e) =
+            crate::commands::takeoff::follow_viewports_after_page_op(state, doc_id, &viewports)
+        {
+            log::warn!("updating the measurement viewports after a page operation failed: {e}");
+        }
+        markups
+    });
     let on_disk = match refreshed {
         Ok(v) => v,
         Err(e) => {
@@ -1026,12 +1062,7 @@ pub async fn extract_pages(
     let was_loaded = state.markups.is_loaded(&doc_id);
     if !was_loaded {
         let snapshot = state.markups.begin_first_load(&doc_id);
-        let p = src.clone();
-        let pw = password.clone();
-        let loaded = tokio::task::spawn_blocking(move || load_markups_from(&p, pw.as_deref()))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| format!("{e:#}"))?;
+        let loaded = parse_and_import(&state, &doc_id, src.clone(), password.clone()).await?;
         state.markups.seed_loaded_with(&doc_id, loaded, snapshot)?;
     }
     ensure_source_unchanged(&state.markups, &doc_id, was_loaded)?;

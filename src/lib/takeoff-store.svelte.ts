@@ -7,12 +7,20 @@
  *   waiting_p1 → waiting_p2 (calibrationClickP1)
  *   waiting_p2 → null (calibrationComplete / cancelCalibration)
  */
-import type { PdfPoint, ScaleRecord } from "./ipc";
+import type { BBox, PdfPoint, ScaleRecord } from "./ipc";
+import { sameSlot, viewportAt, viewportsOn } from "./polylength";
+
+/** What a two-point calibration sets: a new viewport, or an existing viewport's scale. */
+export type ViewportCalibration =
+  | { kind: "new"; page: number; name: string; bbox: BBox }
+  | { kind: "existing"; scaleId: string };
 
 export interface CalibrationParams {
   page: number;
   /** null = DocumentDefault, number = Page-specific */
   appliesToPage: number | null;
+  /** Set when calibrating a measurement viewport instead of the page/document. */
+  viewport?: ViewportCalibration;
 }
 
 export type CalibrationStep = "waiting_p1" | "waiting_p2";
@@ -28,37 +36,76 @@ export class TakeoffStore {
   scales = $state<ScaleRecord[]>([]);
   activeScaleId = $state<string | null>(null);
   calibrationState = $state<CalibrationState | null>(null);
+  /**
+   * Set by the Measurements panel's "Redraw" together with the "viewportRedraw" tool: the next
+   * rectangle replaces this viewport's (scale id). Cleared as soon as that tool is left
+   * (Viewport.svelte), so a later New viewport never moves an old one.
+   */
+  redrawViewportId = $state<string | null>(null);
 
-  /** The currently active scale record, or null. */
+  /**
+   * The currently active page/document scale, or null. Never a viewport: a viewport's scale
+   * applies only inside its rectangle (see `scaleAt`).
+   */
   get activeScale(): ScaleRecord | null {
     if (!this.activeScaleId) return null;
-    return this.scales.find((s) => s.id === this.activeScaleId) ?? null;
+    const s = this.scales.find((x) => x.id === this.activeScaleId) ?? null;
+    return s && s.applies_to.kind !== "Viewport" ? s : null;
   }
 
-  /** Populate from the backend on doc open. Activates the first scale. */
+  /** Every measurement viewport of the document (drawing order). */
+  get viewports(): ScaleRecord[] {
+    return this.scales.filter((s) => !s.retired && s.applies_to.kind === "Viewport");
+  }
+
+  /**
+   * Apply a scale change replayed by undo/redo (MarkupStore's `onScale` hook): a record is
+   * put in place (a retired one hides the viewport), `null` removes the scale.
+   */
+  putScale(id: string, rec: ScaleRecord | null): void {
+    if (rec) this.addScale(rec);
+    else this.deleteScale(id);
+  }
+
+  /** The viewports of one page, in drawing order. */
+  viewportsOn(page: number): ScaleRecord[] {
+    return viewportsOn(this.scales, page);
+  }
+
+  /**
+   * The scale a NEW measurement whose first point is `p` on `page` is taken under: the
+   * viewport containing the point (last-drawn wins where they overlap), else the active
+   * page/document scale. docs/measurement-viewports.md.
+   */
+  scaleAt(page: number, p: PdfPoint | null | undefined): ScaleRecord | null {
+    return (p ? viewportAt(this.scales, page, p) : null) ?? this.activeScale;
+  }
+
+  /** Populate from the backend on doc open. Activates the first page/document scale. */
   seedScales(records: ScaleRecord[]): void {
     this.scales = records;
-    if (records.length > 0 && !this.activeScaleId) {
-      this.activeScaleId = records[0].id;
+    if (this.activeScaleId && !records.some((s) => s.id === this.activeScaleId)) this.activeScaleId = null;
+    if (!this.activeScaleId) {
+      this.activeScaleId = records.find((s) => s.applies_to.kind !== "Viewport")?.id ?? null;
     }
   }
 
   /**
-   * Insert or replace a scale record. Sets it as active. A new calibration of the same
-   * target (same page, or the document default) REPLACES the old record, as the backend's
-   * `add_scale` does - otherwise the old scale would linger and shadow the new one.
+   * Insert or replace a scale record. A new calibration of the same target (same page,
+   * viewport, or the document default) REPLACES the old record in place, as the backend's
+   * `add_scale` does - otherwise the old scale would linger and shadow the new one. A
+   * page/document scale becomes the active one; a viewport never does.
    */
   addScale(rec: ScaleRecord): void {
-    this.scales = this.scales.filter(
-      (s) => s.id === rec.id || JSON.stringify(s.applies_to) !== JSON.stringify(rec.applies_to),
-    );
-    const idx = this.scales.findIndex((s) => s.id === rec.id);
+    const hit = (s: ScaleRecord) => s.id === rec.id || sameSlot(s.applies_to, rec.applies_to);
+    const idx = this.scales.findIndex(hit);
     if (idx >= 0) {
+      this.scales = this.scales.filter((s, i) => i === idx || !hit(s));
       this.scales[idx] = rec;
     } else {
       this.scales = [...this.scales, rec];
     }
-    this.activeScaleId = rec.id;
+    if (rec.applies_to.kind !== "Viewport") this.activeScaleId = rec.id;
   }
 
   /** Remove a scale by id. Clears activeScaleId if it was the active one. */

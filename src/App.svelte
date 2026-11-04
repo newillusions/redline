@@ -40,7 +40,7 @@
   import { dropLayerStore, layerStoreFor } from "$lib/layers-store.svelte";
   import ToolbarMenu from "./components/ToolbarMenu.svelte";
   import type { ToolbarMenuItem } from "./components/ToolbarMenu.svelte";
-  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listMarkups, listScales, saveDocument, saveDocumentAs, saveDocumentAsRebuild, canRebuildFromOriginal, reloadKeepingMarkups, isDiskChangedError, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, reorderMarkups, flattenDocument, optimizeDocument, redactDocument, snapshotVersion, exportMarkupList, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity, getPageCount, type ScaleRecord } from "$lib/ipc";
+  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listMarkups, listScales, saveDocument, saveDocumentAs, saveDocumentAsRebuild, canRebuildFromOriginal, reloadKeepingMarkups, isDiskChangedError, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, reorderMarkups, flattenDocument, optimizeDocument, redactDocument, snapshotVersion, exportMarkupList, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity, getPageCount, putScale, takeScaleNotices, type ScaleRecord } from "$lib/ipc";
   import { normaliseMeasurements } from "$lib/polylength";
   import type { IndexStatus, OcrProgressEvent } from "$lib/ipc";
   import { listen } from "@tauri-apps/api/event";
@@ -901,8 +901,11 @@
         update: updateMarkup,
         remove: deleteMarkup,
         reorder: reorderMarkups,
+        putScale,
       });
       const ts = new TakeoffStore();
+      // Undo/redo of measurement-viewport changes replays onto this tab's scales.
+      store.onScale = (id, rec) => ts.putScale(id, rec);
       tabStore.addTab(doc, store, ts, doc.was_encrypted);
 
       // Record successful open in the MRU history.
@@ -925,10 +928,16 @@
       // load before seeding so measurements can be normalised once under the document's
       // scales: computed-only - no undo frame, document stays clean - so the panels show
       // the numbers the exports compute.
-      const scalesP = listScales(doc.doc_id).catch(() => [] as ScaleRecord[]);
-      Promise.all([loadMarkups(doc.doc_id), scalesP])
+      // Scales are listed AFTER the markups load: that parse also imports the PDF's own
+      // measurement viewports (/VP) as scales (docs/measurement-viewports.md).
+      loadMarkups(doc.doc_id)
+        .then(async (m) => [m, await listScales(doc.doc_id).catch(() => [] as ScaleRecord[])] as const)
         .then(([m, scales]) => {
           ts.seedScales(scales);
+          // E.g. the PDF's own viewports could not be saved next to it: say so, never only log.
+          takeScaleNotices(doc.doc_id)
+            .then((notes) => notes.forEach((n) => surfaceError(n)))
+            .catch(() => {});
           store.seed(normaliseMeasurements(m, scales));
         })
         .catch((e) => { openError = `Load markups failed: ${e}`; });
@@ -1139,7 +1148,14 @@
       console.error("Failed to refresh page count after a page operation:", e);
     }
     // Page labels and links follow the page order, and the undo history was cleared.
-    void tabStore.tabs.find((t) => t.docId === docId)?.navStore.refresh();
+    const tab = tabStore.tabs.find((t) => t.docId === docId);
+    void tab?.navStore.refresh();
+    // Measurement viewports move with their pages (and go with a deleted page).
+    if (tab) {
+      listScales(docId)
+        .then((scales) => tab.takeoffStore.seedScales(scales))
+        .catch((e) => console.error("Failed to refresh scales after a page operation:", e));
+    }
     // The open viewport holds the old page sizes and cached tiles (a rotate swaps width and
     // height without changing the page count). Remount it; the tab's viewportSnapshot restores
     // the page, zoom and scroll.
