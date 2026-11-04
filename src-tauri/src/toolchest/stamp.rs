@@ -70,9 +70,13 @@ pub enum DynamicField {
     DateTime,
     Username,
     DocumentName,
-    SequenceNumber { scope: CounterScope },
+    SequenceNumber {
+        scope: CounterScope,
+    },
     /// User-prompted free text/dropdown value; `label` is shown to the user at placement.
-    PromptedText { label: String },
+    PromptedText {
+        label: String,
+    },
 }
 
 /// Stamp definition attached to a [`super::Tool`] (spec section 102-126 Stamps).
@@ -169,7 +173,9 @@ mod tests {
     fn composes_sequence_number() {
         let text = compose_dynamic_text(
             "Issue #{0}",
-            &[DynamicField::SequenceNumber { scope: CounterScope::PerDocument }],
+            &[DynamicField::SequenceNumber {
+                scope: CounterScope::PerDocument,
+            }],
             fixed_now(),
             "mrobert",
             "plan-set.pdf",
@@ -184,8 +190,12 @@ mod tests {
         let text = compose_dynamic_text(
             "{0} / {1}",
             &[
-                DynamicField::PromptedText { label: "Reason".into() },
-                DynamicField::PromptedText { label: "Ref".into() },
+                DynamicField::PromptedText {
+                    label: "Reason".into(),
+                },
+                DynamicField::PromptedText {
+                    label: "Ref".into(),
+                },
             ],
             fixed_now(),
             "mrobert",
@@ -200,7 +210,9 @@ mod tests {
     fn missing_prompted_value_substitutes_empty_string_not_panic() {
         let text = compose_dynamic_text(
             "Note: {0}",
-            &[DynamicField::PromptedText { label: "Note".into() }],
+            &[DynamicField::PromptedText {
+                label: "Note".into(),
+            }],
             fixed_now(),
             "mrobert",
             "plan-set.pdf",
@@ -253,7 +265,12 @@ mod tests {
     fn stamp_def_serde_round_trips() {
         let def = StampDef::Dynamic {
             asset: Some(StampAsset::Svg("<svg/>".to_string())),
-            fields: vec![DynamicField::Date, DynamicField::SequenceNumber { scope: CounterScope::Global }],
+            fields: vec![
+                DynamicField::Date,
+                DynamicField::SequenceNumber {
+                    scope: CounterScope::Global,
+                },
+            ],
             base_text: "{0} #{1}".to_string(),
         };
         let json = serde_json::to_string(&def).expect("serialize");

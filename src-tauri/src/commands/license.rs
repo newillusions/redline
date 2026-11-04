@@ -64,7 +64,10 @@ pub async fn license_status(app_handle: tauri::AppHandle) -> Result<LicenseState
 
 /// Claim a token for a freshly entered activation code.
 #[tauri::command]
-pub async fn activate_license(app_handle: tauri::AppHandle, code: String) -> Result<LicenseState, String> {
+pub async fn activate_license(
+    app_handle: tauri::AppHandle,
+    code: String,
+) -> Result<LicenseState, String> {
     let dir = data_dir(&app_handle)?;
     let device_fingerprint = resolve_device_fingerprint(dir.clone()).await?;
     let public_key = parse_public_key_pem(LICENSE_PUBLIC_KEY_PEM);

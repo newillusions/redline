@@ -65,7 +65,6 @@
   {/if}
 
   <label class="field-label" for="pdf-password">Password</label>
-  <!-- svelte-ignore a11y_autofocus -->
   <input
     id="pdf-password"
     class="field-input"

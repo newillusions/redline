@@ -2042,7 +2042,7 @@
         store={panelLayout}
         content={{ search: searchBody, recent: recentBody, toolchest: toolChestBody, bookmarks: bookmarksBody, links: linksBody, navigator: navigatorBody, layers: layersBody, history: historyBody, properties: propertiesBody }}
         shown={panelShown}
-        onclose={sidebarClose}
+        closeActions={sidebarClose}
         testId="panel-left"
       />
     {/if}
@@ -2096,7 +2096,7 @@
         store={panelLayout}
         content={{ search: searchBody, recent: recentBody, toolchest: toolChestBody, bookmarks: bookmarksBody, links: linksBody, navigator: navigatorBody, layers: layersBody, history: historyBody, properties: propertiesBody }}
         shown={panelShown}
-        onclose={sidebarClose}
+        closeActions={sidebarClose}
         testId="panel-right"
       />
     {/if}

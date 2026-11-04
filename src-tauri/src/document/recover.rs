@@ -93,15 +93,12 @@ pub fn merge_unsaved(
     // Where the user's markup `id` sits in `merged`: by id, else (a foreign markup with no
     // /NM, whose id is random per read) by the content it had when loaded.
     let find = |merged: &[Markup], claimed: &HashSet<Uuid>, id: Uuid| -> Option<usize> {
-        merged
-            .iter()
-            .position(|m| m.id() == id)
-            .or_else(|| {
-                let k = keys.get(&id)?;
-                merged
-                    .iter()
-                    .position(|m| !claimed.contains(&m.id()) && content_key(m) == Some(*k))
-            })
+        merged.iter().position(|m| m.id() == id).or_else(|| {
+            let k = keys.get(&id)?;
+            merged
+                .iter()
+                .position(|m| !claimed.contains(&m.id()) && content_key(m) == Some(*k))
+        })
     };
 
     for id in unsaved.deleted {
@@ -114,20 +111,27 @@ pub fn merge_unsaved(
     }
     for mut m in unsaved.modified {
         let Some(i) = find(&merged, &claimed, m.id()) else {
-            report.skipped.push(format!("{}: could not be matched in the changed file", describe(&m)));
+            report.skipped.push(format!(
+                "{}: could not be matched in the changed file",
+                describe(&m)
+            ));
             continue;
         };
         if m.page >= page_count {
-            report.skipped.push(format!("{}: the page is no longer in the file", describe(&m)));
+            report.skipped.push(format!(
+                "{}: the page is no longer in the file",
+                describe(&m)
+            ));
             continue;
         }
         let file_changed_it = baseline.get(&m.id()).copied() != merged[i].edit_fingerprint()
             && merged[i].id() == m.id();
         m.adopt_reader_owned_from(&merged[i]);
         if file_changed_it {
-            report
-                .notes
-                .push(format!("{}: also changed in the file; your version was kept", describe(&m)));
+            report.notes.push(format!(
+                "{}: also changed in the file; your version was kept",
+                describe(&m)
+            ));
         }
         claimed.insert(m.id());
         merged[i] = m;
@@ -135,9 +139,15 @@ pub fn merge_unsaved(
     }
     for mut m in unsaved.added {
         if m.page >= page_count {
-            report.skipped.push(format!("{}: the page is no longer in the file", describe(&m)));
+            report.skipped.push(format!(
+                "{}: the page is no longer in the file",
+                describe(&m)
+            ));
         } else if merged.iter().any(|x| x.id() == m.id()) {
-            report.skipped.push(format!("{}: the file already has this mark-up", describe(&m)));
+            report.skipped.push(format!(
+                "{}: the file already has this mark-up",
+                describe(&m)
+            ));
         } else {
             m.clear_reader_owned();
             merged.push(m);

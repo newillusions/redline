@@ -381,10 +381,13 @@ pub type Quad = [PdfPoint; 4];
 pub fn rect_to_quad(rect: [f64; 4]) -> Quad {
     let [left, bottom, right, top] = rect;
     [
-        PdfPoint { x: left, y: top },     // top-left
-        PdfPoint { x: right, y: top },    // top-right
-        PdfPoint { x: left, y: bottom },  // bottom-left
-        PdfPoint { x: right, y: bottom }, // bottom-right
+        PdfPoint { x: left, y: top },    // top-left
+        PdfPoint { x: right, y: top },   // top-right
+        PdfPoint { x: left, y: bottom }, // bottom-left
+        PdfPoint {
+            x: right,
+            y: bottom,
+        }, // bottom-right
     ]
 }
 
@@ -485,7 +488,11 @@ mod tests {
             .filter(|t| t.kind == SnapKind::Midpoint)
             .collect();
         // Open polyline: 2 segments, no closing edge -> exactly 2 midpoints.
-        assert_eq!(midpoints.len(), 2, "no closing-segment midpoint on an open sub-path");
+        assert_eq!(
+            midpoints.len(),
+            2,
+            "no closing-segment midpoint on an open sub-path"
+        );
         assert!(midpoints
             .iter()
             .any(|t| (t.point.x - 5.0).abs() < 1e-9 && (t.point.y - 0.0).abs() < 1e-9));
@@ -512,7 +519,10 @@ mod tests {
             .filter(|t| t.kind == SnapKind::Midpoint)
             .count();
         // 2 interior segments + 1 closing segment = 3 midpoints.
-        assert_eq!(midpoints, 3, "closed sub-path adds a midpoint for the closing edge");
+        assert_eq!(
+            midpoints, 3,
+            "closed sub-path adds a midpoint for the closing edge"
+        );
     }
 
     #[test]
@@ -533,7 +543,10 @@ mod tests {
             .iter()
             .filter(|t| t.kind == SnapKind::Midpoint)
             .count();
-        assert_eq!(midpoints, 2, "no extra closing midpoint when last already equals first");
+        assert_eq!(
+            midpoints, 2,
+            "no extra closing midpoint when last already equals first"
+        );
     }
 
     #[test]
@@ -544,7 +557,10 @@ mod tests {
                 closed: false,
             },
             Subpath {
-                points: vec![PdfPoint { x: 100.0, y: 100.0 }, PdfPoint { x: 101.0, y: 100.0 }],
+                points: vec![
+                    PdfPoint { x: 100.0, y: 100.0 },
+                    PdfPoint { x: 101.0, y: 100.0 },
+                ],
                 closed: false,
             },
         ];
@@ -568,7 +584,10 @@ mod tests {
     #[test]
     fn build_snap_index_empty_and_single_point_subpaths_produce_no_midpoints() {
         let subpaths = vec![
-            Subpath { points: vec![], closed: false },
+            Subpath {
+                points: vec![],
+                closed: false,
+            },
             Subpath {
                 points: vec![PdfPoint { x: 5.0, y: 5.0 }],
                 closed: true,
@@ -597,7 +616,10 @@ mod tests {
         // Round-trip through PageGeometry::nearest_snap to prove the built index is
         // actually queryable, not just structurally correct.
         let subpaths = vec![Subpath {
-            points: vec![PdfPoint { x: 50.0, y: 50.0 }, PdfPoint { x: 150.0, y: 50.0 }],
+            points: vec![
+                PdfPoint { x: 50.0, y: 50.0 },
+                PdfPoint { x: 150.0, y: 50.0 },
+            ],
             closed: false,
         }];
         let geom = build_snap_index(3, &subpaths);
@@ -781,11 +803,19 @@ mod tests {
             [72.0, 672.0, 220.0, 684.0], // line 3: partial (selection ends mid-line)
         ];
         let quads = rects_to_quads(&rects);
-        assert_eq!(quads.len(), 3, "must return exactly one quad per input rect");
+        assert_eq!(
+            quads.len(),
+            3,
+            "must return exactly one quad per input rect"
+        );
         // Never merged into a single bounding quad - each retains its own rect.
         assert_eq!(quads[0][0], pt(72.0, 712.0));
         assert_eq!(quads[0][1], pt(500.0, 712.0));
-        assert_eq!(quads[2][1], pt(220.0, 684.0), "partial last-line width preserved");
+        assert_eq!(
+            quads[2][1],
+            pt(220.0, 684.0),
+            "partial last-line width preserved"
+        );
     }
 
     #[test]

@@ -57,7 +57,6 @@
 
   {#each labels as label, i (i)}
     <label class="field-label" for="stamp-prompt-field-{i}">{label}</label>
-    <!-- svelte-ignore a11y_autofocus -->
     <input
       id="stamp-prompt-field-{i}"
       class="field-input"

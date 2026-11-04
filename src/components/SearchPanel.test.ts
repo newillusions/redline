@@ -11,11 +11,11 @@
  * buttons, markup-kind labeling, folder-picker prompt when no folder chosen.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, fireEvent, waitFor } from "@testing-library/svelte";
+import { render, fireEvent } from "@testing-library/svelte";
 import { tick } from "svelte";
 import SearchPanel from "./SearchPanel.svelte";
 import { SearchStore, type SearchDeps, type UnifiedSearchHit, type SearchGroup } from "$lib/search-store.svelte";
-import type { SearchHit, FolderSearchHit } from "$lib/ipc";
+import type { SearchHit } from "$lib/ipc";
 
 function hit(page: number, snippet = "hit"): SearchHit {
   return { page, rect: [0, 0, 1, 1], snippet };
@@ -337,7 +337,7 @@ describe("SearchPanel — searching/no-results feedback (owner defect fix, 2026-
   it("a zero-hit page-scope search also shows 'No results' (same phantom-group class)", async () => {
     const store = new SearchStore(fakeDeps({ searchDocument: vi.fn(async () => []) }));
     store.query = "elevation";
-    const { container, getByTestId } = mountPanel(store);
+    const { getByTestId } = mountPanel(store);
 
     await store.run({ scope: "page", doc: doc(), page: 0 });
     await tick();
@@ -350,7 +350,7 @@ describe("SearchPanel — searching/no-results feedback (owner defect fix, 2026-
     const store = new SearchStore(fakeDeps({ searchFolder: vi.fn(async () => []) }));
     store.setScope("folder");
     store.query = "elevation";
-    const { container, getByTestId } = mountPanel(store);
+    const { getByTestId } = mountPanel(store);
 
     await store.run({ scope: "folder" });
     await tick();
@@ -365,7 +365,7 @@ describe("SearchPanel — searching/no-results feedback (owner defect fix, 2026-
     const pending = new Promise<never[]>((resolve) => { resolveSearch = resolve; });
     const store = new SearchStore(fakeDeps({ searchDocument: vi.fn(() => pending) }));
     store.query = "elevation";
-    const { container, getByTestId } = mountPanel(store);
+    const { getByTestId } = mountPanel(store);
 
     const run = store.run({ scope: "document", doc: doc() });
     await tick();

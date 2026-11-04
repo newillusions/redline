@@ -684,7 +684,10 @@ impl RenderEngine {
                     .context("Failed to open the PDF with the layer view")?;
                 // SAFETY: as in `load_doc` - the document borrows the engine's bindings,
                 // which outlive every OpenDoc, and owns its reader.
-                (unsafe { std::mem::transmute::<PdfDocument<'_>, PdfDocument<'static>>(doc) }, None)
+                (
+                    unsafe { std::mem::transmute::<PdfDocument<'_>, PdfDocument<'static>>(doc) },
+                    None,
+                )
             }
             None => Self::load_doc(&self.pdfium, &path, file_len, None)?,
         };
@@ -846,10 +849,18 @@ impl RenderEngine {
                 let right = b.right().value as f64;
                 let top = b.top().value as f64;
 
-                if left < merged_left { merged_left = left; }
-                if bottom < merged_bottom { merged_bottom = bottom; }
-                if right > merged_right { merged_right = right; }
-                if top > merged_top { merged_top = top; }
+                if left < merged_left {
+                    merged_left = left;
+                }
+                if bottom < merged_bottom {
+                    merged_bottom = bottom;
+                }
+                if right > merged_right {
+                    merged_right = right;
+                }
+                if top > merged_top {
+                    merged_top = top;
+                }
 
                 if snippet.is_empty() {
                     snippet = seg.text();
@@ -867,12 +878,26 @@ impl RenderEngine {
                 // the two mapped corners are re-normalised by component-wise min/max
                 // rather than kept positionally.
                 let a = true_to_display(
-                    PdfPoint { x: merged_left, y: merged_bottom },
-                    rotation, w0, h0, ox, oy,
+                    PdfPoint {
+                        x: merged_left,
+                        y: merged_bottom,
+                    },
+                    rotation,
+                    w0,
+                    h0,
+                    ox,
+                    oy,
                 );
                 let b = true_to_display(
-                    PdfPoint { x: merged_right, y: merged_top },
-                    rotation, w0, h0, ox, oy,
+                    PdfPoint {
+                        x: merged_right,
+                        y: merged_top,
+                    },
+                    rotation,
+                    w0,
+                    h0,
+                    ox,
+                    oy,
                 );
                 let (left, right) = (a.x.min(b.x), a.x.max(b.x));
                 let (bottom, top) = (a.y.min(b.y), a.y.max(b.y));
@@ -1115,7 +1140,8 @@ impl RenderEngine {
         }
 
         let geom = std::sync::Arc::new(crate::geometry::build_snap_index(page_index, &subpaths));
-        doc.snap_cache.insert(page_index, std::sync::Arc::clone(&geom));
+        doc.snap_cache
+            .insert(page_index, std::sync::Arc::clone(&geom));
         Ok(geom)
     }
 
@@ -1657,7 +1683,8 @@ impl RenderHandle {
                             options,
                             reply,
                         } => {
-                            let _ = reply.send(engine.search_page(&doc_id, page_index, &query, &options));
+                            let _ = reply
+                                .send(engine.search_page(&doc_id, page_index, &query, &options));
                         }
                         RenderCmd::CharIndexAtPoint {
                             doc_id,
@@ -1667,7 +1694,9 @@ impl RenderHandle {
                             tolerance,
                             reply,
                         } => {
-                            let _ = reply.send(engine.char_index_at_point(&doc_id, page_index, x, y, tolerance));
+                            let _ = reply.send(
+                                engine.char_index_at_point(&doc_id, page_index, x, y, tolerance),
+                            );
                         }
                         RenderCmd::TextRangeSelection {
                             doc_id,
@@ -1676,16 +1705,17 @@ impl RenderHandle {
                             end,
                             reply,
                         } => {
-                            let _ = reply.send(engine.text_range_selection(&doc_id, page_index, start, end));
+                            let _ = reply
+                                .send(engine.text_range_selection(&doc_id, page_index, start, end));
                         }
                         RenderCmd::PageSnapIndex {
                             doc_id,
                             page_index,
                             reply,
                         } => {
-                            let result = engine.page_snap_index(&doc_id, page_index).map(|geom| {
-                                geom.snap_index.iter().cloned().collect::<Vec<_>>()
-                            });
+                            let result = engine
+                                .page_snap_index(&doc_id, page_index)
+                                .map(|geom| geom.snap_index.iter().cloned().collect::<Vec<_>>());
                             let _ = reply.send(result);
                         }
                         RenderCmd::RasterizePdfBytes {
@@ -1715,7 +1745,11 @@ impl RenderHandle {
                             );
                             let _ = reply.send(result);
                         }
-                        RenderCmd::SetLayerView { doc_id, view, reply } => {
+                        RenderCmd::SetLayerView {
+                            doc_id,
+                            view,
+                            reply,
+                        } => {
                             let _ = reply.send(engine.set_layer_view(&doc_id, view));
                         }
                     }
@@ -1754,7 +1788,8 @@ impl RenderHandle {
         let out = reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?;
-        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         out
     }
 
@@ -1774,7 +1809,8 @@ impl RenderHandle {
         let out = reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("render thread dropped reply"));
-        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         out
     }
 
@@ -1994,7 +2030,11 @@ impl RenderHandle {
     ) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(RenderCmd::SetLayerView { doc_id, view, reply: reply_tx })
+            .send(RenderCmd::SetLayerView {
+                doc_id,
+                view,
+                reply: reply_tx,
+            })
             .map_err(|_| anyhow::anyhow!("render thread gone"))?;
         reply_rx
             .await
@@ -2147,8 +2187,12 @@ pub(crate) mod tests {
     /// Write a fresh one-page PDF, encrypted with the given user/owner passwords,
     /// to a temp file. Returns the temp dir (keep alive for the file's lifetime)
     /// and the file path.
-    fn write_encrypted_fixture(user_password: &str, owner_password: &str) -> (tempfile::TempDir, PathBuf) {
-        let mut doc = crate::document::annots::tests::encrypted_one_page_doc(user_password, owner_password);
+    fn write_encrypted_fixture(
+        user_password: &str,
+        owner_password: &str,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let mut doc =
+            crate::document::annots::tests::encrypted_one_page_doc(user_password, owner_password);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("encrypted.pdf");
         doc.save(&path).expect("save encrypted fixture");
@@ -2594,8 +2638,7 @@ pub(crate) mod tests {
             .sanitized(),
         );
         let (mut doc, _page_id) = crate::document::annots::tests::one_page_doc();
-        crate::document::annots::write_markups(&mut doc, &[count, legend])
-            .expect("write_markups");
+        crate::document::annots::write_markups(&mut doc, &[count, legend]).expect("write_markups");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legend.pdf");
         doc.save(&path).expect("save fixture");
@@ -2605,7 +2648,9 @@ pub(crate) mod tests {
         )
         .expect("bind pdfium");
         let pdfium = Pdfium::new(bindings);
-        let document = pdfium.load_pdf_from_file(&path, None).expect("load fixture");
+        let document = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("load fixture");
         let page = document.pages().get(0).expect("page 0");
         let bitmap = page
             .render_with_config(
@@ -2642,7 +2687,10 @@ pub(crate) mod tests {
                 red_in_symbol_cell += 1;
             }
         }
-        assert!(dx1 > 0, "the table painted no dark ink (border/text) at all");
+        assert!(
+            dx1 > 0,
+            "the table painted no dark ink (border/text) at all"
+        );
         let tol = 2i64;
         assert!(
             (dx0 - left).abs() <= tol
@@ -3008,7 +3056,8 @@ pub(crate) mod tests {
                     "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1_i64,
                 }),
             );
-            let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+            let catalog_id =
+                doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
             doc.trailer.set("Root", catalog_id);
             doc
         }
@@ -3022,7 +3071,11 @@ pub(crate) mod tests {
             let hits = e
                 .search_page(doc_id, 0, query, &SearchOptions::default())
                 .expect("search_page");
-            assert_eq!(hits.len(), 1, "expected exactly one hit for {query:?}: {hits:?}");
+            assert_eq!(
+                hits.len(),
+                1,
+                "expected exactly one hit for {query:?}: {hits:?}"
+            );
             hits[0].rect
         }
 
@@ -3150,7 +3203,12 @@ pub(crate) mod tests {
         path
     }
 
-    fn near(targets: &[crate::geometry::SnapTarget], x: f64, y: f64, kind: crate::geometry::SnapKind) -> bool {
+    fn near(
+        targets: &[crate::geometry::SnapTarget],
+        x: f64,
+        y: f64,
+        kind: crate::geometry::SnapKind,
+    ) -> bool {
         targets
             .iter()
             .any(|t| t.kind == kind && (t.point.x - x).abs() < 1e-6 && (t.point.y - y).abs() < 1e-6)
@@ -3175,23 +3233,51 @@ pub(crate) mod tests {
         use crate::geometry::SnapKind;
 
         // Open line endpoints.
-        assert!(near(&flat, 72.0, 100.0, SnapKind::Endpoint), "missing open-line start endpoint");
-        assert!(near(&flat, 300.0, 100.0, SnapKind::Endpoint), "missing open-line end endpoint");
+        assert!(
+            near(&flat, 72.0, 100.0, SnapKind::Endpoint),
+            "missing open-line start endpoint"
+        );
+        assert!(
+            near(&flat, 300.0, 100.0, SnapKind::Endpoint),
+            "missing open-line end endpoint"
+        );
         // Open line midpoint - no closing edge, so exactly this one midpoint from it.
-        assert!(near(&flat, 186.0, 100.0, SnapKind::Midpoint), "missing open-line midpoint");
+        assert!(
+            near(&flat, 186.0, 100.0, SnapKind::Midpoint),
+            "missing open-line midpoint"
+        );
 
         // Triangle endpoints.
-        assert!(near(&flat, 100.0, 200.0, SnapKind::Endpoint), "missing triangle vertex 1");
-        assert!(near(&flat, 200.0, 200.0, SnapKind::Endpoint), "missing triangle vertex 2");
-        assert!(near(&flat, 100.0, 300.0, SnapKind::Endpoint), "missing triangle vertex 3");
+        assert!(
+            near(&flat, 100.0, 200.0, SnapKind::Endpoint),
+            "missing triangle vertex 1"
+        );
+        assert!(
+            near(&flat, 200.0, 200.0, SnapKind::Endpoint),
+            "missing triangle vertex 2"
+        );
+        assert!(
+            near(&flat, 100.0, 300.0, SnapKind::Endpoint),
+            "missing triangle vertex 3"
+        );
         // Triangle midpoints, including the closing edge back to the start vertex.
-        assert!(near(&flat, 150.0, 200.0, SnapKind::Midpoint), "missing triangle edge 1 midpoint");
-        assert!(near(&flat, 150.0, 250.0, SnapKind::Midpoint), "missing triangle edge 2 midpoint");
-        assert!(near(&flat, 100.0, 250.0, SnapKind::Midpoint), "missing triangle closing-edge midpoint");
+        assert!(
+            near(&flat, 150.0, 200.0, SnapKind::Midpoint),
+            "missing triangle edge 1 midpoint"
+        );
+        assert!(
+            near(&flat, 150.0, 250.0, SnapKind::Midpoint),
+            "missing triangle edge 2 midpoint"
+        );
+        assert!(
+            near(&flat, 100.0, 250.0, SnapKind::Midpoint),
+            "missing triangle closing-edge midpoint"
+        );
 
         // No Intersection/ArcCenter targets in v1 (see geometry module doc comment).
         assert!(
-            flat.iter().all(|t| matches!(t.kind, SnapKind::Endpoint | SnapKind::Midpoint)),
+            flat.iter()
+                .all(|t| matches!(t.kind, SnapKind::Endpoint | SnapKind::Midpoint)),
             "v1 must not populate Intersection/ArcCenter"
         );
     }
@@ -3323,7 +3409,10 @@ pub(crate) mod tests {
         let sel = e
             .text_range_selection("t", 0, 0, 20)
             .expect("text_range_selection should not error on a text-bearing page");
-        assert!(!sel.quads.is_empty(), "expected at least one line quad for the first 20 chars");
+        assert!(
+            !sel.quads.is_empty(),
+            "expected at least one line quad for the first 20 chars"
+        );
         assert!(!sel.text.is_empty(), "expected non-empty extracted text");
         assert!(
             sel.text.chars().count() <= 20,
@@ -3332,8 +3421,14 @@ pub(crate) mod tests {
         // Every quad must be a well-formed axis-aligned rect: TL/TR share y (top),
         // BL/BR share y (bottom), left points share x, right points share x.
         for q in &sel.quads {
-            assert!((q[0].y - q[1].y).abs() < 1e-6, "top edge must be horizontal");
-            assert!((q[2].y - q[3].y).abs() < 1e-6, "bottom edge must be horizontal");
+            assert!(
+                (q[0].y - q[1].y).abs() < 1e-6,
+                "top edge must be horizontal"
+            );
+            assert!(
+                (q[2].y - q[3].y).abs() < 1e-6,
+                "bottom edge must be horizontal"
+            );
             assert!(q[0].y >= q[2].y, "top must be at or above bottom (y-up)");
         }
     }
@@ -3371,7 +3466,10 @@ pub(crate) mod tests {
         let sel = e
             .text_range_selection("t", 0, 0, 5)
             .expect("text_range_selection on first 5 chars");
-        assert!(!sel.quads.is_empty(), "need at least one quad to hit-test against");
+        assert!(
+            !sel.quads.is_empty(),
+            "need at least one quad to hit-test against"
+        );
 
         // Hit-test the centre of the first quad's rect - generous tolerance (the
         // quad's own half-width/height) so this is robust to font metrics.
@@ -3382,7 +3480,10 @@ pub(crate) mod tests {
         let hit = e
             .char_index_at_point("t", 0, cx, cy, tol)
             .expect("char_index_at_point should not error");
-        assert!(hit.is_some(), "expected a character hit near the first selected quad");
+        assert!(
+            hit.is_some(),
+            "expected a character hit near the first selected quad"
+        );
     }
 
     #[test]

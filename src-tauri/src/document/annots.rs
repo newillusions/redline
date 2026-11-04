@@ -253,7 +253,10 @@ fn irt_ref(d: &Dictionary) -> Option<ObjectId> {
 /// `/RT /Group` + `/IRT` together mean "grouped with"; `/IRT` alone (no `/RT`, or
 /// `/RT /R`) is an ordinary comment reply and must not be treated as a group edge.
 fn rt_is_group(d: &Dictionary) -> bool {
-    matches!(d.get(b"RT").ok().and_then(|o| o.as_name().ok()), Some(b"Group"))
+    matches!(
+        d.get(b"RT").ok().and_then(|o| o.as_name().ok()),
+        Some(b"Group")
+    )
 }
 
 /// Resolve the page's /Annots into a list of (annot ObjectId | inline dict).
@@ -540,8 +543,8 @@ fn write_workflow_annots(
     if m.workflow.thread.is_empty() && history.is_empty() {
         return Vec::new();
     }
-    let ap = *empty_ap
-        .get_or_insert_with(|| doc.add_object(Object::Stream(replies::empty_ap_stream())));
+    let ap =
+        *empty_ap.get_or_insert_with(|| doc.add_object(Object::Stream(replies::empty_ap_stream())));
     let rect = replies::note_rect(parent_rect);
     let mut out = Vec::new();
     let mut oid_of: std::collections::HashMap<uuid::Uuid, ObjectId> =
@@ -551,7 +554,12 @@ fn write_workflow_annots(
             .in_reply_to
             .and_then(|p| oid_of.get(&p).copied())
             .unwrap_or(parent);
-        let anchor = replies::NoteAnchor { parent: target, page, rect, ap };
+        let anchor = replies::NoteAnchor {
+            parent: target,
+            page,
+            rect,
+            ap,
+        };
         let oid = doc.add_object(Object::Dictionary(replies::reply_dict(r, &anchor)));
         oid_of.insert(r.id, oid);
         out.push(oid);
@@ -581,7 +589,12 @@ fn write_workflow_annots(
     let mut written = 0usize;
     while let Some((i, target)) = queue.pop() {
         let c = &history[i];
-        let anchor = replies::NoteAnchor { parent: target, page, rect, ap };
+        let anchor = replies::NoteAnchor {
+            parent: target,
+            page,
+            rect,
+            ap,
+        };
         let oid = doc.add_object(Object::Dictionary(replies::state_dict(c, &anchor)));
         out.push(oid);
         out.extend(
@@ -647,7 +660,9 @@ fn add_appearance(doc: &mut Document, m: &Markup) -> ObjectId {
 /// resolves, or resolves to something else (the file changed under us), is not usable.
 fn ap_usable(doc: &Document, o: &Object) -> bool {
     let is_stream = |o: &Object| match o {
-        Object::Reference(r) => doc.get_object(*r).is_ok_and(|t| matches!(t, Object::Stream(_))),
+        Object::Reference(r) => doc
+            .get_object(*r)
+            .is_ok_and(|t| matches!(t, Object::Stream(_))),
         _ => false,
     };
     let dict = match o {
@@ -657,7 +672,9 @@ fn ap_usable(doc: &Document, o: &Object) -> bool {
     };
     dict.is_some_and(|d| match d.get(b"N") {
         Ok(n @ Object::Reference(_)) => is_stream(n),
-        Ok(Object::Dictionary(states)) => !states.is_empty() && states.iter().all(|(_, v)| is_stream(v)),
+        Ok(Object::Dictionary(states)) => {
+            !states.is_empty() && states.iter().all(|(_, v)| is_stream(v))
+        }
         _ => false,
     })
 }
@@ -763,8 +780,10 @@ pub(crate) fn write_markups_scaled(
     // Managed = redline-owned: redline-authored (/RLType), or the very annotation (object id
     // and /NM) a store markup was imported from, so a Revu-authored markup is replaced on
     // save rather than kept next to its rewritten copy. Never matched by /NM alone.
-    let mut ids: std::collections::HashSet<SourceRef> =
-        markups.iter().filter_map(|m| m.source_ref.clone()).collect();
+    let mut ids: std::collections::HashSet<SourceRef> = markups
+        .iter()
+        .filter_map(|m| m.source_ref.clone())
+        .collect();
     ids.extend(removed.iter().cloned());
     let pages = doc.get_pages(); // 1-based page no -> page ObjectId
 
@@ -808,7 +827,9 @@ pub(crate) fn write_markups_scaled(
             .collect();
         let mut keep = Vec::new();
         for (i, (oid, dict)) in annots.into_iter().enumerate() {
-            if is_managed(oid, &dict, (*page_no, i), &ids) || oid.is_some_and(|o| owned.contains(&o)) {
+            if is_managed(oid, &dict, (*page_no, i), &ids)
+                || oid.is_some_and(|o| owned.contains(&o))
+            {
                 continue;
             }
             if oid.is_none()
@@ -957,12 +978,16 @@ pub(crate) fn write_markups_scaled(
     // `to_annotation_dict` above, per-markup) is left untouched as the redline-only
     // fallback.
     for members in group_members.values() {
-        let [head, followers @ ..] = members.as_slice() else { continue };
+        let [head, followers @ ..] = members.as_slice() else {
+            continue;
+        };
         if followers.is_empty() {
             continue;
         }
         for &follower_aid in followers {
-            let dict = doc.get_dictionary_mut(follower_aid).context("group follower dict")?;
+            let dict = doc
+                .get_dictionary_mut(follower_aid)
+                .context("group follower dict")?;
             dict.set("RT", Object::Name(b"Group".to_vec()));
             dict.set("IRT", Object::Reference(*head));
         }
@@ -1017,7 +1042,12 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
             if st == "Text" && dict.has(b"StateModel") {
                 continue;
             }
-            collected.push(Collected { oid, dict, page_no_1based, idx });
+            collected.push(Collected {
+                oid,
+                dict,
+                page_no_1based,
+                idx,
+            });
         }
     }
 
@@ -1047,13 +1077,18 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
         if !rt_is_group(&c.dict) {
             continue;
         }
-        let Some(target_oid) = irt_ref(&c.dict) else { continue };
-        let Some(&j) = oid_to_index.get(&target_oid) else { continue };
+        let Some(target_oid) = irt_ref(&c.dict) else {
+            continue;
+        };
+        let Some(&j) = oid_to_index.get(&target_oid) else {
+            continue;
+        };
         union(&mut parent, i, j);
     }
     // Assign one fresh synthetic group id per component of size >= 2. Components of
     // size 1 (no group edges, or an unresolvable `/IRT`) are not a group.
-    let mut component_size: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut component_size: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
     for i in 0..collected.len() {
         *component_size.entry(find(&mut parent, i)).or_insert(0) += 1;
     }
@@ -1070,13 +1105,18 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
         let s = d.get(b"RLGroup").ok()?.as_str().ok()?;
         uuid::Uuid::parse_str(&String::from_utf8_lossy(s)).ok()
     }
-    let mut group_ids: std::collections::HashMap<usize, uuid::Uuid> = std::collections::HashMap::new();
+    let mut group_ids: std::collections::HashMap<usize, uuid::Uuid> =
+        std::collections::HashMap::new();
     for c in &collected {
-        let Some(existing) = existing_rl_group(&c.dict) else { continue };
+        let Some(existing) = existing_rl_group(&c.dict) else {
+            continue;
+        };
         // `oid` is None for an inline (non-indirect) annotation dict, which cannot
         // participate in the union-find (nothing can point /IRT at it) - safe to skip.
         let Some(oid) = c.oid else { continue };
-        let Some(&i) = oid_to_index.get(&oid) else { continue };
+        let Some(&i) = oid_to_index.get(&oid) else {
+            continue;
+        };
         let root = find(&mut parent, i);
         if component_size.get(&root).copied().unwrap_or(1) < 2 {
             continue; // no surviving group to attach a stable id to
@@ -1092,7 +1132,9 @@ pub fn read_markups(doc: &Document) -> Result<Vec<Markup>> {
     for (i, c) in collected.into_iter().enumerate() {
         let dict = c.dict;
         let page_no_1based = c.page_no_1based;
-        let page_id = *pages.get(&page_no_1based).context("page id for collected annotation")?;
+        let page_id = *pages
+            .get(&page_no_1based)
+            .context("page id for collected annotation")?;
         let (rotation, w0, h0, ox, oy) = page_space.get(page_id, page_no_1based - 1)?;
         {
             let mut m = Markup::from_annotation_dict(&measure_inlined(doc, &dict));
@@ -1929,7 +1971,10 @@ pub(crate) mod tests {
                 display_name: "Alice".into(),
             },
         )
-        .with_stamp_asset(StampAsset::BluebeamFormXObject { root_id: "ROOTID".to_string(), objects });
+        .with_stamp_asset(StampAsset::BluebeamFormXObject {
+            root_id: "ROOTID".to_string(),
+            objects,
+        });
 
         write_markups(&mut doc, std::slice::from_ref(&m)).unwrap();
 
@@ -1939,26 +1984,48 @@ pub(crate) mod tests {
         let ap_stream = resolve_ap_n_stream(&doc, dict);
 
         let content = String::from_utf8(ap_stream.content.clone()).unwrap();
-        assert!(content.contains("/Fx0 Do\n"), "AP content must reference the spliced Form: {content}");
-        assert!(!content.contains(" re\n"), "a real Form-backed stamp must not draw the box fallback: {content}");
+        assert!(
+            content.contains("/Fx0 Do\n"),
+            "AP content must reference the spliced Form: {content}"
+        );
+        assert!(
+            !content.contains(" re\n"),
+            "a real Form-backed stamp must not draw the box fallback: {content}"
+        );
 
         let resources = ap_stream.dict.get(b"Resources").unwrap().as_dict().unwrap();
-        let xobjects = resources.get(b"XObject").expect("Resources must carry /XObject").as_dict().unwrap();
+        let xobjects = resources
+            .get(b"XObject")
+            .expect("Resources must carry /XObject")
+            .as_dict()
+            .unwrap();
         let fx0_ref = match xobjects.get(b"Fx0").unwrap() {
             Object::Reference(r) => *r,
             other => panic!("/XObject /Fx0 must be an indirect reference, got {other:?}"),
         };
         let fx0 = match doc.get_object(fx0_ref).unwrap() {
             Object::Stream(s) => s,
-            other => panic!("/XObject /Fx0 must resolve to a real Form XObject Stream, got {other:?}"),
+            other => {
+                panic!("/XObject /Fx0 must resolve to a real Form XObject Stream, got {other:?}")
+            }
         };
-        assert_eq!(fx0.dict.get(b"Subtype").unwrap().as_name().unwrap(), b"Form");
+        assert_eq!(
+            fx0.dict.get(b"Subtype").unwrap().as_name().unwrap(),
+            b"Form"
+        );
 
         // The nested /BBObjPtr_GSID reference (the root's OWN /Resources/ExtGState
         // entry) must also have been resolved to a real indirect reference, not left as
         // a dangling placeholder name - proving multi-level graph splicing, not just the
         // root object.
-        let nested_gs = fx0.dict.get(b"Resources").unwrap().as_dict().unwrap().get(b"ExtGState").unwrap();
+        let nested_gs = fx0
+            .dict
+            .get(b"Resources")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"ExtGState")
+            .unwrap();
         let nested_gs_ref = match nested_gs {
             Object::Reference(r) => *r,
             other => panic!("nested /BBObjPtr_GSID must resolve to a real reference, not a dangling name: {other:?}"),
@@ -1967,7 +2034,10 @@ pub(crate) mod tests {
             Object::Dictionary(d) => d,
             other => panic!("nested ExtGState must resolve to a real Dictionary, got {other:?}"),
         };
-        assert_eq!(nested_gs_obj.get(b"Type").unwrap().as_name().unwrap(), b"ExtGState");
+        assert_eq!(
+            nested_gs_obj.get(b"Type").unwrap().as_name().unwrap(),
+            b"ExtGState"
+        );
     }
 
     // --- 2026-08-08 Form XObject stamp RENDERING follow-up: build_isolated_form_xobject_pdf ---
@@ -2016,11 +2086,24 @@ pub(crate) mod tests {
             other => panic!("/Fx0 must be an indirect reference, got {other:?}"),
         };
         let fx0 = doc.get_object(fx0_ref).unwrap().as_stream().unwrap();
-        assert_eq!(fx0.dict.get(b"Subtype").unwrap().as_name().unwrap(), b"Form");
+        assert_eq!(
+            fx0.dict.get(b"Subtype").unwrap().as_name().unwrap(),
+            b"Form"
+        );
         // Nested /BBObjPtr_GSID must be resolved too (same multi-level splice guarantee
         // as write_markups's own test).
-        let nested = fx0.dict.get(b"Resources").unwrap().as_dict().unwrap().get(b"ExtGState").unwrap();
-        assert!(matches!(nested, Object::Reference(_)), "nested ref must resolve, got {nested:?}");
+        let nested = fx0
+            .dict
+            .get(b"Resources")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"ExtGState")
+            .unwrap();
+        assert!(
+            matches!(nested, Object::Reference(_)),
+            "nested ref must resolve, got {nested:?}"
+        );
 
         let content_id = match page.get(b"Contents").unwrap() {
             Object::Reference(r) => *r,
@@ -2028,7 +2111,10 @@ pub(crate) mod tests {
         };
         let content = doc.get_object(content_id).unwrap().as_stream().unwrap();
         let content_str = String::from_utf8(content.content.clone()).unwrap();
-        assert!(content_str.contains("/Fx0 Do"), "content stream must paint the form: {content_str}");
+        assert!(
+            content_str.contains("/Fx0 Do"),
+            "content stream must paint the form: {content_str}"
+        );
     }
 
     #[test]
@@ -3712,7 +3798,11 @@ pub(crate) mod tests {
         for (oid, dict) in &annots[1..] {
             assert_eq!(dict.get(b"RT").unwrap().as_name().unwrap(), b"Group");
             assert_eq!(dict.get(b"IRT").unwrap(), &Object::Reference(head_oid));
-            assert_ne!(*oid, Some(head_oid), "followers must be distinct objects from the head");
+            assert_ne!(
+                *oid,
+                Some(head_oid),
+                "followers must be distinct objects from the head"
+            );
         }
     }
 
@@ -3761,7 +3851,13 @@ pub(crate) mod tests {
             "IRT" => Object::Reference(head_id),
         }));
         let page = doc.get_dictionary_mut(page_id).unwrap();
-        page.set("Annots", Object::Array(vec![Object::Reference(head_id), Object::Reference(follower_id)]));
+        page.set(
+            "Annots",
+            Object::Array(vec![
+                Object::Reference(head_id),
+                Object::Reference(follower_id),
+            ]),
+        );
         (doc, page_id, head_id, follower_id)
     }
 
@@ -3770,7 +3866,10 @@ pub(crate) mod tests {
         let (doc, _page_id, _head_id, _follower_id) = two_annot_grouped_doc();
         let markups = read_markups(&doc).unwrap();
         assert_eq!(markups.len(), 2);
-        assert!(markups[0].group_id.is_some(), "head must be assigned a group_id on read");
+        assert!(
+            markups[0].group_id.is_some(),
+            "head must be assigned a group_id on read"
+        );
         assert_eq!(
             markups[0].group_id, markups[1].group_id,
             "head and follower must share the SAME synthesized group_id"
@@ -3808,7 +3907,13 @@ pub(crate) mod tests {
             // no /RT at all - PDF default reply type is /R (comment reply)
         }));
         let page = doc.get_dictionary_mut(page_id).unwrap();
-        page.set("Annots", Object::Array(vec![Object::Reference(head_id), Object::Reference(reply_id)]));
+        page.set(
+            "Annots",
+            Object::Array(vec![
+                Object::Reference(head_id),
+                Object::Reference(reply_id),
+            ]),
+        );
 
         let markups = read_markups(&doc).unwrap();
         assert!(
@@ -3830,14 +3935,20 @@ pub(crate) mod tests {
         let read1 = read_markups(&doc).unwrap();
         assert_eq!(read1.len(), 2);
         assert!(read1[0].group_id.is_some());
-        assert_eq!(read1[0].group_id, read1[1].group_id, "cycle 1: still grouped");
+        assert_eq!(
+            read1[0].group_id, read1[1].group_id,
+            "cycle 1: still grouped"
+        );
 
         // Re-save with no edits, then re-read - the group link must not degrade.
         write_markups(&mut doc, &read1).unwrap();
         let read2 = read_markups(&doc).unwrap();
         assert_eq!(read2.len(), 2);
         assert!(read2[0].group_id.is_some());
-        assert_eq!(read2[0].group_id, read2[1].group_id, "cycle 2: still grouped after re-save");
+        assert_eq!(
+            read2[0].group_id, read2[1].group_id,
+            "cycle 2: still grouped after re-save"
+        );
     }
     // --- Text mark-up (Underline / StrikeOut / Squiggly) + sticky Note ----------------
 

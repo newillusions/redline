@@ -63,7 +63,12 @@ fn corpus_files() -> Vec<PathBuf> {
         .flatten()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("btx")) == Some(true))
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("btx"))
+                == Some(true)
+        })
         .collect();
     files.sort();
     files
@@ -92,12 +97,18 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 fn is_hex_zlib(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
-    lower.len() >= 4 && lower.starts_with("789c") && lower.len() % 2 == 0 && lower.bytes().all(|b| b.is_ascii_hexdigit())
+    lower.len() >= 4
+        && lower.starts_with("789c")
+        && lower.len() % 2 == 0
+        && lower.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Wrap a bare `<< dict >>` literal as a minimal one-object PDF and parse it via lopdf -
@@ -139,7 +150,10 @@ fn golden_items(path: &PathBuf) -> Vec<GoldenItem> {
     };
     if bytes.starts_with(b"PK\x03\x04") {
         // zip-wrapped .btx: none in the current corpus. Named, not silently guessed at.
-        eprintln!("  (skip {}: zip-wrapped .btx not handled by this harness)", path.display());
+        eprintln!(
+            "  (skip {}: zip-wrapped .btx not handled by this harness)",
+            path.display()
+        );
         return Vec::new();
     }
     let xml = match std::str::from_utf8(&bytes) {
@@ -152,21 +166,33 @@ fn golden_items(path: &PathBuf) -> Vec<GoldenItem> {
     };
     let source_file = path.file_name().unwrap().to_string_lossy().to_string();
     let mut out = Vec::new();
-    for item in doc.descendants().filter(|n| n.has_tag_name("ToolChestItem")) {
+    for item in doc
+        .descendants()
+        .filter(|n| n.has_tag_name("ToolChestItem"))
+    {
         let name = item
             .children()
             .find(|n| n.has_tag_name("Name"))
             .and_then(|n| n.text())
             .unwrap_or("<unnamed>")
             .to_string();
-        let Some(raw) = item.children().find(|n| n.has_tag_name("Raw")).and_then(|n| n.text()) else {
+        let Some(raw) = item
+            .children()
+            .find(|n| n.has_tag_name("Raw"))
+            .and_then(|n| n.text())
+        else {
             continue;
         };
         let Some(dict) = decode_raw(raw) else {
             continue;
         };
         let has_child = item.children().any(|n| n.has_tag_name("Child"));
-        out.push(GoldenItem { source_file: source_file.clone(), name, has_child, dict });
+        out.push(GoldenItem {
+            source_file: source_file.clone(),
+            name,
+            has_child,
+            dict,
+        });
     }
     out
 }
@@ -176,11 +202,16 @@ fn golden_items(path: &PathBuf) -> Vec<GoldenItem> {
 // ---------------------------------------------------------------------------
 
 fn dict_keys(d: &Dictionary) -> BTreeSet<String> {
-    d.iter().map(|(k, _)| String::from_utf8_lossy(k).to_string()).collect()
+    d.iter()
+        .map(|(k, _)| String::from_utf8_lossy(k).to_string())
+        .collect()
 }
 
 fn subtype_of(d: &Dictionary) -> Option<String> {
-    d.get(b"Subtype").ok().and_then(|o| o.as_name().ok()).map(|n| String::from_utf8_lossy(n).to_string())
+    d.get(b"Subtype")
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        .map(|n| String::from_utf8_lossy(n).to_string())
 }
 
 /// Keys redline's own model owns (private extension keys, `RL`-prefixed by convention -
@@ -195,8 +226,34 @@ fn is_redline_private_key(k: &str) -> bool {
 /// defect history. Not exhaustive - anything else seen on the golden side that redline
 /// doesn't write is still reported, just without a named category.
 const WATCHED_STANDARD_KEYS: &[&str] = &[
-    "Type", "Subtype", "Rect", "NM", "Subj", "Contents", "C", "IC", "CA", "BS", "BE", "IT", "F", "AP", "DA", "Q",
-    "RC", "Measure", "IRT", "RT", "Popup", "T", "QuadPoints", "L", "Vertices", "CL", "M", "CreationDate",
+    "Type",
+    "Subtype",
+    "Rect",
+    "NM",
+    "Subj",
+    "Contents",
+    "C",
+    "IC",
+    "CA",
+    "BS",
+    "BE",
+    "IT",
+    "F",
+    "AP",
+    "DA",
+    "Q",
+    "RC",
+    "Measure",
+    "IRT",
+    "RT",
+    "Popup",
+    "T",
+    "QuadPoints",
+    "L",
+    "Vertices",
+    "CL",
+    "M",
+    "CreationDate",
 ];
 
 // ---------------------------------------------------------------------------
@@ -251,21 +308,33 @@ fn build_report() -> (BTreeMap<String, SubtypeReport>, usize, usize, usize) {
             // "present on our side, absent from every golden example" case is visible
             // too (only interesting for non-RL, non-watched keys - see report printer).
             for k in &redline_keys {
-                report.key_presence.entry(k.clone()).or_insert((0, 0)).1 += if !golden_keys.contains(k) { 1 } else { 0 };
+                report.key_presence.entry(k.clone()).or_insert((0, 0)).1 +=
+                    if !golden_keys.contains(k) { 1 } else { 0 };
             }
 
             if golden_keys.is_empty() {
-                report.round_trip_failures.push(format!("{}/{}: empty golden dict", item.source_file, item.name));
+                report.round_trip_failures.push(format!(
+                    "{}/{}: empty golden dict",
+                    item.source_file, item.name
+                ));
             }
         }
     }
 
-    (reports, total_items, total_with_child, total_decode_failures)
+    (
+        reports,
+        total_items,
+        total_with_child,
+        total_decode_failures,
+    )
 }
 
 fn print_report(reports: &BTreeMap<String, SubtypeReport>) {
     for (subtype, report) in reports {
-        println!("\n=== Subtype: {subtype}  ({} golden item(s)) ===", report.golden_count);
+        println!(
+            "\n=== Subtype: {subtype}  ({} golden item(s)) ===",
+            report.golden_count
+        );
 
         let mut missing: Vec<(&String, usize)> = Vec::new();
         let mut redline_only_standard: Vec<&String> = Vec::new();
@@ -288,8 +357,15 @@ fn print_report(reports: &BTreeMap<String, SubtypeReport>) {
         } else {
             println!("  MISSING on round-trip (BB writes it, redline's write path drops it):");
             for (key, n_dropped) in &missing {
-                let watched = if WATCHED_STANDARD_KEYS.contains(&key.as_str()) { " [WATCHED]" } else { "" };
-                println!("    /{key}: dropped in {n_dropped}/{} golden item(s){watched}", report.golden_count);
+                let watched = if WATCHED_STANDARD_KEYS.contains(&key.as_str()) {
+                    " [WATCHED]"
+                } else {
+                    ""
+                };
+                println!(
+                    "    /{key}: dropped in {n_dropped}/{} golden item(s){watched}",
+                    report.golden_count
+                );
             }
         }
 
@@ -316,17 +392,28 @@ fn stamp_resolvability_report() -> (usize, usize) {
     let mut resolvable = 0usize;
     let mut unresolvable = 0usize;
     for path in corpus_files() {
-        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
         let report = import_btx_bytes(&bytes);
         for tool in &report.tools {
-            let (Some(StampDef::Static { asset: StampAsset::BluebeamFormXObject { root_id, objects } })
-                | Some(StampDef::Dynamic { asset: Some(StampAsset::BluebeamFormXObject { root_id, objects }), .. })) = &tool.stamp
+            let (Some(StampDef::Static {
+                asset: StampAsset::BluebeamFormXObject { root_id, objects },
+            })
+            | Some(StampDef::Dynamic {
+                asset: Some(StampAsset::BluebeamFormXObject { root_id, objects }),
+                ..
+            })) = &tool.stamp
             else {
                 continue;
             };
             if objects.contains_key(root_id) {
                 resolvable += 1;
-                println!("  RESOLVABLE artwork: {:?} / \"{}\"", path.file_name().unwrap(), tool.name);
+                println!(
+                    "  RESOLVABLE artwork: {:?} / \"{}\"",
+                    path.file_name().unwrap(),
+                    tool.name
+                );
             } else {
                 unresolvable += 1;
                 println!(
@@ -398,7 +485,10 @@ fn calibration_flags_known_defect_classes() {
     }
 
     let (_reports, total_items, total_with_child, _decode_failures) = build_report();
-    assert!(total_items > 0, "corpus present but zero golden items decoded - decoder likely broken");
+    assert!(
+        total_items > 0,
+        "corpus present but zero golden items decoded - decoder likely broken"
+    );
     assert!(
         total_with_child > 0,
         "calibration FAILED: expected the harness to detect at least one grouped <Child> \
@@ -424,7 +514,9 @@ fn calibration_flags_known_defect_classes() {
     let mut raw_uid_names = 0usize;
     let mut checked = 0usize;
     for path in corpus_files() {
-        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
         let report = import_btx_bytes(&bytes);
         for tool in &report.tools {
             if tool.markup_type != redline_lib::markup::MarkupType::Stamp
@@ -434,11 +526,18 @@ fn calibration_flags_known_defect_classes() {
             }
             checked += 1;
             let looks_like_raw_uid = !tool.name.is_empty()
-                && tool.name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                && tool
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
                 && !tool.name.contains(' ');
             if looks_like_raw_uid {
                 raw_uid_names += 1;
-                println!("  STILL A RAW UID NAME: {:?} -> {:?}", path.file_name().unwrap(), tool.name);
+                println!(
+                    "  STILL A RAW UID NAME: {:?} -> {:?}",
+                    path.file_name().unwrap(),
+                    tool.name
+                );
             }
         }
     }
@@ -484,7 +583,9 @@ fn grouped_children_are_captured_not_dropped_by_the_real_import_path() {
     for path in &files {
         golden_grouped_items += golden_items(path).iter().filter(|i| i.has_child).count();
 
-        let Ok(bytes) = std::fs::read(path) else { continue };
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
         let report = import_btx_bytes(&bytes);
         for tool in &report.tools {
             if tool.children.is_empty() {
@@ -501,7 +602,10 @@ fn grouped_children_are_captured_not_dropped_by_the_real_import_path() {
          production_total_children={production_total_children} max_group_size={max_group_size}"
     );
 
-    assert!(golden_grouped_items > 0, "corpus present but golden side found zero grouped items - has the corpus changed?");
+    assert!(
+        golden_grouped_items > 0,
+        "corpus present but golden side found zero grouped items - has the corpus changed?"
+    );
     assert_eq!(
         production_grouped_tools, golden_grouped_items,
         "calibration FAILED: production import_btx_bytes found a DIFFERENT number of grouped \

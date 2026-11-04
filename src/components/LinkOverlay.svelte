@@ -103,7 +103,6 @@
 <svelte:window onkeydown={onKeyDown} />
 
 {#if mode !== "off"}
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
   <svg
     bind:this={svgEl}
     class="link-overlay"

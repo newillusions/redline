@@ -351,6 +351,7 @@
                     {/if}
                     {#if hit.snippetHtml}
                       <!-- Tantivy snippet HTML: only <b> tags, safe to render. -->
+                      <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                       <span class="search-result-snippet">{@html hit.snippet}</span>
                     {:else}
                       <span class="search-result-snippet">{hit.snippet}</span>
@@ -384,6 +385,7 @@
                   {/if}
                   {#if hit.snippetHtml}
                     <!-- Tantivy snippet HTML: only <b> tags, safe to render. -->
+                    <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                     <span class="search-result-snippet">{@html hit.snippet}</span>
                   {:else}
                     <span class="search-result-snippet">{hit.snippet}</span>

@@ -110,7 +110,10 @@ impl ScalesUndo {
 pub fn stage_scales(pdf_path: &Path, scales: &[ScaleRecord]) -> io::Result<ScalesUndo> {
     let previous = std::fs::read(sidecar_dir(pdf_path).join("meta.json")).ok();
     save_scales(pdf_path, scales)?;
-    Ok(ScalesUndo { pdf_path: pdf_path.to_path_buf(), previous })
+    Ok(ScalesUndo {
+        pdf_path: pdf_path.to_path_buf(),
+        previous,
+    })
 }
 
 #[cfg(test)]
@@ -184,7 +187,10 @@ mod tests {
         assert_eq!(got.scales.len(), 1);
         assert_eq!(got.scales[0].id, scale.id);
         assert_eq!(got.next_version_seq, 7);
-        assert!(load_meta(&src).unwrap().scales.is_empty(), "the source sidecar is untouched");
+        assert!(
+            load_meta(&src).unwrap().scales.is_empty(),
+            "the source sidecar is untouched"
+        );
     }
 
     fn scale(label: &str) -> crate::takeoff::ScaleRecord {
@@ -212,7 +218,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let fresh = dir.path().join("fresh.pdf");
         stage_scales(&fresh, &[scale("1:100")]).unwrap().undo();
-        assert!(!sidecar_dir(&fresh).join("meta.json").exists(), "a new sidecar is removed again");
+        assert!(
+            !sidecar_dir(&fresh).join("meta.json").exists(),
+            "a new sidecar is removed again"
+        );
 
         let old = dir.path().join("old.pdf");
         save_scales(&old, &[scale("old")]).unwrap();

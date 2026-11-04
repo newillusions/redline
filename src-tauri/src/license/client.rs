@@ -56,7 +56,10 @@ const BAKED_DEFAULT: Option<&str> = option_env!("REDLINE_LICENSE_API_URL_DEFAULT
 /// plain function of its arguments - a test-only injection seam, since `option_env!` is
 /// fixed at THIS binary's compile time and can't be toggled per test, and mutating the
 /// real process env var would race under Rust's parallel test runner.
-fn resolve_base_url(env_override: Option<String>, baked: Option<&str>) -> Result<String, ClientError> {
+fn resolve_base_url(
+    env_override: Option<String>,
+    baked: Option<&str>,
+) -> Result<String, ClientError> {
     if let Some(v) = env_override {
         return Ok(v);
     }
@@ -77,7 +80,11 @@ fn license_url(base: &str, path: &str) -> String {
     format!("{}/api/license/{}", base.trim_end_matches('/'), path)
 }
 
-async fn post_license(path: &str, code: &str, device_fingerprint: &str) -> Result<String, ClientError> {
+async fn post_license(
+    path: &str,
+    code: &str,
+    device_fingerprint: &str,
+) -> Result<String, ClientError> {
     let base = base_url()?;
     let url = license_url(&base, path);
     let client = reqwest::Client::builder()
@@ -110,7 +117,9 @@ async fn post_license(path: &str, code: &str, device_fingerprint: &str) -> Resul
             .unwrap_or_else(|_| "unknown".to_string());
         Err(ClientError::Rejected(reason))
     } else {
-        Err(ClientError::Transport(format!("unexpected status {status}")))
+        Err(ClientError::Transport(format!(
+            "unexpected status {status}"
+        )))
     }
 }
 

@@ -8,7 +8,9 @@
 //! match THIS install) lives one layer up in `gate.rs`, since it needs the
 //! locally persisted device id, not just the token bytes.
 
-use base64::{engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+    engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD, Engine as _,
+};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -42,7 +44,10 @@ pub enum VerifyResult {
 }
 
 fn invalid(reason: VerifyFailureReason) -> VerifyResult {
-    VerifyResult::Invalid { reason, payload: None }
+    VerifyResult::Invalid {
+        reason,
+        payload: None,
+    }
 }
 
 /// Verify a token's signature and expiry against `public_key`. Offline - no DB

@@ -68,13 +68,21 @@ impl ToolChestStore {
             .and_then(|s| serde_json::from_str::<Vec<Tool>>(&s).ok())
             .unwrap_or_default();
 
-        Ok(Self { dir, sets: Mutex::new(sets), recent: Mutex::new(recent) })
+        Ok(Self {
+            dir,
+            sets: Mutex::new(sets),
+            recent: Mutex::new(recent),
+        })
     }
 
     /// An in-memory-only store (no disk I/O) - used for command-layer tests and any
     /// short-lived context where a real app-data dir isn't available.
     pub fn in_memory() -> Self {
-        Self { dir: PathBuf::new(), sets: Mutex::new(Vec::new()), recent: Mutex::new(Vec::new()) }
+        Self {
+            dir: PathBuf::new(),
+            sets: Mutex::new(Vec::new()),
+            recent: Mutex::new(Vec::new()),
+        }
     }
 
     fn sets_dir(&self) -> PathBuf {
@@ -94,7 +102,10 @@ impl ToolChestStore {
             return Ok(());
         }
         fs::create_dir_all(self.sets_dir())?;
-        let file = ToolSetFile { version: FILE_VERSION, set: set.clone() };
+        let file = ToolSetFile {
+            version: FILE_VERSION,
+            set: set.clone(),
+        };
         let text = serde_json::to_string_pretty(&file)?;
         fs::write(self.sets_dir().join(set_file_name(set.id)), text)?;
         Ok(())
@@ -314,11 +325,19 @@ mod tests {
         let c = store.add_tool(set.id, sample_tool("C")).unwrap();
 
         store.reorder_tools(set.id, vec![c.id, a.id, b.id]).unwrap();
-        let names: Vec<String> = store.list_sets()[0].tools.iter().map(|t| t.name.clone()).collect();
+        let names: Vec<String> = store.list_sets()[0]
+            .tools
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
         assert_eq!(names, vec!["C", "A", "B"]);
 
         let reloaded = ToolChestStore::load(tmp.path()).unwrap();
-        let names: Vec<String> = reloaded.list_sets()[0].tools.iter().map(|t| t.name.clone()).collect();
+        let names: Vec<String> = reloaded.list_sets()[0]
+            .tools
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
         assert_eq!(names, vec!["C", "A", "B"]);
     }
 
@@ -332,7 +351,11 @@ mod tests {
 
         // Only naming `a` in the new order: `b` must still be present, appended after.
         store.reorder_tools(set.id, vec![a.id]).unwrap();
-        let names: Vec<String> = store.list_sets()[0].tools.iter().map(|t| t.name.clone()).collect();
+        let names: Vec<String> = store.list_sets()[0]
+            .tools
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
         assert_eq!(names, vec!["A", "B"]);
     }
 
@@ -360,7 +383,11 @@ mod tests {
         store.record_recent(t.clone()).unwrap();
 
         let recent = store.recent();
-        assert_eq!(recent.len(), 2, "re-using the same tool must not duplicate it");
+        assert_eq!(
+            recent.len(),
+            2,
+            "re-using the same tool must not duplicate it"
+        );
         assert_eq!(recent[0].id, t.id);
     }
 
@@ -369,7 +396,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = ToolChestStore::load(tmp.path()).unwrap();
         for i in 0..(RECENT_CAP + 5) {
-            store.record_recent(sample_tool(&format!("Tool {i}"))).unwrap();
+            store
+                .record_recent(sample_tool(&format!("Tool {i}")))
+                .unwrap();
         }
         assert_eq!(store.recent().len(), RECENT_CAP);
         // Most recent survives; oldest were evicted.
@@ -398,7 +427,11 @@ mod tests {
         fs::write(sets_dir.join("garbage.toolset.json"), "{ not json").unwrap();
 
         let reloaded = ToolChestStore::load(tmp.path()).unwrap();
-        assert_eq!(reloaded.list_sets().len(), 1, "the corrupt file is skipped, not fatal");
+        assert_eq!(
+            reloaded.list_sets().len(),
+            1,
+            "the corrupt file is skipped, not fatal"
+        );
         assert_eq!(reloaded.list_sets()[0].name, "Good Set");
     }
 }

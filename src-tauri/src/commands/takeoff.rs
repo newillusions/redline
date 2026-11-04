@@ -558,14 +558,21 @@ mod tests {
             depth: None,
             count_value: None,
             custom_columns: BTreeMap::new(),
-            rise_drop: vec![RiseDrop { segment: 0, amount: 1.0, unit: "m".into() }],
+            rise_drop: vec![RiseDrop {
+                segment: 0,
+                amount: 1.0,
+                unit: "m".into(),
+            }],
         });
         let dir = tempdir().unwrap();
         let out = dir.path().join("q.csv");
         export_markup_list_with_scales(&[l], store.list("d"), &out, ExportFormat::Csv).unwrap();
         let mut rdr = csv::Reader::from_path(&out).unwrap();
         let rec = rdr.records().next().unwrap().unwrap();
-        assert_eq!(&rec[8], "3.00", "1000 x 0.002 + 1 m rise under the NEW scale");
+        assert_eq!(
+            &rec[8], "3.00",
+            "1000 x 0.002 + 1 m rise under the NEW scale"
+        );
     }
 
     #[test]

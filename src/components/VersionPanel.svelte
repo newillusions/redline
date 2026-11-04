@@ -206,7 +206,7 @@
 
   .version-panel__title {
     font-weight: 600;
-    color: var(--color-text-primary, #1a1a1a);
+    color: var(--color-text);
   }
 
   .version-panel__snapshot {
@@ -219,17 +219,17 @@
     /* Let the input shrink in a narrow sidebar instead of pushing the button off the edge. */
     min-width: 0;
     padding: var(--space-1, 4px) var(--space-2, 8px);
-    border: 1px solid var(--color-border, #d1d5db);
+    border: 1px solid var(--color-border);
     border-radius: var(--radius-sm, 4px);
     font-size: var(--text-sm, 13px);
-    background: var(--color-surface, #fff);
-    color: var(--color-text-primary, #1a1a1a);
+    background: var(--color-bg-panel-alt);
+    color: var(--color-text);
   }
 
   .version-panel__snapshot-btn {
     padding: var(--space-1, 4px) var(--space-2, 8px);
-    background: var(--color-primary, #2563eb);
-    color: var(--color-on-primary, #fff);
+    background: var(--color-primary);
+    color: var(--color-text);
     border: none;
     border-radius: var(--radius-sm, 4px);
     cursor: pointer;
@@ -243,10 +243,10 @@
   }
 
   .version-panel__error {
-    color: var(--color-error, #dc2626);
+    color: var(--color-danger);
     font-size: var(--text-xs, 11px);
     padding: var(--space-1, 4px);
-    background: var(--color-error-surface, #fef2f2);
+    background: color-mix(in srgb, var(--color-danger) 18%, var(--color-bg-panel));
     border-radius: var(--radius-sm, 4px);
   }
 
@@ -266,9 +266,9 @@
     align-items: flex-start;
     gap: var(--space-2, 8px);
     padding: var(--space-2, 8px);
-    border: 1px solid var(--color-border, #e5e7eb);
+    border: 1px solid var(--color-border);
     border-radius: var(--radius-sm, 4px);
-    background: var(--color-surface, #fff);
+    background: var(--color-bg-panel-alt);
   }
 
   .version-panel__item-info {
@@ -281,18 +281,18 @@
 
   .version-panel__item-date {
     font-size: var(--text-xs, 11px);
-    color: var(--color-text-secondary, #6b7280);
+    color: var(--color-text-secondary);
   }
 
   .version-panel__item-label {
     font-size: var(--text-sm, 13px);
-    color: var(--color-text-primary, #1a1a1a);
+    color: var(--color-text);
     font-weight: 500;
   }
 
   .version-panel__item-file {
     font-size: 10px;
-    color: var(--color-text-tertiary, #9ca3af);
+    color: var(--color-text-muted);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -301,17 +301,17 @@
   .version-panel__restore-btn {
     padding: var(--space-1, 4px) var(--space-2, 8px);
     background: none;
-    border: 1px solid var(--color-border, #d1d5db);
+    border: 1px solid var(--color-border);
     border-radius: var(--radius-sm, 4px);
     cursor: pointer;
     font-size: var(--text-xs, 11px);
-    color: var(--color-text-primary, #1a1a1a);
+    color: var(--color-text);
     white-space: nowrap;
     flex-shrink: 0;
   }
 
   .version-panel__restore-btn:hover:not(:disabled) {
-    background: var(--color-surface-hover, #f3f4f6);
+    background: var(--color-bg-hover);
   }
 
   .version-panel__restore-btn:disabled {
@@ -322,7 +322,7 @@
   .version-panel__empty {
     padding: var(--space-3, 12px);
     text-align: center;
-    color: var(--color-text-secondary, #6b7280);
+    color: var(--color-text-secondary);
     font-size: var(--text-sm, 13px);
   }
 </style>

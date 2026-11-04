@@ -79,7 +79,10 @@ impl LicenseState {
     /// app keeps working through the offline grace window, just with a
     /// warning surfaced elsewhere).
     pub fn is_usable(&self) -> bool {
-        matches!(self, LicenseState::Valid { .. } | LicenseState::Grace { .. })
+        matches!(
+            self,
+            LicenseState::Valid { .. } | LicenseState::Grace { .. }
+        )
     }
 }
 
@@ -211,8 +214,14 @@ mod tests {
     #[test]
     fn missing_when_no_token() {
         let (_, vk) = test_keypair(1);
-        assert_eq!(evaluate(None, "device-1", &vk, Utc::now()), LicenseState::Missing);
-        assert_eq!(evaluate(Some(""), "device-1", &vk, Utc::now()), LicenseState::Missing);
+        assert_eq!(
+            evaluate(None, "device-1", &vk, Utc::now()),
+            LicenseState::Missing
+        );
+        assert_eq!(
+            evaluate(Some(""), "device-1", &vk, Utc::now()),
+            LicenseState::Missing
+        );
     }
 
     #[test]
@@ -265,7 +274,10 @@ mod tests {
         let token = token_with(now, "device-1", -1, &sk); // expired 1 day ago
         let state = evaluate(Some(&token), "device-1", &vk, now);
         assert!(state.is_usable());
-        assert!(!state.is_valid(), "grace is usable but not the same as Valid");
+        assert!(
+            !state.is_valid(),
+            "grace is usable but not the same as Valid"
+        );
         match state {
             LicenseState::Grace {
                 days_remaining,
@@ -296,7 +308,10 @@ mod tests {
         let (sk, vk) = test_keypair(1);
         let now = Utc::now();
         let token = token_with(now, "device-1", -(GRACE_WINDOW_DAYS + 1), &sk);
-        assert_eq!(evaluate(Some(&token), "device-1", &vk, now), LicenseState::Expired);
+        assert_eq!(
+            evaluate(Some(&token), "device-1", &vk, now),
+            LicenseState::Expired
+        );
     }
 
     #[test]
@@ -305,6 +320,9 @@ mod tests {
         let now = Utc::now();
         // Expired AND bound to another device - must not extend grace here.
         let token = token_with(now, "device-OTHER", -1, &sk);
-        assert_eq!(evaluate(Some(&token), "device-1", &vk, now), LicenseState::Expired);
+        assert_eq!(
+            evaluate(Some(&token), "device-1", &vk, now),
+            LicenseState::Expired
+        );
     }
 }

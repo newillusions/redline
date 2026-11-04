@@ -150,6 +150,24 @@ export function clampBottomHeight(height: number, windowHeight?: number): number
 }
 
 /** Read any value (persisted JSON, possibly from an older or newer build) as a valid layout. */
+/**
+ * Why a stored version-1 layout is damaged, or null when its shape is sound. Missing keys are
+ * fine (older builds, new panels); a key that is present with the wrong type is not.
+ */
+export function layoutProblem(raw: unknown): string | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return "not an object";
+  const r = raw as Record<string, unknown>;
+  const isObj = (v: unknown) => !!v && typeof v === "object" && !Array.isArray(v);
+  for (const key of ["left", "right", "bottom", "weights", "collapsed"]) {
+    if (r[key] !== undefined && !isObj(r[key])) return `"${key}" is not an object`;
+  }
+  for (const side of ["left", "right"] as const) {
+    const s = r[side] as Record<string, unknown> | undefined;
+    if (s && s.panels !== undefined && !Array.isArray(s.panels)) return `"${side}.panels" is not a list`;
+  }
+  return null;
+}
+
 export function normalizeLayout(raw: unknown): PanelLayout {
   const base = defaultLayout();
   if (!raw || typeof raw !== "object") return base;

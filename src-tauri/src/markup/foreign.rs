@@ -204,15 +204,13 @@ pub fn fits_carry_budget(o: &Object) -> bool {
             Object::String(b, _) => text(b.len()),
             Object::Name(n) => text(n.len()),
             Object::Array(a) => a.iter().all(|e| walk(e, depth + 1, nodes, bytes)),
-            Object::Dictionary(d) => d
-                .iter()
-                .all(|(k, v)| {
-                    let key_ok = {
-                        *bytes += k.len();
-                        k.len() <= MAX_NAME_BYTES && *bytes <= MAX_BYTES
-                    };
-                    key_ok && walk(v, depth + 1, nodes, bytes)
-                }),
+            Object::Dictionary(d) => d.iter().all(|(k, v)| {
+                let key_ok = {
+                    *bytes += k.len();
+                    k.len() <= MAX_NAME_BYTES && *bytes <= MAX_BYTES
+                };
+                key_ok && walk(v, depth + 1, nodes, bytes)
+            }),
             _ => true,
         }
     }
@@ -246,7 +244,9 @@ fn check_plain(
         PdfValue::Name(_) => Err("name with unsafe characters"),
         PdfValue::Str(b, _) if b.len() <= MAX_STRING_BYTES => Ok(()),
         PdfValue::Str(..) => Err("string too long"),
-        PdfValue::Array(a) => a.iter().try_for_each(|e| check_plain(e, depth + 1, nodes, measure)),
+        PdfValue::Array(a) => a
+            .iter()
+            .try_for_each(|e| check_plain(e, depth + 1, nodes, measure)),
         PdfValue::Dict(d) => {
             for (k, val) in d {
                 let allowed = if measure {
@@ -375,7 +375,9 @@ const MAX_ORIGINAL_DEPTH: usize = 16;
 /// and its own marker. `/AP` (checked by the caller), `/P` (the page) and `/F` (the
 /// annotation flags, a plain integer at this level) are kept.
 fn top_level_dropped(k: &[u8]) -> bool {
-    let Ok(k) = std::str::from_utf8(k) else { return true };
+    let Ok(k) = std::str::from_utf8(k) else {
+        return true;
+    };
     k == "RT"
         || k == PRESERVED_MARKER
         || (ACTION_KEYS.contains(&k) && !matches!(k, "AP" | "P" | "F"))
@@ -478,7 +480,9 @@ fn clean_original(
         Object::Reference(r) => {
             if st.active.contains(r) {
                 if !st.cycle_logged {
-                    log::warn!("foreign annotation: reference cycle at {r:?}; dropping the reference");
+                    log::warn!(
+                        "foreign annotation: reference cycle at {r:?}; dropping the reference"
+                    );
                     st.cycle_logged = true;
                 }
                 return Ok(None);
@@ -488,7 +492,13 @@ fn clean_original(
             };
             // A big object already inlined once is not copied again, nor is anything once the
             // document-wide budget is spent: the markup is rebuilt from the model.
-            if st.shared.exhausted() || st.shared.costs.get(r).is_some_and(|c| *c > SHARED_INLINE_MAX) {
+            if st.shared.exhausted()
+                || st
+                    .shared
+                    .costs
+                    .get(r)
+                    .is_some_and(|c| *c > SHARED_INLINE_MAX)
+            {
                 return Err(Fail::Whole);
             }
             let before = st.nodes;
@@ -533,7 +543,8 @@ fn clean_original(
             }
             let mut out = Dictionary::new();
             for (k, v) in d.iter() {
-                let dropped = std::str::from_utf8(k).map_or(true, |k| k != "P" && ACTION_KEYS.contains(&k));
+                let dropped =
+                    std::str::from_utf8(k).map_or(true, |k| k != "P" && ACTION_KEYS.contains(&k));
                 if dropped {
                     continue;
                 }
@@ -600,7 +611,9 @@ pub fn sanitized_original(
             // A key's inlined content is over budget: a preserved original is never partial,
             // so rebuild the whole markup from the model instead of dropping the key.
             Err(Fail::Key | Fail::Whole) => {
-                log::warn!("foreign annotation: original dictionary too large to carry; rebuilding");
+                log::warn!(
+                    "foreign annotation: original dictionary too large to carry; rebuilding"
+                );
                 return None;
             }
         }

@@ -241,7 +241,7 @@
     gap: var(--space-2, 8px);
     padding: var(--space-2, 8px);
     font-size: var(--text-sm, 13px);
-    color: var(--color-text-primary, #1a1a1a);
+    color: var(--color-text);
   }
 
   .layers__toolbar,
@@ -256,26 +256,26 @@
     flex: 1;
     min-width: 0;
     padding: var(--space-1, 4px) var(--space-2, 8px);
-    border: 1px solid var(--color-border, #d1d5db);
+    border: 1px solid var(--color-border);
     border-radius: var(--radius-sm, 4px);
     font-size: var(--text-sm, 13px);
-    background: var(--color-surface, #fff);
-    color: var(--color-text-primary, #1a1a1a);
+    background: var(--color-bg-panel-alt);
+    color: var(--color-text);
   }
 
   .layers__btn {
     padding: var(--space-1, 4px) var(--space-2, 8px);
     background: none;
-    border: 1px solid var(--color-border, #d1d5db);
+    border: 1px solid var(--color-border);
     border-radius: var(--radius-sm, 4px);
     cursor: pointer;
     font-size: var(--text-xs, 11px);
-    color: var(--color-text-primary, #1a1a1a);
+    color: var(--color-text);
     white-space: nowrap;
   }
 
   .layers__btn:hover:not(:disabled) {
-    background: var(--color-surface-hover, #f3f4f6);
+    background: var(--color-bg-hover);
   }
 
   .layers__btn:disabled {
@@ -286,16 +286,16 @@
   .layers__hint,
   .layers__note {
     margin: 0;
-    color: var(--color-text-secondary, #6b7280);
+    color: var(--color-text-secondary);
     font-size: var(--text-xs, 11px);
   }
 
   .layers__error {
     margin: 0;
-    color: var(--color-error, #dc2626);
+    color: var(--color-danger);
     font-size: var(--text-xs, 11px);
     padding: var(--space-1, 4px);
-    background: var(--color-error-surface, #fef2f2);
+    background: color-mix(in srgb, var(--color-danger) 18%, var(--color-bg-panel));
     border-radius: var(--radius-sm, 4px);
   }
 
@@ -305,7 +305,7 @@
     padding: 0;
     max-height: 320px;
     overflow-y: auto;
-    border: 1px solid var(--color-border, #e5e7eb);
+    border: 1px solid var(--color-border);
     border-radius: var(--radius-sm, 4px);
   }
 
@@ -313,7 +313,7 @@
     padding: 3px 6px;
     font-size: var(--text-xs, 11px);
     font-weight: 600;
-    color: var(--color-text-secondary, #6b7280);
+    color: var(--color-text-secondary);
     text-transform: none;
   }
 
@@ -326,11 +326,11 @@
   }
 
   .layers__row--selected {
-    background: var(--color-surface-selected, #e0e7ff);
+    background: var(--color-bg-active);
   }
 
   .layers__row--off .layers__name {
-    color: var(--color-text-tertiary, #9ca3af);
+    color: var(--color-text-muted);
   }
 
   .layers__twisty {
@@ -340,7 +340,7 @@
     background: none;
     cursor: pointer;
     padding: 0;
-    color: var(--color-text-secondary, #6b7280);
+    color: var(--color-text-secondary);
   }
 
   .layers__twisty--none {
@@ -361,7 +361,7 @@
     cursor: pointer;
     padding: 2px 4px;
     font-size: var(--text-sm, 13px);
-    color: var(--color-text-primary, #1a1a1a);
+    color: var(--color-text);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -372,12 +372,12 @@
     font-size: 10px;
     padding: 0 4px;
     border-radius: var(--radius-sm, 4px);
-    border: 1px solid var(--color-border, #d1d5db);
-    color: var(--color-text-secondary, #6b7280);
+    border: 1px solid var(--color-border);
+    color: var(--color-text-secondary);
   }
 
   .layers__badge--markup {
-    color: var(--color-primary, #2563eb);
-    border-color: var(--color-primary, #2563eb);
+    color: var(--color-primary);
+    border-color: var(--color-primary);
   }
 </style>

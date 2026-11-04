@@ -61,7 +61,8 @@ fn ap_bytes(doc: &Document, d: &Dictionary) -> Vec<u8> {
     };
     let n = ap.get(b"N").unwrap().as_reference().unwrap();
     let s = doc.get_object(n).unwrap().as_stream().unwrap();
-    s.decompressed_content().unwrap_or_else(|_| s.content.clone())
+    s.decompressed_content()
+        .unwrap_or_else(|_| s.content.clone())
 }
 
 const ORIGINAL_AP: &[u8] = b"q 1 0 0 RG 5 5 m 50 5 l 50 40 l S Q ORIGINAL-REVU-AP";
@@ -167,8 +168,15 @@ fn unedited_revu_cloud_keeps_its_intensity_and_original_appearance_over_three_cy
         let d = only(&doc, "Polygon");
         assert_eq!(intensity(&d), 1.0, "cycle {n}: /BE /I must stay 1");
         assert_eq!(nm(&d).as_deref(), Some("CLOUDREVU0000001"), "cycle {n}");
-        assert_eq!(ap_bytes(&doc, &d), ORIGINAL_AP, "cycle {n}: original /AP byte-for-byte");
-        assert!(!d.has(b"RLType"), "cycle {n}: not turned into a redline annotation");
+        assert_eq!(
+            ap_bytes(&doc, &d),
+            ORIGINAL_AP,
+            "cycle {n}: original /AP byte-for-byte"
+        );
+        assert!(
+            !d.has(b"RLType"),
+            "cycle {n}: not turned into a redline annotation"
+        );
         assert!(d.has(b"BSIColumnData"), "cycle {n}");
         assert_eq!(floats(&d, b"Vertices").len(), 8, "cycle {n}");
         assert_eq!(annots(&doc).len(), 1, "cycle {n}");
@@ -186,7 +194,10 @@ fn edited_revu_cloud_keeps_its_intensity_and_gets_a_curved_appearance() {
         assert_eq!(intensity(&d), 1.0, "cycle {n}");
         assert_eq!(nm(&d).as_deref(), Some("CLOUDREVU0000001"), "cycle {n}");
         let ap = String::from_utf8_lossy(&ap_bytes(&doc, &d)).into_owned();
-        assert!(ap.contains(" c\n"), "cycle {n}: scalloped Bezier arcs: {ap}");
+        assert!(
+            ap.contains(" c\n"),
+            "cycle {n}: scalloped Bezier arcs: {ap}"
+        );
         assert!(!ap.contains(" l\n"), "cycle {n}: no straight edges: {ap}");
         assert_eq!(annots(&doc).len(), 1, "cycle {n}");
     }
@@ -205,7 +216,10 @@ fn a_redline_authored_cloud_is_still_written_at_intensity_two() {
             PdfPoint { x: 50.0, y: 50.0 },
         ]),
         Appearance::default(),
-        UserRef { user_id: uuid::Uuid::new_v4(), display_name: "A".into() },
+        UserRef {
+            user_id: uuid::Uuid::new_v4(),
+            display_name: "A".into(),
+        },
     );
     write_markups(&mut doc, &[m]).unwrap();
     let doc = reload(&mut doc);
@@ -216,17 +230,35 @@ fn a_redline_authored_cloud_is_still_written_at_intensity_two() {
 
 #[test]
 fn unedited_revu_callout_is_written_back_verbatim_for_every_line_ending() {
-    for le in [None, Some("OpenArrow"), Some("None"), Some("Circle"), Some("ClosedArrow")] {
+    for le in [
+        None,
+        Some("OpenArrow"),
+        Some("None"),
+        Some("Circle"),
+        Some("ClosedArrow"),
+    ] {
         let (mut doc, page) = one_page_doc();
         let c = revu_callout(&mut doc, "CALLOUTREVU00001", le);
         set_annots(&mut doc, page, vec![c.into()]);
         for n in 1..=3 {
             cycle(&mut doc, |_| {});
             let d = only(&doc, "FreeText");
-            let got = d.get(b"LE").ok().and_then(|o| o.as_name().ok()).map(|n| n.to_vec());
+            let got = d
+                .get(b"LE")
+                .ok()
+                .and_then(|o| o.as_name().ok())
+                .map(|n| n.to_vec());
             assert_eq!(got, le.map(|s| s.as_bytes().to_vec()), "{le:?} cycle {n}");
-            assert_eq!(floats(&d, b"CL"), vec![100.0, 110.0, 150.0, 160.0, 160.0, 180.0], "{le:?} cycle {n}");
-            assert_eq!(floats(&d, b"RD"), vec![60.0, 5.0, 10.0, 20.0], "{le:?} cycle {n}");
+            assert_eq!(
+                floats(&d, b"CL"),
+                vec![100.0, 110.0, 150.0, 160.0, 160.0, 180.0],
+                "{le:?} cycle {n}"
+            );
+            assert_eq!(
+                floats(&d, b"RD"),
+                vec![60.0, 5.0, 10.0, 20.0],
+                "{le:?} cycle {n}"
+            );
             assert_eq!(ap_bytes(&doc, &d), ORIGINAL_AP, "{le:?} cycle {n}");
             assert_eq!(annots(&doc).len(), 1, "{le:?} cycle {n}");
         }
@@ -248,10 +280,18 @@ fn edited_revu_callout_writes_the_line_ending_it_was_read_with_and_draws_it() {
         for n in 1..=3 {
             cycle(&mut doc, |ms| ms[0].contents = Some(format!("edit {n}")));
             let d = only(&doc, "FreeText");
-            let got = d.get(b"LE").ok().and_then(|o| o.as_name().ok()).map(|n| n.to_vec());
+            let got = d
+                .get(b"LE")
+                .ok()
+                .and_then(|o| o.as_name().ok())
+                .map(|n| n.to_vec());
             assert_eq!(got, le.map(|s| s.as_bytes().to_vec()), "{le:?} cycle {n}");
             let ap = String::from_utf8_lossy(&ap_bytes(&doc, &d)).into_owned();
-            assert_eq!(ap.contains("h\nf\n"), filled_head, "{le:?} cycle {n} filled head: {ap}");
+            assert_eq!(
+                ap.contains("h\nf\n"),
+                filled_head,
+                "{le:?} cycle {n} filled head: {ap}"
+            );
             if le == Some("Circle") {
                 assert!(ap.contains(" c\n"), "circle ending drawn: {ap}");
             }
@@ -266,9 +306,15 @@ fn a_callout_redline_authored_gets_a_closed_arrow() {
     let m = Markup::new(
         MarkupType::Callout,
         0,
-        MarkupGeometry::Polyline(vec![PdfPoint { x: 10.0, y: 10.0 }, PdfPoint { x: 60.0, y: 60.0 }]),
+        MarkupGeometry::Polyline(vec![
+            PdfPoint { x: 10.0, y: 10.0 },
+            PdfPoint { x: 60.0, y: 60.0 },
+        ]),
         Appearance::default(),
-        UserRef { user_id: uuid::Uuid::new_v4(), display_name: "A".into() },
+        UserRef {
+            user_id: uuid::Uuid::new_v4(),
+            display_name: "A".into(),
+        },
     );
     let d = m.to_annotation_dict();
     assert_eq!(d.get(b"LE").unwrap().as_name().unwrap(), b"ClosedArrow");
@@ -284,14 +330,23 @@ fn cl_is_never_written_with_fewer_than_two_finite_leader_points() {
         vec![],
         vec![PdfPoint { x: 1.0, y: 1.0 }],
         vec![PdfPoint { x: nan, y: 1.0 }, PdfPoint { x: 5.0, y: 5.0 }],
-        vec![PdfPoint { x: nan, y: nan }, PdfPoint { x: f64::INFINITY, y: 0.0 }],
+        vec![
+            PdfPoint { x: nan, y: nan },
+            PdfPoint {
+                x: f64::INFINITY,
+                y: 0.0,
+            },
+        ],
     ] {
         let m = Markup::new(
             MarkupType::Callout,
             0,
             MarkupGeometry::Polyline(pts.clone()),
             Appearance::default(),
-            UserRef { user_id: uuid::Uuid::new_v4(), display_name: "A".into() },
+            UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: "A".into(),
+            },
         );
         let d = m.to_annotation_dict();
         assert!(!d.has(b"CL"), "no /CL for {pts:?}");
@@ -300,9 +355,15 @@ fn cl_is_never_written_with_fewer_than_two_finite_leader_points() {
     let two = Markup::new(
         MarkupType::Callout,
         0,
-        MarkupGeometry::Polyline(vec![PdfPoint { x: 1.0, y: 1.0 }, PdfPoint { x: 5.0, y: 5.0 }]),
+        MarkupGeometry::Polyline(vec![
+            PdfPoint { x: 1.0, y: 1.0 },
+            PdfPoint { x: 5.0, y: 5.0 },
+        ]),
         Appearance::default(),
-        UserRef { user_id: uuid::Uuid::new_v4(), display_name: "A".into() },
+        UserRef {
+            user_id: uuid::Uuid::new_v4(),
+            display_name: "A".into(),
+        },
     );
     assert_eq!(floats(&two.to_annotation_dict(), b"CL").len(), 4);
 }
@@ -323,7 +384,11 @@ fn unedited_revu_polylength_keeps_it_and_measure_over_three_cycles() {
             "cycle {n}"
         );
         let measure = d.get(b"Measure").unwrap().as_dict().unwrap();
-        assert_eq!(measure.get(b"Subtype").unwrap().as_name().unwrap(), b"RL", "cycle {n}");
+        assert_eq!(
+            measure.get(b"Subtype").unwrap().as_name().unwrap(),
+            b"RL",
+            "cycle {n}"
+        );
         assert_eq!(nm(&d).as_deref(), Some("POLYLENREVU0001"), "cycle {n}");
         assert_eq!(ap_bytes(&doc, &d), ORIGINAL_AP, "cycle {n}");
         assert_eq!(annots(&doc).len(), 1, "cycle {n}");
@@ -345,13 +410,27 @@ fn two_inline_annotations_sharing_an_nm_are_not_confused_on_save() {
         "NM" => Object::string_literal("SHAREDSHAREDSHAR"),
         "Rect" => vec![200.into(), 200.into(), 220.into(), 220.into()],
     };
-    set_annots(&mut doc, page, vec![Object::Dictionary(square), Object::Dictionary(attach)]);
+    set_annots(
+        &mut doc,
+        page,
+        vec![Object::Dictionary(square), Object::Dictionary(attach)],
+    );
     for n in 1..=3 {
         cycle(&mut doc, |_| {});
         let all = annots(&doc);
         assert_eq!(all.len(), 2, "cycle {n}");
-        assert_eq!(all.iter().filter(|(_, d)| subtype(d) == "FileAttachment").count(), 1, "cycle {n}");
-        assert_eq!(all.iter().filter(|(_, d)| subtype(d) == "Square").count(), 1, "cycle {n}");
+        assert_eq!(
+            all.iter()
+                .filter(|(_, d)| subtype(d) == "FileAttachment")
+                .count(),
+            1,
+            "cycle {n}"
+        );
+        assert_eq!(
+            all.iter().filter(|(_, d)| subtype(d) == "Square").count(),
+            1,
+            "cycle {n}"
+        );
     }
     // Deleting the inline square removes only it.
     let (mut doc, page) = one_page_doc();
@@ -363,13 +442,22 @@ fn two_inline_annotations_sharing_an_nm_are_not_confused_on_save() {
         "Type" => "Annot", "Subtype" => "FileAttachment", "NM" => Object::string_literal("SHAREDSHAREDSHAR"),
         "Rect" => vec![200.into(), 200.into(), 220.into(), 220.into()],
     };
-    set_annots(&mut doc, page, vec![Object::Dictionary(sq), Object::Dictionary(fa)]);
+    set_annots(
+        &mut doc,
+        page,
+        vec![Object::Dictionary(sq), Object::Dictionary(fa)],
+    );
     let store = MarkupStore::default();
     store.register("d", std::path::PathBuf::from("/tmp/x.pdf"), None);
     store.seed_loaded("d", read_markups(&doc).unwrap()).unwrap();
     let id = store.list("d").unwrap()[0].id();
     store.delete("d", id).unwrap();
-    write_markups_removing(&mut doc, &store.list("d").unwrap(), &store.removed_sources("d")).unwrap();
+    write_markups_removing(
+        &mut doc,
+        &store.list("d").unwrap(),
+        &store.removed_sources("d"),
+    )
+    .unwrap();
     let doc = reload(&mut doc);
     let all = annots(&doc);
     assert_eq!(all.len(), 1);
@@ -396,7 +484,10 @@ fn a_markup_sent_back_unchanged_through_json_stays_unedited_and_an_edit_does_not
     // The frontend round-trip: serialise, deserialise, update (reader-owned fields come back
     // from the stored slot, never from the input).
     let echoed: Markup = serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
-    assert!(!echoed.is_unedited(), "reader-owned state is not in the JSON");
+    assert!(
+        !echoed.is_unedited(),
+        "reader-owned state is not in the JSON"
+    );
     store.update("d", echoed.clone()).unwrap();
     assert!(store.list("d").unwrap()[0].is_unedited());
     let mut edited = echoed;
@@ -404,7 +495,10 @@ fn a_markup_sent_back_unchanged_through_json_stays_unedited_and_an_edit_does_not
     store.update("d", edited).unwrap();
     let got = store.list("d").unwrap().remove(0);
     assert!(!got.is_unedited());
-    assert!(got.source_dict.is_some(), "still the foreign markup, just edited");
+    assert!(
+        got.source_dict.is_some(),
+        "still the foreign markup, just edited"
+    );
     // Editing it back to the original makes it unedited again.
     let mut back = got.clone();
     back.contents = m.contents.clone();
@@ -441,16 +535,35 @@ fn delete_after_an_in_session_save_of_an_unedited_foreign_markup_still_reaches_t
     set_annots(&mut doc, page, vec![c.into()]);
     let store = loaded_store(&doc);
     // Save 1 (unedited -> written back with the redline marker), then delete, save 2.
-    write_markups_removing(&mut doc, &store.list("d").unwrap(), &store.removed_sources("d")).unwrap();
+    write_markups_removing(
+        &mut doc,
+        &store.list("d").unwrap(),
+        &store.removed_sources("d"),
+    )
+    .unwrap();
     doc = reload(&mut doc);
     assert_eq!(annots(&doc).len(), 1);
     // A second save of the unedited markup must not duplicate it either.
-    write_markups_removing(&mut doc, &store.list("d").unwrap(), &store.removed_sources("d")).unwrap();
+    write_markups_removing(
+        &mut doc,
+        &store.list("d").unwrap(),
+        &store.removed_sources("d"),
+    )
+    .unwrap();
     doc = reload(&mut doc);
-    assert_eq!(annots(&doc).len(), 1, "no duplicate on a second in-session save");
+    assert_eq!(
+        annots(&doc).len(),
+        1,
+        "no duplicate on a second in-session save"
+    );
     let id = store.list("d").unwrap()[0].id();
     store.delete("d", id).unwrap();
-    write_markups_removing(&mut doc, &store.list("d").unwrap(), &store.removed_sources("d")).unwrap();
+    write_markups_removing(
+        &mut doc,
+        &store.list("d").unwrap(),
+        &store.removed_sources("d"),
+    )
+    .unwrap();
     let doc = reload(&mut doc);
     assert_eq!(annots(&doc).len(), 0, "the delete reaches the file");
 }
@@ -480,8 +593,20 @@ fn an_unedited_originals_action_keys_are_stripped_at_every_level() {
     for n in 1..=3 {
         cycle(&mut doc, |_| {});
         let d = only(&doc, "Square");
-        for k in [&b"A"[..], b"AA", b"JS", b"OpenAction", b"URI", b"Launch", b"Dest"] {
-            assert!(!d.has(k), "cycle {n}: /{} survived", String::from_utf8_lossy(k));
+        for k in [
+            &b"A"[..],
+            b"AA",
+            b"JS",
+            b"OpenAction",
+            b"URI",
+            b"Launch",
+            b"Dest",
+        ] {
+            assert!(
+                !d.has(k),
+                "cycle {n}: /{} survived",
+                String::from_utf8_lossy(k)
+            );
         }
         let custom = d.get(b"Custom").unwrap().as_dict().unwrap();
         assert!(custom.has(b"Keep") && !custom.has(b"A"), "cycle {n}");
@@ -490,7 +615,15 @@ fn an_unedited_originals_action_keys_are_stripped_at_every_level() {
             custom.get(b"Act").is_err(),
             "cycle {n}: nested action dictionary survived"
         );
-        assert!(custom.get(b"Nested").unwrap().as_array().unwrap().is_empty(), "cycle {n}");
+        assert!(
+            custom
+                .get(b"Nested")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "cycle {n}"
+        );
         assert_eq!(ap_bytes(&doc, &d), ORIGINAL_AP, "cycle {n}");
         assert_eq!(annots(&doc).len(), 1, "cycle {n}");
     }
@@ -572,7 +705,11 @@ fn b2_inline_refs_stay_correct_across_three_in_session_saves_with_reordering() {
         "NM" => Object::string_literal("SHAREDSHAREDSHAR"),
         "Rect" => vec![200.into(), 200.into(), 220.into(), 220.into()],
     };
-    set_annots(&mut doc, page, vec![Object::Dictionary(sq), Object::Dictionary(fa)]);
+    set_annots(
+        &mut doc,
+        page,
+        vec![Object::Dictionary(sq), Object::Dictionary(fa)],
+    );
     let store = loaded_store(&doc);
     for n in 1..=3 {
         save_in_session(&mut doc, &store);
@@ -584,7 +721,11 @@ fn b2_inline_refs_stay_correct_across_three_in_session_saves_with_reordering() {
     store.delete("d", id).unwrap();
     for n in 1..=3 {
         save_in_session(&mut doc, &store);
-        assert_eq!(names(&doc), vec!["FileAttachment"], "after delete, save {n}");
+        assert_eq!(
+            names(&doc),
+            vec!["FileAttachment"],
+            "after delete, save {n}"
+        );
         reverse_annots(&mut doc);
     }
 }
@@ -602,7 +743,11 @@ fn b2_an_inline_markup_deleted_and_undone_after_a_save_is_not_matched_to_a_neigh
         "NM" => Object::string_literal("SHAREDSHAREDSHAR"),
         "Rect" => vec![200.into(), 200.into(), 220.into(), 220.into()],
     };
-    set_annots(&mut doc, page, vec![Object::Dictionary(sq), Object::Dictionary(fa)]);
+    set_annots(
+        &mut doc,
+        page,
+        vec![Object::Dictionary(sq), Object::Dictionary(fa)],
+    );
     let store = loaded_store(&doc);
     let m = store.list("d").unwrap().remove(0);
     store.delete("d", m.id()).unwrap();
@@ -634,7 +779,10 @@ fn b1_a_preserved_appearance_that_is_no_longer_a_stream_is_rebuilt_not_pointed_a
         .unwrap()
         .as_reference()
         .unwrap();
-    doc.objects.insert(ap_id, Object::Dictionary(dictionary! { "Imposter" => true }));
+    doc.objects.insert(
+        ap_id,
+        Object::Dictionary(dictionary! { "Imposter" => true }),
+    );
     write_markups(&mut doc, &ms).unwrap();
     let doc = reload(&mut doc);
     let d = only(&doc, "Polygon");
@@ -666,7 +814,9 @@ fn n1_the_marker_alone_does_not_make_a_link_or_widget_ours() {
 }
 
 fn js_action(doc: &mut Document) -> ObjectId {
-    doc.add_object(dictionary! { "S" => "JavaScript", "JS" => Object::string_literal("app.alert(1)") })
+    doc.add_object(
+        dictionary! { "S" => "JavaScript", "JS" => Object::string_literal("app.alert(1)") },
+    )
 }
 
 #[test]
@@ -689,14 +839,30 @@ fn n2_indirect_action_objects_are_not_carried_and_other_refs_are_inlined() {
         cycle(&mut doc, |_| {});
         let d = only(&doc, "Square");
         assert!(!d.has(b"A"), "cycle {n}");
-        let m = d.get(b"Measure").unwrap().as_dict().expect("inlined, not a reference");
-        assert_eq!(m.get(b"Subtype").unwrap().as_name().unwrap(), b"RL", "cycle {n}");
+        let m = d
+            .get(b"Measure")
+            .unwrap()
+            .as_dict()
+            .expect("inlined, not a reference");
+        assert_eq!(
+            m.get(b"Subtype").unwrap().as_name().unwrap(),
+            b"RL",
+            "cycle {n}"
+        );
         assert!(!m.has(b"A"), "cycle {n}");
-        assert!(d.get(b"Nest").unwrap().as_array().unwrap().is_empty(), "cycle {n}");
+        assert!(
+            d.get(b"Nest").unwrap().as_array().unwrap().is_empty(),
+            "cycle {n}"
+        );
         let any_js = doc.objects.values().any(|o| {
-            o.as_dict().is_ok_and(|d| d.get(b"S").ok().and_then(|s| s.as_name().ok()) == Some(&b"JavaScript"[..]))
+            o.as_dict().is_ok_and(|d| {
+                d.get(b"S").ok().and_then(|s| s.as_name().ok()) == Some(&b"JavaScript"[..])
+            })
         });
-        assert!(!any_js, "cycle {n}: no JavaScript action object left in the file");
+        assert!(
+            !any_js,
+            "cycle {n}: no JavaScript action object left in the file"
+        );
         assert_eq!(ap_bytes(&doc, &d), ORIGINAL_AP, "cycle {n}");
     }
 }
@@ -723,7 +889,11 @@ fn n3_indirect_refs_survive_save_delete_save_undo_save() {
     store.add("d", m).unwrap();
     save_in_session(&mut doc, &store);
     let d = only(&doc, "Square");
-    let meas = d.get(b"Measure").unwrap().as_dict().expect("direct dictionary, nothing to dangle");
+    let meas = d
+        .get(b"Measure")
+        .unwrap()
+        .as_dict()
+        .expect("direct dictionary, nothing to dangle");
     assert_eq!(meas.get(b"Subtype").unwrap().as_name().unwrap(), b"RL");
 }
 
@@ -776,18 +946,30 @@ fn timed_read(doc: &Document) -> (Vec<Markup>, std::time::Duration) {
 fn security_a_two_object_reference_cycle_is_cut_not_followed() {
     let (mut doc, page) = one_page_doc();
     let (a, b) = (doc.new_object_id(), doc.new_object_id());
-    doc.objects.insert(a, Object::Dictionary(dictionary! { "Loop" => Object::Reference(b), "X" => 1 }));
-    doc.objects.insert(b, Object::Dictionary(dictionary! { "Loop" => Object::Reference(a), "Y" => 2 }));
+    doc.objects.insert(
+        a,
+        Object::Dictionary(dictionary! { "Loop" => Object::Reference(b), "X" => 1 }),
+    );
+    doc.objects.insert(
+        b,
+        Object::Dictionary(dictionary! { "Loop" => Object::Reference(a), "Y" => 2 }),
+    );
     let ann = annot_with(&mut doc, vec![("Cyc", Object::Reference(a))]);
     set_annots(&mut doc, page, vec![ann.into()]);
     let (ms, took) = timed_read(&doc);
     assert!(took.as_millis() < 500, "{took:?}");
-    let src = ms[0].source_dict.as_ref().expect("carried with the cycle cut");
+    let src = ms[0]
+        .source_dict
+        .as_ref()
+        .expect("carried with the cycle cut");
     let cyc = src.get(b"Cyc").unwrap().as_dict().unwrap();
     let inner = cyc.get(b"Loop").unwrap().as_dict().unwrap();
     assert_eq!(cyc.get(b"X").unwrap().as_i64().unwrap(), 1);
     assert_eq!(inner.get(b"Y").unwrap().as_i64().unwrap(), 2);
-    assert!(!inner.has(b"Loop"), "the reference back to the first object is dropped");
+    assert!(
+        !inner.has(b"Loop"),
+        "the reference back to the first object is dropped"
+    );
     for n in 1..=3 {
         cycle(&mut doc, |_| {});
         assert_eq!(annots(&doc).len(), 1, "cycle {n}");
@@ -798,8 +980,17 @@ fn security_a_two_object_reference_cycle_is_cut_not_followed() {
 fn security_a_self_reference_is_dropped() {
     let (mut doc, page) = one_page_doc();
     let s = doc.new_object_id();
-    doc.objects.insert(s, Object::Dictionary(dictionary! { "Me" => Object::Reference(s), "Z" => 3 }));
-    let ann = annot_with(&mut doc, vec![("Selfish", Object::Reference(s)), ("Arr", Object::Array(vec![Object::Reference(s); 50]))]);
+    doc.objects.insert(
+        s,
+        Object::Dictionary(dictionary! { "Me" => Object::Reference(s), "Z" => 3 }),
+    );
+    let ann = annot_with(
+        &mut doc,
+        vec![
+            ("Selfish", Object::Reference(s)),
+            ("Arr", Object::Array(vec![Object::Reference(s); 50])),
+        ],
+    );
     set_annots(&mut doc, page, vec![ann.into()]);
     let (ms, took) = timed_read(&doc);
     assert!(took.as_millis() < 500, "{took:?}");
@@ -825,7 +1016,10 @@ fn security_a_thirty_level_chain_hits_the_depth_limit_and_is_rebuilt() {
     set_annots(&mut doc, page, vec![ann.into()]);
     let (ms, took) = timed_read(&doc);
     assert!(took.as_millis() < 500, "{took:?}");
-    assert!(ms[0].source_dict.is_none(), "too deep to carry: rebuilt from the model");
+    assert!(
+        ms[0].source_dict.is_none(),
+        "too deep to carry: rebuilt from the model"
+    );
     for n in 1..=3 {
         cycle(&mut doc, |_| {});
         assert_eq!(annots(&doc).len(), 1, "cycle {n}");
@@ -836,7 +1030,10 @@ fn security_a_thirty_level_chain_hits_the_depth_limit_and_is_rebuilt() {
 fn security_fan_out_to_one_big_object_is_charged_per_expansion_and_dropped() {
     let (mut doc, page) = one_page_doc();
     let big = doc.new_object_id();
-    doc.objects.insert(big, Object::String(vec![b'x'; 1_000_000], lopdf::StringFormat::Literal));
+    doc.objects.insert(
+        big,
+        Object::String(vec![b'x'; 1_000_000], lopdf::StringFormat::Literal),
+    );
     let refs: Vec<Object> = (0..1_000).map(|_| Object::Reference(big)).collect();
     let ann = annot_with(
         &mut doc,
@@ -846,15 +1043,24 @@ fn security_fan_out_to_one_big_object_is_charged_per_expansion_and_dropped() {
     let (ms, took) = timed_read(&doc);
     assert!(took.as_secs() < 2, "{took:?}");
     // Over the inlining budget: the markup is rebuilt - a preserved original is never partial.
-    assert!(ms[0].source_dict.is_none(), "one key over budget rebuilds the whole markup");
-    assert!(ms[0].contents.is_some() || ms[0].source_nm.is_some(), "the model itself is intact");
+    assert!(
+        ms[0].source_dict.is_none(),
+        "one key over budget rebuilds the whole markup"
+    );
+    assert!(
+        ms[0].contents.is_some() || ms[0].source_nm.is_some(),
+        "the model itself is intact"
+    );
     // Nested arrays of references share the same budget.
     let nested: Vec<Object> = (0..200)
         .map(|_| Object::Array((0..200).map(|_| Object::Reference(big)).collect()))
         .collect();
     let (mut doc2, page2) = one_page_doc();
     let big2 = doc2.new_object_id();
-    doc2.objects.insert(big2, Object::String(vec![b'y'; 500_000], lopdf::StringFormat::Literal));
+    doc2.objects.insert(
+        big2,
+        Object::String(vec![b'y'; 500_000], lopdf::StringFormat::Literal),
+    );
     let nested: Vec<Object> = nested
         .into_iter()
         .map(|_| Object::Array(vec![Object::Reference(big2); 200]))
@@ -863,12 +1069,20 @@ fn security_fan_out_to_one_big_object_is_charged_per_expansion_and_dropped() {
     set_annots(&mut doc2, page2, vec![ann2.into()]);
     let (ms2, took2) = timed_read(&doc2);
     assert!(took2.as_secs() < 2, "{took2:?}");
-    assert!(ms2[0].source_dict.is_none(), "nested over budget: rebuilt, not partial");
+    assert!(
+        ms2[0].source_dict.is_none(),
+        "nested over budget: rebuilt, not partial"
+    );
 }
 
 // --- security: document-wide budget across many annotations ------------------------------
 
-fn many_annots_sharing(doc: &mut Document, shared: ObjectId, annots_n: usize, refs_per_annot: usize) -> Vec<Object> {
+fn many_annots_sharing(
+    doc: &mut Document,
+    shared: ObjectId,
+    annots_n: usize,
+    refs_per_annot: usize,
+) -> Vec<Object> {
     (0..annots_n)
         .map(|i| {
             let refs: Vec<Object> = (0..refs_per_annot).map(|_| Object::Reference(shared)).collect();
@@ -902,7 +1116,10 @@ fn read_write_bounded(mut doc: Document, n_annots: usize, check_size: bool) {
         let write = t.elapsed();
         assert!(write.as_millis() < 1000, "write took {write:?}");
         let after = size_of(&mut doc);
-        assert!(after < before + 3_000_000, "file grew from {before} to {after}");
+        assert!(
+            after < before + 3_000_000,
+            "file grew from {before} to {after}"
+        );
         assert_eq!(annots(&doc).len(), n_annots);
     }
 }
@@ -952,5 +1169,7 @@ fn security_small_shared_objects_still_preserve_across_annotations() {
         .collect();
     set_annots(&mut doc, page, items);
     let ms = read_markups(&doc).unwrap();
-    assert!(ms.iter().all(|m| m.is_unedited() && m.source_dict.as_ref().unwrap().has(b"Measure")));
+    assert!(ms
+        .iter()
+        .all(|m| m.is_unedited() && m.source_dict.as_ref().unwrap().has(b"Measure")));
 }

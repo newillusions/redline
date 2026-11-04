@@ -217,8 +217,7 @@ impl PdfDiffEngine<'static> {
     /// [`PdfDiffEngine::with_pdfium`] instead — see the module doc comment.
     pub fn new() -> Result<Self> {
         let bindings = if let Ok(p) = std::env::var("PDFIUM_DYNAMIC_LIB_PATH") {
-            Pdfium::bind_to_library(p)
-                .context("PDFium not found at PDFIUM_DYNAMIC_LIB_PATH")?
+            Pdfium::bind_to_library(p).context("PDFium not found at PDFIUM_DYNAMIC_LIB_PATH")?
         } else {
             Pdfium::bind_to_system_library()
                 .context("PDFium not found; set PDFIUM_DYNAMIC_LIB_PATH")?
@@ -269,14 +268,19 @@ impl<'p> PdfDiffEngine<'p> {
         // Probe page 0. If it fails on a large file, run lopdf normalize.
         let probe_ok = doc.pages().get(0).is_ok();
         let (doc, backing, page_count) = if !probe_ok && file_len >= MMAP_THRESHOLD {
-            warn!("pdf-diff: large PDF page load failed; normalizing via lopdf: {:?}", path);
+            warn!(
+                "pdf-diff: large PDF page load failed; normalizing via lopdf: {:?}",
+                path
+            );
             drop(doc);
             drop(backing);
             let norm_path = normalize_large_pdf(path)?;
             let norm_len = std::fs::metadata(&norm_path).map(|m| m.len()).unwrap_or(0);
             let (d, b) = load_doc(&self.pdfium, &norm_path, norm_len)?;
             let pc = d.pages().len() as u32;
-            d.pages().get(0).context("normalized PDF still fails to load page 0 — possibly corrupt")?;
+            d.pages()
+                .get(0)
+                .context("normalized PDF still fails to load page 0 — possibly corrupt")?;
             (d, b, pc)
         } else {
             (doc, backing, page_count)
@@ -284,9 +288,17 @@ impl<'p> PdfDiffEngine<'p> {
 
         self.docs.insert(
             id.clone(),
-            OpenDoc { document: doc, _backing: backing, page_count, path: path.to_path_buf() },
+            OpenDoc {
+                document: doc,
+                _backing: backing,
+                page_count,
+                path: path.to_path_buf(),
+            },
         );
-        info!("pdf-diff: opened {:?} ({} pages) id={}", path, page_count, id);
+        info!(
+            "pdf-diff: opened {:?} ({} pages) id={}",
+            path, page_count, id
+        );
         Ok(DocId(id))
     }
 
@@ -310,11 +322,21 @@ impl<'p> PdfDiffEngine<'p> {
     /// The matrix path (M1.5 tile strategy from redline) is used with tile
     /// origin (0, 0), so the full page is rendered into a bitmap of
     /// `(page_w_pts * dpi/72) x (page_h_pts * dpi/72)` pixels.
-    pub fn render_page_full(&mut self, doc: &DocId, page_idx: u32, dpi: f32) -> Result<DynamicImage> {
-        let open_doc = self.docs.get_mut(&doc.0)
+    pub fn render_page_full(
+        &mut self,
+        doc: &DocId,
+        page_idx: u32,
+        dpi: f32,
+    ) -> Result<DynamicImage> {
+        let open_doc = self
+            .docs
+            .get_mut(&doc.0)
             .with_context(|| format!("unknown doc id: {}", doc.0))?;
 
-        let page = open_doc.document.pages().get(page_idx as u16)
+        let page = open_doc
+            .document
+            .pages()
+            .get(page_idx as u16)
             .with_context(|| format!("page {} not found", page_idx))?;
 
         let scale = dpi / 72.0;
@@ -345,24 +367,38 @@ impl<'p> PdfDiffEngine<'p> {
     /// Skips control characters and characters with no Unicode representation.
     /// Positions are in PDF user-space points (y-up, origin bottom-left of page).
     pub fn extract_chars(&mut self, doc: &DocId, page_idx: u32) -> Result<Vec<CharInfo>> {
-        let open_doc = self.docs.get_mut(&doc.0)
+        let open_doc = self
+            .docs
+            .get_mut(&doc.0)
             .with_context(|| format!("unknown doc id: {}", doc.0))?;
 
-        let page = open_doc.document.pages().get(page_idx as u16)
+        let page = open_doc
+            .document
+            .pages()
+            .get(page_idx as u16)
             .with_context(|| format!("page {} not found", page_idx))?;
 
-        let page_text = page.text()
+        let page_text = page
+            .text()
             .with_context(|| format!("text-layer load failed for page {}", page_idx))?;
 
         let mut chars = Vec::new();
         for ch in page_text.chars().iter() {
             let Some(c) = ch.unicode_char() else { continue };
-            if c.is_control() { continue }
+            if c.is_control() {
+                continue;
+            }
             // loose_bounds: full glyph box in PDF user-space (y-up).
-            let Ok(bounds) = ch.loose_bounds() else { continue };
+            let Ok(bounds) = ch.loose_bounds() else {
+                continue;
+            };
             let cx = (bounds.left().value + bounds.right().value) * 0.5;
             let cy = (bounds.bottom().value + bounds.top().value) * 0.5;
-            chars.push(CharInfo { ch: c, x: cx, y: cy });
+            chars.push(CharInfo {
+                ch: c,
+                x: cx,
+                y: cy,
+            });
         }
         Ok(chars)
     }
@@ -391,16 +427,23 @@ impl<'p> PdfDiffEngine<'p> {
 
         // Position deltas only when sequences match — otherwise the pairing is undefined.
         let position_deltas = if char_sequence_match {
-            chars_a.iter().zip(chars_b.iter()).map(|(a, b)| CharDelta {
-                ch: a.ch,
-                delta_x: b.x - a.x,
-                delta_y: b.y - a.y,
-            }).collect()
+            chars_a
+                .iter()
+                .zip(chars_b.iter())
+                .map(|(a, b)| CharDelta {
+                    ch: a.ch,
+                    delta_x: b.x - a.x,
+                    delta_y: b.y - a.y,
+                })
+                .collect()
         } else {
             Vec::new()
         };
 
-        Ok(TextDiffResult { char_sequence_match, position_deltas })
+        Ok(TextDiffResult {
+            char_sequence_match,
+            position_deltas,
+        })
     }
 }
 
@@ -418,13 +461,20 @@ impl<'p> PdfDiffEngine<'p> {
 ///
 /// Returns `Err` when image dimensions differ — render both pages at the same
 /// DPI with [`PdfDiffEngine::render_page_full`] to ensure matching sizes.
-pub fn pixel_diff(img_a: &DynamicImage, img_b: &DynamicImage, tolerance: u8) -> Result<PixelDiffResult> {
+pub fn pixel_diff(
+    img_a: &DynamicImage,
+    img_b: &DynamicImage,
+    tolerance: u8,
+) -> Result<PixelDiffResult> {
     let (w, h) = img_a.dimensions();
     let (wb, hb) = img_b.dimensions();
     anyhow::ensure!(
         w == wb && h == hb,
         "image dimensions mismatch: {}x{} vs {}x{} — render both pages at the same DPI",
-        w, h, wb, hb
+        w,
+        h,
+        wb,
+        hb
     );
 
     let total = (w * h) as u64;
@@ -442,22 +492,26 @@ pub fn pixel_diff(img_a: &DynamicImage, img_b: &DynamicImage, tolerance: u8) -> 
             let pa = rgb_a.get_pixel(x, y);
             let pb = rgb_b.get_pixel(x, y);
             // Max channel delta across R, G, B.
-            let d = pa.0.iter().zip(pb.0.iter())
-                .map(|(&a, &b)| a.abs_diff(b))
-                .max()
-                .unwrap_or(0);
-            if d > max_delta { max_delta = d; }
+            let d =
+                pa.0.iter()
+                    .zip(pb.0.iter())
+                    .map(|(&a, &b)| a.abs_diff(b))
+                    .max()
+                    .unwrap_or(0);
+            if d > max_delta {
+                max_delta = d;
+            }
             let off = ((y * w + x) * 3) as usize;
             if d > tolerance {
                 changed += 1;
                 // Red highlight for changed pixels.
-                diff_buf[off]     = 220;
+                diff_buf[off] = 220;
                 diff_buf[off + 1] = 30;
                 diff_buf[off + 2] = 30;
             } else {
                 // 50% grey blend for unchanged — makes surrounding context visible.
                 let grey = ((pa.0[0] as u16 + pb.0[0] as u16) / 2) as u8;
-                diff_buf[off]     = grey;
+                diff_buf[off] = grey;
                 diff_buf[off + 1] = grey;
                 diff_buf[off + 2] = grey;
             }
@@ -472,7 +526,7 @@ pub fn pixel_diff(img_a: &DynamicImage, img_b: &DynamicImage, tolerance: u8) -> 
 
     let diff_image = DynamicImage::ImageRgb8(
         RgbImage::from_vec(w, h, diff_buf)
-            .context("failed to construct diff image buffer (size mismatch?)")?
+            .context("failed to construct diff image buffer (size mismatch?)")?,
     );
 
     Ok(PixelDiffResult {
@@ -503,11 +557,10 @@ fn load_doc(
     file_len: u64,
 ) -> Result<(PdfDocument<'static>, Option<Mmap>)> {
     if file_len >= MMAP_THRESHOLD {
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("open for mmap: {:?}", path))?;
+        let file =
+            std::fs::File::open(path).with_context(|| format!("open for mmap: {:?}", path))?;
         // SAFETY: file is read-only; mmap is kept alive in OpenDoc._backing.
-        let mmap = unsafe { Mmap::map(&file) }
-            .with_context(|| format!("mmap: {:?}", path))?;
+        let mmap = unsafe { Mmap::map(&file) }.with_context(|| format!("mmap: {:?}", path))?;
         let doc = pdfium
             .load_pdf_from_byte_slice(
                 // SAFETY: byte slice borrows mmap, which lives in OpenDoc._backing
@@ -534,11 +587,13 @@ fn load_doc(
 /// Normalize an oversized PDF via lopdf into a temp file.
 /// One-time cost; see redline render/mod.rs for the full rationale.
 fn normalize_large_pdf(path: &Path) -> Result<PathBuf> {
-    let mut doc = lopdf::Document::load(path)
-        .with_context(|| format!("lopdf load {:?}", path))?;
+    let mut doc = lopdf::Document::load(path).with_context(|| format!("lopdf load {:?}", path))?;
     let pruned = doc.prune_objects();
     if !pruned.is_empty() {
-        info!("pdf-diff: normalize pruned {} unreferenced objects", pruned.len());
+        info!(
+            "pdf-diff: normalize pruned {} unreferenced objects",
+            pruned.len()
+        );
     }
     doc.compress();
     let stem = path
@@ -547,7 +602,8 @@ fn normalize_large_pdf(path: &Path) -> Result<PathBuf> {
         .unwrap_or_else(|| "doc".into());
     let mut out = std::env::temp_dir();
     out.push(format!("pdf-diff-norm-{}-{}.pdf", stem, std::process::id()));
-    doc.save(&out).with_context(|| format!("lopdf save to {:?}", out))?;
+    doc.save(&out)
+        .with_context(|| format!("lopdf save to {:?}", out))?;
     Ok(out)
 }
 
@@ -632,7 +688,11 @@ mod tests {
     fn text_diff_result_serde_round_trip() {
         let r = TextDiffResult {
             char_sequence_match: false,
-            position_deltas: vec![CharDelta { ch: 'A', delta_x: 1.0, delta_y: -2.5 }],
+            position_deltas: vec![CharDelta {
+                ch: 'A',
+                delta_x: 1.0,
+                delta_y: -2.5,
+            }],
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: TextDiffResult = serde_json::from_str(&json).unwrap();

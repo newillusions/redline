@@ -94,7 +94,11 @@ impl Tool {
     /// spec "Tools & Tool Sets"). Serializes the markup's type + appearance [+ geometry,
     /// for Drawing mode] into a fresh, independent template - later edits to the source
     /// markup never affect the tool.
-    pub fn from_markup(markup: &Markup, name: impl Into<String>, placement_mode: PlacementMode) -> Self {
+    pub fn from_markup(
+        markup: &Markup,
+        name: impl Into<String>,
+        placement_mode: PlacementMode,
+    ) -> Self {
         let geometry = match placement_mode {
             PlacementMode::Drawing => Some(markup.geometry.clone()),
             PlacementMode::Properties => None,
@@ -124,7 +128,11 @@ pub struct ToolSet {
 
 impl ToolSet {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { id: Uuid::new_v4(), name: name.into(), tools: Vec::new() }
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            tools: Vec::new(),
+        }
     }
 }
 
@@ -136,15 +144,25 @@ mod tests {
     use uuid::Uuid as U;
 
     fn user() -> UserRef {
-        UserRef { user_id: U::new_v4(), display_name: "Alice".to_string() }
+        UserRef {
+            user_id: U::new_v4(),
+            display_name: "Alice".to_string(),
+        }
     }
 
     fn rect_markup() -> Markup {
         Markup::new(
             MarkupType::Rectangle,
             2,
-            Geom::Rect { min: PdfPoint { x: 10.0, y: 20.0 }, max: PdfPoint { x: 110.0, y: 70.0 } },
-            Appearance { color: "#ff0000".to_string(), line_weight: 3.0, ..Appearance::default() },
+            Geom::Rect {
+                min: PdfPoint { x: 10.0, y: 20.0 },
+                max: PdfPoint { x: 110.0, y: 70.0 },
+            },
+            Appearance {
+                color: "#ff0000".to_string(),
+                line_weight: 3.0,
+                ..Appearance::default()
+            },
             user(),
         )
     }
@@ -158,7 +176,10 @@ mod tests {
 
         assert_eq!(tool.markup_type, MarkupType::Rectangle);
         assert_eq!(tool.appearance, m.appearance);
-        assert!(tool.geometry.is_none(), "properties-mode tools carry no fixed geometry");
+        assert!(
+            tool.geometry.is_none(),
+            "properties-mode tools carry no fixed geometry"
+        );
         assert_eq!(tool.name, "My Rectangle");
     }
 
@@ -201,8 +222,10 @@ mod tests {
     fn tool_set_json_round_trips_with_ordered_tools() {
         let m = rect_markup();
         let mut set = ToolSet::new("Ordered Set");
-        set.tools.push(Tool::from_markup(&m, "First", PlacementMode::Properties));
-        set.tools.push(Tool::from_markup(&m, "Second", PlacementMode::Properties));
+        set.tools
+            .push(Tool::from_markup(&m, "First", PlacementMode::Properties));
+        set.tools
+            .push(Tool::from_markup(&m, "Second", PlacementMode::Properties));
 
         let json = serde_json::to_string(&set).expect("serialize");
         let back: ToolSet = serde_json::from_str(&json).expect("deserialize");

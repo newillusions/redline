@@ -25,7 +25,6 @@ const mockRotatePage = vi.fn(async (_args: any) => {});
 // Thumbnail rendering (PR-B, 2026-09-15) — default resolved values so every existing
 // test (which never asserts on thumbnail content) mounts cleanly; thumbnail-specific
 // tests below override these per-case.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mockGetPageSize = vi.fn(async (docId: string, pageIndex: number) => ({
   doc_id: docId, page_index: pageIndex, width_pts: 200, height_pts: 260,
 }));

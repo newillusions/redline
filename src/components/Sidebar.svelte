@@ -60,11 +60,11 @@
     /** Panels that only exist while switched on elsewhere (Search). Default: always shown. */
     shown?: (id: PanelId) => boolean;
     /** Panels with a close button (Search) - called when it is pressed. */
-    onclose?: Partial<Record<PanelId, () => void>>;
+    closeActions?: Partial<Record<PanelId, () => void>>;
     testId?: string;
   }
 
-  const { side, store, content, shown = () => true, onclose = {}, testId }: Props = $props();
+  const { side, store, content, shown = () => true, closeActions = {}, testId }: Props = $props();
 
   /** Existing data-testids kept stable for harnesses and tests written against the old stack. */
   const HEADER_TEST_IDS: Partial<Record<PanelId, string>> = {
@@ -381,12 +381,12 @@
             data-testid="panel-menu-{id}"
             onclick={(e) => openMenu(id, e.currentTarget)}
           >⋯</button>
-          {#if onclose[id]}
+          {#if closeActions[id]}
             <button
               type="button"
               class="panel-icon-btn"
               aria-label="Close {PANEL_TITLES[id].toLowerCase()}"
-              onclick={() => onclose[id]?.()}
+              onclick={() => closeActions[id]?.()}
             >✕</button>
           {/if}
         </header>

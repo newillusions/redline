@@ -70,7 +70,7 @@
   import {
     hitTest, marqueeHits, boundsOf, isRectResizable,
     handleAnchors, resizeBounds, scaleGeometryToBounds,
-    expandSelectionToGroups, moveVertex, insertVertex, deleteVertex, calloutBoxBounds,
+    expandSelectionToGroups, moveVertex, insertVertex, deleteVertex,
     type Bounds, type HandleId,
   } from "$lib/markup-select";
   import { type CalloutEdit, applyCalloutEdit, hitCallout, translateMarkup } from "$lib/callout-edit";
@@ -231,6 +231,7 @@
   // Shift+wheel zoom "works but I'll forget that") — reachable via the toolbar's [?]
   // button or the ? key; dismiss on Esc or an outside click. Bindings are unchanged
   // (owner-decided 2026-09-08 scheme, docs/navigation.md) - this is discovery only. ---
+  const SHORTCUTS_TITLE = "Pan & zoom shortcuts (?)\nPinch or Shift+scroll or ⌘/Ctrl+scroll — zoom\nTwo-finger swipe or wheel — pan\nSpace+drag — pan with any tool";
   let showShortcuts = $state(false);
 
   // --- Zoom toolbar collapse + reposition (owner feedback 2026-09-15: hideable/
@@ -968,7 +969,7 @@
     const renderViewState: ViewportState = { ...viewState, zoom: renderZoom, scrollX: renderScrollX, scrollY: renderScrollY };
     const tiles = visibleTiles(renderViewState);
 
-    let ctx: CanvasRenderingContext2D | null = null;
+    let ctx: CanvasRenderingContext2D | null;
     try {
       ctx = canvasEl.getContext("2d");
     } catch {
@@ -3660,7 +3661,7 @@
         <!-- Leader/arrowhead have no independent Fill control - the arrowhead's
              fill-opacity tracks strokeOpacity too (mirrors the Arrow shape above and
              appearance.rs's line_gstate for the leader). -->
-        {#each s.leaders as leader}
+        {#each s.leaders as leader, li (li)}
           <polyline points={leader.points} stroke={s.stroke} stroke-width={s.strokeWidth}
             stroke-opacity={s.strokeOpacity} fill="none" stroke-dasharray={s.dashArray ?? undefined}
             pointer-events="none" />
@@ -3942,7 +3943,7 @@
         />
         <button
           class="btn-zoom btn-shortcuts"
-          title={"Pan & zoom shortcuts (?)\nPinch or Shift+scroll or ⌘/Ctrl+scroll — zoom\nTwo-finger swipe or wheel — pan\nSpace+drag — pan with any tool"}
+          title={SHORTCUTS_TITLE}
           aria-label="Show pan and zoom shortcuts"
           onclick={() => (showShortcuts = !showShortcuts)}
         >?</button>

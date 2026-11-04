@@ -394,9 +394,15 @@ fn is_ours_to_delete(obj: &Object) -> bool {
     };
     match dict.get(b"Type") {
         // No /Type: an outline item or an untyped link, unless it looks like page structure.
-        Err(_) => ![&b"Kids"[..], b"Contents", b"MediaBox", b"Resources", b"Count"]
-            .iter()
-            .any(|k| dict.has(k) && !dict.has(b"Title")),
+        Err(_) => ![
+            &b"Kids"[..],
+            b"Contents",
+            b"MediaBox",
+            b"Resources",
+            b"Count",
+        ]
+        .iter()
+        .any(|k| dict.has(k) && !dict.has(b"Title")),
         Ok(Object::Name(n)) => n == b"Outlines" || n == b"Annot",
         Ok(_) => false,
     }
@@ -506,7 +512,11 @@ fn dangling_targets(doc: &Document, budget: usize) -> Option<std::collections::H
             return None;
         }
     }
-    Some(refs.into_iter().filter(|r| !doc.objects.contains_key(r)).collect())
+    Some(
+        refs.into_iter()
+            .filter(|r| !doc.objects.contains_key(r))
+            .collect(),
+    )
 }
 
 /// Delete the candidates that [`unreferenced_among`] clears, then verify in code that the

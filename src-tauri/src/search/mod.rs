@@ -26,13 +26,12 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tantivy::{
-    Document, Index, IndexWriter, TantivyDocument,
     collector::TopDocs,
     doc,
     query::QueryParser,
-    schema::{Field, NumericOptions, Schema, STRING, STORED, TEXT},
+    schema::{Field, NumericOptions, Schema, STORED, STRING, TEXT},
     snippet::SnippetGenerator,
-    Term,
+    Document, Index, IndexWriter, TantivyDocument, Term,
 };
 
 // ---------------------------------------------------------------------------
@@ -68,13 +67,8 @@ pub struct FolderSearchHit {
 #[serde(tag = "kind")]
 pub enum IndexState {
     Idle,
-    Indexing {
-        current_file: String,
-        progress: f32,
-    },
-    Error {
-        message: String,
-    },
+    Indexing { current_file: String, progress: f32 },
+    Error { message: String },
 }
 
 /// Status summary returned by `folder_index_status` IPC.
@@ -136,23 +130,28 @@ impl FolderIndex {
 
         let meta_exists = index_dir.join("meta.json").exists();
 
-        let (index, f_file_path, f_page_number, f_text, f_source, f_indexed_at) =
-            if meta_exists {
-                let idx = Index::open_in_dir(index_dir)
-                    .with_context(|| format!("open tantivy index in {:?}", index_dir))?;
-                let schema = idx.schema();
-                let fp = schema.get_field(F_FILE_PATH).context("missing field file_path")?;
-                let pn = schema.get_field(F_PAGE_NUMBER).context("missing field page_number")?;
-                let tx = schema.get_field(F_TEXT).context("missing field text")?;
-                let src = schema.get_field(F_SOURCE).context("missing field source")?;
-                let ia = schema.get_field(F_INDEXED_AT).context("missing field indexed_at")?;
-                (idx, fp, pn, tx, src, ia)
-            } else {
-                let (schema, fp, pn, tx, src, ia) = build_schema();
-                let idx = Index::create_in_dir(index_dir, schema)
-                    .with_context(|| format!("create tantivy index in {:?}", index_dir))?;
-                (idx, fp, pn, tx, src, ia)
-            };
+        let (index, f_file_path, f_page_number, f_text, f_source, f_indexed_at) = if meta_exists {
+            let idx = Index::open_in_dir(index_dir)
+                .with_context(|| format!("open tantivy index in {:?}", index_dir))?;
+            let schema = idx.schema();
+            let fp = schema
+                .get_field(F_FILE_PATH)
+                .context("missing field file_path")?;
+            let pn = schema
+                .get_field(F_PAGE_NUMBER)
+                .context("missing field page_number")?;
+            let tx = schema.get_field(F_TEXT).context("missing field text")?;
+            let src = schema.get_field(F_SOURCE).context("missing field source")?;
+            let ia = schema
+                .get_field(F_INDEXED_AT)
+                .context("missing field indexed_at")?;
+            (idx, fp, pn, tx, src, ia)
+        } else {
+            let (schema, fp, pn, tx, src, ia) = build_schema();
+            let idx = Index::create_in_dir(index_dir, schema)
+                .with_context(|| format!("create tantivy index in {:?}", index_dir))?;
+            (idx, fp, pn, tx, src, ia)
+        };
 
         let writer = index.writer(50_000_000).context("create index writer")?;
 
@@ -240,7 +239,12 @@ impl FolderIndex {
         writer.commit().context("commit delete")?;
         drop(writer);
 
-        self.inner.status.lock().unwrap().file_pages.remove(file_path);
+        self.inner
+            .status
+            .lock()
+            .unwrap()
+            .file_pages
+            .remove(file_path);
         Ok(())
     }
 
@@ -260,13 +264,11 @@ impl FolderIndex {
         let searcher = reader.searcher();
         let schema = self.inner.index.schema();
 
-        let query_parser =
-            QueryParser::for_index(&self.inner.index, vec![self.inner.f_text]);
+        let query_parser = QueryParser::for_index(&self.inner.index, vec![self.inner.f_text]);
         let query = query_parser.parse_query(query_str)?;
 
-        let mut snippet_gen =
-            SnippetGenerator::create(&searcher, &*query, self.inner.f_text)
-                .context("create snippet generator")?;
+        let mut snippet_gen = SnippetGenerator::create(&searcher, &*query, self.inner.f_text)
+            .context("create snippet generator")?;
         snippet_gen.set_max_num_chars(150);
 
         let top_docs = searcher
@@ -275,8 +277,7 @@ impl FolderIndex {
 
         let mut hits = Vec::with_capacity(top_docs.len());
         for (_score, doc_addr) in top_docs {
-            let doc: TantivyDocument =
-                searcher.doc(doc_addr).context("retrieve doc")?;
+            let doc: TantivyDocument = searcher.doc(doc_addr).context("retrieve doc")?;
 
             let json: serde_json::Value =
                 serde_json::from_str(&doc.to_json(&schema)).unwrap_or_default();
@@ -338,13 +339,18 @@ impl FolderIndex {
 fn build_schema() -> (Schema, Field, Field, Field, Field, Field) {
     let mut b = Schema::builder();
     let f_file_path = b.add_text_field(F_FILE_PATH, STRING | STORED);
-    let f_page_number =
-        b.add_u64_field(F_PAGE_NUMBER, NumericOptions::default().set_stored());
+    let f_page_number = b.add_u64_field(F_PAGE_NUMBER, NumericOptions::default().set_stored());
     let f_text = b.add_text_field(F_TEXT, TEXT | STORED);
     let f_source = b.add_text_field(F_SOURCE, STRING | STORED);
-    let f_indexed_at =
-        b.add_u64_field(F_INDEXED_AT, NumericOptions::default().set_stored());
-    (b.build(), f_file_path, f_page_number, f_text, f_source, f_indexed_at)
+    let f_indexed_at = b.add_u64_field(F_INDEXED_AT, NumericOptions::default().set_stored());
+    (
+        b.build(),
+        f_file_path,
+        f_page_number,
+        f_text,
+        f_source,
+        f_indexed_at,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -388,8 +394,7 @@ mod tests {
 
     fn make_index() -> (FolderIndex, tempfile::TempDir) {
         let dir = tempdir().unwrap();
-        let idx =
-            FolderIndex::open_or_create(dir.path(), Path::new("/test/folder")).unwrap();
+        let idx = FolderIndex::open_or_create(dir.path(), Path::new("/test/folder")).unwrap();
         (idx, dir)
     }
 
@@ -438,12 +443,8 @@ mod tests {
             "lopdf",
         )
         .unwrap();
-        idx.index_pages(
-            "b.pdf",
-            &[(3, "concrete slab detail".to_string())],
-            "lopdf",
-        )
-        .unwrap();
+        idx.index_pages("b.pdf", &[(3, "concrete slab detail".to_string())], "lopdf")
+            .unwrap();
 
         let hits = idx.search("concrete", 10).unwrap();
         assert_eq!(hits.len(), 2);
@@ -471,12 +472,8 @@ mod tests {
     #[test]
     fn test_re_index_replaces_document() {
         let (idx, _dir) = make_index();
-        idx.index_pages(
-            "plan.pdf",
-            &[(1, "old content here".to_string())],
-            "lopdf",
-        )
-        .unwrap();
+        idx.index_pages("plan.pdf", &[(1, "old content here".to_string())], "lopdf")
+            .unwrap();
 
         // Re-index the same path with different content.
         idx.index_pages(
@@ -524,14 +521,12 @@ mod tests {
     fn test_open_existing_index() {
         let dir = tempdir().unwrap();
         {
-            let idx =
-                FolderIndex::open_or_create(dir.path(), Path::new("/folder")).unwrap();
+            let idx = FolderIndex::open_or_create(dir.path(), Path::new("/folder")).unwrap();
             idx.index_pages("x.pdf", &[(1, "search me content".to_string())], "lopdf")
                 .unwrap();
         }
         // Re-open the same directory — data must survive across handles.
-        let idx2 =
-            FolderIndex::open_or_create(dir.path(), Path::new("/folder")).unwrap();
+        let idx2 = FolderIndex::open_or_create(dir.path(), Path::new("/folder")).unwrap();
         let hits = idx2.search("search", 10).unwrap();
         assert_eq!(hits.len(), 1);
     }

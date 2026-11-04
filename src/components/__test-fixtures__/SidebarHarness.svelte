@@ -24,7 +24,7 @@
     {store}
     content={{ search, recent, toolchest, layers, properties }}
     shown={(id: PanelId) => id !== "search" || searchOpen}
-    onclose={{ search: onclosesearch }}
+    closeActions={{ search: onclosesearch }}
     testId="sidebar-{side}"
   />
 {/each}

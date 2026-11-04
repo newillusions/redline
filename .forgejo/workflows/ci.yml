@@ -112,6 +112,9 @@ jobs:
       # PDFium-dependent tests in src-tauri skip gracefully via early-return when the env
       # var is absent (render::tests::corpus() helper pattern). The `ocr` job below sets
       # it explicitly for the feature-gated benchmark that needs a real PDFium.
+      - name: Rust format check
+        run: cargo fmt --all -- --check
+
       - name: Test
         run: |
           cargo test --lib -p redline
@@ -215,3 +218,6 @@ jobs:
 
       - name: Svelte type check
         run: npm run check
+
+      - name: Lint
+        run: npm run lint

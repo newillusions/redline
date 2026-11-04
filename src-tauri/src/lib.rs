@@ -26,8 +26,8 @@ use tauri::Manager;
 mod commands;
 pub mod document;
 pub mod geometry;
-pub mod layers;
 mod identity;
+pub mod layers;
 pub mod license;
 #[cfg(feature = "ocr")]
 pub mod ocr;

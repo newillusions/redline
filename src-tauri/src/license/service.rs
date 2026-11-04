@@ -78,7 +78,12 @@ pub async fn activate(
         },
     )
     .map_err(|e| ActivateError::Persist(e.to_string()))?;
-    Ok(gate::evaluate(Some(&token), device_fingerprint, public_key, now))
+    Ok(gate::evaluate(
+        Some(&token),
+        device_fingerprint,
+        public_key,
+        now,
+    ))
 }
 
 /// The online check-in, called unconditionally on every app launch (see
@@ -147,7 +152,12 @@ pub fn info(
     LicenseInfo {
         code: stored.map(|s| s.code.clone()),
         device_fingerprint: device_fingerprint.to_string(),
-        state: gate::evaluate(stored.map(|s| s.token.as_str()), device_fingerprint, public_key, now),
+        state: gate::evaluate(
+            stored.map(|s| s.token.as_str()),
+            device_fingerprint,
+            public_key,
+            now,
+        ),
     }
 }
 
@@ -188,7 +198,11 @@ mod tests {
         (signing_key, verifying_key)
     }
 
-    fn token_for(signing_key: &SigningKey, device_fingerprint: &str, expires_in_days: i64) -> String {
+    fn token_for(
+        signing_key: &SigningKey,
+        device_fingerprint: &str,
+        expires_in_days: i64,
+    ) -> String {
         let now = Utc::now();
         let payload = LicensePayload {
             staff_id: "staff:abc123".to_string(),
@@ -214,14 +228,22 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LicenseClient for FakeClient {
-        async fn issue(&self, _code: &str, _device_fingerprint: &str) -> Result<String, ClientError> {
+        async fn issue(
+            &self,
+            _code: &str,
+            _device_fingerprint: &str,
+        ) -> Result<String, ClientError> {
             self.issue_result
                 .lock()
                 .unwrap()
                 .take()
                 .expect("issue() called more times than expected")
         }
-        async fn renew(&self, _code: &str, _device_fingerprint: &str) -> Result<String, ClientError> {
+        async fn renew(
+            &self,
+            _code: &str,
+            _device_fingerprint: &str,
+        ) -> Result<String, ClientError> {
             self.renew_result
                 .lock()
                 .unwrap()
@@ -255,13 +277,22 @@ mod tests {
         let (_, vk) = test_keypair(1);
         let dir = scratch_dir();
         let client = FakeClient {
-            issue_result: Mutex::new(Some(Err(ClientError::Rejected("staff_not_active".to_string())))),
+            issue_result: Mutex::new(Some(Err(ClientError::Rejected(
+                "staff_not_active".to_string(),
+            )))),
             renew_result: Mutex::new(None),
         };
 
         let result = activate(&client, &dir, "CODE-1", "device-1", &vk, Utc::now()).await;
-        assert!(matches!(result, Err(ActivateError::Client(ClientError::Rejected(_)))));
-        assert_eq!(store::load(&dir).unwrap(), None, "a rejected issue must not write a token");
+        assert!(matches!(
+            result,
+            Err(ActivateError::Client(ClientError::Rejected(_)))
+        ));
+        assert_eq!(
+            store::load(&dir).unwrap(),
+            None,
+            "a rejected issue must not write a token"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -282,7 +313,9 @@ mod tests {
 
         let client = FakeClient {
             issue_result: Mutex::new(None),
-            renew_result: Mutex::new(Some(Err(ClientError::Rejected("staff_not_active".to_string())))),
+            renew_result: Mutex::new(Some(Err(ClientError::Rejected(
+                "staff_not_active".to_string(),
+            )))),
         };
         let state = renew(&client, &dir, &stored, "device-1", &vk, Utc::now()).await;
         match state {
@@ -340,7 +373,10 @@ mod tests {
             renew_result: Mutex::new(Some(Err(ClientError::Transport("offline".to_string())))),
         };
         let state = renew(&client, &dir, &stored, "device-1", &vk, Utc::now()).await;
-        assert!(matches!(state, LicenseState::Grace { .. }), "expected Grace, got {state:?}");
+        assert!(
+            matches!(state, LicenseState::Grace { .. }),
+            "expected Grace, got {state:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

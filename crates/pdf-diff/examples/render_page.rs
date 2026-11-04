@@ -51,10 +51,12 @@ fn main() {
         process::exit(1);
     }
 
-    let img = engine.render_page_full(&doc, page_idx, dpi).unwrap_or_else(|e| {
-        eprintln!("Render failed: {e}");
-        process::exit(1);
-    });
+    let img = engine
+        .render_page_full(&doc, page_idx, dpi)
+        .unwrap_or_else(|e| {
+            eprintln!("Render failed: {e}");
+            process::exit(1);
+        });
 
     if let Some(parent) = out_png.parent() {
         let _ = std::fs::create_dir_all(parent);

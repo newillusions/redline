@@ -106,9 +106,16 @@ pub fn create_tool_set(state: State<'_, AppState>, name: String) -> Result<ToolS
 }
 
 #[tauri::command]
-pub fn rename_tool_set(state: State<'_, AppState>, set_id: String, name: String) -> Result<(), String> {
+pub fn rename_tool_set(
+    state: State<'_, AppState>,
+    set_id: String,
+    name: String,
+) -> Result<(), String> {
     let id = parse_uuid(&set_id, "tool set")?;
-    state.toolchest.rename_set(id, name).map_err(|e| e.to_string())
+    state
+        .toolchest
+        .rename_set(id, name)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -130,33 +137,53 @@ pub fn add_tool_from_markup(
 ) -> Result<Tool, String> {
     let id = parse_uuid(&set_id, "tool set")?;
     let tool = Tool::from_markup(&markup, name, placement_mode);
-    state.toolchest.add_tool(id, tool).map_err(|e| e.to_string())
+    state
+        .toolchest
+        .add_tool(id, tool)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn delete_tool(state: State<'_, AppState>, set_id: String, tool_id: String) -> Result<(), String> {
+pub fn delete_tool(
+    state: State<'_, AppState>,
+    set_id: String,
+    tool_id: String,
+) -> Result<(), String> {
     let set = parse_uuid(&set_id, "tool set")?;
     let tool = parse_uuid(&tool_id, "tool")?;
-    state.toolchest.delete_tool(set, tool).map_err(|e| e.to_string())
+    state
+        .toolchest
+        .delete_tool(set, tool)
+        .map_err(|e| e.to_string())
 }
 
 /// Reorder a set's tools to match `tool_ids` (front to back). Unnamed ids keep their
 /// relative order, appended after - see `ToolChestStore::reorder_tools`.
 #[tauri::command]
-pub fn reorder_tools(state: State<'_, AppState>, set_id: String, tool_ids: Vec<String>) -> Result<(), String> {
+pub fn reorder_tools(
+    state: State<'_, AppState>,
+    set_id: String,
+    tool_ids: Vec<String>,
+) -> Result<(), String> {
     let set = parse_uuid(&set_id, "tool set")?;
     let ids = tool_ids
         .iter()
         .map(|s| parse_uuid(s, "tool"))
         .collect::<Result<Vec<_>, _>>()?;
-    state.toolchest.reorder_tools(set, ids).map_err(|e| e.to_string())
+    state
+        .toolchest
+        .reorder_tools(set, ids)
+        .map_err(|e| e.to_string())
 }
 
 /// Record a tool as recently used (move-to-front, de-duplicated, capped). Call this when
 /// the user activates a tool from the Tool Chest panel.
 #[tauri::command]
 pub fn record_recent_tool(state: State<'_, AppState>, tool: Tool) -> Result<(), String> {
-    state.toolchest.record_recent(tool).map_err(|e| e.to_string())
+    state
+        .toolchest
+        .record_recent(tool)
+        .map_err(|e| e.to_string())
 }
 
 /// Import a `.btx` (or `.zip`-wrapped `.btx`) file from `path` as a new Tool Set named
@@ -164,7 +191,9 @@ pub fn record_recent_tool(state: State<'_, AppState>, tool: Tool) -> Result<(), 
 /// never fatal to the whole import (spec "Importing Bluebeam Tool Sets & stamps").
 #[tauri::command]
 pub async fn import_btx(state: State<'_, AppState>, path: String) -> Result<ImportReport, String> {
-    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("read {path}: {e}"))?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| format!("read {path}: {e}"))?;
     let mut report = tokio::task::spawn_blocking(move || btx::import_btx_bytes(&bytes))
         .await
         .map_err(|e| e.to_string())?;
@@ -221,5 +250,13 @@ pub fn compose_stamp_text(
     prompted: Vec<String>,
 ) -> String {
     let now = Local::now().fixed_offset();
-    compose_dynamic_text(&base_text, &fields, now, &username, &document_name, sequence, &prompted)
+    compose_dynamic_text(
+        &base_text,
+        &fields,
+        now,
+        &username,
+        &document_name,
+        sequence,
+        &prompted,
+    )
 }

@@ -237,7 +237,7 @@ mod tests {
         let mut s1 = ScaleStore::default();
         s1.add("d1", rec.clone());
         s1.clear("d1"); // close
-        // Session 2: fresh store, same file, new doc id.
+                        // Session 2: fresh store, same file, new doc id.
         let mut s2 = ScaleStore::default();
         s2.ensure_loaded("d2", Some(&pdf));
         assert_eq!(s2.list("d2"), std::slice::from_ref(&rec));

@@ -14,7 +14,7 @@
 
   --color-text:          #f2f2f7;
   --color-text-secondary:#aeaeb2;
-  --color-text-muted:    #636366;
+  --color-text-muted:    #9a9aa0; /* 5.5:1 on --color-bg-panel, 5.0:1 on --color-bg-panel-alt (WCAG AA 4.5:1) */
   --color-text-inverse:  #1a1a1c;
 
   --color-primary:       #0a84ff;

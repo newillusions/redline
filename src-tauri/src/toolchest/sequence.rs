@@ -66,7 +66,11 @@ mod tests {
         let counters = SequenceCounters::new();
         let tool = Uuid::new_v4();
         assert_eq!(counters.next(CounterScope::PerDocument, tool, "doc-a"), 1);
-        assert_eq!(counters.next(CounterScope::PerDocument, tool, "doc-b"), 1, "a different doc starts fresh");
+        assert_eq!(
+            counters.next(CounterScope::PerDocument, tool, "doc-b"),
+            1,
+            "a different doc starts fresh"
+        );
         assert_eq!(counters.next(CounterScope::PerDocument, tool, "doc-a"), 2);
     }
 
@@ -75,7 +79,11 @@ mod tests {
         let counters = SequenceCounters::new();
         let tool = Uuid::new_v4();
         assert_eq!(counters.next(CounterScope::Global, tool, "doc-a"), 1);
-        assert_eq!(counters.next(CounterScope::Global, tool, "doc-b"), 2, "global counter is shared across docs");
+        assert_eq!(
+            counters.next(CounterScope::Global, tool, "doc-b"),
+            2,
+            "global counter is shared across docs"
+        );
     }
 
     #[test]

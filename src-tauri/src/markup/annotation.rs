@@ -378,7 +378,9 @@ fn non_standard_note_rect(d: &Dictionary) -> Option<[f64; 4]> {
 /// Call it in the frame where text is upright (the display frame), not on raw page space of a
 /// rotated page.
 pub(crate) fn canonical_quad(q: &Quad) -> Quad {
-    let turn = |a: PdfPoint, b: PdfPoint, c: PdfPoint| (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+    let turn = |a: PdfPoint, b: PdfPoint, c: PdfPoint| {
+        (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
+    };
     let t = [
         turn(q[0], q[1], q[2]),
         turn(q[1], q[2], q[3]),
@@ -801,8 +803,8 @@ impl Markup {
         if matches!(t, MarkupType::Cloud) {
             let mut be = Dictionary::new();
             be.set("S", name("C")); // Cloudy border style
-            // intensity (0..2); 2 = standard revision-cloud amplitude. A foreign cloud keeps
-            // the intensity it was read with.
+                                    // intensity (0..2); 2 = standard revision-cloud amplitude. A foreign cloud keeps
+                                    // the intensity it was read with.
             be.set("I", real(super::appearance::cloud_intensity(self)));
             d.set("BE", Object::Dictionary(be));
             d.set("IT", name("PolygonCloud"));
@@ -1014,7 +1016,10 @@ impl Markup {
         let id = nm
             .as_deref()
             .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            .or_else(|| nm.as_deref().map(|s| super::derive_uuid(&format!("nm:{s}"))))
+            .or_else(|| {
+                nm.as_deref()
+                    .map(|s| super::derive_uuid(&format!("nm:{s}")))
+            })
             .unwrap_or_else(uuid::Uuid::new_v4);
         let source_nm = nm.filter(|s| *s != id.to_string());
 

@@ -5,8 +5,7 @@
  * refresh, and its stored rectangle is kept equal to the table that is drawn.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, waitFor, fireEvent } from "@testing-library/svelte";
-import { tick } from "svelte";
+import { render, waitFor } from "@testing-library/svelte";
 import Viewport from "./Viewport.svelte";
 import { MarkupStore } from "$lib/markup-store.svelte";
 import { legendFromCountSets } from "$lib/legend";

@@ -2643,7 +2643,7 @@ describe("Viewport G8 grouping", () => {
   // G8-1: Cmd+G groups selected markups (≥2) into one undo frame
   // -------------------------------------------------------------------------
   it("G8-1: Cmd+G groups 2 selected markups — both get same non-null group_id, loner stays null, one undo frame", async () => {
-    const { overlay } = await mountViewport(store);
+    await mountViewport(store);
     seedRect3(store, "a", 40, 90, 110, 160);
     seedRect3(store, "b", 120, 30, 180, 80);
     seedRect3(store, "c", 5, 5, 20, 15);
@@ -3050,7 +3050,7 @@ describe("Viewport G8 grouping", () => {
   // G8-4: Cmd+Shift+G ungroups — group_id back to null, one undo frame
   // -------------------------------------------------------------------------
   it("G8-4: Cmd+Shift+G ungroups selected markups — group_id set to null, one undo frame", async () => {
-    const { overlay } = await mountViewport(store);
+    await mountViewport(store);
     seedRect3(store, "a", 40, 90, 110, 160);
     seedRect3(store, "b", 120, 30, 180, 80);
 

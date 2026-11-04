@@ -131,4 +131,27 @@ describe("PanelLayoutStore", () => {
     await store.flush();
     expect(persist).toHaveBeenCalledOnce();
   });
+
+  it("a damaged version-1 layout is reported and left on disk until the user changes the layout", async () => {
+    const onError = vi.fn();
+    const persist = vi.fn().mockResolvedValue(undefined);
+    const store = new PanelLayoutStore(persist, 10, onError);
+    store.load({ version: 1, left: "garbage", right: { panels: 7 } });
+    expect(onError).toHaveBeenCalledOnce();
+    expect(store.layout).toEqual(defaultLayout());
+    await vi.advanceTimersByTimeAsync(1000);
+    await store.flush();
+    expect(persist).not.toHaveBeenCalled();
+    store.update((l) => setSidebarWidth(l, "left", 300));
+    await store.flush();
+    expect(persist).toHaveBeenCalledOnce();
+  });
+
+  it("a sound or absent stored layout raises no error", () => {
+    const onError = vi.fn();
+    const store = new PanelLayoutStore(vi.fn(), 10, onError);
+    store.load({ version: 1, left: { panels: ["layers"] } });
+    store.load(null);
+    expect(onError).not.toHaveBeenCalled();
+  });
 });

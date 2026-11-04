@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { markupToSvg, cloudPath, selectionChrome, countSymbolRender, quadToScreenPolygon, textMarkupPolyline, MAX_TEXT_MARKUP_QUADS, squiggleSegmentsPerQuad, type SvgShape } from "./markup-render";
+import { markupToSvg, cloudPath, selectionChrome, countSymbolRender, quadToScreenPolygon, textMarkupPolyline, MAX_TEXT_MARKUP_QUADS, squiggleSegmentsPerQuad } from "./markup-render";
 import type { Markup, MarkupType, Appearance, MarkupGeometry, CountSet } from "./ipc";
 import type { ViewportState } from "./viewport";
 import { pdfUserSpaceToScreen } from "./viewport";

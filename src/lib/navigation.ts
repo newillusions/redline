@@ -220,7 +220,7 @@ export function moveSpec(nodes: readonly BookmarkView[], id: string, op: MoveOp)
   }
 }
 
-export interface DropSpec extends MoveSpec {}
+export type DropSpec = MoveSpec;
 
 /** Drag-and-drop: the upper quarter of a row drops before it, the lower quarter after, the
  *  middle makes the dragged node its child. A drop onto itself or its own subtree is null. */

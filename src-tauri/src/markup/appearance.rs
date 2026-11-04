@@ -396,7 +396,9 @@ pub(crate) fn ap_bbox(m: &Markup) -> [f64; 4] {
         MarkupType::Arrow => pad = pad.max(m.appearance.line_weight.max(0.0) * 4.0 + 8.0),
         // Scallops bulge up to about half a chord outside the polygon edge.
         MarkupType::Cloud => {
-            pad = pad.max(cloud_chord(cloud_intensity(m)) * 0.5 + m.appearance.line_weight.max(0.0) + 2.0)
+            pad = pad.max(
+                cloud_chord(cloud_intensity(m)) * 0.5 + m.appearance.line_weight.max(0.0) + 2.0,
+            )
         }
         _ => {}
     }
@@ -805,7 +807,12 @@ fn draw_text_block(
 
 /// One callout leader: shaft from the box end to the target, then the `/LE` ending at the
 /// target (`ending`: `None` = no ending).
-fn draw_callout_leader(out: &mut String, leader: &[PdfPoint], a: &Appearance, ending: Option<&str>) {
+fn draw_callout_leader(
+    out: &mut String,
+    leader: &[PdfPoint],
+    a: &Appearance,
+    ending: Option<&str>,
+) {
     let Some(&anchor) = leader.last() else {
         return;
     };
@@ -842,8 +849,14 @@ fn draw_callout_leader(out: &mut String, leader: &[PdfPoint], a: &Appearance, en
         "RClosedArrow" | "ROpenArrow" => {
             // Reversed: the point is at the base, the wide side at the target.
             let (l, rt) = (
-                PdfPoint { x: left.x + (tip.x - base.x), y: left.y + (tip.y - base.y) },
-                PdfPoint { x: right.x + (tip.x - base.x), y: right.y + (tip.y - base.y) },
+                PdfPoint {
+                    x: left.x + (tip.x - base.x),
+                    y: left.y + (tip.y - base.y),
+                },
+                PdfPoint {
+                    x: right.x + (tip.x - base.x),
+                    y: right.y + (tip.y - base.y),
+                },
             );
             if ending == "RClosedArrow" {
                 fill_color(out, &a.color);
@@ -866,17 +879,41 @@ fn draw_callout_leader(out: &mut String, leader: &[PdfPoint], a: &Appearance, en
             let (nx, ny) = (-uy, ux);
             let pts: Vec<PdfPoint> = if ending == "Square" {
                 vec![
-                    PdfPoint { x: tip.x + r * (ux + nx), y: tip.y + r * (uy + ny) },
-                    PdfPoint { x: tip.x + r * (ux - nx), y: tip.y + r * (uy - ny) },
-                    PdfPoint { x: tip.x - r * (ux + nx), y: tip.y - r * (uy + ny) },
-                    PdfPoint { x: tip.x - r * (ux - nx), y: tip.y - r * (uy - ny) },
+                    PdfPoint {
+                        x: tip.x + r * (ux + nx),
+                        y: tip.y + r * (uy + ny),
+                    },
+                    PdfPoint {
+                        x: tip.x + r * (ux - nx),
+                        y: tip.y + r * (uy - ny),
+                    },
+                    PdfPoint {
+                        x: tip.x - r * (ux + nx),
+                        y: tip.y - r * (uy + ny),
+                    },
+                    PdfPoint {
+                        x: tip.x - r * (ux - nx),
+                        y: tip.y - r * (uy - ny),
+                    },
                 ]
             } else {
                 vec![
-                    PdfPoint { x: tip.x + r * ux, y: tip.y + r * uy },
-                    PdfPoint { x: tip.x + r * nx, y: tip.y + r * ny },
-                    PdfPoint { x: tip.x - r * ux, y: tip.y - r * uy },
-                    PdfPoint { x: tip.x - r * nx, y: tip.y - r * ny },
+                    PdfPoint {
+                        x: tip.x + r * ux,
+                        y: tip.y + r * uy,
+                    },
+                    PdfPoint {
+                        x: tip.x + r * nx,
+                        y: tip.y + r * ny,
+                    },
+                    PdfPoint {
+                        x: tip.x - r * ux,
+                        y: tip.y - r * uy,
+                    },
+                    PdfPoint {
+                        x: tip.x - r * nx,
+                        y: tip.y - r * ny,
+                    },
                 ]
             };
             path_from_points(out, &pts);
@@ -886,13 +923,25 @@ fn draw_callout_leader(out: &mut String, leader: &[PdfPoint], a: &Appearance, en
             let (nx, ny) = (-uy, ux);
             let (a0, a1) = if ending == "Butt" {
                 (
-                    PdfPoint { x: tip.x + r * nx, y: tip.y + r * ny },
-                    PdfPoint { x: tip.x - r * nx, y: tip.y - r * ny },
+                    PdfPoint {
+                        x: tip.x + r * nx,
+                        y: tip.y + r * ny,
+                    },
+                    PdfPoint {
+                        x: tip.x - r * nx,
+                        y: tip.y - r * ny,
+                    },
                 )
             } else {
                 (
-                    PdfPoint { x: tip.x + r * (nx + ux), y: tip.y + r * (ny + uy) },
-                    PdfPoint { x: tip.x - r * (nx + ux), y: tip.y - r * (ny + uy) },
+                    PdfPoint {
+                        x: tip.x + r * (nx + ux),
+                        y: tip.y + r * (ny + uy),
+                    },
+                    PdfPoint {
+                        x: tip.x - r * (nx + ux),
+                        y: tip.y - r * (ny + uy),
+                    },
                 )
             };
             moveto(out, a0);
@@ -924,7 +973,8 @@ const CLOUD_MAX_ARCS_TOTAL: usize = 20_000;
 /// Returns false, writing nothing, when the polygon cannot be scalloped (fewer than 3
 /// distinct finite points, intensity 0, or too many arcs): the caller draws it straight.
 fn cloud_path(out: &mut String, pts: &[PdfPoint], intensity: f64) -> bool {
-    if intensity <= 0.0 || pts.len() < 3 || pts.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+    if intensity <= 0.0 || pts.len() < 3 || pts.iter().any(|p| !p.x.is_finite() || !p.y.is_finite())
+    {
         return false;
     }
     let chord = cloud_chord(intensity);
@@ -1103,9 +1153,19 @@ fn draw_stamp_image(
 /// kind exists to preserve). Only a translate to the geometry's own origin is applied, so
 /// a source Rect that doesn't start at `(0,0)` (not seen in the sample corpus, but not
 /// guaranteed absent) still lands in the right place.
-fn draw_stamp_form_xobject(out: &mut String, res: &mut Resources, a: &Appearance, min: PdfPoint, name: &str) {
+fn draw_stamp_form_xobject(
+    out: &mut String,
+    res: &mut Resources,
+    a: &Appearance,
+    min: PdfPoint,
+    name: &str,
+) {
     let gs_name = res.add_gstate(shape_gstate(a));
-    out.push_str(&format!("q\n/{gs_name} gs\n1 0 0 1 {} {} cm\n/{name} Do\nQ\n", num(min.x), num(min.y)));
+    out.push_str(&format!(
+        "q\n/{gs_name} gs\n1 0 0 1 {} {} cm\n/{name} Do\nQ\n",
+        num(min.x),
+        num(min.y)
+    ));
 }
 
 /// Decode a base64 PNG stamp asset into a color Image XObject stream + optional soft-mask
@@ -1235,7 +1295,13 @@ fn draw_legend(out: &mut String, res: &mut Resources, m: &Markup, a: &Appearance
     let gs = res.add_gstate(shape_gstate(a));
     out.push_str(&format!("q\n/{gs} gs\n"));
     fill_color(out, a.fill.as_deref().unwrap_or("#ffffff"));
-    out.push_str(&format!("{} {} {} {} re\nf\n", num(x0), num(y1 - h), num(w), num(h)));
+    out.push_str(&format!(
+        "{} {} {} {} re\nf\n",
+        num(x0),
+        num(y1 - h),
+        num(w),
+        num(h)
+    ));
     if props.show_title {
         fill_color(out, "#e6e6e6");
         out.push_str(&format!(
@@ -1247,7 +1313,13 @@ fn draw_legend(out: &mut String, res: &mut Resources, m: &Markup, a: &Appearance
         ));
     }
     let [r, g, b] = hex_to_rgb(&a.color);
-    out.push_str(&format!("{} {} {} RG\n{} w\n", num(r), num(g), num(b), num(lw)));
+    out.push_str(&format!(
+        "{} {} {} RG\n{} w\n",
+        num(r),
+        num(g),
+        num(b),
+        num(lw)
+    ));
     // Horizontal lines: under the title, under the header, under every row.
     let mut ys = Vec::new();
     if props.show_title {
@@ -1263,7 +1335,13 @@ fn draw_legend(out: &mut String, res: &mut Resources, m: &Markup, a: &Appearance
         ys.push(cursor);
     }
     for y in &ys {
-        out.push_str(&format!("{} {} m\n{} {} l\nS\n", num(x0), num(*y), num(x0 + w), num(*y)));
+        out.push_str(&format!(
+            "{} {} m\n{} {} l\nS\n",
+            num(x0),
+            num(*y),
+            num(x0 + w),
+            num(*y)
+        ));
     }
     for c in lay.columns.iter().skip(1) {
         out.push_str(&format!(
@@ -1274,7 +1352,13 @@ fn draw_legend(out: &mut String, res: &mut Resources, m: &Markup, a: &Appearance
             num(y1 - h)
         ));
     }
-    out.push_str(&format!("{} {} {} {} re\nS\nQ\n", num(x0), num(y1 - h), num(w), num(h)));
+    out.push_str(&format!(
+        "{} {} {} {} re\nS\nQ\n",
+        num(x0),
+        num(y1 - h),
+        num(w),
+        num(h)
+    ));
 
     // Text, fully opaque like Text/Callout (outside the alpha scope).
     let font = lay.font;
@@ -1304,11 +1388,20 @@ fn draw_legend(out: &mut String, res: &mut Resources, m: &Markup, a: &Appearance
     }
 
     // Symbols.
-    if let Some(sym) = lay.columns.iter().find(|c| c.column == LegendColumn::Symbol) {
+    if let Some(sym) = lay
+        .columns
+        .iter()
+        .find(|c| c.column == LegendColumn::Symbol)
+    {
         let gs = res.add_gstate(line_gstate(a));
         out.push_str(&format!("q\n/{gs} gs\n"));
         let radius = lay.row_h * 0.3;
-        let mut top = body_top - if props.show_headers { lay.header_h } else { 0.0 };
+        let mut top = body_top
+            - if props.show_headers {
+                lay.header_h
+            } else {
+                0.0
+            };
         for row in rows {
             let cx = x0 + sym.x + sym.w.min(lay.row_h) / 2.0;
             let cy = top - lay.row_h / 2.0;
@@ -1373,7 +1466,14 @@ fn draw_legend_symbol(out: &mut String, row: &super::legend::LegendRow, cx: f64,
 /// Build the content-stream operators + resources for `m`. Returns (content, resources,
 /// auxiliary image xobjects, auxiliary form xobject) - both auxiliary outputs are empty/
 /// `None` except for a PNG- or Bluebeam-Form-backed Stamp/StampDynamic respectively.
-fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>, Option<StampFormXObjectRef>) {
+fn draw(
+    m: &Markup,
+) -> (
+    String,
+    Dictionary,
+    Vec<StampImageXObject>,
+    Option<StampFormXObjectRef>,
+) {
     let mut out = String::new();
     let mut res = Resources::new();
     let mut image_xobjects: Vec<StampImageXObject> = Vec::new();
@@ -1693,7 +1793,11 @@ fn draw(m: &Markup) -> (String, Dictionary, Vec<StampImageXObject>, Option<Stamp
             if let Some((root_id, objects)) = bb_form {
                 let name = "Fx0".to_string();
                 draw_stamp_form_xobject(&mut out, &mut res, a, *min, &name);
-                form_xobject = Some(StampFormXObjectRef { name, root_id, objects });
+                form_xobject = Some(StampFormXObjectRef {
+                    name,
+                    root_id,
+                    objects,
+                });
                 // Dynamic-stamp overlay text draws OUTSIDE any alpha scope, same
                 // convention as every other Stamp asset kind and Text/Callout.
                 if let Some(text) = &m.contents {
@@ -2255,7 +2359,10 @@ mod tests {
         assert!(!c.contains(" l\n"), "a cloud has no straight edges: {c}");
         // The scallops bulge outward, so the BBox must clear the polygon.
         let bb = ap_bbox(&m);
-        assert!(bb[0] < -10.0 && bb[2] > 110.0 && bb[1] < -10.0 && bb[3] > 70.0, "{bb:?}");
+        assert!(
+            bb[0] < -10.0 && bb[2] > 110.0 && bb[1] < -10.0 && bb[3] > 70.0,
+            "{bb:?}"
+        );
     }
 
     #[test]
@@ -2275,7 +2382,12 @@ mod tests {
             let lowest = out
                 .lines()
                 .filter(|l| l.ends_with(" c"))
-                .flat_map(|l| l.split_whitespace().take(6).map(|t| t.parse::<f64>().unwrap()).collect::<Vec<_>>())
+                .flat_map(|l| {
+                    l.split_whitespace()
+                        .take(6)
+                        .map(|t| t.parse::<f64>().unwrap())
+                        .collect::<Vec<_>>()
+                })
                 .fold(f64::MAX, f64::min);
             assert!(lowest < -1.0, "no outward bulge below the polygon: {out}");
         }
@@ -2301,7 +2413,10 @@ mod tests {
         ];
         assert!(!cloud_path(&mut out, &far, 2.0) && out.is_empty());
         let nan = [
-            PdfPoint { x: f64::NAN, y: 0.0 },
+            PdfPoint {
+                x: f64::NAN,
+                y: 0.0,
+            },
             PdfPoint { x: 1.0, y: 0.0 },
             PdfPoint { x: 1.0, y: 1.0 },
         ];
@@ -2423,9 +2538,16 @@ mod tests {
             PdfPoint { x: 100.0, y: 60.0 },
         ]]);
         let c = content_str(&m);
-        assert_eq!(c.matches("h\nf\n").count(), 2, "one arrowhead per leader: {c}");
+        assert_eq!(
+            c.matches("h\nf\n").count(),
+            2,
+            "one arrowhead per leader: {c}"
+        );
         // The primary leader runs box end -> knee -> tip.
-        assert!(c.contains("100 50 m\n40 50 l\n10 10 l\nS\n"), "knee path missing: {c}");
+        assert!(
+            c.contains("100 50 m\n40 50 l\n10 10 l\nS\n"),
+            "knee path missing: {c}"
+        );
     }
 
     #[test]
@@ -2440,7 +2562,10 @@ mod tests {
     #[test]
     fn callout_with_hostile_props_falls_back_to_the_legacy_box_without_panicking() {
         let mut m = callout_with_props(vec![]);
-        m.callout.as_mut().unwrap().box_max = PdfPoint { x: f64::NAN, y: 70.0 };
+        m.callout.as_mut().unwrap().box_max = PdfPoint {
+            x: f64::NAN,
+            y: 70.0,
+        };
         let r = interop_rect(&m).unwrap();
         assert!(r.iter().all(|v| v.is_finite()), "{r:?}");
         assert_eq!(r, [10.0, 10.0, 244.0, 68.0]); // legacy 144x18 box at the anchor (100,50)

@@ -234,8 +234,7 @@ pub fn recompress_flate_streams(doc: &mut Document) -> (u32, u64) {
         if decoded_total >= image_ops::MAX_TOTAL_DECODED_BYTES {
             break;
         }
-        let Ok(raw) = s.decompressed_content_with_limit(image_ops::MAX_STREAM_DECODED_BYTES)
-        else {
+        let Ok(raw) = s.decompressed_content_with_limit(image_ops::MAX_STREAM_DECODED_BYTES) else {
             continue;
         };
         decoded_total += raw.len() as u64;

@@ -832,14 +832,29 @@ mod phase2b_param_tests {
 
     #[test]
     fn mcp_preset_accepts_schema_values_and_defaults_to_balanced() {
-        for (v, want) in [("high", Some(crate::docops::ImageQualityPreset::High)), ("High", Some(crate::docops::ImageQualityPreset::High)), ("balanced", Some(crate::docops::ImageQualityPreset::Balanced)), ("Small", Some(crate::docops::ImageQualityPreset::Small)), ("none", None)] {
-            let p: ReduceFileSizeParams = serde_json::from_value(serde_json::json!({"doc_id":"d","image_preset":v})).unwrap();
+        for (v, want) in [
+            ("high", Some(crate::docops::ImageQualityPreset::High)),
+            ("High", Some(crate::docops::ImageQualityPreset::High)),
+            (
+                "balanced",
+                Some(crate::docops::ImageQualityPreset::Balanced),
+            ),
+            ("Small", Some(crate::docops::ImageQualityPreset::Small)),
+            ("none", None),
+        ] {
+            let p: ReduceFileSizeParams =
+                serde_json::from_value(serde_json::json!({"doc_id":"d","image_preset":v})).unwrap();
             assert_eq!(ReducePreset::resolve(p.image_preset), want, "{v}");
         }
-        let p: ReduceFileSizeParams = serde_json::from_value(serde_json::json!({"doc_id":"d"})).unwrap();
-        assert_eq!(ReducePreset::resolve(p.image_preset), Some(crate::docops::ImageQualityPreset::Balanced));
+        let p: ReduceFileSizeParams =
+            serde_json::from_value(serde_json::json!({"doc_id":"d"})).unwrap();
+        assert_eq!(
+            ReducePreset::resolve(p.image_preset),
+            Some(crate::docops::ImageQualityPreset::Balanced)
+        );
         // The engine-level enum accepts both spellings too.
-        let q: crate::docops::ImageQualityPreset = serde_json::from_value(serde_json::json!("Balanced")).unwrap();
+        let q: crate::docops::ImageQualityPreset =
+            serde_json::from_value(serde_json::json!("Balanced")).unwrap();
         assert_eq!(q, crate::docops::ImageQualityPreset::Balanced);
     }
 

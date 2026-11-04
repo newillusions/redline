@@ -142,11 +142,16 @@ pub(crate) fn originals_dir() -> Option<&'static std::path::Path> {
 
 /// Remove directories left by earlier runs that crashed before dropping their copies.
 fn sweep_old_originals() {
-    let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
     // A week: a long-running instance of ours keeps its directory younger by creating files.
     let day = std::time::Duration::from_secs(7 * 24 * 3600);
     for e in rd.flatten() {
-        let ours = e.file_name().to_string_lossy().starts_with("redline-originals-");
+        let ours = e
+            .file_name()
+            .to_string_lossy()
+            .starts_with("redline-originals-");
         let old = e
             .metadata()
             .and_then(|m| m.modified())
@@ -177,7 +182,11 @@ pub struct Snapshot {
 /// Snapshot `path` now.
 pub fn take_snapshot(path: &std::path::Path) -> Snapshot {
     let (stamp, original) = snapshot_of(path);
-    Snapshot { path: path.to_path_buf(), stamp, original }
+    Snapshot {
+        path: path.to_path_buf(),
+        stamp,
+        original,
+    }
 }
 
 /// The file's current stamp, and - when it is small enough - a private copy of its bytes,
@@ -198,7 +207,11 @@ fn snapshot_of(path: &std::path::Path) -> (Option<DiskStamp>, Option<OriginalCop
             });
     }
     let hash = hash_file(path, copy.as_mut().map(|(_, f)| f));
-    let stamp = Some(DiskStamp { modified, len, hash });
+    let stamp = Some(DiskStamp {
+        modified,
+        len,
+        hash,
+    });
     // A copy whose read failed halfway is partial: drop (and so delete) it.
     let copy = copy.filter(|_| hash.is_some()).map(|(tp, _)| tp);
     (stamp, copy)
@@ -457,15 +470,16 @@ impl MarkupStore {
                 .markups
                 .iter()
                 .filter_map(|m| {
-                    let page = by_id.get(&m.id()).or_else(|| {
-                        by_oid.get(&m.source_ref.as_ref()?.oid?)
-                    })?;
+                    let page = by_id
+                        .get(&m.id())
+                        .or_else(|| by_oid.get(&m.source_ref.as_ref()?.oid?))?;
                     Some((m.id(), *page))
                 })
                 .collect();
             let snapped: std::collections::HashSet<Uuid> =
                 snap.markups.iter().map(|m| m.id()).collect();
-            e.markups.retain(|m| pages.contains_key(&m.id()) || !snapped.contains(&m.id()));
+            e.markups
+                .retain(|m| pages.contains_key(&m.id()) || !snapped.contains(&m.id()));
             for m in e.markups.iter_mut() {
                 if let Some(&p) = pages.get(&m.id()) {
                     m.page = p;
@@ -493,7 +507,8 @@ impl MarkupStore {
             // Deletions made after the snapshot are not in the file; keep them. An object id
             // names the same annotation only because a page op does not renumber objects
             // (`prune_objects` removes unreferenced ones, it does not renumber).
-            e.removed_sources.retain(|r| !snap.removed.contains(r) && r.oid.is_some());
+            e.removed_sources
+                .retain(|r| !snap.removed.contains(r) && r.oid.is_some());
             e.baseline = fingerprints(&written);
             e.dirty = true;
         }
@@ -518,7 +533,10 @@ impl MarkupStore {
     /// operation or reload already holds it.
     pub fn save_guard(&self, doc_id: &str) -> Result<SaveGuard<'_>, String> {
         self.begin_save(doc_id)?;
-        Ok(SaveGuard { store: self, doc_id: doc_id.to_string() })
+        Ok(SaveGuard {
+            store: self,
+            doc_id: doc_id.to_string(),
+        })
     }
 
     /// Err([`ERR_DISK_CHANGED`]) if the file registered for `doc_id` is no longer the one
@@ -541,9 +559,8 @@ impl MarkupStore {
             return Ok(());
         }
         // Hash outside the lock: it reads the whole file.
-        let same_content = len == before.len
-            && before.hash.is_some()
-            && hash_file(&path, None) == before.hash;
+        let same_content =
+            len == before.len && before.hash.is_some() && hash_file(&path, None) == before.hash;
         if !same_content {
             return Err(ERR_DISK_CHANGED.to_string());
         }
@@ -566,9 +583,11 @@ impl MarkupStore {
                 .get(doc_id)
                 .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
             if !e.loaded {
-                return Err("This document's mark-ups were never loaded, so there is nothing \
+                return Err(
+                    "This document's mark-ups were never loaded, so there is nothing \
                             to keep. Close and reopen it."
-                    .to_string());
+                        .to_string(),
+                );
             }
             e.path.clone()
         };
@@ -588,7 +607,12 @@ impl MarkupStore {
             }
         }
         let present: std::collections::HashSet<Uuid> = e.markups.iter().map(|m| m.id()).collect();
-        unsaved.deleted = e.baseline.keys().filter(|id| !present.contains(id)).copied().collect();
+        unsaved.deleted = e
+            .baseline
+            .keys()
+            .filter(|id| !present.contains(id))
+            .copied()
+            .collect();
         Ok(ReloadTxn {
             path,
             unsaved,
@@ -656,12 +680,20 @@ impl MarkupStore {
 
     /// The private copy of the bytes redline last opened or wrote, for Save As (rebuild).
     pub fn original_copy(&self, doc_id: &str) -> Option<PathBuf> {
-        self.docs.lock().unwrap().get(doc_id).and_then(|e| e.original.as_ref().map(|c| c.to_path_buf()))
+        self.docs
+            .lock()
+            .unwrap()
+            .get(doc_id)
+            .and_then(|e| e.original.as_ref().map(|c| c.to_path_buf()))
     }
 
     /// True if a write reached the file but the refresh failed (see [`DocEntry::needs_reload`]).
     pub fn needs_reload(&self, doc_id: &str) -> bool {
-        self.docs.lock().unwrap().get(doc_id).is_some_and(|e| e.needs_reload)
+        self.docs
+            .lock()
+            .unwrap()
+            .get(doc_id)
+            .is_some_and(|e| e.needs_reload)
     }
 
     /// True if the PDF's existing annotations have been loaded into the store.
@@ -786,8 +818,12 @@ impl MarkupStore {
         let e = g
             .get_mut(doc_id)
             .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
-        let at: std::collections::HashMap<Uuid, usize> =
-            e.markups.iter().enumerate().map(|(i, m)| (m.id(), i)).collect();
+        let at: std::collections::HashMap<Uuid, usize> = e
+            .markups
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.id(), i))
+            .collect();
         let mut seen = std::collections::HashSet::new();
         let mut order: Vec<usize> = Vec::new();
         for id in ids {
@@ -926,7 +962,10 @@ impl MarkupStore {
 
     /// Source annotations of markups deleted since load, for `annots::write_markups_removing`
     /// (see [`DocEntry::removed_sources`]). Empty for an unknown doc.
-    pub fn removed_sources(&self, doc_id: &str) -> std::collections::HashSet<crate::markup::SourceRef> {
+    pub fn removed_sources(
+        &self,
+        doc_id: &str,
+    ) -> std::collections::HashSet<crate::markup::SourceRef> {
         self.docs
             .lock()
             .unwrap()
@@ -1012,7 +1051,11 @@ impl ReloadTxn {
     /// The unsaved work, the baseline fingerprints and the content keys captured at the start.
     pub fn into_parts(
         self,
-    ) -> (super::recover::Unsaved, HashMap<Uuid, u64>, HashMap<Uuid, u64>) {
+    ) -> (
+        super::recover::Unsaved,
+        HashMap<Uuid, u64>,
+        HashMap<Uuid, u64>,
+    ) {
         (self.unsaved, self.baseline, self.keys)
     }
 }
@@ -1266,7 +1309,10 @@ mod tests {
         assert!(s.is_dirty("d1"), "the late edit is not on disk");
         let g = s.docs.lock().unwrap();
         let e = g.get("d1").unwrap();
-        assert!(!e.baseline.contains_key(&late.id()), "so it is not part of the baseline");
+        assert!(
+            !e.baseline.contains_key(&late.id()),
+            "so it is not part of the baseline"
+        );
         assert!(e.baseline.contains_key(&first));
     }
 
@@ -1285,7 +1331,10 @@ mod tests {
         let s = MarkupStore::default();
         s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
         let g = s.save_guard("d1").unwrap();
-        assert_eq!(s.save_guard("d1").err().as_deref(), Some("save already in progress"));
+        assert_eq!(
+            s.save_guard("d1").err().as_deref(),
+            Some("save already in progress")
+        );
         drop(g);
         assert!(s.save_guard("d1").is_ok());
     }
@@ -1317,7 +1366,10 @@ mod tests {
         s.mark_needs_reload("d1");
         let err = s.write_snapshot("d1").err().expect("must refuse");
         assert_eq!(err, ERR_NEEDS_RELOAD);
-        assert!(err.contains("needs a reload"), "the frontend matches this marker");
+        assert!(
+            err.contains("needs a reload"),
+            "the frontend matches this marker"
+        );
         // A reload that succeeds clears it.
         let txn = s.begin_reload("d1").unwrap();
         s.commit_reload("d1", txn, vec![], 1).unwrap();
@@ -1332,16 +1384,28 @@ mod tests {
         s.register("d1", PathBuf::from("/tmp/a.pdf"), None);
         let oid = (42, 0);
         let mut m = markup();
-        m.source_ref = Some(crate::markup::SourceRef { oid: Some(oid), nm: None, loc: None });
+        m.source_ref = Some(crate::markup::SourceRef {
+            oid: Some(oid),
+            nm: None,
+            loc: None,
+        });
         s.seed_loaded("d1", vec![m.clone()]).unwrap(); // `add` would drop reader-owned fields
         let snap = s.write_snapshot("d1").unwrap();
         let mut back = markup(); // a fresh random id, as an unnamed annotation reads
         back.page = 2;
-        back.source_ref = Some(crate::markup::SourceRef { oid: Some(oid), nm: None, loc: None });
+        back.source_ref = Some(crate::markup::SourceRef {
+            oid: Some(oid),
+            nm: None,
+            loc: None,
+        });
         s.finish_page_op("d1", &snap, std::slice::from_ref(&back));
         let kept = s.list("d1").unwrap();
         assert_eq!(kept.len(), 1, "not dropped");
-        assert_eq!((kept[0].id(), kept[0].page), (m.id(), 2), "keeps its id, takes the new page");
+        assert_eq!(
+            (kept[0].id(), kept[0].page),
+            (m.id(), 2),
+            "keeps its id, takes the new page"
+        );
     }
 
     #[test]
@@ -1724,7 +1788,10 @@ mod tests {
         std::fs::write(&p, b"%PDF-1.5 rewritten by another program").unwrap();
         let err = s.check_disk_unchanged("d1").unwrap_err();
         assert_eq!(err, ERR_DISK_CHANGED);
-        assert!(err.contains("Save As (rebuild)") && err.contains("reload"), "{err}");
+        assert!(
+            err.contains("Save As (rebuild)") && err.contains("reload"),
+            "{err}"
+        );
 
         // redline's own write (every caller of invalidate_cache) makes it the known file again.
         s.invalidate_cache(&p);
@@ -1740,12 +1807,20 @@ mod tests {
         s.register("d1", a.clone(), None);
         std::fs::write(&a, b"CCCC").unwrap(); // same size, different content
         let f = std::fs::OpenOptions::new().write(true).open(&a).unwrap();
-        f.set_modified(SystemTime::now() + std::time::Duration::from_secs(60)).unwrap();
-        assert_eq!(s.check_disk_unchanged("d1"), Err(ERR_DISK_CHANGED.to_string()));
+        f.set_modified(SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(
+            s.check_disk_unchanged("d1"),
+            Err(ERR_DISK_CHANGED.to_string())
+        );
 
         std::fs::write(&b, b"BBBB").unwrap();
         s.set_path("d1", b).unwrap();
-        assert_eq!(s.check_disk_unchanged("d1"), Ok(()), "Save As re-baselines on the new file");
+        assert_eq!(
+            s.check_disk_unchanged("d1"),
+            Ok(()),
+            "Save As re-baselines on the new file"
+        );
     }
 
     #[test]

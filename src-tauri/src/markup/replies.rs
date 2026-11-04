@@ -238,7 +238,9 @@ fn popup_of(d: &Dictionary) -> Option<PopupProps> {
     let p = d.get(b"Popup").ok()?.as_dict().ok()?;
     let a = p.get(b"Rect").ok()?.as_array().ok()?;
     let v: Vec<f32> = a.iter().filter_map(|o| o.as_float().ok()).collect();
-    let rect = <[f32; 4]>::try_from(v).ok().filter(|r| r.iter().all(|c| c.is_finite()))?;
+    let rect = <[f32; 4]>::try_from(v)
+        .ok()
+        .filter(|r| r.iter().all(|c| c.is_finite()))?;
     Some(PopupProps {
         rect,
         open: matches!(p.get(b"Open").ok(), Some(Object::Boolean(true))),

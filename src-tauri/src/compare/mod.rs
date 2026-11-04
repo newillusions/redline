@@ -27,7 +27,7 @@
 //! Tauri integration here provides a functional one-shot diff command.
 
 use anyhow::Result;
-use pdf_diff::{PdfDiffEngine, pixel_diff};
+use pdf_diff::{pixel_diff, PdfDiffEngine};
 use pdfium_render::prelude::Pdfium;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -87,7 +87,9 @@ pub fn run_two_tier_diff(
     let text = engine.text_diff(&doc_a, &doc_b, page_a, page_b)?;
 
     let text_rms_delta_pts = if text.char_sequence_match && !text.position_deltas.is_empty() {
-        let sum_sq: f64 = text.position_deltas.iter()
+        let sum_sq: f64 = text
+            .position_deltas
+            .iter()
             .map(|d| (d.delta_x * d.delta_x + d.delta_y * d.delta_y) as f64)
             .sum();
         (sum_sq / text.position_deltas.len() as f64).sqrt() as f32
@@ -136,8 +138,16 @@ fn base64_encode(input: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(CHARS[((n >> 18) & 63) as usize] as char);
         out.push(CHARS[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { CHARS[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { CHARS[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            CHARS[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            CHARS[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }

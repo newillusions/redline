@@ -2830,7 +2830,11 @@ mod hostile_references {
             &ids,
             super::super::MAX_REACH_NODES,
         );
-        assert_eq!(full.len(), ids.len(), "with a real budget and no outside reference everything is removable");
+        assert_eq!(
+            full.len(),
+            ids.len(),
+            "with a real budget and no outside reference everything is removable"
+        );
         assert!(
             super::super::unreferenced_among(&doc, &ids).is_empty(),
             "the catalog still reaches the root, which reaches every item"
@@ -3047,7 +3051,10 @@ mod round5 {
         forest[0].dict.set("A", id);
         put(&mut doc, &forest);
         delete(&mut doc, 0, id).unwrap();
-        assert!(doc.objects.contains_key(&id), "the outline /A still points at it");
+        assert!(
+            doc.objects.contains_key(&id),
+            "the outline /A still points at it"
+        );
     }
 
     #[test]
@@ -3061,7 +3068,10 @@ mod round5 {
             .unwrap()
             .set("Annots", vec![Object::Reference(p[1])]);
         let _ = delete(&mut doc, 0, p[1]);
-        assert!(doc.objects.contains_key(&p[1]), "the page object is untouched");
+        assert!(
+            doc.objects.contains_key(&p[1]),
+            "the page object is untouched"
+        );
         assert_eq!(PageIndex::build(&doc).count(), 2);
     }
 
@@ -3209,17 +3219,24 @@ mod round6 {
         let a = item_ids(&doc)[0];
         // A different generation of the same object number, referenced from the catalog.
         let twin = (a.0, a.1 + 1);
-        doc.objects
-            .insert(twin, Object::Dictionary(dictionary! { "Title" => Object::string_literal("twin") }));
+        doc.objects.insert(
+            twin,
+            Object::Dictionary(dictionary! { "Title" => Object::string_literal("twin") }),
+        );
         doc.catalog_mut().unwrap().set("Custom", twin);
         put(&mut doc, &[]);
-        assert!(doc.objects.contains_key(&a), "same number, other generation: kept");
+        assert!(
+            doc.objects.contains_key(&a),
+            "same number, other generation: kept"
+        );
         assert!(dangling(&doc).is_empty());
         // A reference to (n, other generation) alone also protects the candidate.
         let (mut doc, p) = n_page_doc(1);
         put(&mut doc, &[node("A", Some(p[0]), false, vec![])]);
         let a = item_ids(&doc)[0];
-        doc.catalog_mut().unwrap().set("Custom", Object::Reference((a.0, 7)));
+        doc.catalog_mut()
+            .unwrap()
+            .set("Custom", Object::Reference((a.0, 7)));
         put(&mut doc, &[]);
         assert!(doc.objects.contains_key(&a));
     }
@@ -3229,7 +3246,13 @@ mod round6 {
         let (mut doc, p) = n_page_doc(2);
         let font = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1" });
         let cat = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
-        let pages = doc.catalog().unwrap().get(b"Pages").unwrap().as_reference().unwrap();
+        let pages = doc
+            .catalog()
+            .unwrap()
+            .get(b"Pages")
+            .unwrap()
+            .as_reference()
+            .unwrap();
         let candidates = [p[0], p[1], font, cat, pages];
         // Detach the references the document itself has so only the type guard decides.
         let mut bare = Document::with_version("1.7");
@@ -3243,19 +3266,59 @@ mod round6 {
         let (mut doc, p) = n_page_doc(3);
         put(
             &mut doc,
-            &[node("A", Some(p[0]), false, vec![node("A1", Some(p[1]), false, vec![])]), node("B", Some(p[2]), false, vec![])],
+            &[
+                node(
+                    "A",
+                    Some(p[0]),
+                    false,
+                    vec![node("A1", Some(p[1]), false, vec![])],
+                ),
+                node("B", Some(p[2]), false, vec![]),
+            ],
         );
-        let l1 = links::create_link(&mut doc, 0, [0.0, 0.0, 9.0, 9.0], &TargetInput::Page { page: 1, view: PageView::Fit }).unwrap();
+        let l1 = links::create_link(
+            &mut doc,
+            0,
+            [0.0, 0.0, 9.0, 9.0],
+            &TargetInput::Page {
+                page: 1,
+                view: PageView::Fit,
+            },
+        )
+        .unwrap();
         let shared = doc.add_object(Object::Dictionary(link_dict([0, 0, 5, 5], dest_to(p[1]))));
         for pg in [p[1], p[2]] {
-            doc.get_dictionary_mut(pg).unwrap().set("Annots", vec![Object::Reference(shared)]);
+            doc.get_dictionary_mut(pg)
+                .unwrap()
+                .set("Annots", vec![Object::Reference(shared)]);
         }
         let mut hist = NavHistory::default();
-        do_edit(&mut doc, &mut hist, NavEdit::LinkDelete { page: 0, id: links::link_id(l1) });
+        do_edit(
+            &mut doc,
+            &mut hist,
+            NavEdit::LinkDelete {
+                page: 0,
+                id: links::link_id(l1),
+            },
+        );
         assert!(dangling(&doc).is_empty(), "link delete");
-        do_edit(&mut doc, &mut hist, NavEdit::LinkDelete { page: 1, id: links::link_id(shared) });
+        do_edit(
+            &mut doc,
+            &mut hist,
+            NavEdit::LinkDelete {
+                page: 1,
+                id: links::link_id(shared),
+            },
+        );
         assert!(dangling(&doc).is_empty(), "shared link delete");
-        do_edit(&mut doc, &mut hist, NavEdit::LabelRename { page: 1, text: "X".into() });
+        do_edit(
+            &mut doc,
+            &mut hist,
+            NavEdit::LabelRename {
+                page: 1,
+                text: "X".into(),
+            },
+        );
         assert!(dangling(&doc).is_empty(), "labels");
         put(&mut doc, &[node("N", Some(p[0]), false, vec![])]);
         assert!(dangling(&doc).is_empty(), "outline rewrite");
@@ -3305,7 +3368,10 @@ mod round7 {
             dangling(&reload(&mut doc.clone())).into_iter().collect();
         put(&mut doc, &[]);
         assert!(doc.objects.contains_key(&twin));
-        assert!(doc.objects.contains_key(&b), "B is pointed at by the surviving twin");
+        assert!(
+            doc.objects.contains_key(&b),
+            "B is pointed at by the surviving twin"
+        );
         assert_eq!(dangling(&doc), before, "no new dangling reference");
         let reloaded = reload(&mut doc);
         assert!(
@@ -3317,11 +3383,16 @@ mod round7 {
     #[test]
     fn a_reference_to_a_missing_generation_protects_the_candidate_without_new_dangling() {
         let (mut doc, a, b) = two_items();
-        doc.catalog_mut().unwrap().set("Custom", Object::Reference((a.0, 9)));
+        doc.catalog_mut()
+            .unwrap()
+            .set("Custom", Object::Reference((a.0, 9)));
         let before = dangling(&doc);
         assert!(before.contains(&(a.0, 9)), "the file already dangles there");
         put(&mut doc, &[]);
-        assert!(doc.objects.contains_key(&a), "kept: some generation of its number is referenced");
+        assert!(
+            doc.objects.contains_key(&a),
+            "kept: some generation of its number is referenced"
+        );
         assert!(doc.objects.contains_key(&b), "kept: A points at it");
         assert_eq!(dangling(&doc), before, "deleting added nothing");
         let reloaded = reload(&mut doc);
@@ -3361,8 +3432,15 @@ mod round7 {
             let before = dangling(&doc);
             put(&mut doc, &[]);
             assert!(doc.objects.contains_key(&a), "gen {twin_gen}: A kept");
-            assert!(doc.objects.contains_key(&b), "gen {twin_gen}: B kept because A points at it");
-            assert_eq!(dangling(&doc), before, "gen {twin_gen}: nothing new dangles");
+            assert!(
+                doc.objects.contains_key(&b),
+                "gen {twin_gen}: B kept because A points at it"
+            );
+            assert_eq!(
+                dangling(&doc),
+                before,
+                "gen {twin_gen}: nothing new dangles"
+            );
         }
         // No outside reference at all: the twin alone keeps A, and A keeps B.
         let (mut doc, a, b) = two_items();
@@ -3389,7 +3467,8 @@ mod round7 {
         // would otherwise be deletable.
         let (mut doc, p) = n_page_doc(1);
         let y = doc.add_object(dictionary! { "Title" => Object::string_literal("y") });
-        let x = doc.add_object(dictionary! { "Contents" => Object::Reference(y), "Subtype" => "Link" });
+        let x =
+            doc.add_object(dictionary! { "Contents" => Object::Reference(y), "Subtype" => "Link" });
         let _ = p;
         assert!(
             super::super::unreferenced_among(&doc, &[x, y]).is_empty(),

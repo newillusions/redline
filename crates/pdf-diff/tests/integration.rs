@@ -86,8 +86,8 @@ fn diff_image_has_red_for_changed_grey_for_unchanged() {
     let px = rgb.get_pixel(0, 0);
     // Changed pixel = red (220, 30, 30).
     assert_eq!(px.0[0], 220, "R channel of changed pixel");
-    assert_eq!(px.0[1], 30,  "G channel of changed pixel");
-    assert_eq!(px.0[2], 30,  "B channel of changed pixel");
+    assert_eq!(px.0[1], 30, "G channel of changed pixel");
+    assert_eq!(px.0[2], 30, "B channel of changed pixel");
 }
 
 #[test]
@@ -127,7 +127,11 @@ fn tolerance_zero_passes_identical() {
 
 #[test]
 fn char_delta_serde_round_trip() {
-    let d = CharDelta { ch: 'D', delta_x: 3.5, delta_y: -1.2 };
+    let d = CharDelta {
+        ch: 'D',
+        delta_x: 3.5,
+        delta_y: -1.2,
+    };
     let json = serde_json::to_string(&d).unwrap();
     let back: CharDelta = serde_json::from_str(&json).unwrap();
     assert_eq!(back.ch, 'D');
@@ -142,7 +146,10 @@ fn pixel_diff_result_serde_skips_diff_image() {
     let img = solid_rgb(0, 0, 0, 4, 4);
     let r = pixel_diff(&img, &img, 0).unwrap();
     let json = serde_json::to_string(&r).unwrap();
-    assert!(!json.contains("diff_image"), "diff_image must be excluded from JSON");
+    assert!(
+        !json.contains("diff_image"),
+        "diff_image must be excluded from JSON"
+    );
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(parsed.get("passed").is_some());
     assert!(parsed.get("changed_pct").is_some());
@@ -179,7 +186,11 @@ macro_rules! require_fixture {
 fn engine_new_with_pdfium() {
     require_pdfium!();
     let engine = pdf_diff::PdfDiffEngine::new();
-    assert!(engine.is_ok(), "PdfDiffEngine::new() failed: {:?}", engine.err());
+    assert!(
+        engine.is_ok(),
+        "PdfDiffEngine::new() failed: {:?}",
+        engine.err()
+    );
 }
 
 #[test]
@@ -187,10 +198,17 @@ fn open_and_render_page() {
     require_pdfium!();
     let fixture_a = require_fixture!("PDF_DIFF_TEST_A");
     let mut engine = pdf_diff::PdfDiffEngine::new().expect("PDFium init");
-    let doc = engine.open(std::path::Path::new(&fixture_a)).expect("open PDF_DIFF_TEST_A");
-    let img = engine.render_page_full(&doc, 0, 72.0).expect("render page 0 at 72 dpi");
+    let doc = engine
+        .open(std::path::Path::new(&fixture_a))
+        .expect("open PDF_DIFF_TEST_A");
+    let img = engine
+        .render_page_full(&doc, 0, 72.0)
+        .expect("render page 0 at 72 dpi");
     let (w, h) = img.dimensions();
-    assert!(w > 100 && h > 100, "render produced implausibly small image {w}x{h}");
+    assert!(
+        w > 100 && h > 100,
+        "render produced implausibly small image {w}x{h}"
+    );
     println!("Rendered page 0 of {fixture_a}: {w}x{h} at 72 DPI");
 }
 
@@ -214,12 +232,16 @@ fn moe_fec_dd_vs_ifc_two_tier_diff() {
         .expect("open PDF_DIFF_TEST_B");
 
     // --- Tier 1: text-layer diff ---
-    let text = engine
-        .text_diff(&doc_a, &doc_b, 0, 0)
-        .expect("text_diff");
+    let text = engine.text_diff(&doc_a, &doc_b, 0, 0).expect("text_diff");
 
-    println!("text_diff: char_sequence_match={}", text.char_sequence_match);
-    println!("text_diff: position_deltas count={}", text.position_deltas.len());
+    println!(
+        "text_diff: char_sequence_match={}",
+        text.char_sequence_match
+    );
+    println!(
+        "text_diff: position_deltas count={}",
+        text.position_deltas.len()
+    );
 
     // Rebadge-only: status, date, revision changed => sequences differ.
     assert!(
@@ -287,7 +309,9 @@ fn identical_pdf_shows_no_diff() {
         .expect("open PDF_DIFF_TEST_A (b)");
 
     // Tier 1: same file, same page.
-    let text = engine.text_diff(&doc_a, &doc_b, 0, 0).expect("text_diff identical");
+    let text = engine
+        .text_diff(&doc_a, &doc_b, 0, 0)
+        .expect("text_diff identical");
     assert!(
         text.char_sequence_match,
         "identical PDF: char_sequence_match must be true"
@@ -297,7 +321,9 @@ fn identical_pdf_shows_no_diff() {
         assert!(
             d.delta_x.abs() < 0.01 && d.delta_y.abs() < 0.01,
             "identical PDF: delta for '{}' should be ~zero, got ({:.4}, {:.4})",
-            d.ch, d.delta_x, d.delta_y
+            d.ch,
+            d.delta_x,
+            d.delta_y
         );
     }
 
@@ -315,10 +341,7 @@ fn identical_pdf_shows_no_diff() {
         "identical PDF must produce passed=true, got changed={:.4}%",
         px.changed_pct
     );
-    assert_eq!(
-        px.changed_pct, 0.0,
-        "identical PDF: 0% changed expected"
-    );
+    assert_eq!(px.changed_pct, 0.0, "identical PDF: 0% changed expected");
 }
 
 /// Verify that PdfDiffEngine is headless (no Tauri dependency).

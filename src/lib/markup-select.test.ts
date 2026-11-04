@@ -21,7 +21,7 @@ import {
   HANDLE_IDS,
 } from "./markup-select";
 import { DEFAULT_TEXT_BOX } from "./markup-tools";
-import type { Bounds, HandleId } from "./markup-select";
+import type { Bounds } from "./markup-select";
 import type { Markup, MarkupGeometry, Appearance, UserRef } from "./ipc";
 
 // ---------------------------------------------------------------------------

@@ -6,9 +6,7 @@
 use super::annotation::canonical_quad;
 use super::*;
 use crate::document::annots::tests::{one_page_doc, redline_markup};
-use crate::document::annots::{
-    page_annots, read_markups, write_markups, write_markups_removing,
-};
+use crate::document::annots::{page_annots, read_markups, write_markups, write_markups_removing};
 use crate::document::store::MarkupStore;
 use crate::geometry::{display_to_true, PdfPoint, Quad};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId};
@@ -193,7 +191,11 @@ fn deleting_a_revu_markup_removes_the_original_its_replies_and_states_on_save() 
         } else {
             save_from_store(&mut doc, &store);
         }
-        assert_eq!(annots(&doc).len(), 1, "cycle {cycle}: only the circle is left");
+        assert_eq!(
+            annots(&doc).len(),
+            1,
+            "cycle {cycle}: only the circle is left"
+        );
         assert_eq!(
             nm_set(&doc),
             BTreeSet::from(["ZZZZYYYYXXXXWWWW".to_string()]),
@@ -237,10 +239,16 @@ fn deleting_an_acrobat_uuid_nm_markup_removes_it_and_its_reply_too() {
         set_annots(&mut doc, page, &[sq, reply]);
         let store = new_store();
         load_into(&store, &doc);
-        store.delete("d", find(&store, "acrobat square").id()).unwrap();
+        store
+            .delete("d", find(&store, "acrobat square").id())
+            .unwrap();
         for cycle in 1..=3 {
             save_from_store(&mut doc, &store);
-            assert!(annots(&doc).is_empty(), "{nm} cycle {cycle}: {:?}", nm_set(&doc));
+            assert!(
+                annots(&doc).is_empty(),
+                "{nm} cycle {cycle}: {:?}",
+                nm_set(&doc)
+            );
         }
     }
 }
@@ -277,7 +285,11 @@ fn removed_sources_only_ever_come_from_markups_the_store_held() {
 
     // A very large removal set is plain data: no panic, nothing else touched.
     let big: HashSet<SourceRef> = (0..100_000)
-        .map(|i| SourceRef { oid: Some((i + 10_000, 0)), nm: Some(format!("NAME{i:012}")), loc: None })
+        .map(|i| SourceRef {
+            oid: Some((i + 10_000, 0)),
+            nm: Some(format!("NAME{i:012}")),
+            loc: None,
+        })
         .collect();
     write_markups_removing(&mut doc, &[], &big).unwrap();
     assert_eq!(count_of(&doc, "Link"), 1);
@@ -322,13 +334,29 @@ fn rich_reply_doc() -> Document {
         "plain text",
         vec![
             ("Subj", Object::string_literal("Sticky Note")),
-            ("C", vec![Object::Real(1.0), Object::Real(0.5), Object::Real(0.0)].into()),
+            (
+                "C",
+                vec![Object::Real(1.0), Object::Real(0.5), Object::Real(0.0)].into(),
+            ),
             ("RC", Object::string_literal(RC)),
-            ("BSIColumnData", vec![Object::string_literal("Electrical")].into()),
-            ("BBMeasure", dictionary! { "Scale" => Object::Real(0.5) }.into()),
+            (
+                "BSIColumnData",
+                vec![Object::string_literal("Electrical")].into(),
+            ),
+            (
+                "BBMeasure",
+                dictionary! { "Scale" => Object::Real(0.5) }.into(),
+            ),
             // never carried:
-            ("A", dictionary! { "S" => "JavaScript", "JS" => Object::string_literal("app.alert(1)") }.into()),
-            ("AA", dictionary! { "E" => dictionary! { "S" => "JavaScript" } }.into()),
+            (
+                "A",
+                dictionary! { "S" => "JavaScript", "JS" => Object::string_literal("app.alert(1)") }
+                    .into(),
+            ),
+            (
+                "AA",
+                dictionary! { "E" => dictionary! { "S" => "JavaScript" } }.into(),
+            ),
             ("Unlisted", Object::Integer(7)),
         ],
     );
@@ -363,8 +391,16 @@ fn an_unedited_reply_keeps_subj_c_rc_popup_and_bluebeam_keys_over_three_cycles()
         write_markups(&mut doc, &ms).unwrap();
         doc = reload(&mut doc);
 
-        assert_eq!(annots(&doc).len(), 4, "cycle {cycle}: sq + reply + popup + state");
-        assert_eq!(count_of(&doc, "Popup"), 1, "cycle {cycle}: one pop-up, not stacked");
+        assert_eq!(
+            annots(&doc).len(),
+            4,
+            "cycle {cycle}: sq + reply + popup + state"
+        );
+        assert_eq!(
+            count_of(&doc, "Popup"),
+            1,
+            "cycle {cycle}: one pop-up, not stacked"
+        );
         let (reply_oid, r) = reply_dict_of(&doc, "REPLYRICH0000001");
         assert_eq!(text(&r, b"Subj").as_deref(), Some("Sticky Note"));
         assert_eq!(floats(&r, b"C"), vec![1.0, 0.5, 0.0]);
@@ -375,7 +411,11 @@ fn an_unedited_reply_keeps_subj_c_rc_popup_and_bluebeam_keys_over_three_cycles()
         );
         assert!(r.has(b"BBMeasure"));
         for bad in [&b"A"[..], b"AA", b"Unlisted"] {
-            assert!(!r.has(bad), "cycle {cycle}: /{} was carried", String::from_utf8_lossy(bad));
+            assert!(
+                !r.has(bad),
+                "cycle {cycle}: /{} was carried",
+                String::from_utf8_lossy(bad)
+            );
         }
         // The pop-up is rebuilt and parented to the rewritten reply.
         let popup_ref = r.get(b"Popup").unwrap().as_reference().unwrap();
@@ -384,7 +424,10 @@ fn an_unedited_reply_keeps_subj_c_rc_popup_and_bluebeam_keys_over_three_cycles()
             .find(|(o, _)| *o == Some(popup_ref))
             .expect("/Popup points at a page annotation");
         assert_eq!(subtype(&popup), "Popup");
-        assert_eq!(popup.get(b"Parent").unwrap().as_reference().unwrap(), reply_oid);
+        assert_eq!(
+            popup.get(b"Parent").unwrap().as_reference().unwrap(),
+            reply_oid
+        );
         assert_eq!(floats(&popup, b"Rect"), vec![200.0, 200.0, 300.0, 300.0]);
         assert!(matches!(popup.get(b"Open"), Ok(Object::Boolean(true))));
         // The state keeps its subject too.
@@ -404,7 +447,10 @@ fn an_edited_reply_keeps_subj_c_and_private_keys_but_drops_the_stale_rich_text()
         doc = reload(&mut doc);
         let (_, r) = reply_dict_of(&doc, "REPLYRICH0000001");
         assert_eq!(text(&r, b"Contents").as_deref(), Some("edited text"));
-        assert!(!r.has(b"RC"), "cycle {cycle}: a stale /RC would contradict /Contents");
+        assert!(
+            !r.has(b"RC"),
+            "cycle {cycle}: a stale /RC would contradict /Contents"
+        );
         assert_eq!(text(&r, b"Subj").as_deref(), Some("Sticky Note"));
         assert_eq!(floats(&r, b"C"), vec![1.0, 0.5, 0.0]);
         assert!(r.has(b"BSIColumnData") && r.has(b"BBMeasure"));
@@ -427,7 +473,10 @@ fn hostile_reply_keys_are_dropped_on_read_and_refused_on_write() {
         sq,
         "r",
         vec![
-            ("RC", Object::String(vec![b'x'; 70_000], lopdf::StringFormat::Literal)),
+            (
+                "RC",
+                Object::String(vec![b'x'; 70_000], lopdf::StringFormat::Literal),
+            ),
             ("Popup", Object::Reference(not_a_popup)),
             ("Subj", Object::Reference(sq)),
         ],
@@ -448,24 +497,46 @@ fn hostile_reply_keys_are_dropped_on_read_and_refused_on_write() {
     let mut m = redline_markup(0);
     let mut reply = Reply {
         id: uuid::Uuid::new_v4(),
-        author: UserRef { user_id: uuid::Uuid::new_v4(), display_name: "A".into() },
+        author: UserRef {
+            user_id: uuid::Uuid::new_v4(),
+            display_name: "A".into(),
+        },
         at: chrono::Utc::now(),
         contents: "x".into(),
         in_reply_to: None,
         nm: None,
         extras: None,
     };
-    let key = |name: &str, value: foreign::PdfValue| foreign::ForeignKey { name: name.into(), value };
+    let key = |name: &str, value: foreign::PdfValue| foreign::ForeignKey {
+        name: name.into(),
+        value,
+    };
     reply.extras = Some(SourceExtras {
         keys: vec![
-            key("A", foreign::PdfValue::Dict(vec![("S".into(), foreign::PdfValue::Name("JavaScript".into()))])),
-            key("JS", foreign::PdfValue::Str(b"app.alert(1)".to_vec(), false)),
+            key(
+                "A",
+                foreign::PdfValue::Dict(vec![(
+                    "S".into(),
+                    foreign::PdfValue::Name("JavaScript".into()),
+                )]),
+            ),
+            key(
+                "JS",
+                foreign::PdfValue::Str(b"app.alert(1)".to_vec(), false),
+            ),
             key("Parent", foreign::PdfValue::Int(1)),
-            key("Subj", foreign::PdfValue::Dict(vec![("JS".into(), foreign::PdfValue::Int(1))])),
+            key(
+                "Subj",
+                foreign::PdfValue::Dict(vec![("JS".into(), foreign::PdfValue::Int(1))]),
+            ),
             key("C", foreign::PdfValue::Real(1e300)),
             key("Evil)>>/A<<", foreign::PdfValue::Int(1)),
         ],
-        popup: Some(PopupProps { rect: [f32::NAN, 0.0, 1.0, 1.0], open: true, flags: None }),
+        popup: Some(PopupProps {
+            rect: [f32::NAN, 0.0, 1.0, 1.0],
+            open: true,
+            flags: None,
+        }),
         contents_at_read: "x".into(),
     });
     m.workflow.thread = vec![reply];
@@ -474,20 +545,34 @@ fn hostile_reply_keys_are_dropped_on_read_and_refused_on_write() {
     for (_, d) in annots(&doc2) {
         for bad in [&b"A"[..], b"JS", b"Parent", b"Subj", b"C", b"Popup"] {
             if d.has(b"IRT") {
-                assert!(!d.has(bad), "/{} reached the file", String::from_utf8_lossy(bad));
+                assert!(
+                    !d.has(bad),
+                    "/{} reached the file",
+                    String::from_utf8_lossy(bad)
+                );
             }
         }
     }
-    assert_eq!(count_of(&doc2, "Popup"), 0, "a non-finite pop-up rectangle is not written");
+    assert_eq!(
+        count_of(&doc2, "Popup"),
+        0,
+        "a non-finite pop-up rectangle is not written"
+    );
 
     // The store never accepts extras from outside.
     let mut finite = m.clone();
     if let Some(x) = finite.workflow.thread[0].extras.as_mut() {
-        x.popup = Some(PopupProps { rect: [0.0, 0.0, 1.0, 1.0], open: true, flags: None });
+        x.popup = Some(PopupProps {
+            rect: [0.0, 0.0, 1.0, 1.0],
+            open: true,
+            flags: None,
+        });
     }
     let store = new_store();
     store.add("d", through_json(&finite, |_| {})).unwrap();
-    assert!(store.list("d").unwrap()[0].workflow.thread[0].extras.is_none());
+    assert!(store.list("d").unwrap()[0].workflow.thread[0]
+        .extras
+        .is_none());
 }
 
 // --- 3. duplicate reply /NM -------------------------------------------------------
@@ -535,12 +620,20 @@ fn replies_and_states_sharing_one_nm_keep_distinct_stable_identities() {
             let m = &ms[0];
             let mut ids: HashSet<uuid::Uuid> = m.workflow.thread.iter().map(|r| r.id).collect();
             ids.extend(m.workflow.status_history.iter().map(|c| c.id));
-            assert_eq!(ids.len(), 4, "reversed={reversed} cycle {cycle}: ids are distinct");
+            assert_eq!(
+                ids.len(),
+                4,
+                "reversed={reversed} cycle {cycle}: ids are distinct"
+            );
             assert_eq!(m.workflow.thread.len(), 3);
             assert_eq!(m.workflow.status_history.len(), 1);
             let summary = thread_summary(m);
             let by_text = |t: &str| summary.iter().find(|(c, ..)| c == t).unwrap();
-            assert_eq!(by_text("second").2, Some(by_text("first").1), "nesting kept");
+            assert_eq!(
+                by_text("second").2,
+                Some(by_text("first").1),
+                "nesting kept"
+            );
             assert_eq!(by_text("first").2, None);
             // Same identities on every load and whatever order the file lists the notes in.
             match &first {
@@ -550,12 +643,19 @@ fn replies_and_states_sharing_one_nm_keep_distinct_stable_identities() {
 
             write_markups(&mut doc, &ms).unwrap();
             doc = reload(&mut doc);
-            assert_eq!(annots(&doc).len(), 5, "reversed={reversed} cycle {cycle}: nothing lost or doubled");
+            assert_eq!(
+                annots(&doc).len(),
+                5,
+                "reversed={reversed} cycle {cycle}: nothing lost or doubled"
+            );
             let dup_nm = annots(&doc)
                 .iter()
                 .filter(|(_, d)| text(d, b"NM").as_deref() == Some("DUPLICATEREPLY01"))
                 .count();
-            assert_eq!(dup_nm, 4, "the source /NM values are written back as they were");
+            assert_eq!(
+                dup_nm, 4,
+                "the source /NM values are written back as they were"
+            );
         }
     }
 }
@@ -593,14 +693,20 @@ fn foreign_note(doc: &mut Document, rect: [i64; 4]) -> ObjectId {
 }
 
 fn note_rect(doc: &Document) -> Vec<f32> {
-    let (_, d) = annots(doc).into_iter().find(|(_, d)| subtype(d) == "Text").unwrap();
+    let (_, d) = annots(doc)
+        .into_iter()
+        .find(|(_, d)| subtype(d) == "Text")
+        .unwrap();
     floats(&d, b"Rect")
 }
 
 fn ap_bbox_of(doc: &Document, d: &Dictionary) -> Vec<f32> {
     let ap = d.get(b"AP").unwrap().as_dict().unwrap();
     let n = ap.get(b"N").unwrap().as_reference().unwrap();
-    floats(&doc.get_object(n).unwrap().as_stream().unwrap().dict, b"BBox")
+    floats(
+        &doc.get_object(n).unwrap().as_stream().unwrap().dict,
+        b"BBox",
+    )
 }
 
 #[test]
@@ -608,7 +714,9 @@ fn an_unmoved_foreign_sticky_note_keeps_its_rect_over_three_cycles() {
     for rotate in [0, 90, 270] {
         let (mut doc, page) = one_page_doc();
         if rotate != 0 {
-            doc.get_dictionary_mut(page).unwrap().set("Rotate", rotate as i64);
+            doc.get_dictionary_mut(page)
+                .unwrap()
+                .set("Rotate", rotate as i64);
         }
         let n = foreign_note(&mut doc, [100, 100, 140, 150]); // 40 x 50, not the 20 x 20 icon box
         set_annots(&mut doc, page, &[n]);
@@ -622,7 +730,9 @@ fn an_unmoved_foreign_sticky_note_keeps_its_rect_over_three_cycles() {
             let r = note_rect(&doc);
             let want = [100.0, 100.0, 140.0, 150.0];
             assert!(
-                r.iter().zip(want).all(|(a, b)| (f64::from(*a) - b).abs() < 1e-3),
+                r.iter()
+                    .zip(want)
+                    .all(|(a, b)| (f64::from(*a) - b).abs() < 1e-3),
                 "rotate {rotate} cycle {cycle}: /Rect {r:?}"
             );
             let (_, d) = annots(&doc).into_iter().next().unwrap();
@@ -651,11 +761,24 @@ fn a_small_foreign_note_box_is_kept_and_the_icon_shrinks_to_fit_it() {
     write_markups(&mut doc, &ms).unwrap();
     let (_, d) = annots(&doc).into_iter().next().unwrap();
     assert_eq!(floats(&d, b"Rect"), vec![100.0, 100.0, 110.0, 110.0]);
-    let ap = d.get(b"AP").unwrap().as_dict().unwrap().get(b"N").unwrap().as_reference().unwrap();
+    let ap = d
+        .get(b"AP")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"N")
+        .unwrap()
+        .as_reference()
+        .unwrap();
     let stream = doc.get_object(ap).unwrap().as_stream().unwrap();
-    let content = stream.decompressed_content().unwrap_or_else(|_| stream.content.clone());
+    let content = stream
+        .decompressed_content()
+        .unwrap_or_else(|_| stream.content.clone());
     let content = String::from_utf8_lossy(&content).into_owned();
-    assert!(content.contains("0.5 0 0 0.5"), "icon scaled to half: {content}");
+    assert!(
+        content.contains("0.5 0 0 0.5"),
+        "icon scaled to half: {content}"
+    );
 }
 
 #[test]
@@ -666,7 +789,10 @@ fn a_hostile_source_rect_is_ignored() {
             0,
             MarkupGeometry::Point(pt(300.0, 400.0)),
             Appearance::default(),
-            UserRef { user_id: uuid::Uuid::new_v4(), display_name: "A".into() },
+            UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: "A".into(),
+            },
         );
         m.source_rect = rect;
         m
@@ -691,7 +817,10 @@ fn a_hostile_source_rect_is_ignored() {
     // Data from outside never sets it: the store clears it on add.
     let store = new_store();
     let crafted = through_json(&base(Some([0.0, 0.0, 600.0, 800.0])), |_| {});
-    assert!(crafted.source_rect.is_some(), "precondition: JSON carries it");
+    assert!(
+        crafted.source_rect.is_some(),
+        "precondition: JSON carries it"
+    );
     store.add("d", crafted).unwrap();
     assert!(store.list("d").unwrap()[0].source_rect.is_none());
 }
@@ -706,7 +835,11 @@ const Z_ORDER: Quad = [TL, TR, BL, BR];
 
 #[test]
 fn acrobat_z_order_is_left_alone_and_polygon_orders_are_reordered_from_any_corner() {
-    assert_eq!(canonical_quad(&Z_ORDER), Z_ORDER, "Acrobat / Revu order unchanged");
+    assert_eq!(
+        canonical_quad(&Z_ORDER),
+        Z_ORDER,
+        "Acrobat / Revu order unchanged"
+    );
     // ISO counter-clockwise (BL, BR, TR, TL) started at each corner.
     let ccw = [BL, BR, TR, TL];
     // Clockwise (TL, TR, BR, BL) started at each corner.
@@ -714,13 +847,28 @@ fn acrobat_z_order_is_left_alone_and_polygon_orders_are_reordered_from_any_corne
     for (label, poly) in [("ccw", ccw), ("cw", cw)] {
         for start in 0..4 {
             let q: Quad = std::array::from_fn(|i| poly[(start + i) % 4]);
-            assert_eq!(canonical_quad(&q), Z_ORDER, "{label} starting at corner {start}");
+            assert_eq!(
+                canonical_quad(&q),
+                Z_ORDER,
+                "{label} starting at corner {start}"
+            );
         }
     }
     // A skewed (italic) line: Z order stays, polygon order is recovered.
-    let (stl, str_, sbl, sbr) = (pt(14.0, 20.0), pt(114.0, 20.0), pt(10.0, 10.0), pt(110.0, 10.0));
-    assert_eq!(canonical_quad(&[stl, str_, sbl, sbr]), [stl, str_, sbl, sbr]);
-    assert_eq!(canonical_quad(&[sbl, sbr, str_, stl]), [stl, str_, sbl, sbr]);
+    let (stl, str_, sbl, sbr) = (
+        pt(14.0, 20.0),
+        pt(114.0, 20.0),
+        pt(10.0, 10.0),
+        pt(110.0, 10.0),
+    );
+    assert_eq!(
+        canonical_quad(&[stl, str_, sbl, sbr]),
+        [stl, str_, sbl, sbr]
+    );
+    assert_eq!(
+        canonical_quad(&[sbl, sbr, str_, stl]),
+        [stl, str_, sbl, sbr]
+    );
 }
 
 #[test]
@@ -729,11 +877,19 @@ fn degenerate_and_hostile_quads_are_returned_unchanged_and_never_panic() {
     assert_eq!(canonical_quad(&flat), flat);
     let point: Quad = [pt(5.0, 5.0); 4];
     assert_eq!(canonical_quad(&point), point);
-    let huge: Quad = [pt(f64::MAX, f64::MAX), pt(-f64::MAX, f64::MAX), pt(-f64::MAX, -f64::MAX), pt(f64::MAX, -f64::MAX)];
+    let huge: Quad = [
+        pt(f64::MAX, f64::MAX),
+        pt(-f64::MAX, f64::MAX),
+        pt(-f64::MAX, -f64::MAX),
+        pt(f64::MAX, -f64::MAX),
+    ];
     let _ = canonical_quad(&huge);
     let nan: Quad = [pt(f64::NAN, 0.0), pt(1.0, 0.0), pt(1.0, 1.0), pt(0.0, 1.0)];
     let out = canonical_quad(&nan);
-    assert!(out[0].x.is_nan() && out[1] == nan[1], "non-finite input is returned as is");
+    assert!(
+        out[0].x.is_nan() && out[1] == nan[1],
+        "non-finite input is returned as is"
+    );
 }
 
 fn quad_annot(doc: &mut Document, st: &str, nm: &str, pts: &[PdfPoint; 4]) -> ObjectId {
@@ -758,7 +914,9 @@ fn quads_of(m: &Markup) -> Vec<Quad> {
 }
 
 fn close(a: &Quad, b: &Quad) -> bool {
-    a.iter().zip(b).all(|(p, q)| (p.x - q.x).abs() < 1e-3 && (p.y - q.y).abs() < 1e-3)
+    a.iter()
+        .zip(b)
+        .all(|(p, q)| (p.x - q.x).abs() < 1e-3 && (p.y - q.y).abs() < 1e-3)
 }
 
 #[test]
@@ -794,8 +952,14 @@ fn text_markups_in_either_quadpoints_order_load_and_save_to_the_same_geometry() 
                 assert_eq!(annots(&doc).len(), 1, "{st} {label} cycle {cycle}");
                 let (_, d) = annots(&doc).into_iter().next().unwrap();
                 let written = floats(&d, b"QuadPoints");
-                let z: Vec<f32> = Z_ORDER.iter().flat_map(|p| [p.x as f32, p.y as f32]).collect();
-                assert_eq!(written, z, "{st} {label} cycle {cycle}: written in Acrobat order");
+                let z: Vec<f32> = Z_ORDER
+                    .iter()
+                    .flat_map(|p| [p.x as f32, p.y as f32])
+                    .collect();
+                assert_eq!(
+                    written, z,
+                    "{st} {label} cycle {cycle}: written in Acrobat order"
+                );
             }
         }
     }
@@ -807,7 +971,9 @@ fn quadpoints_order_is_resolved_in_the_displayed_frame_on_rotated_pages() {
         // The line as the reader sees it (upright), mapped back to the file's page space.
         let to_true = |p: PdfPoint| display_to_true(p, rotation, 612.0, 792.0, 0.0, 0.0);
         let (mut doc, page) = one_page_doc();
-        doc.get_dictionary_mut(page).unwrap().set("Rotate", rotation as i64);
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Rotate", rotation as i64);
         let file_iso: [PdfPoint; 4] = [to_true(BL), to_true(BR), to_true(TR), to_true(TL)];
         let file_z: [PdfPoint; 4] = [to_true(TL), to_true(TR), to_true(BL), to_true(BR)];
         let a = quad_annot(&mut doc, "Underline", "QUADROTATED00001", &file_iso);
@@ -818,7 +984,10 @@ fn quadpoints_order_is_resolved_in_the_displayed_frame_on_rotated_pages() {
             assert_eq!(ms.len(), 2);
             for m in &ms {
                 let q = quads_of(m);
-                assert!(close(&q[0], &Z_ORDER), "rotation {rotation} cycle {cycle}: {q:?}");
+                assert!(
+                    close(&q[0], &Z_ORDER),
+                    "rotation {rotation} cycle {cycle}: {q:?}"
+                );
             }
             write_markups(&mut doc, &ms).unwrap();
             doc = reload(&mut doc);
@@ -868,7 +1037,9 @@ fn shared_nm_doc() -> Document {
     set_annots(
         &mut doc,
         page,
-        &[sq, sq_popup, sq_reply, sq_state, fa, fa_popup, fa_reply, fa2],
+        &[
+            sq, sq_popup, sq_reply, sq_state, fa, fa_popup, fa_reply, fa2,
+        ],
     );
     doc
 }
@@ -880,9 +1051,15 @@ fn assert_popups_consistent(doc: &Document, what: &str) {
         all.iter().filter_map(|(o, d)| o.map(|o| (o, d))).collect();
     for (oid, d) in &all {
         if let Ok(Object::Reference(p)) = d.get(b"Popup") {
-            let pd = by_oid.get(p).unwrap_or_else(|| panic!("{what}: dangling /Popup"));
+            let pd = by_oid
+                .get(p)
+                .unwrap_or_else(|| panic!("{what}: dangling /Popup"));
             assert_eq!(subtype(pd), "Popup", "{what}");
-            assert_eq!(pd.get(b"Parent").unwrap().as_reference().unwrap(), oid.unwrap(), "{what}");
+            assert_eq!(
+                pd.get(b"Parent").unwrap().as_reference().unwrap(),
+                oid.unwrap(),
+                "{what}"
+            );
         }
         if subtype(d) == "Popup" {
             let parent = d.get(b"Parent").unwrap().as_reference().unwrap();
@@ -901,7 +1078,11 @@ fn assert_popups_consistent(doc: &Document, what: &str) {
 /// The kept, non-imported annotations survive untouched: both FileAttachments, the reply to
 /// the first still answering it, and the first's pop-up still parented to it.
 fn assert_non_imported_intact(doc: &Document, what: &str) {
-    assert_eq!(count_of(doc, "FileAttachment"), 2, "{what}: FileAttachments");
+    assert_eq!(
+        count_of(doc, "FileAttachment"),
+        2,
+        "{what}: FileAttachments"
+    );
     let all = annots(doc);
     let (fa_oid, fa) = all
         .iter()
@@ -932,7 +1113,11 @@ fn a_non_imported_annotation_sharing_an_imported_nm_survives_three_save_cycles()
     for cycle in 1..=3 {
         let store = new_store();
         load_into(&store, &doc);
-        assert_eq!(store.list("d").unwrap().len(), 1, "only the square is imported");
+        assert_eq!(
+            store.list("d").unwrap().len(),
+            1,
+            "only the square is imported"
+        );
         save_from_store(&mut doc, &store);
         assert_eq!(annots(&doc).len(), 8, "cycle {cycle}");
         assert_eq!(count_of(&doc, "Square"), 1, "cycle {cycle}");
@@ -1027,7 +1212,10 @@ fn an_annotation_is_only_replaced_by_the_object_it_was_imported_from() {
             .iter()
             .filter_map(|(_, d)| text(d, b"Contents"))
             .collect();
-        assert!(contents.contains(&"not imported".to_string()), "cycle {cycle}: {contents:?}");
+        assert!(
+            contents.contains(&"not imported".to_string()),
+            "cycle {cycle}: {contents:?}"
+        );
     }
 }
 
@@ -1042,10 +1230,17 @@ fn a_foreign_markups_own_popup_is_kept_over_three_cycles() {
         assert!(ms[0].source_popup.is_some(), "cycle {cycle}");
         write_markups(&mut doc, &ms).unwrap();
         doc = reload(&mut doc);
-        assert_eq!(count_of(&doc, "Popup"), 1, "cycle {cycle}: one pop-up, not 0 or 2");
+        assert_eq!(
+            count_of(&doc, "Popup"),
+            1,
+            "cycle {cycle}: one pop-up, not 0 or 2"
+        );
         assert_eq!(annots(&doc).len(), 2, "cycle {cycle}");
         assert_popups_consistent(&doc, &format!("cycle {cycle}"));
-        let (_, p) = annots(&doc).into_iter().find(|(_, d)| subtype(d) == "Popup").unwrap();
+        let (_, p) = annots(&doc)
+            .into_iter()
+            .find(|(_, d)| subtype(d) == "Popup")
+            .unwrap();
         assert_eq!(floats(&p, b"Rect"), vec![300.0, 300.0, 400.0, 400.0]);
         assert!(matches!(p.get(b"Open"), Ok(Object::Boolean(true))));
     }
@@ -1075,7 +1270,12 @@ fn source_ref_and_popup_never_come_from_input() {
     let fresh = redline_markup(0);
     let fresh_id = fresh.id();
     store.add("d", fresh).unwrap();
-    let got = store.list("d").unwrap().into_iter().find(|m| m.id() == fresh_id).unwrap();
+    let got = store
+        .list("d")
+        .unwrap()
+        .into_iter()
+        .find(|m| m.id() == fresh_id)
+        .unwrap();
     assert!(got.source_ref.is_none() && got.source_popup.is_none());
     save_from_store(&mut doc, &store);
     assert_non_imported_intact(&doc, "after update");

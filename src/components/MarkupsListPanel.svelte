@@ -18,7 +18,7 @@
   import { exportDoneMessage, exportFormatFromPath } from "$lib/doc-op-flow";
   import {
     STATUS_ORDER, applyRowClick, buildRows, cellText, columnLabel, columnKind, COLUMN_DEFS,
-    customColumnNames, customKey, defaultColumnConfig, displayItems, emptyFilter, filterRows,
+    customColumnNames, defaultColumnConfig, displayItems, emptyFilter, filterRows,
     isFilterActive, jumpTarget, moveColumn, nextSort, normalizeColumnConfig, sortRows,
     statusForShortcut, toggleColumn, visibleColumns, windowRange,
     type ColumnConfig, type ListFilter, type SortState,
@@ -349,7 +349,6 @@
   {#if message}<div class="ml-ok" role="status">{message}</div>{/if}
   {#if error}<div class="ml-err" role="alert">{error}</div>{/if}
 
-  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <div
     class="ml-scroller"
     role="grid"

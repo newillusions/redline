@@ -126,7 +126,10 @@ pub fn import_btx_bytes(bytes: &[u8]) -> ImportReport {
         Ok(xml) => parse_btx_xml(xml),
         Err(e) => ImportReport {
             tools: Vec::new(),
-            skipped: vec![SkippedItem { name: "<document>".to_string(), reason: format!("not valid UTF-8: {e}") }],
+            skipped: vec![SkippedItem {
+                name: "<document>".to_string(),
+                reason: format!("not valid UTF-8: {e}"),
+            }],
         },
     }
 }
@@ -135,12 +138,18 @@ pub fn import_btx_bytes(bytes: &[u8]) -> ImportReport {
 /// wrinkle: tool sets are often distributed zip-wrapped, per spec).
 fn import_btx_zip(bytes: &[u8]) -> ImportReport {
     let cursor = std::io::Cursor::new(bytes);
-    let mut report = ImportReport { tools: Vec::new(), skipped: Vec::new() };
+    let mut report = ImportReport {
+        tools: Vec::new(),
+        skipped: Vec::new(),
+    };
 
     let mut archive = match zip::ZipArchive::new(cursor) {
         Ok(a) => a,
         Err(e) => {
-            report.skipped.push(SkippedItem { name: "<zip>".to_string(), reason: format!("bad zip: {e}") });
+            report.skipped.push(SkippedItem {
+                name: "<zip>".to_string(),
+                reason: format!("bad zip: {e}"),
+            });
             return report;
         }
     };
@@ -149,7 +158,10 @@ fn import_btx_zip(bytes: &[u8]) -> ImportReport {
         let mut entry = match archive.by_index(i) {
             Ok(e) => e,
             Err(e) => {
-                report.skipped.push(SkippedItem { name: format!("<zip entry {i}>"), reason: e.to_string() });
+                report.skipped.push(SkippedItem {
+                    name: format!("<zip entry {i}>"),
+                    reason: e.to_string(),
+                });
                 continue;
             }
         };
@@ -159,7 +171,10 @@ fn import_btx_zip(bytes: &[u8]) -> ImportReport {
         }
         let mut buf = Vec::new();
         if let Err(e) = entry.read_to_end(&mut buf) {
-            report.skipped.push(SkippedItem { name, reason: format!("zip read error: {e}") });
+            report.skipped.push(SkippedItem {
+                name,
+                reason: format!("zip read error: {e}"),
+            });
             continue;
         }
         let sub = import_btx_bytes(&buf);
@@ -168,7 +183,10 @@ fn import_btx_zip(bytes: &[u8]) -> ImportReport {
     }
 
     if report.tools.is_empty() && report.skipped.is_empty() {
-        report.skipped.push(SkippedItem { name: "<zip>".to_string(), reason: "no .btx member found".to_string() });
+        report.skipped.push(SkippedItem {
+            name: "<zip>".to_string(),
+            reason: "no .btx member found".to_string(),
+        });
     }
     report
 }
@@ -199,7 +217,10 @@ pub fn parse_btx_xml(xml: &str) -> ImportReport {
         }
     };
 
-    let mut report = ImportReport { tools: Vec::new(), skipped: Vec::new() };
+    let mut report = ImportReport {
+        tools: Vec::new(),
+        skipped: Vec::new(),
+    };
     // Bluebeam's authored display order (`<Index>`) does NOT match XML document order in
     // real exports (measured: one sample's `<Index>` values were `139,2,0,24,0,0,12,43,0`
     // against document positions `0..8`) - collect `(index, tool)` pairs and sort once at
@@ -208,7 +229,11 @@ pub fn parse_btx_xml(xml: &str) -> ImportReport {
     // document position as a stand-in key (a stable sort then leaves it where it would
     // have landed anyway relative to other index-less items).
     let mut indexed: Vec<(i64, Tool)> = Vec::new();
-    for (doc_pos, item) in doc.descendants().filter(|n| n.has_tag_name("ToolChestItem")).enumerate() {
+    for (doc_pos, item) in doc
+        .descendants()
+        .filter(|n| n.has_tag_name("ToolChestItem"))
+        .enumerate()
+    {
         let name = child_text(item, "Name").unwrap_or("<unnamed>").to_string();
         match import_item(item, &name) {
             Ok(tool) => {
@@ -226,13 +251,18 @@ pub fn parse_btx_xml(xml: &str) -> ImportReport {
 }
 
 fn child_text<'a>(node: roxmltree::Node<'a, 'a>, tag: &str) -> Option<&'a str> {
-    node.children().find(|n| n.has_tag_name(tag)).and_then(|n| n.text())
+    node.children()
+        .find(|n| n.has_tag_name(tag))
+        .and_then(|n| n.text())
 }
 
 fn import_item(item: roxmltree::Node, name: &str) -> Result<Tool, String> {
     let mode_tag = child_text(item, "Mode").unwrap_or("properties");
-    let placement_mode =
-        if mode_tag.eq_ignore_ascii_case("drawing") { PlacementMode::Drawing } else { PlacementMode::Properties };
+    let placement_mode = if mode_tag.eq_ignore_ascii_case("drawing") {
+        PlacementMode::Drawing
+    } else {
+        PlacementMode::Properties
+    };
 
     let raw = child_text(item, "Raw").ok_or_else(|| "missing <Raw> element".to_string())?;
     let dict = raw_to_dict(raw)?;
@@ -293,7 +323,10 @@ fn import_item(item: roxmltree::Node, name: &str) -> Result<Tool, String> {
     // Stamp-shaped this way (not a Stamp, or a Stamp using some other/no artwork
     // mechanism - none observed in the sample corpus, but not assumed impossible).
     let stamp = bb_form_xobject_root_id(&dict).map(|root_id| StampDef::Static {
-        asset: StampAsset::BluebeamFormXObject { root_id, objects: collect_bb_resources(item) },
+        asset: StampAsset::BluebeamFormXObject {
+            root_id,
+            objects: collect_bb_resources(item),
+        },
     });
 
     // Grouped/compound tools (module doc "<Child>", design doc §4): zero or more
@@ -341,7 +374,10 @@ fn import_child(child_node: roxmltree::Node, item: roxmltree::Node) -> Option<To
 
     let markup = Markup::from_annotation_dict(&dict);
     let stamp = bb_form_xobject_root_id(&dict).map(|root_id| StampDef::Static {
-        asset: StampAsset::BluebeamFormXObject { root_id, objects: collect_bb_resources(item) },
+        asset: StampAsset::BluebeamFormXObject {
+            root_id,
+            objects: collect_bb_resources(item),
+        },
     });
 
     Some(ToolChild {
@@ -369,7 +405,10 @@ fn bb_form_xobject_root_id(dict: &Dictionary) -> Option<String> {
     let ap = dict.get(b"AP").ok()?.as_dict().ok()?;
     let n = ap.get(b"N").ok()?;
     let name = n.as_name().ok()?;
-    std::str::from_utf8(name).ok()?.strip_prefix("BBObjPtr_").map(str::to_string)
+    std::str::from_utf8(name)
+        .ok()?
+        .strip_prefix("BBObjPtr_")
+        .map(str::to_string)
 }
 
 /// Decode every `<Resources>` child of `item` into `(id, raw_bytes)` pairs - Bluebeam's
@@ -383,14 +422,19 @@ fn bb_form_xobject_root_id(dict: &Dictionary) -> Option<String> {
 fn collect_bb_resources(item: roxmltree::Node) -> std::collections::BTreeMap<String, Vec<u8>> {
     let mut out = std::collections::BTreeMap::new();
     for res in item.children().filter(|n| n.has_tag_name("Resources")) {
-        let (Some(id_hex), Some(data_hex)) = (child_text(res, "ID"), child_text(res, "Data")) else {
-            continue;
-        };
-        let (Some(id_bytes), Some(data_bytes)) = (decode_hex_zlib_bytes(id_hex), decode_hex_zlib_bytes(data_hex))
+        let (Some(id_hex), Some(data_hex)) = (child_text(res, "ID"), child_text(res, "Data"))
         else {
             continue;
         };
-        let Ok(id) = String::from_utf8(id_bytes) else { continue };
+        let (Some(id_bytes), Some(data_bytes)) = (
+            decode_hex_zlib_bytes(id_hex),
+            decode_hex_zlib_bytes(data_hex),
+        ) else {
+            continue;
+        };
+        let Ok(id) = String::from_utf8(id_bytes) else {
+            continue;
+        };
         out.insert(id, data_bytes);
     }
     out
@@ -438,7 +482,10 @@ fn raw_to_dict(raw: &str) -> Result<Dictionary, String> {
 
 fn is_hex_zlib(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
-    lower.len() >= 4 && lower.starts_with("789c") && lower.len() % 2 == 0 && lower.bytes().all(|b| b.is_ascii_hexdigit())
+    lower.len() >= 4
+        && lower.starts_with("789c")
+        && lower.len() % 2 == 0
+        && lower.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn inflate_hex_zlib(hex: &str) -> Result<String, String> {
@@ -479,9 +526,14 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 /// this is the supported route to reuse its (well-tested) object parser.
 fn parse_pdf_dict(text: &str) -> Result<Dictionary, String> {
     let bytes = wrap_dict_as_pdf(text);
-    let doc = lopdf::Document::load_mem(&bytes).map_err(|e| format!("PDF dict parse failed: {e}"))?;
-    let obj = doc.get_object((1, 0)).map_err(|e| format!("missing wrapped object: {e}"))?;
-    obj.as_dict().cloned().map_err(|e| format!("<Raw> is not a dictionary: {e}"))
+    let doc =
+        lopdf::Document::load_mem(&bytes).map_err(|e| format!("PDF dict parse failed: {e}"))?;
+    let obj = doc
+        .get_object((1, 0))
+        .map_err(|e| format!("missing wrapped object: {e}"))?;
+    obj.as_dict()
+        .cloned()
+        .map_err(|e| format!("<Raw> is not a dictionary: {e}"))
 }
 
 /// Build a minimal, byte-exact, well-formed single-object PDF wrapping `dict_text` as
@@ -525,7 +577,10 @@ fn wrap_dict_as_pdf(dict_text: &str) -> Vec<u8> {
 /// decode, or wasn't captured) is left as a literal, inert name - PDF viewers ignore a
 /// `/Resources` entry that resolves to nothing rather than failing the whole page, so
 /// this degrades that one visual detail, not the stamp.
-pub(crate) fn resolve_bb_objptr_refs(raw: &[u8], id_to_objid: &std::collections::BTreeMap<String, (u32, u16)>) -> Vec<u8> {
+pub(crate) fn resolve_bb_objptr_refs(
+    raw: &[u8],
+    id_to_objid: &std::collections::BTreeMap<String, (u32, u16)>,
+) -> Vec<u8> {
     let stream_at = find_subslice(raw, b"stream\n")
         .or_else(|| find_subslice(raw, b"stream\r\n"))
         .unwrap_or(raw.len());
@@ -736,7 +791,10 @@ mod tests {
         assert_eq!(tool.appearance.line_weight, 2.0);
         assert_eq!(tool.subject.as_deref(), Some("Door"));
         assert_eq!(tool.placement_mode, PlacementMode::Properties);
-        assert!(tool.geometry.is_none(), "properties mode carries no fixed geometry");
+        assert!(
+            tool.geometry.is_none(),
+            "properties mode carries no fixed geometry"
+        );
     }
 
     #[test]
@@ -936,11 +994,15 @@ mod tests {
     #[test]
     fn parses_zlib_deflated_raw_item() {
         let dict_text = "<< /Subtype /Square /Rect [0 0 50 50] /C [0 1 0] >>";
-        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(dict_text.as_bytes()).unwrap();
         let compressed = encoder.finish().unwrap();
         let hex: String = compressed.iter().map(|b| format!("{b:02x}")).collect();
-        assert!(hex.starts_with("789c"), "zlib default-compression header must be 789c, got {hex}");
+        assert!(
+            hex.starts_with("789c"),
+            "zlib default-compression header must be 789c, got {hex}"
+        );
 
         let xml = format!(
             r#"<ToolChestData><ToolChestItem><Name>Green Box</Name><Mode>properties</Mode><Raw>{hex}</Raw></ToolChestItem></ToolChestData>"#
@@ -959,7 +1021,9 @@ mod tests {
         {
             let cursor = std::io::Cursor::new(&mut zip_bytes);
             let mut writer = zip::ZipWriter::new(cursor);
-            writer.start_file::<_, ()>("MyTools.btx", zip::write::FileOptions::default()).unwrap();
+            writer
+                .start_file::<_, ()>("MyTools.btx", zip::write::FileOptions::default())
+                .unwrap();
             writer.write_all(PLAIN_ITEM.as_bytes()).unwrap();
             writer.finish().unwrap();
         }
@@ -976,7 +1040,9 @@ mod tests {
         {
             let cursor = std::io::Cursor::new(&mut zip_bytes);
             let mut writer = zip::ZipWriter::new(cursor);
-            writer.start_file::<_, ()>("readme.txt", zip::write::FileOptions::default()).unwrap();
+            writer
+                .start_file::<_, ()>("readme.txt", zip::write::FileOptions::default())
+                .unwrap();
             writer.write_all(b"not a tool set").unwrap();
             writer.finish().unwrap();
         }
@@ -1026,7 +1092,11 @@ mod tests {
         </ToolChestData>"#;
 
         let report = parse_btx_xml(xml);
-        assert_eq!(report.tools.len(), 1, "only the genuinely supported subtype imports");
+        assert_eq!(
+            report.tools.len(),
+            1,
+            "only the genuinely supported subtype imports"
+        );
         assert_eq!(report.tools[0].name, "Good Square");
         assert_eq!(
             report.skipped.len(),
@@ -1162,11 +1232,18 @@ mod tests {
         </ToolChestData>"#;
 
         let report = parse_btx_xml(xml);
-        assert!(report.skipped.is_empty(), "the Stamp item itself is NOT skipped - it silently 'succeeds': {:?}", report.skipped);
+        assert!(
+            report.skipped.is_empty(),
+            "the Stamp item itself is NOT skipped - it silently 'succeeds': {:?}",
+            report.skipped
+        );
         assert_eq!(report.tools.len(), 1);
         let tool = &report.tools[0];
         assert_eq!(tool.markup_type, crate::markup::MarkupType::Stamp);
-        assert!(tool.stamp.is_none(), "no /AP reference means nothing to resolve - box+label fallback is correct here");
+        assert!(
+            tool.stamp.is_none(),
+            "no /AP reference means nothing to resolve - box+label fallback is correct here"
+        );
     }
 
     // --- Stamp artwork fixed (module doc "Stamp artwork") - real mechanism, verified
@@ -1177,7 +1254,8 @@ mod tests {
     /// relying on the plain-text `<Raw>` fallback (UNVERIFIED against any real sample -
     /// see module doc).
     fn hex_zlib_encode(bytes: &[u8]) -> String {
-        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(bytes).unwrap();
         let compressed = encoder.finish().unwrap();
         compressed.iter().map(|b| format!("{b:02x}")).collect()
@@ -1210,10 +1288,15 @@ mod tests {
         let tool = &report.tools[0];
         assert_eq!(tool.markup_type, crate::markup::MarkupType::Stamp);
         match &tool.stamp {
-            Some(StampDef::Static { asset: StampAsset::BluebeamFormXObject { root_id, objects } }) => {
+            Some(StampDef::Static {
+                asset: StampAsset::BluebeamFormXObject { root_id, objects },
+            }) => {
                 assert_eq!(root_id, "LBLQFTNPNJGWOKCB");
                 assert_eq!(objects.len(), 1);
-                assert_eq!(objects.get("LBLQFTNPNJGWOKCB").map(Vec::as_slice), Some(&form_bytes[..]));
+                assert_eq!(
+                    objects.get("LBLQFTNPNJGWOKCB").map(Vec::as_slice),
+                    Some(&form_bytes[..])
+                );
             }
             other => panic!("expected a resolved BluebeamFormXObject asset, got {other:?}"),
         }
@@ -1271,7 +1354,11 @@ mod tests {
     fn leading_utf8_bom_does_not_break_xml_parsing() {
         let xml_with_bom = format!("\u{FEFF}{PLAIN_ITEM}");
         let report = parse_btx_xml(&xml_with_bom);
-        assert!(report.skipped.is_empty(), "a leading BOM must not fail XML parsing: {:?}", report.skipped);
+        assert!(
+            report.skipped.is_empty(),
+            "a leading BOM must not fail XML parsing: {:?}",
+            report.skipped
+        );
         assert_eq!(report.tools.len(), 1);
     }
 
@@ -1298,17 +1385,40 @@ mod tests {
         </BluebeamRevuToolSet>"#;
 
         let report = parse_btx_xml(xml);
-        assert!(report.skipped.is_empty(), "the parent still imports cleanly: {:?}", report.skipped);
-        assert_eq!(report.tools.len(), 1, "exactly the PARENT becomes a top-level tool - the <Child> is not a second tool");
+        assert!(
+            report.skipped.is_empty(),
+            "the parent still imports cleanly: {:?}",
+            report.skipped
+        );
+        assert_eq!(
+            report.tools.len(),
+            1,
+            "exactly the PARENT becomes a top-level tool - the <Child> is not a second tool"
+        );
         let tool = &report.tools[0];
         assert_eq!(tool.subject.as_deref(), Some("Cloud Shape"));
         assert_eq!(tool.markup_type, crate::markup::MarkupType::Polygon);
 
-        assert_eq!(tool.children.len(), 1, "the <Child> must now be captured, not discarded");
+        assert_eq!(
+            tool.children.len(),
+            1,
+            "the <Child> must now be captured, not discarded"
+        );
         let child = &tool.children[0];
-        assert_eq!(child.subject.as_deref(), Some("Attached Label"), "child's own /Subj must be preserved");
-        assert_eq!(child.markup_type, crate::markup::MarkupType::Text, "FreeText with no /CL maps to Text");
-        assert!(child.geometry.is_some(), "a Drawing-mode compound tool's child must carry a fixed geometry template");
+        assert_eq!(
+            child.subject.as_deref(),
+            Some("Attached Label"),
+            "child's own /Subj must be preserved"
+        );
+        assert_eq!(
+            child.markup_type,
+            crate::markup::MarkupType::Text,
+            "FreeText with no /CL maps to Text"
+        );
+        assert!(
+            child.geometry.is_some(),
+            "a Drawing-mode compound tool's child must carry a fixed geometry template"
+        );
     }
 
     #[test]
@@ -1328,8 +1438,15 @@ mod tests {
 
         let report = parse_btx_xml(xml);
         assert_eq!(report.tools.len(), 1);
-        let subjects: Vec<Option<&str>> = report.tools[0].children.iter().map(|c| c.subject.as_deref()).collect();
-        assert_eq!(subjects, vec![Some("Label A"), Some("Label B"), Some("Divider")]);
+        let subjects: Vec<Option<&str>> = report.tools[0]
+            .children
+            .iter()
+            .map(|c| c.subject.as_deref())
+            .collect();
+        assert_eq!(
+            subjects,
+            vec![Some("Label A"), Some("Label B"), Some("Divider")]
+        );
     }
 
     #[test]
@@ -1344,9 +1461,15 @@ mod tests {
         </BluebeamRevuToolSet>"#;
 
         let report = parse_btx_xml(xml);
-        assert!(report.skipped.is_empty(), "a bad child must not fail the whole item");
+        assert!(
+            report.skipped.is_empty(),
+            "a bad child must not fail the whole item"
+        );
         assert_eq!(report.tools.len(), 1);
-        assert!(report.tools[0].children.is_empty(), "the unparseable child is dropped, not fabricated");
+        assert!(
+            report.tools[0].children.is_empty(),
+            "the unparseable child is dropped, not fabricated"
+        );
     }
 
     #[test]
@@ -1368,12 +1491,21 @@ mod tests {
     // here, these 4 files are checked in as real fixtures per the dispatch) ---
 
     fn real_corpus_files() -> Vec<std::path::PathBuf> {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("bench").join("corpus").join("btx");
-        let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("bench")
+            .join("corpus")
+            .join("btx");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
         entries
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("btx")))
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("btx"))
+            })
             .collect()
     }
 
@@ -1400,14 +1532,23 @@ mod tests {
                 "{path:?} produced neither tools nor skips - the parse silently found nothing"
             );
             for tool in &report.tools {
-                assert!(!tool.name.trim().is_empty(), "{path:?}: every imported tool must have a non-empty name");
-                if let Some(StampDef::Static { asset: StampAsset::BluebeamFormXObject { .. } }) = &tool.stamp {
+                assert!(
+                    !tool.name.trim().is_empty(),
+                    "{path:?}: every imported tool must have a non-empty name"
+                );
+                if let Some(StampDef::Static {
+                    asset: StampAsset::BluebeamFormXObject { .. },
+                }) = &tool.stamp
+                {
                     total_bluebeam_form_stamps += 1;
                 }
             }
             total_tools += report.tools.len();
         }
-        assert!(total_tools > 0, "the real corpus must produce at least one tool across all 4 files");
+        assert!(
+            total_tools > 0,
+            "the real corpus must produce at least one tool across all 4 files"
+        );
         assert!(
             total_bluebeam_form_stamps > 0,
             "at least one real Stamp item must resolve to a BluebeamFormXObject asset - \
@@ -1432,9 +1573,17 @@ mod tests {
             let mut tools_with_children = 0usize;
             let mut total_children = 0usize;
             for t in &report.tools {
-                if matches!(t.markup_type, crate::markup::MarkupType::Stamp | crate::markup::MarkupType::StampDynamic) {
+                if matches!(
+                    t.markup_type,
+                    crate::markup::MarkupType::Stamp | crate::markup::MarkupType::StampDynamic
+                ) {
                     stamps_total += 1;
-                    if matches!(&t.stamp, Some(StampDef::Static { asset: StampAsset::BluebeamFormXObject { .. } })) {
+                    if matches!(
+                        &t.stamp,
+                        Some(StampDef::Static {
+                            asset: StampAsset::BluebeamFormXObject { .. }
+                        })
+                    ) {
                         stamps_with_artwork += 1;
                     }
                 }
@@ -1484,9 +1633,17 @@ mod tests {
         assert_eq!(report.tools.len(), N);
         let names: std::collections::HashSet<&str> =
             report.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names.len(), N, "every item's name must be distinct and present");
+        assert_eq!(
+            names.len(),
+            N,
+            "every item's name must be distinct and present"
+        );
         let ids: std::collections::HashSet<uuid::Uuid> =
             report.tools.iter().map(|t| t.id).collect();
-        assert_eq!(ids.len(), N, "every tool must get a unique id - no collisions at scale");
+        assert_eq!(
+            ids.len(),
+            N,
+            "every tool must get a unique id - no collisions at scale"
+        );
     }
 }

@@ -210,7 +210,10 @@ pub async fn close_document(state: State<'_, AppState>, doc_id: String) -> Resul
 /// close tab) stays in sync without a call at each of those call sites individually.
 /// `doc_id: None` means no document is open/focused (last tab closed).
 #[tauri::command]
-pub fn set_active_document(state: State<'_, AppState>, doc_id: Option<String>) -> Result<(), String> {
+pub fn set_active_document(
+    state: State<'_, AppState>,
+    doc_id: Option<String>,
+) -> Result<(), String> {
     *state.active_doc.lock().unwrap() = doc_id;
     Ok(())
 }
@@ -355,7 +358,10 @@ pub async fn save_document_as_rebuild(
 pub fn can_rebuild_from_original(state: State<'_, AppState>, doc_id: String) -> bool {
     // A document awaiting a reload cannot rebuild: the private copy predates the last write.
     !state.markups.needs_reload(&doc_id)
-        && state.markups.original_copy(&doc_id).is_some_and(|p| p.exists())
+        && state
+            .markups
+            .original_copy(&doc_id)
+            .is_some_and(|p| p.exists())
 }
 
 /// Reload and keep my mark-ups: recovery for a PDF another program changed since redline
@@ -382,9 +388,11 @@ async fn reload_keeping_inner(
         .path(doc_id)
         .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
     if !state.markups.is_loaded(doc_id) {
-        return Err("This document's mark-ups were never loaded, so there is nothing to keep. \
+        return Err(
+            "This document's mark-ups were never loaded, so there is nothing to keep. \
                     Close and reopen it."
-            .to_string());
+                .to_string(),
+        );
     }
     let password = state.markups.password(doc_id);
 
@@ -504,9 +512,11 @@ async fn save_inner(
     let rebuild = rebuild && was_loaded;
     let (markups, removed, write_src) = if rebuild {
         if same_file(&dest, &src) {
-            return Err("Save As (rebuild) writes a new file: choose a different name or \
+            return Err(
+                "Save As (rebuild) writes a new file: choose a different name or \
                         folder, not the changed file."
-                .to_string());
+                    .to_string(),
+            );
         }
         let copy = state.markups.original_copy(doc_id).ok_or_else(|| {
             "redline has no private copy of the file as it was loaded (it was too large to \
@@ -535,9 +545,9 @@ async fn save_inner(
         tokio::task::spawn_blocking(move || {
             save_with_markups_scaled(&write_src, &staged, &markups, &removed, &scales)
         })
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| format!("{e:#}"))?;
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))?;
     }
 
     // Scale calibration lives in the sidecar next to the PDF, not in the PDF: a Save As must
@@ -675,8 +685,7 @@ pub(crate) fn apply_edit_and_save_inner(
     op: impl FnOnce(&mut lopdf::Document) -> anyhow::Result<()>,
     only_if_smaller: bool,
 ) -> anyhow::Result<bool> {
-    let mut doc =
-        lopdf::Document::load(src).with_context(|| format!("load {}", src.display()))?;
+    let mut doc = lopdf::Document::load(src).with_context(|| format!("load {}", src.display()))?;
     // Page ops rewrite the file the same way save_with_markups does (full lopdf
     // load -> save), which would silently strip encryption on an encrypted PDF
     // (lopdf has no re-encrypt-on-save path). Refuse rather than corrupt/de-protect.
@@ -953,8 +962,7 @@ pub(crate) fn extract_pages_to_new_file_scaled(
     scales: &[crate::takeoff::ScaleRecord],
     page_indices: &[u32],
 ) -> anyhow::Result<()> {
-    let mut doc =
-        lopdf::Document::load(src).with_context(|| format!("load {}", src.display()))?;
+    let mut doc = lopdf::Document::load(src).with_context(|| format!("load {}", src.display()))?;
     if doc.is_encrypted() {
         anyhow::bail!(
             "Extracting pages from a password-protected PDF is not supported yet - saving \
@@ -967,7 +975,9 @@ pub(crate) fn extract_pages_to_new_file_scaled(
     crate::document::annots::write_markups_scaled(&mut doc, markups, removed, scales)?;
     crate::document::page_ops::extract_pages(&mut doc, page_indices)?;
 
-    let dir = dest.parent().context("no parent dir for destination path")?;
+    let dir = dest
+        .parent()
+        .context("no parent dir for destination path")?;
     let tmp = dir.join(format!(
         ".redline-tmp-{}-{}",
         std::process::id(),
@@ -1004,10 +1014,12 @@ pub async fn extract_pages(
         .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
     let dest = PathBuf::from(dest_path);
     if dest == src {
-        return Err("extraction destination must be a different file from the source \
+        return Err(
+            "extraction destination must be a different file from the source \
                      document - use Save As on the open document instead if that's the \
                      intent"
-            .to_string());
+                .to_string(),
+        );
     }
 
     let password = state.markups.password(&doc_id);
@@ -1050,7 +1062,10 @@ mod tests {
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         assert!(same_file(&a, &dotted));
         assert!(!same_file(&a, &dir.path().join("b.pdf")));
-        assert!(!same_file(&a, &dir.path().join("new.pdf")), "a not-yet-existing name is a different file");
+        assert!(
+            !same_file(&a, &dir.path().join("new.pdf")),
+            "a not-yet-existing name is a different file"
+        );
         #[cfg(unix)]
         {
             let link = dir.path().join("link.pdf");
@@ -1058,8 +1073,8 @@ mod tests {
             assert!(same_file(&a, &link));
         }
     }
-    use crate::document::annots::tests::{one_page_doc, redline_markup};
     use crate::docops::{flatten_annotations, optimize_in_place};
+    use crate::document::annots::tests::{one_page_doc, redline_markup};
     use crate::geometry::PdfPoint;
     use crate::markup::{Appearance, Markup, MarkupGeometry, MarkupType, UserRef};
 
@@ -1068,14 +1083,20 @@ mod tests {
     /// saves >= 19 bytes - the 3-point `redline_markup` fixture is too small).
     fn long_ink_markup(page: u32) -> Markup {
         let stroke: Vec<PdfPoint> = (0..200)
-            .map(|i| PdfPoint { x: (i % 20) as f64, y: (i / 20) as f64 })
+            .map(|i| PdfPoint {
+                x: (i % 20) as f64,
+                y: (i / 20) as f64,
+            })
             .collect();
         Markup::new(
             MarkupType::Ink,
             page,
             MarkupGeometry::Ink(vec![stroke]),
             Appearance::default(),
-            UserRef { user_id: uuid::Uuid::new_v4(), display_name: "Alice".into() },
+            UserRef {
+                user_id: uuid::Uuid::new_v4(),
+                display_name: "Alice".into(),
+            },
         )
     }
 
@@ -1090,10 +1111,15 @@ mod tests {
         doc.save(&path).unwrap();
 
         let m = redline_markup(0);
-        apply_edit_and_save(&path, std::slice::from_ref(&m), &Default::default(), |doc| {
-            flatten_annotations(doc)?;
-            Ok(())
-        })
+        apply_edit_and_save(
+            &path,
+            std::slice::from_ref(&m),
+            &Default::default(),
+            |doc| {
+                flatten_annotations(doc)?;
+                Ok(())
+            },
+        )
         .unwrap();
 
         let reopened = lopdf::Document::load(&path).unwrap();
@@ -1136,17 +1162,25 @@ mod tests {
             panic!("expected polyline geometry from redline_markup fixture");
         }
 
-        apply_edit_and_save(&path, std::slice::from_ref(&m), &Default::default(), |doc| {
-            flatten_annotations(doc)?;
-            Ok(())
-        })
+        apply_edit_and_save(
+            &path,
+            std::slice::from_ref(&m),
+            &Default::default(),
+            |doc| {
+                flatten_annotations(doc)?;
+                Ok(())
+            },
+        )
         .unwrap();
 
         let reopened = lopdf::Document::load(&path).unwrap();
         let page_id = *reopened.get_pages().values().next().unwrap();
         // No live annotation must remain (fully flattened, no duplicate at either position).
         let page = reopened.get_dictionary(page_id).unwrap();
-        assert!(page.get(b"Annots").is_err(), "must be fully flattened, no live duplicate");
+        assert!(
+            page.get(b"Annots").is_err(),
+            "must be fully flattened, no live duplicate"
+        );
         // Exactly one baked overlay content stream (not two - one per position).
         let contents = page.get(b"Contents").unwrap().as_array().unwrap();
         assert_eq!(
@@ -1173,13 +1207,19 @@ mod tests {
         // (Stream::compress() only compresses when it saves >= 19 bytes - see
         // docops::tests::compressible_stream_content for the same constraint).
         let m = long_ink_markup(0);
-        apply_edit_and_save(&path, std::slice::from_ref(&m), &Default::default(), |doc| optimize_in_place(doc, 2))
-            .unwrap();
+        apply_edit_and_save(
+            &path,
+            std::slice::from_ref(&m),
+            &Default::default(),
+            |doc| optimize_in_place(doc, 2),
+        )
+        .unwrap();
 
         let reopened = lopdf::Document::load(&path).unwrap();
-        let compressed_stream_exists = reopened.objects.values().any(|o| {
-            matches!(o, lopdf::Object::Stream(s) if s.is_compressed())
-        });
+        let compressed_stream_exists = reopened
+            .objects
+            .values()
+            .any(|o| matches!(o, lopdf::Object::Stream(s) if s.is_compressed()));
         assert!(
             compressed_stream_exists,
             "level-2 optimize must compress at least one stream, including annotation appearances written just before it"
@@ -1296,9 +1336,12 @@ mod tests {
         doc.save(&path).unwrap();
 
         let m = redline_markup(0);
-        apply_edit_and_save(&path, std::slice::from_ref(&m), &Default::default(), |doc| {
-            page_ops::rotate_page(doc, 0, 90)
-        })
+        apply_edit_and_save(
+            &path,
+            std::slice::from_ref(&m),
+            &Default::default(),
+            |doc| page_ops::rotate_page(doc, 0, 90),
+        )
         .unwrap();
 
         let reopened = lopdf::Document::load(&path).unwrap();
@@ -1317,8 +1360,13 @@ mod tests {
         let mut doc = encrypted_one_page_doc("redline-pw", "owner-pw");
         doc.save(&path).unwrap();
 
-        let err = apply_edit_and_save(&path, &[], &Default::default(), |doc| optimize_in_place(doc, 1));
-        assert!(err.is_err(), "encrypted PDFs must be refused, not silently de-protected");
+        let err = apply_edit_and_save(&path, &[], &Default::default(), |doc| {
+            optimize_in_place(doc, 1)
+        });
+        assert!(
+            err.is_err(),
+            "encrypted PDFs must be refused, not silently de-protected"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1345,7 +1393,11 @@ mod tests {
         );
 
         let extracted = lopdf::Document::load(&dest).unwrap();
-        assert_eq!(extracted.get_pages().len(), 2, "only the requested pages must be present");
+        assert_eq!(
+            extracted.get_pages().len(),
+            2,
+            "only the requested pages must be present"
+        );
     }
 
     #[test]
@@ -1358,11 +1410,22 @@ mod tests {
         doc.save(&src).unwrap();
 
         let m = redline_markup(1); // markup lives on page index 1
-        extract_pages_to_new_file(&src, &dest, std::slice::from_ref(&m), &Default::default(), &[1]).unwrap();
+        extract_pages_to_new_file(
+            &src,
+            &dest,
+            std::slice::from_ref(&m),
+            &Default::default(),
+            &[1],
+        )
+        .unwrap();
 
         let extracted = lopdf::Document::load(&dest).unwrap();
         let markups = crate::document::annots::read_markups(&extracted).unwrap();
-        assert_eq!(markups.len(), 1, "the markup on the kept page must survive extraction");
+        assert_eq!(
+            markups.len(),
+            1,
+            "the markup on the kept page must survive extraction"
+        );
     }
 
     #[test]
@@ -1375,12 +1438,23 @@ mod tests {
         doc.save(&src).unwrap();
 
         let m = redline_markup(2); // markup lives on page index 2 - NOT extracted below
-        extract_pages_to_new_file(&src, &dest, std::slice::from_ref(&m), &Default::default(), &[0, 1]).unwrap();
+        extract_pages_to_new_file(
+            &src,
+            &dest,
+            std::slice::from_ref(&m),
+            &Default::default(),
+            &[0, 1],
+        )
+        .unwrap();
 
         let extracted = lopdf::Document::load(&dest).unwrap();
         assert_eq!(extracted.get_pages().len(), 2);
         let markups = crate::document::annots::read_markups(&extracted).unwrap();
-        assert_eq!(markups.len(), 0, "a markup on a page that was NOT extracted must not appear");
+        assert_eq!(
+            markups.len(),
+            0,
+            "a markup on a page that was NOT extracted must not appear"
+        );
     }
 
     #[test]
@@ -1393,7 +1467,10 @@ mod tests {
         doc.save(&src).unwrap();
 
         let err = extract_pages_to_new_file(&src, &dest, &[], &Default::default(), &[0]);
-        assert!(err.is_err(), "encrypted PDFs must be refused, not silently de-protected");
+        assert!(
+            err.is_err(),
+            "encrypted PDFs must be refused, not silently de-protected"
+        );
         assert!(!dest.exists(), "no partial destination file on refusal");
     }
 
@@ -1470,8 +1547,14 @@ mod tests {
     ) -> Vec<u32> {
         let out = path.with_extension("next.pdf");
         let snap = store.write_snapshot("d").unwrap();
-        crate::document::save::save_with_markups_scaled(path, &out, &snap.markups, &snap.removed, &[])
-            .unwrap();
+        crate::document::save::save_with_markups_scaled(
+            path,
+            &out,
+            &snap.markups,
+            &snap.removed,
+            &[],
+        )
+        .unwrap();
         let mut pages: Vec<u32> = crate::document::save::load_markups_from(&out, None)
             .unwrap()
             .iter()
@@ -1492,15 +1575,27 @@ mod tests {
 
         // Without the resync the store still says page 0: the next save moves the markup to
         // whatever sheet now sits first (the Codex R2 probe).
-        page_op(&store, &path, false, |d| page_ops::reorder_pages(d, vec![1, 2, 0]));
-        assert_eq!(pages_after_next_save(&store, &path), vec![0], "premise: the stale store misplaces it");
+        page_op(&store, &path, false, |d| {
+            page_ops::reorder_pages(d, vec![1, 2, 0])
+        });
+        assert_eq!(
+            pages_after_next_save(&store, &path),
+            vec![0],
+            "premise: the stale store misplaces it"
+        );
 
         let dir2 = tempfile::tempdir().unwrap();
         let path2 = dir2.path().join("reorder.pdf");
         n_page_doc(3).0.save(&path2).unwrap();
         let store = store_with(&path2, m);
-        page_op(&store, &path2, true, |d| page_ops::reorder_pages(d, vec![1, 2, 0]));
-        assert_eq!(store.list("d").unwrap()[0].page, 2, "the sheet moved from 0 to 2");
+        page_op(&store, &path2, true, |d| {
+            page_ops::reorder_pages(d, vec![1, 2, 0])
+        });
+        assert_eq!(
+            store.list("d").unwrap()[0].page,
+            2,
+            "the sheet moved from 0 to 2"
+        );
         assert_eq!(pages_after_next_save(&store, &path2), vec![2]);
         assert!(!store.is_dirty("d"));
     }
@@ -1531,7 +1626,10 @@ mod tests {
         let store = store_with(&path, redline_markup(0));
 
         page_op(&store, &path, true, |d| flatten_annotations(d).map(|_| ()));
-        assert!(store.list("d").unwrap().is_empty(), "baked into the page, no longer a markup");
+        assert!(
+            store.list("d").unwrap().is_empty(),
+            "baked into the page, no longer a markup"
+        );
         assert_eq!(pages_after_next_save(&store, &path), Vec::<u32>::new());
     }
 
@@ -1550,13 +1648,19 @@ mod tests {
             Err("save already in progress".to_string()),
             "an edit during the write is refused: its page index could not be remapped"
         );
-        apply_edit_and_save(&path, &snap.markups, &snap.removed, |d| page_ops::reorder_pages(d, vec![1, 0]))
-            .unwrap();
+        apply_edit_and_save(&path, &snap.markups, &snap.removed, |d| {
+            page_ops::reorder_pages(d, vec![1, 0])
+        })
+        .unwrap();
         let on_disk = crate::document::save::load_markups_from(&path, None).unwrap();
         store.finish_page_op("d", &snap, &on_disk);
         drop(slot);
         assert_eq!(store.list("d").unwrap().len(), 1);
-        assert_eq!(store.list("d").unwrap()[0].page, 1, "the original markup moved with its sheet");
+        assert_eq!(
+            store.list("d").unwrap()[0].page,
+            1,
+            "the original markup moved with its sheet"
+        );
         assert!(!store.is_dirty("d"));
     }
 
@@ -1587,13 +1691,19 @@ mod tests {
         let store = crate::document::store::MarkupStore::default();
         store.register("d", path.clone(), None);
         let loaded = crate::document::save::load_markups_from(&path, None).unwrap();
-        assert_eq!(loaded.len(), 1, "precondition: the foreign annotation is imported");
+        assert_eq!(
+            loaded.len(),
+            1,
+            "precondition: the foreign annotation is imported"
+        );
         store.seed_loaded("d", loaded).unwrap();
 
         page_op(&store, &path, true, |d| page_ops::rotate_page(d, 0, 90));
         assert_eq!(store.list("d").unwrap().len(), 1, "survives a rotate");
 
-        page_op(&store, &path, true, |d| page_ops::reorder_pages(d, vec![1, 2, 0]));
+        page_op(&store, &path, true, |d| {
+            page_ops::reorder_pages(d, vec![1, 2, 0])
+        });
         let kept = store.list("d").unwrap();
         assert_eq!(kept.len(), 1, "survives a reorder");
         assert_eq!(kept[0].page, 2, "and follows its sheet");
@@ -1609,13 +1719,19 @@ mod tests {
         let store = store_with(&path, redline_markup(0));
         // The flatten reached the file, then the read-back failed (no finish_page_op).
         let snap = store.write_snapshot("d").unwrap();
-        apply_edit_and_save(&path, &snap.markups, &snap.removed, |d| flatten_annotations(d).map(|_| ())).unwrap();
+        apply_edit_and_save(&path, &snap.markups, &snap.removed, |d| {
+            flatten_annotations(d).map(|_| ())
+        })
+        .unwrap();
         store.mark_needs_reload("d");
 
         let txn = store.begin_reload("d").unwrap();
         let loaded = crate::document::save::load_markups_from(&path, None).unwrap();
         store.commit_reload("d", txn, loaded, 1).unwrap();
-        assert!(store.list("d").unwrap().is_empty(), "the flattened markup stays gone");
+        assert!(
+            store.list("d").unwrap().is_empty(),
+            "the flattened markup stays gone"
+        );
         assert!(!store.is_dirty("d"));
         assert_eq!(pages_after_next_save(&store, &path), Vec::<u32>::new());
     }
@@ -1628,14 +1744,21 @@ mod tests {
         n_page_doc(3).0.save(&path).unwrap();
         let store = store_with(&path, redline_markup(0));
         let snap = store.write_snapshot("d").unwrap();
-        apply_edit_and_save(&path, &snap.markups, &snap.removed, |d| page_ops::reorder_pages(d, vec![1, 2, 0])).unwrap();
+        apply_edit_and_save(&path, &snap.markups, &snap.removed, |d| {
+            page_ops::reorder_pages(d, vec![1, 2, 0])
+        })
+        .unwrap();
         store.mark_needs_reload("d");
 
         let txn = store.begin_reload("d").unwrap();
         let loaded = crate::document::save::load_markups_from(&path, None).unwrap();
         store.commit_reload("d", txn, loaded, 3).unwrap();
         assert_eq!(store.list("d").unwrap().len(), 1);
-        assert_eq!(store.list("d").unwrap()[0].page, 2, "the sheet moved from 0 to 2");
+        assert_eq!(
+            store.list("d").unwrap()[0].page,
+            2,
+            "the sheet moved from 0 to 2"
+        );
         assert_eq!(pages_after_next_save(&store, &path), vec![2]);
     }
 }

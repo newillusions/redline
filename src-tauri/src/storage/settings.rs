@@ -272,10 +272,7 @@ mod tests {
     fn upsert_recent_color_dedups_and_moves_to_front() {
         let mut colors = vec!["#111111".to_string(), "#222222".to_string()];
         upsert_recent_color(&mut colors, "#222222".to_string());
-        assert_eq!(
-            colors,
-            vec!["#222222".to_string(), "#111111".to_string()]
-        );
+        assert_eq!(colors, vec!["#222222".to_string(), "#111111".to_string()]);
     }
 
     #[test]

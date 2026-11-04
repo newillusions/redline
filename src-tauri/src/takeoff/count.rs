@@ -58,7 +58,12 @@ fn with_total(m: &Markup, total: u64) -> Markup {
 /// A count item's own value: a placed count mark counts once when no value is recorded (a
 /// foreign or hand-edited item), the same rule as the group totals and every panel.
 fn item_value(m: &Markup) -> u64 {
-    u64::from(m.measurement.as_ref().and_then(|x| x.count_value).unwrap_or(1))
+    u64::from(
+        m.measurement
+            .as_ref()
+            .and_then(|x| x.count_value)
+            .unwrap_or(1),
+    )
 }
 
 /// One row per count group: the first item of each group stands in for the whole group

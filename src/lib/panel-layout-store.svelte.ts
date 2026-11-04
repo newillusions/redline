@@ -12,7 +12,7 @@
  * a failed save keeps the change dirty so the next flush or change retries it. Both
  * failures are reported through `onError` so the user is told.
  */
-import { defaultLayout, normalizeLayout, type PanelLayout } from "./panel-layout";
+import { defaultLayout, layoutProblem, normalizeLayout, type PanelLayout } from "./panel-layout";
 
 export const LAYOUT_SAVE_DEBOUNCE_MS = 400;
 
@@ -44,7 +44,8 @@ export class PanelLayoutStore {
   /**
    * Adopt a persisted value (validated). Does not trigger a save. A value carrying an
    * unrecognised `version` (written by a newer build) is NOT adopted and saving stays
-   * disabled, so the stored layout is never overwritten by this session's default.
+   * disabled, so the stored layout is never overwritten by this session's default. A damaged
+   * version-1 value is replaced by the default in memory only, and reported.
    */
   load(raw: unknown): void {
     if (raw && typeof raw === "object" && "version" in raw && (raw as { version: unknown }).version !== 1) {
@@ -55,6 +56,14 @@ export class PanelLayoutStore {
     }
     this.layout = normalizeLayout(raw);
     this.#ready = true;
+    // A damaged value is reported once; it stays on disk until the user changes the layout
+    // (load() never marks the store dirty, so nothing is written before then).
+    const problem = raw === null || raw === undefined ? null : layoutProblem(raw);
+    if (problem) {
+      this.#onError(
+        `The saved panel layout is damaged (${problem}); using the default layout. The saved value is kept until you change the layout.`,
+      );
+    }
   }
 
   /** The stored value could not be read: keep the default for this session, never save over it. */

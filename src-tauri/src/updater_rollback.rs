@@ -138,7 +138,9 @@ fn commits_url(path: &str, limit: u32) -> String {
 }
 
 fn contents_url(path: &str, git_ref: &str) -> String {
-    format!("https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}?ref={git_ref}")
+    format!(
+        "https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}?ref={git_ref}"
+    )
 }
 
 /// The real rollback install target for a given commit — a plain, immutable
@@ -149,7 +151,8 @@ pub fn manifest_raw_url(git_ref: &str, path: &str) -> String {
 }
 
 fn parse_commit_entries(bytes: &[u8]) -> Result<Vec<CommitEntry>, RollbackError> {
-    serde_json::from_slice(bytes).map_err(|e| RollbackError::Transport(format!("bad commits response: {e}")))
+    serde_json::from_slice(bytes)
+        .map_err(|e| RollbackError::Transport(format!("bad commits response: {e}")))
 }
 
 /// Decode one `contents` API response into its manifest. Returns `None` on
@@ -161,7 +164,11 @@ fn decode_manifest_snapshot(bytes: &[u8]) -> Option<ManifestSnapshot> {
         return None;
     }
     // GitHub's contents API line-wraps the base64 payload at 60 chars.
-    let cleaned: String = contents.content.chars().filter(|c| !c.is_whitespace()).collect();
+    let cleaned: String = contents
+        .content
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     let decoded = STANDARD.decode(cleaned).ok()?;
     serde_json::from_slice(&decoded).ok()
 }
@@ -172,7 +179,10 @@ fn decode_manifest_snapshot(bytes: &[u8]) -> Option<ManifestSnapshot> {
 /// commit lookups that fail to fetch or parse are skipped rather than
 /// failing the whole list — a GitHub API hiccup or one malformed commit
 /// shouldn't hide every other release from the About page.
-pub async fn list_releases_with(source: &impl ReleaseSource, limit: u32) -> Result<Vec<ReleaseInfo>, RollbackError> {
+pub async fn list_releases_with(
+    source: &impl ReleaseSource,
+    limit: u32,
+) -> Result<Vec<ReleaseInfo>, RollbackError> {
     let commits_bytes = source.list_commits(MANIFEST_PATH, limit).await?;
     let commits = parse_commit_entries(&commits_bytes)?;
 
@@ -248,7 +258,10 @@ mod tests {
 
     #[tokio::test]
     async fn lists_releases_newest_first_from_commit_history() {
-        let commits = commits_json(&[("sha2", "2026-08-08T00:00:00Z"), ("sha1", "2026-08-06T00:00:00Z")]);
+        let commits = commits_json(&[
+            ("sha2", "2026-08-08T00:00:00Z"),
+            ("sha1", "2026-08-06T00:00:00Z"),
+        ]);
         let mut contents = HashMap::new();
         contents.insert(
             "sha2".to_string(),
@@ -264,7 +277,10 @@ mod tests {
 
         assert_eq!(releases.len(), 2);
         assert_eq!(releases[0].version, "0.3.14");
-        assert_eq!(releases[0].manifest_url, manifest_raw_url("sha2", "update.json"));
+        assert_eq!(
+            releases[0].manifest_url,
+            manifest_raw_url("sha2", "update.json")
+        );
         assert_eq!(releases[1].version, "0.3.13");
     }
 
@@ -301,7 +317,10 @@ mod tests {
         let releases = list_releases_with(&source, 15).await.unwrap();
 
         assert_eq!(releases.len(), 1);
-        assert_eq!(releases[0].manifest_url, manifest_raw_url("sha2", "update.json"));
+        assert_eq!(
+            releases[0].manifest_url,
+            manifest_raw_url("sha2", "update.json")
+        );
     }
 
     #[tokio::test]
@@ -335,7 +354,10 @@ mod tests {
     #[test]
     fn manifest_raw_url_is_commit_pinned_not_branch_pinned() {
         let url = manifest_raw_url("abc123", "update.json");
-        assert_eq!(url, "https://raw.githubusercontent.com/newillusions/redline/abc123/update.json");
+        assert_eq!(
+            url,
+            "https://raw.githubusercontent.com/newillusions/redline/abc123/update.json"
+        );
         assert!(!url.contains("/main/"));
     }
 }

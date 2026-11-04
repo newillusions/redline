@@ -141,7 +141,10 @@ fn check_authority_is_canonical(authority: &str, url: &url::Url) -> Result<(), S
         // unchanged, so they are fine in every label except the last (the public suffix).
         let last_label_start = host.rfind('.').map_or(0, |i| i + 1);
         if !host.bytes().enumerate().all(|(i, b)| {
-            b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || (b == b'_' && i < last_label_start)
+            b.is_ascii_alphanumeric()
+                || b == b'.'
+                || b == b'-'
+                || (b == b'_' && i < last_label_start)
         }) {
             return bad("host characters");
         }
@@ -187,7 +190,12 @@ fn normalise_mailto(url: &url::Url) -> Result<String, String> {
     let mut body = None;
     // RFC 6068 percent-decoding only: `+` is a literal plus here, not a space (that is the
     // form-encoding the generic query iterator applies).
-    for part in url.query().unwrap_or("").split('&').filter(|p| !p.is_empty()) {
+    for part in url
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter(|p| !p.is_empty())
+    {
         let (k, v) = part.split_once('=').ok_or_else(bad)?;
         let k = percent_decode(k);
         let v = percent_decode(v);
@@ -357,7 +365,11 @@ fn opener_command(uri: &str) -> Command {
     let root = std::env::var_os("SystemRoot")
         .or_else(|| std::env::var_os("windir"))
         .unwrap_or_else(|| "C:\\Windows".into());
-    let mut c = Command::new(std::path::Path::new(&root).join("System32").join("rundll32.exe"));
+    let mut c = Command::new(
+        std::path::Path::new(&root)
+            .join("System32")
+            .join("rundll32.exe"),
+    );
     c.arg("url.dll,FileProtocolHandler").arg(uri);
     c
 }

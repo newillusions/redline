@@ -31,7 +31,8 @@ pub async fn rollback_to_version(
     target_version: String,
 ) -> Result<(), String> {
     let wanted_version = target_version.clone();
-    let endpoint = reqwest::Url::parse(&manifest_url).map_err(|e| format!("invalid rollback manifest URL: {e}"))?;
+    let endpoint = reqwest::Url::parse(&manifest_url)
+        .map_err(|e| format!("invalid rollback manifest URL: {e}"))?;
     let updater = app_handle
         .updater_builder()
         .endpoints(vec![endpoint])

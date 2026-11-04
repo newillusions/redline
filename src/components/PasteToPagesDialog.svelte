@@ -49,7 +49,6 @@
 <dialog open class="paste-pages" aria-modal="true" aria-label="Paste to pages" onkeydown={onKey}>
   <p class="title">Paste to pages</p>
   <label class="field" for="paste-pages-input">Pages (1 to {pageCount})</label>
-  <!-- svelte-ignore a11y_autofocus -->
   <input id="paste-pages-input" class="input" type="text" bind:value={text} autofocus aria-label="Pages" />
   <p class="hint">The markups are pasted at the same position on each page.</p>
   {#if error}<p class="error" role="alert">{error}</p>{/if}
