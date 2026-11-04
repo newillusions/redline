@@ -925,7 +925,7 @@ mod tests {
             }
         }
         // No object in the whole file is an action dictionary.
-        for (_, o) in doc.objects.iter() {
+        for o in doc.objects.values() {
             if let Object::Dictionary(d) = o {
                 assert!(
                     !d.has(b"JS") && !d.has(b"OpenAction"),

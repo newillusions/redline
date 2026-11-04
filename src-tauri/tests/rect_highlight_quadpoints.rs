@@ -60,8 +60,10 @@ fn rect_highlight_is_accepted_by_poppler_and_qpdf() {
         user_id: uuid::Uuid::new_v4(),
         display_name: "T".into(),
     };
-    let mut a = Appearance::default();
-    a.color = "#ffe000".into();
+    let a = Appearance {
+        color: "#ffe000".into(),
+        ..Default::default()
+    };
     let m = Markup::new(
         MarkupType::Highlight,
         0,

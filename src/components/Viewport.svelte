@@ -4377,6 +4377,10 @@
   {/if}
 
   {#if !slot}
+  <!-- Bottom chrome: page nav + zoom toolbar. The wrapper is the size container for the
+       narrow-viewport layout (not .viewport-root: inline-size containment would make that the
+       containing block of every position:fixed dialog/menu inside it and clip them). -->
+  <div class="bottom-chrome">
   <!-- Page navigation -->
   <nav class="page-nav">
     <button
@@ -4466,6 +4470,7 @@
         onclick={() => setToolbarCollapsed(false)}
       >⚙</button>
     {/if}
+  </div>
   </div>
 
   {/if}
@@ -4755,6 +4760,15 @@
     pointer-events: none;
   }
 
+  /* --- Bottom chrome wrapper: covers the viewport, passes clicks through to the page. --- */
+  .bottom-chrome {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    container: viewport / inline-size;
+  }
+  .bottom-chrome > * { pointer-events: auto; }
+
   /* --- Page navigation --- */
   .page-nav {
     position: absolute;
@@ -4822,12 +4836,22 @@
   .zoom-controls-wrap.corner-bottom-right{ bottom: var(--space-4); right: var(--space-4); }
   .zoom-controls {
     display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    max-width: calc(100cqw - 2 * var(--space-4));
     gap: var(--space-1);
     background: rgba(26, 26, 28, 0.85);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-lg);
     padding: var(--space-1);
     backdrop-filter: blur(8px);
+  }
+  /* Narrow viewport: the centred page nav (~300px) and the toolbar cannot share the bottom
+     row, so the bottom-anchored toolbar stacks above the nav instead of covering it (the
+     toolbar wraps within the viewport width, see .zoom-controls). Top corners are free. */
+  @container viewport (max-width: 900px) {
+    .zoom-controls-wrap.corner-bottom-left,
+    .zoom-controls-wrap.corner-bottom-right { bottom: calc(var(--space-4) + 2.75rem); }
   }
   .toolbar-grip {
     cursor: grab;

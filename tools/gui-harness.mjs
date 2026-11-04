@@ -10,6 +10,7 @@
  * Tiles are checker-coloured and labelled "P{page} t{tx},{ty} z{zoom}" so position, page,
  * zoom, seams and stale-tile races are all visually obvious.
  *
+ * Exits 0 and prints PASS on success; exits 1 with FAIL lines otherwise.
  * Run:  node tools/gui-harness.mjs            (needs `npm run dev` / tauri:dev serving :1421)
  *       OUT=/tmp/h node tools/gui-harness.mjs  (screenshot dir; default /tmp)
  */
@@ -17,6 +18,7 @@ import { chromium } from "playwright";
 
 const URL = process.env.HARNESS_URL || "http://localhost:1421/";
 const OUT = process.env.OUT || "/tmp";
+const WIDTH = Number(process.env.HARNESS_WIDTH) || 1280;
 
 // Runs in the PAGE context, before the app boots. Must be self-contained (no closures over
 // Node scope). Sets up the mock Tauri IPC.
@@ -123,6 +125,9 @@ function installMockTauri() {
   };
 }
 
+let failed = false;
+const fail = (msg) => { console.log(`FAIL: ${msg}`); failed = true; };
+
 const shot = async (page, name) => {
   const p = `${OUT}/harness-${name}.png`;
   await page.screenshot({ path: p });
@@ -130,54 +135,164 @@ const shot = async (page, name) => {
 };
 
 const browser = await chromium.launch();
-const page = await browser.newPage({ deviceScaleFactor: 2, viewport: { width: 1600, height: 900 } });
-page.on("console", (m) => {
-  const t = m.text();
-  if (m.type() === "error" || m.type() === "warning" || t.startsWith("MOCK_INVOKE_UNHANDLED")) {
-    console.log(`[page:${m.type()}]`, t);
+
+async function openApp(dpr, width, height = 900) {
+  const page = await browser.newPage({ deviceScaleFactor: dpr, viewport: { width, height } });
+  page.on("console", (m) => {
+    const t = m.text();
+    if (m.type() === "error" || m.type() === "warning" || t.startsWith("MOCK_INVOKE_UNHANDLED")) {
+      console.log(`[page:${m.type()}]`, t);
+    }
+  });
+  page.on("pageerror", (e) => console.log("[pageerror]", e.message));
+  await page.addInitScript(installMockTauri);
+  await page.goto(URL, { waitUntil: "load" });
+  // Wait for the viewport to mount (doc auto-opens via mock auto_open_path).
+  await page.waitForSelector(".viewport-root", { timeout: 15000 });
+  await page.waitForTimeout(1200);
+  return page;
+}
+
+const intersects = (a, b) =>
+  a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+
+// Layout check: the zoom toolbar must not overlap the page-nav bar (or leave the viewport)
+// at any width, at both dpr 1 and 2.5. Regression: at 1280 with both sidebars open the
+// toolbar sat on top of the page-nav buttons.
+async function checkToolbarOverlap(dpr, width) {
+  const page = await openApp(dpr, width);
+  const label = `${width}px dpr ${dpr}`;
+  const nav = await page.$(".page-nav");
+  const bar = await page.$(".zoom-controls-wrap");
+  const root = await page.$(".viewport-root");
+  if (!nav || !bar || !root) {
+    fail(`${label}: missing element (.page-nav=${!!nav} .zoom-controls-wrap=${!!bar} .viewport-root=${!!root})`);
+    await page.close();
+    return;
   }
-});
-page.on("pageerror", (e) => console.log("[pageerror]", e.message));
+  const n = await nav.boundingBox();
+  const b = await bar.boundingBox();
+  const r = await root.boundingBox();
+  if (!n || !b || !r) {
+    fail(`${label}: element has no bounding box`);
+  } else {
+    if (intersects(n, b)) fail(`${label}: zoom toolbar overlaps page nav (nav ${JSON.stringify(n)} toolbar ${JSON.stringify(b)})`);
+    if (b.x < r.x - 0.5 || b.x + b.width > r.x + r.width + 0.5) {
+      fail(`${label}: zoom toolbar leaves the viewport horizontally (toolbar ${JSON.stringify(b)} viewport ${JSON.stringify(r)})`);
+    }
+    // Every button of both bars must stay clickable, i.e. not covered by the other bar.
+    for (const sel of [".page-nav button", ".zoom-controls button"]) {
+      for (const btn of await page.$$(sel)) {
+        const bb = await btn.boundingBox();
+        const other = sel.startsWith(".page-nav") ? b : n;
+        if (bb && intersects(bb, other)) fail(`${label}: ${sel} button overlaps the other bar`);
+      }
+    }
+    console.log(`overlap ${label}: nav y=${Math.round(n.y)} h=${Math.round(n.height)}, toolbar y=${Math.round(b.y)} h=${Math.round(b.height)} w=${Math.round(b.width)}`);
+  }
+  await page.close();
+}
 
-await page.addInitScript(installMockTauri);
-await page.goto(URL, { waitUntil: "load" });
-
-// Wait for the viewport to mount (doc auto-opens via mock auto_open_path).
-await page.waitForSelector(".viewport-root", { timeout: 15000 });
-await page.waitForTimeout(1200);
+const page = await openApp(2, WIDTH);
 await shot(page, "100");
 
 // Zoom in with the wheel, centred on the viewport.
 const vp = await page.$(".viewport-root");
-const box = await vp.boundingBox();
-const cx = box.x + box.width / 2;
-const cy = box.y + box.height / 2;
-await page.mouse.move(cx, cy);
-for (let i = 0; i < 6; i++) {
-  await page.mouse.wheel(0, -120);
-  await page.waitForTimeout(50);
-}
-await page.waitForTimeout(400);
-await shot(page, "zoomin");
+if (!vp) {
+  fail("missing .viewport-root");
+} else {
+  const box = await vp.boundingBox();
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  await page.mouse.move(cx, cy);
+  for (let i = 0; i < 6; i++) {
+    await page.mouse.wheel(0, -120);
+    await page.waitForTimeout(50);
+  }
+  await page.waitForTimeout(400);
+  await shot(page, "zoomin");
 
-// Pan a bit (drag with the Hand tool — default tool is hand).
-await page.mouse.move(cx, cy);
-await page.mouse.down();
-await page.mouse.move(cx - 150, cy - 120, { steps: 8 });
-await page.mouse.up();
-await page.waitForTimeout(300);
-await shot(page, "panned");
+  // Pan a bit (drag with the Hand tool - default tool is hand).
+  await page.mouse.move(cx, cy);
+  await page.mouse.down();
+  await page.mouse.move(cx - 150, cy - 120, { steps: 8 });
+  await page.mouse.up();
+  await page.waitForTimeout(300);
+  await shot(page, "panned");
+}
 
 // Next page (rapid double-click to also probe the stale-tile race).
-// 1600 wide: at 1280 with both sidebars open the zoom toolbar overlaps the page nav.
-// The Next-page button follows the page label; the last .btn-nav is now "Next view".
+// The Next-page button follows the page label; the last .btn-nav is "Next view".
+const label = () => page.$eval(".page-label", (e) => e.textContent.replace(/\s+/g, " ").trim()).catch(() => null);
 const next = await page.$(".page-nav .page-label + .btn-nav");
-if (next) {
+if (!next) {
+  fail("Next-page button (.page-nav .page-label + .btn-nav) not found");
+} else {
+  const before = await label();
   await next.click();
   await next.click();
   await page.waitForTimeout(500);
   await shot(page, "page-switch");
+  const after = await label();
+  if (after !== "Page 3 / 5") fail(`expected "Page 3 / 5" after two Next clicks, got ${JSON.stringify(after)} (was ${JSON.stringify(before)})`);
+}
+await page.close();
+
+// Overlays inside .viewport-root must stay relative to the WINDOW: a context menu opens at the
+// click and a modal backdrop covers the whole window, with both sidebars open (the viewport is
+// then far narrower than the window). Guards against anything on .viewport-root (containment,
+// transform, filter) becoming the containing block of position:fixed descendants.
+{
+  const w = WIDTH;
+  const h = 900;
+  const op = await openApp(1, w, h);
+  const root = await op.$(".viewport-root");
+  const rb = root ? await root.boundingBox() : null;
+  if (!rb) {
+    fail("overlay check: .viewport-root missing");
+  } else {
+    if (rb.x < 50) fail(`overlay check: expected sidebars to offset the viewport, got x=${rb.x}`);
+    const px = Math.round(rb.x + rb.width / 3);
+    const py = Math.round(rb.y + rb.height / 3);
+    await op.mouse.click(px, py, { button: "right" });
+    const menu = op.locator('[data-testid="context-menu"]');
+    await menu.waitFor({ timeout: 3000 }).catch(() => {});
+    const mb = (await menu.count()) ? await menu.boundingBox() : null;
+    if (!mb) fail("overlay check: right-click did not open the context menu");
+    else if (Math.abs(mb.x - px) > 4 || Math.abs(mb.y - py) > 4) {
+      fail(`overlay check: context menu at (${mb.x},${mb.y}), click at (${px},${py})`);
+    } else console.log(`context menu at click point OK (${mb.x},${mb.y})`);
+    await op.keyboard.press("Escape");
+
+    const tool = op.locator('.tool-strip .tool-btn[title^="Viewport"]');
+    if ((await tool.count()) !== 1) fail("overlay check: Viewport tool button not found");
+    else {
+      await tool.click();
+      await op.mouse.move(px, py);
+      await op.mouse.down();
+      await op.mouse.move(px + 60, py + 50, { steps: 4 });
+      await op.mouse.move(px + 120, py + 100, { steps: 4 });
+      await op.mouse.up();
+      const dlg = op.getByRole("dialog", { name: "New Viewport" });
+      await dlg.waitFor({ timeout: 3000 }).catch(() => {});
+      const bd = op.locator(".dialog-backdrop");
+      const bb = (await bd.count()) ? await bd.first().boundingBox() : null;
+      if (!bb) fail("overlay check: dragging with the Viewport tool did not open a dialog backdrop");
+      else if (Math.abs(bb.x) > 1 || Math.abs(bb.y) > 1 || bb.width < w - 1 || bb.height < h - 1) {
+        fail(`overlay check: dialog backdrop ${JSON.stringify(bb)} does not cover the ${w}x${h} window`);
+      } else console.log("dialog backdrop covers the window OK");
+    }
+  }
+  await op.close();
+}
+
+for (const dpr of [1, 2.5]) {
+  for (const width of [1024, 1280, 1600]) await checkToolbarOverlap(dpr, width);
 }
 
 await browser.close();
-console.log("DONE");
+if (failed) {
+  console.log("FAIL: see lines above.");
+  process.exit(1);
+}
+console.log("PASS");
