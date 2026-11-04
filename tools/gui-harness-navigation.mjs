@@ -146,6 +146,13 @@ function installMockTauri() {
     folder_index_status: () => ({ status: "idle", doc_count: 0 }),
     list_document_versions: () => [],
     load_recent_docs: () => [], save_recent_docs: () => null, check_file_exists: () => true, search_document: () => [],
+    // The panel layout loads from settings; null raises "Could not load the panel layout".
+    load_settings: () => ({
+      theme: "dark", default_tool: null, measurement_unit: "m", author_name: "", last_window: null,
+      recent_colors: [], auto_ocr_on_open: false, viewer_mode: "single", panel_layout: null,
+    }),
+    save_settings: () => null,
+
     // ---- Navigator ----
     get_navigation: () => info(),
     navigation_edit: (a) => { window.__calls.push(["navigation_edit", a.edit.op]); return edit(a.edit); },

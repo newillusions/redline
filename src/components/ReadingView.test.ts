@@ -11,6 +11,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, fireEvent, waitFor } from "@testing-library/svelte";
 import ReadingView from "./ReadingView.svelte";
+import { uiPrefs } from "$lib/ui-prefs.svelte";
 import { dropLayerStore, layerStoreFor } from "$lib/layers-store.svelte";
 
 vi.mock("$lib/ipc", () => ({
@@ -81,6 +82,21 @@ function stubResizeObserver(): (w: number, h: number) => void {
 beforeEach(() => {
   stubPageSizes(10);
   stubRenderTile();
+});
+
+describe("ReadingView — Reuse tools toggle", () => {
+  it("exposes the Reuse toggle in the reading-mode toolbar and flips the preference", async () => {
+    stubResizeObserver();
+    const { container } = render(ReadingView, { props: { docInfo: FAKE_DOC } });
+    const btn = container.querySelector(".reading-zoom-toolbar .btn-reuse") as HTMLButtonElement;
+    expect(btn).not.toBeNull();
+    const before = uiPrefs.reuseTools;
+    expect(btn.getAttribute("aria-pressed")).toBe(String(before));
+    await fireEvent.click(btn);
+    expect(uiPrefs.reuseTools).toBe(!before);
+    expect(btn.getAttribute("aria-pressed")).toBe(String(!before));
+    uiPrefs.setReuseTools(before);
+  });
 });
 
 describe("ReadingView — fit-width default", () => {

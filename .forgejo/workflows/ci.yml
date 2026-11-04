@@ -115,6 +115,9 @@ jobs:
       - name: Rust format check
         run: cargo fmt --all -- --check
 
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
       - name: Test
         run: |
           cargo test --lib -p redline
@@ -221,3 +224,28 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+  # ---------------------------------------------------------------------------
+  # gui-harness - every tools/gui-harness*.mjs in headless Chromium against the Vite dev
+  # server with a mocked Tauri IPC (scripts/run-harnesses.sh). Separate job so a browser
+  # install problem does not mask the unit-test result above.
+  # ---------------------------------------------------------------------------
+  gui-harness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup Node.js
+        uses: https://data.forgejo.org/actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Install Chromium (with system libraries)
+        run: npx playwright install --with-deps chromium
+
+      - name: Run GUI harnesses
+        run: npm run harness

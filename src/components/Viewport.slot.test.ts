@@ -143,6 +143,31 @@ describe("Viewport page-slot mode", () => {
     expect(store.activeTool).toBe("Ellipse");
   });
 
+  it("Space-pan: window blur while Space is held restores the tool", async () => {
+    store.activeTool = "Rectangle";
+    await mountSlot(store, takeoff, { page: 0, zoom: 1, active: true, inert: false });
+    key("keydown", { key: " ", code: "Space" });
+    await tick();
+    expect(store.activeTool).toBe("hand");
+    window.dispatchEvent(new Event("blur"));
+    await tick();
+    expect(store.activeTool).toBe("Rectangle");
+    expect(store.spacePanTool).toBeNull();
+  });
+
+  it("Space-pan: the tab being hidden while Space is held restores the tool", async () => {
+    store.activeTool = "Ellipse";
+    await mountSlot(store, takeoff, { page: 0, zoom: 1, active: true, inert: false });
+    key("keydown", { key: " ", code: "Space" });
+    await tick();
+    const vis = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    document.dispatchEvent(new Event("visibilitychange"));
+    vis.mockRestore();
+    await tick();
+    expect(store.activeTool).toBe("Ellipse");
+    expect(store.spacePanTool).toBeNull();
+  });
+
   // Review finding 2 (PR #168): a first calibration point must not keep its page busy (and
   // every other page inert) once the Calibrate tool is left.
   it("leaving the Calibrate tool after the first point cancels the calibration and frees the page", async () => {

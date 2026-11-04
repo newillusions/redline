@@ -31,6 +31,9 @@ use super::client::{self, ClientError};
 use super::gate::{self, LicenseState};
 use super::store::{self, StoredLicense};
 
+// async_trait's generated `#[must_use]` wrapper trips clippy::double_must_use on Result
+// returns (newer clippy only); the lint fires inside the macro expansion, not our code.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait LicenseClient: Send + Sync {
     async fn issue(&self, code: &str, device_fingerprint: &str) -> Result<String, ClientError>;

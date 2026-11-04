@@ -423,6 +423,7 @@ pub fn fixed2(q: f64) -> String {
     }
 }
 
+#[cfg(test)]
 fn pages_text(pages: &BTreeSet<u32>) -> String {
     pages_text_labelled(pages, &[])
 }

@@ -84,11 +84,24 @@ function installMockTauri() {
     load_recent_docs: () => [],
     save_recent_docs: () => null,
     check_file_exists: () => true,
+    // The panel layout loads from settings; null would raise "Could not load the panel layout".
+    load_settings: () => ({
+      theme: "dark", default_tool: null, measurement_unit: "m", author_name: "", last_window: null,
+      recent_colors: [], auto_ocr_on_open: false, viewer_mode: "single", panel_layout: null,
+    }),
+    save_settings: () => null,
+    // VersionPanel iterates this; a null return crashes the sidebar.
+    list_document_versions: () => [],
     // One hit, well off the opening page, so a real jump is unambiguous.
     search_document: () => [{ page: 3, rect: [50, 700, 150, 720], snippet: "the test phrase" }],
   };
 
   window.__TAURI_INTERNALS__ = {
+    // getCurrentWindow() reads these (the close guard in App.svelte).
+    metadata: {
+      currentWindow: { label: "main" },
+      currentWebview: { label: "main", windowLabel: "main" },
+    },
     transformCallback(cb) {
       const id = (window.__cbid = (window.__cbid || 0) + 1);
       window[`__cb_${id}`] = cb;

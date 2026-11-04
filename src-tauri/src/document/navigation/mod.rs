@@ -417,6 +417,7 @@ fn is_ours_to_delete(obj: &Object) -> bool {
 ///
 /// Fails CLOSED: if the scan cannot complete within its budget, nothing is returned and
 /// nothing is deleted (orphans are harmless; a deleted live object is not).
+#[cfg(test)]
 pub(crate) fn unreferenced_among(doc: &Document, candidates: &[ObjectId]) -> Vec<ObjectId> {
     unreferenced_among_with_budget(doc, candidates, MAX_REACH_NODES)
 }

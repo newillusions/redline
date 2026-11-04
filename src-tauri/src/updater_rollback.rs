@@ -93,6 +93,9 @@ struct ManifestSnapshot {
 
 /// Source of the two GitHub API calls this module needs — real network in
 /// production, a fixed fake in tests. Mirrors `license::service::LicenseClient`.
+// async_trait's generated `#[must_use]` wrapper trips clippy::double_must_use on Result
+// returns (newer clippy only); the lint fires inside the macro expansion, not our code.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait ReleaseSource: Send + Sync {
     async fn list_commits(&self, path: &str, limit: u32) -> Result<Vec<u8>, RollbackError>;

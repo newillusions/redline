@@ -219,6 +219,9 @@ fn parse_columns(keys: &[String]) -> Result<Vec<ListColumn>, String> {
     keys.iter().map(|k| ListColumn::parse(k)).collect()
 }
 
+/// A view's (headers, rows, column weights).
+pub(crate) type ViewTable = (Vec<String>, Vec<Vec<String>>, Vec<f32>);
+
 /// The view as plain text: header cells, one row of cells per picked mark-up (in view order,
 /// quantities recomputed under `scales`, count items carrying their group total), and a
 /// relative width weight per column. Shared by the PDF summary.
@@ -228,7 +231,7 @@ pub(crate) fn view_table(
     ids: &[String],
     column_keys: &[String],
     labels: &[String],
-) -> Result<(Vec<String>, Vec<Vec<String>>, Vec<f32>), String> {
+) -> Result<ViewTable, String> {
     let mut recomputed = all.to_vec();
     crate::takeoff::recompute_all(&mut recomputed, scales);
     let cols = parse_columns(column_keys)?;
@@ -254,6 +257,7 @@ pub(crate) fn view_table(
 }
 
 /// Write the view to `path`. Returns the number of rows written.
+#[cfg(test)]
 pub fn export_view_to(
     all: &[Markup],
     ids: &[String],
@@ -266,6 +270,7 @@ pub fn export_view_to(
 
 /// [`export_view_to`] that first recomputes scaled quantities from `raw_measure` under the
 /// document's current scales, so this export shows the same totals as the Quantities one.
+#[cfg(test)]
 pub fn export_view_with_scales(
     all: &[Markup],
     scales: &[crate::takeoff::ScaleRecord],

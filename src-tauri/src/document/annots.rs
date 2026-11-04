@@ -760,6 +760,7 @@ pub(crate) fn write_markups(doc: &mut Document, markups: &[Markup]) -> Result<()
 /// as "foreign" and the delete would silently not reach the saved file. They are treated as
 /// redline-owned for this save, so they and everything answering them (replies, states) are
 /// stripped and, being absent from `markups`, not re-emitted.
+#[cfg(test)]
 pub(crate) fn write_markups_removing(
     doc: &mut Document,
     markups: &[Markup],

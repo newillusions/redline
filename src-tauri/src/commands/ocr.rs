@@ -35,6 +35,7 @@
 //! uses for PDFium (a whole dedicated OS thread) and `apply_page_edit` already uses for
 //! lopdf save work (`spawn_blocking` per call).
 
+#[cfg(any(test, feature = "ocr"))]
 use std::collections::HashSet;
 
 use serde::Serialize;
@@ -117,6 +118,7 @@ pub async fn document_needs_ocr(
 /// as owed to this phase ("detecting/preventing re-OCR of an already-OCR'd page is left as
 /// a Phase 2c-ii command-layer responsibility"): re-running OCR on a page that already has
 /// text would append a second, overlapping invisible layer for no benefit.
+#[cfg(any(test, feature = "ocr"))]
 fn pages_needing_ocr(page_count: u32, existing_text_pages: &HashSet<u32>) -> Vec<u32> {
     (0..page_count)
         .filter(|p| !existing_text_pages.contains(p))
@@ -182,6 +184,7 @@ fn pages_to_ocr_in_doc(doc: &mut lopdf::Document, page_count: u32, force: bool) 
 /// Per-page progress, emitted on the `"ocr-progress"` Tauri event as `run_ocr_document`
 /// recognizes each page — the frontend listens via `@tauri-apps/api/event`'s `listen` to
 /// drive a live per-page status line (spec requirement 2).
+#[cfg(feature = "ocr")]
 #[derive(Debug, Clone, Serialize)]
 pub struct OcrProgressEvent {
     pub doc_id: String,

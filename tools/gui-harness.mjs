@@ -91,9 +91,22 @@ function installMockTauri() {
     load_recent_docs: () => [],
     save_recent_docs: () => null,
     check_file_exists: () => true,
+    // The panel layout loads from settings; null would raise "Could not load the panel layout".
+    load_settings: () => ({
+      theme: "dark", default_tool: null, measurement_unit: "m", author_name: "", last_window: null,
+      recent_colors: [], auto_ocr_on_open: false, viewer_mode: "single", panel_layout: null,
+    }),
+    save_settings: () => null,
+    // VersionPanel iterates this; a null return crashes the sidebar.
+    list_document_versions: () => [],
   };
 
   window.__TAURI_INTERNALS__ = {
+    // getCurrentWindow() reads these (the close guard in App.svelte).
+    metadata: {
+      currentWindow: { label: "main" },
+      currentWebview: { label: "main", windowLabel: "main" },
+    },
     transformCallback(cb) {
       const id = (window.__cbid = (window.__cbid || 0) + 1);
       window[`__cb_${id}`] = cb;
@@ -117,7 +130,7 @@ const shot = async (page, name) => {
 };
 
 const browser = await chromium.launch();
-const page = await browser.newPage({ deviceScaleFactor: 2, viewport: { width: 1280, height: 800 } });
+const page = await browser.newPage({ deviceScaleFactor: 2, viewport: { width: 1600, height: 900 } });
 page.on("console", (m) => {
   const t = m.text();
   if (m.type() === "error" || m.type() === "warning" || t.startsWith("MOCK_INVOKE_UNHANDLED")) {
@@ -156,7 +169,9 @@ await page.waitForTimeout(300);
 await shot(page, "panned");
 
 // Next page (rapid double-click to also probe the stale-tile race).
-const next = await page.$(".page-nav .btn-nav:last-child");
+// 1600 wide: at 1280 with both sidebars open the zoom toolbar overlaps the page nav.
+// The Next-page button follows the page label; the last .btn-nav is now "Next view".
+const next = await page.$(".page-nav .page-label + .btn-nav");
 if (next) {
   await next.click();
   await next.click();

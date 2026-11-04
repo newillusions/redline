@@ -614,7 +614,6 @@ impl MarkupStore {
             .copied()
             .collect();
         Ok(ReloadTxn {
-            path,
             unsaved,
             baseline: e.baseline.clone(),
             keys: e.keys.clone(),
@@ -1040,7 +1039,6 @@ impl Drop for SaveGuard<'_> {
 
 /// An in-flight reload (see [`MarkupStore::begin_reload`]).
 pub struct ReloadTxn {
-    path: PathBuf,
     unsaved: super::recover::Unsaved,
     baseline: HashMap<Uuid, u64>,
     keys: HashMap<Uuid, u64>,

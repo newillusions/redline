@@ -497,19 +497,9 @@ pub async fn export_markup_list(
     export_markup_list_with_labels(&markups, &scales, &PathBuf::from(&path), format, &labels)
 }
 
-/// Core of [`export_markup_list`], extracted so it can be called with just a markup
-/// slice - no `State`/`AppState` dependency - by the MCP bridge's `export_markup_schedule`
-/// tool (`rpc::tools`, MCP server design §3: "wraps the existing M3 export command - no
-/// new export logic"), sharing exactly this code path with the Tauri command above.
-pub fn export_markup_list_to(
-    markups: &[Markup],
-    path: &std::path::Path,
-    format: ExportFormat,
-) -> Result<(), String> {
-    export_markup_list_with_scales(markups, &[], path, format)
-}
-
-/// [`export_markup_list_to`] that first recomputes every scaled quantity from its
+/// Export from a bare markup slice - no `State`/`AppState` dependency - so the MCP bridge's
+/// `export_markup_schedule` tool (`rpc::tools`) shares this code path with the Tauri command
+/// above. First recomputes every scaled quantity from its
 /// `raw_measure` under the document's current scales (so an export is never stale after
 /// a recalibration) and collapses each count group to one row carrying its total.
 pub fn export_markup_list_with_scales(
@@ -544,6 +534,7 @@ pub fn export_markup_list_with_labels(
 // XLSX writer
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 fn export_xlsx(
     markups: &[crate::markup::Markup],
     path: &std::path::Path,
@@ -623,6 +614,7 @@ fn export_xlsx_labelled(
 // CSV writer
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 fn export_csv(
     markups: &[crate::markup::Markup],
     path: &std::path::Path,

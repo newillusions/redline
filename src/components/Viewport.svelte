@@ -1373,6 +1373,16 @@
     store.endSpacePan();
   }
 
+  // The keyup never arrives when focus leaves the window (alt-tab, devtools) or the tab is
+  // hidden while Space is held, which would leave the Hand tool stuck on. endSpacePan is a
+  // no-op when no pan is armed, so every slot may run it.
+  function endSpacePanOnFocusLoss() {
+    store.endSpacePan();
+  }
+  function onVisibilityChange() {
+    if (document.visibilityState === "hidden") store.endSpacePan();
+  }
+
   // ---------------------------------------------------------------------------
   // Zoom toolbar: collapse/re-show + drag-to-corner reposition (owner feedback
   // 2026-09-15). Persistence lives in $lib/viewport (loadToolbarPrefs/
@@ -3788,6 +3798,8 @@
     }
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onSpaceKeyUp);
+    window.addEventListener("blur", endSpacePanOnFocusLoss);
+    document.addEventListener("visibilitychange", onVisibilityChange);
     const toolbarPrefs = loadToolbarPrefs();
     zoomToolbarCollapsed = toolbarPrefs.collapsed;
     zoomToolbarCorner = toolbarPrefs.corner;
@@ -3808,6 +3820,8 @@
     }
     window.removeEventListener("keydown", onKeyDown);
     window.removeEventListener("keyup", onSpaceKeyUp);
+    window.removeEventListener("blur", endSpacePanOnFocusLoss);
+    document.removeEventListener("visibilitychange", onVisibilityChange);
     // Mid-drag unmount safety net (e.g. tab switch while panning) - endMousePan() also
     // removes these, but this covers the case where mouseup/blur never fires at all.
     if (dragging) endMousePan();

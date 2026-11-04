@@ -218,6 +218,7 @@ pub struct ExportMarkupScheduleResult {
 /// output: "file path of the generated export" - an OUTPUT the tool produces, not an
 /// input the caller supplies, unlike the underlying `export_markup_list` Tauri command
 /// which takes an explicit destination from a GUI file dialog).
+#[cfg(test)]
 pub fn export_markup_schedule(
     store: &MarkupStore,
     p: ExportMarkupScheduleParams,
@@ -573,10 +574,13 @@ pub fn live_scales(all: Vec<crate::takeoff::ScaleRecord>) -> Vec<crate::takeoff:
     all.into_iter().filter(|s| !s.retired).collect()
 }
 
+/// A viewport a scale applies to: (page, name, bbox).
+pub type ScaleViewport<'a> = (u32, &'a str, [f64; 4]);
+
 impl AddScaleParams {
     /// The viewport this call describes: `Ok(None)` when neither viewport field is given,
     /// an error when only one is, or when no page says where the rectangle is.
-    pub fn viewport(&self) -> Result<Option<(u32, &str, [f64; 4])>, String> {
+    pub fn viewport(&self) -> Result<Option<ScaleViewport<'_>>, String> {
         match (
             &self.viewport_name,
             self.viewport_bbox,

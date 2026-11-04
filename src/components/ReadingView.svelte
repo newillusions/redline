@@ -69,6 +69,7 @@
   } from "$lib/reading-mode";
   import { layerStoreFor } from "$lib/layers-store.svelte";
   import Viewport from "./Viewport.svelte";
+  import { uiPrefs } from "$lib/ui-prefs.svelte";
   import type { MarkupStore } from "$lib/markup-store.svelte";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
   import type { NavigationStore } from "$lib/navigation-store.svelte";
@@ -633,6 +634,15 @@
         else if (e.key === "Escape") { e.preventDefault(); (e.target as HTMLInputElement).blur(); }
       }}
     />
+    <button
+      class="btn-zoom btn-reuse"
+      class:active={uiPrefs.reuseTools}
+      aria-pressed={uiPrefs.reuseTools}
+      title={uiPrefs.reuseTools
+        ? "Reuse tools is on: a tool stays active after each markup. Click to return to Select after each markup."
+        : "Reuse tools is off: back to Select after each markup. Click to keep the tool active."}
+      onclick={() => uiPrefs.setReuseTools(!uiPrefs.reuseTools)}
+    >Reuse</button>
     <span class="reading-zoom-indicator">{Math.round(zoom * 100)}%</span>
   </div>
 </div>
@@ -708,6 +718,8 @@
     font-size: var(--font-size-sm);
     padding: 2px var(--space-2);
   }
+
+  .btn-reuse.active { color: var(--color-text); }
 
   .btn-zoom:hover {
     background: var(--color-bg-hover);
