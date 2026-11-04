@@ -42,6 +42,9 @@ export interface AppSettings {
    *  behaviour) or "reading" (continuous vertically-scrolling column). Persisted so the
    *  toggle survives a restart (owner request 2026-09-15, see ReadingView.svelte). */
   viewer_mode: ViewerMode;
+  /** Sidebar/panel layout, owned and validated by `panel-layout.ts` (`normalizeLayout`).
+   *  Opaque to Rust; `null` until the user first changes the layout. */
+  panel_layout: unknown | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +63,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   recent_colors: [],
   auto_ocr_on_open: false,
   viewer_mode: "single",
+  panel_layout: null,
 };
 
 // ---------------------------------------------------------------------------

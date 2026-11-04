@@ -22,6 +22,14 @@ export function formatUncaughtError(event: ErrorEvent | PromiseRejectionEvent): 
   return `Unhandled promise rejection: ${text}`;
 }
 
+/** Event name for app code to show a handled (caught) error in the crash-guard banner. */
+export const SURFACE_ERROR_EVENT = "redline:surface-error";
+
+/** Show a caught error in the ErrorBanner (and the file log) instead of swallowing it. */
+export function surfaceError(message: string): void {
+  window.dispatchEvent(new CustomEvent<string>(SURFACE_ERROR_EVENT, { detail: message }));
+}
+
 /**
  * Install `window` listeners for uncaught errors and unhandled promise rejections,
  * calling `onError(formattedMessage)` for each. Returns an uninstall function.
@@ -32,11 +40,15 @@ export function installGlobalErrorHandlers(onError: (message: string) => void): 
   const handleError = (event: ErrorEvent) => onError(formatUncaughtError(event));
   const handleRejection = (event: PromiseRejectionEvent) => onError(formatUncaughtError(event));
 
+  const handleSurface = (event: Event) => onError(String((event as CustomEvent<string>).detail));
+
   window.addEventListener("error", handleError);
+  window.addEventListener(SURFACE_ERROR_EVENT, handleSurface);
   window.addEventListener("unhandledrejection", handleRejection);
 
   return () => {
     window.removeEventListener("error", handleError);
+    window.removeEventListener(SURFACE_ERROR_EVENT, handleSurface);
     window.removeEventListener("unhandledrejection", handleRejection);
   };
 }

@@ -237,9 +237,13 @@
     flex-shrink: 0;
   }
 
+  /* overflow: auto, not hidden (owner defect 2026-11-04). This scoped rule carries
+     Svelte's hash class, so it out-ranks the global .panel-body / .panel-body-flush
+     `overflow-y: auto` that callers pass via bodyClass - with `hidden` here, no accordion
+     body could ever scroll and overflowing content was silently clipped. */
   .accordion-body {
     flex: 1;
     min-height: 0;
-    overflow: hidden;
+    overflow: auto;
   }
 </style>

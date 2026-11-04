@@ -80,6 +80,13 @@ pub struct AppSettings {
     /// survives a restart, matching every other viewer preference in this struct.
     #[serde(default = "default_viewer_mode")]
     pub viewer_mode: String,
+    /// Sidebar/panel layout (which sidebar each panel sits in, order, sizes, collapsed
+    /// state, sidebar widths, bottom-panel height). Opaque to Rust: the frontend owns the
+    /// shape and validates it on load (`src/lib/panel-layout.ts` `normalizeLayout`), so a
+    /// malformed or older value falls back to the default layout there. `None` until the
+    /// user first changes the layout.
+    #[serde(default)]
+    pub panel_layout: Option<serde_json::Value>,
 }
 
 impl Default for AppSettings {
@@ -93,6 +100,7 @@ impl Default for AppSettings {
             recent_colors: Vec::new(),
             auto_ocr_on_open: false,
             viewer_mode: default_viewer_mode(),
+            panel_layout: None,
         }
     }
 }
@@ -179,6 +187,7 @@ mod tests {
         assert!(s.recent_colors.is_empty());
         assert!(!s.auto_ocr_on_open);
         assert_eq!(s.viewer_mode, "single");
+        assert!(s.panel_layout.is_none());
     }
 
     #[test]
@@ -204,6 +213,10 @@ mod tests {
             recent_colors: vec!["#ff0000".to_string(), "#00ff00".to_string()],
             auto_ocr_on_open: true,
             viewer_mode: "reading".to_string(),
+            panel_layout: Some(serde_json::json!({
+                "version": 1,
+                "left": { "width": 300, "panels": ["recent", "toolchest"] },
+            })),
         };
 
         save_settings(dir.path(), &settings).unwrap();
@@ -248,6 +261,10 @@ mod tests {
         assert_eq!(
             loaded.viewer_mode, "single",
             "a pre-reading-mode settings file must default to the original single-page viewer"
+        );
+        assert!(
+            loaded.panel_layout.is_none(),
+            "a pre-panel-layout settings file must fall back to the default layout"
         );
     }
 

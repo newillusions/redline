@@ -54,11 +54,17 @@
   /* Fixed regardless of which panel(s) are showing in the sidebar (owner defect
      fix, 2026-09-08 - width is a property of the sidebar, not the panel; see
      App.svelte's panel-left comment). */
+  /* Sidebar widths and the bottom panel's height are now user-resizable and persisted
+     (src/lib/panel-layout.ts DEFAULT_SIDEBAR_WIDTH / DEFAULT_BOTTOM_HEIGHT are the
+     defaults); these tokens remain only for consumers that size against them. */
   --panel-left-width:   260px;
   --panel-right-width:  260px;
   --toolbar-height:     40px;
   --bottom-panel-height: 200px;
   --splitter-size:       4px;
+
+  /* --- Elevation --- */
+  --shadow-menu: 0 8px 24px rgba(0, 0, 0, 0.32);
 }
 
 /* --- Base reset --- */

@@ -67,8 +67,24 @@
   import AboutDialog from "./components/AboutDialog.svelte";
   import UpdateNotification from "./components/UpdateNotification.svelte";
   import ErrorBanner from "./components/ErrorBanner.svelte";
+  import { surfaceError } from "$lib/error-surface";
+  import { handleCloseRequested } from "$lib/window-close";
   import ToolChestPanel from "./components/ToolChestPanel.svelte";
   import Accordion from "./components/Accordion.svelte";
+  import Sidebar from "./components/Sidebar.svelte";
+  import ResizeHandle from "./components/ResizeHandle.svelte";
+  import { PanelLayoutStore } from "$lib/panel-layout-store.svelte";
+  import {
+    BOTTOM_MIN_HEIGHT,
+    clampBottomHeight,
+    setBottomHeight,
+    setBottomHidden,
+    setCollapsed,
+    setSidebarHidden,
+    sideOf,
+    type PanelId,
+    type Side,
+  } from "$lib/panel-layout";
   import { ToolChestStore } from "$lib/toolchest-store.svelte";
   import ActivationGate from "./components/ActivationGate.svelte";
   import LicenseGraceWarning from "./components/LicenseGraceWarning.svelte";
@@ -369,7 +385,12 @@
   /** Open the search panel (toolbar button / Cmd/Ctrl+F), auto-expanding the left panel. */
   async function openSearchPanel() {
     searchPanelVisible = true;
-    if (leftCollapsed) leftCollapsed = false;
+    // Make sure the Search panel can be seen wherever the user has put it.
+    panelLayout.update((l) => {
+      const side = sideOf(l, "search");
+      const shown = l[side].hidden ? setSidebarHidden(l, side, false) : l;
+      return shown.collapsed.search ? setCollapsed(shown, "search", false) : shown;
+    });
     await tick();
     (document.querySelector('[data-testid="search-input"]') as HTMLInputElement | null)?.focus();
   }
@@ -695,16 +716,20 @@
 
   onMount(async () => {
     // Window close guard: intercept close-requested while any tab has unsaved mark-ups.
-    // preventDefault must run synchronously inside the handler (Tauri destroys the window
-    // right after an awaited handler returns unless it was prevented). Not available in a
-    // plain browser (vite dev without Tauri), so a failure here is non-fatal.
+    // Tauri awaits this handler and destroys the window right after it resolves unless
+    // preventDefault was called by then, so the pending panel-layout save is awaited first
+    // (see window-close.ts). Not available in a plain browser (vite dev without Tauri), so a
+    // failure here is non-fatal.
     getCurrentWindow()
-      .onCloseRequested((event) => {
-        const dirty = dirtyDocIds(tabStore.tabs);
-        if (dirty.length === 0) return;
-        event.preventDefault();
-        quitQueue = dirty;
-      })
+      .onCloseRequested((event) =>
+        handleCloseRequested(event, {
+          flush: () => panelLayout.flush(),
+          dirtyDocIds: () => dirtyDocIds(tabStore.tabs),
+          setQuitQueue: (ids) => {
+            quitQueue = ids;
+          },
+        }),
+      )
       .then((unlisten) => {
         _closeUnlisten = unlisten;
       })
@@ -714,8 +739,11 @@
     // up front, independent of the license flow below. A load failure just keeps the
     // single-page default rather than blocking startup.
     loadSettings()
-      .then((settings) => { viewerMode = settings.viewer_mode; })
-      .catch(() => {});
+      .then((settings) => {
+        viewerMode = settings.viewer_mode;
+        panelLayout.load(settings.panel_layout);
+      })
+      .catch((e) => panelLayout.loadFailed(e));
 
     licenseState = await getLicenseStatus().catch(
       (e): LicenseState => ({ state: "invalid", reason: e instanceof Error ? e.message : String(e) }),
@@ -763,9 +791,34 @@
   }
 
   // Panel collapse state
-  let leftCollapsed  = $state(false);
-  let rightCollapsed = $state(false);
-  let bottomCollapsed = $state(true);
+  // Sidebar/panel layout - persisted (AppSettings.panel_layout), loaded in onMount. The
+  // save is a read-modify-write so it never clobbers settings saved elsewhere in between.
+  const panelLayout = new PanelLayoutStore(
+    async (layout) => {
+      const current = await loadSettings();
+      await saveSettings({ ...current, panel_layout: layout });
+    },
+    undefined,
+    surfaceError,
+  );
+  const leftCollapsed = $derived(panelLayout.layout.left.hidden);
+  const rightCollapsed = $derived(panelLayout.layout.right.hidden);
+  const bottomCollapsed = $derived(panelLayout.layout.bottom.hidden);
+  function toggleSidebar(side: Side) {
+    panelLayout.update((l) => setSidebarHidden(l, side, !l[side].hidden));
+  }
+  function toggleBottomPanel() {
+    panelLayout.update((l) => setBottomHidden(l, !l.bottom.hidden));
+  }
+  let windowHeight = $state(typeof window === "undefined" ? 800 : window.innerHeight);
+  const bottomHeight = $derived(clampBottomHeight(panelLayout.layout.bottom.height, windowHeight));
+  function resizeBottomPanel(dy: number) {
+    // The handle sits on the panel's top edge: dragging up (negative dy) makes it taller.
+    panelLayout.update((l) => setBottomHeight(l, bottomHeight - dy, windowHeight));
+  }
+  /** Search only exists while it is switched on (toolbar Find / Cmd-Ctrl+F). */
+  const panelShown = (id: PanelId) => id !== "search" || searchPanelVisible;
+  const sidebarClose: Partial<Record<PanelId, () => void>> = { search: () => (searchPanelVisible = false) };
   /** Which view the bottom panel shows: the Markups List or the takeoff Quantities. */
   let bottomTab = $state<"markups" | "quantities">("markups");
 
@@ -1546,9 +1599,9 @@
       label: viewerMode === "reading" ? "Switch to single-page view" : "Switch to reading mode",
       onselect: () => void toggleViewerMode(),
     },
-    { id: "left", label: "Toggle left sidebar", separator: true, onselect: () => (leftCollapsed = !leftCollapsed) },
-    { id: "right", label: "Toggle right sidebar", onselect: () => (rightCollapsed = !rightCollapsed) },
-    { id: "bottom", label: "Toggle markups list / quantities panel", onselect: () => (bottomCollapsed = !bottomCollapsed) },
+    { id: "left", label: "Toggle left sidebar", separator: true, onselect: () => toggleSidebar("left") },
+    { id: "right", label: "Toggle right sidebar", onselect: () => toggleSidebar("right") },
+    { id: "bottom", label: "Toggle markups list / quantities panel", onselect: toggleBottomPanel },
     { id: "settings", label: "Settings", separator: true, onselect: () => (settingsOpen = true) },
     { id: "about", label: "About Redline", onselect: () => (aboutOpen = true) },
   ]);
@@ -1633,7 +1686,7 @@
   }
 </script>
 
-<svelte:window onkeydown={handleKeydown} bind:innerWidth={viewportWidth} />
+<svelte:window onkeydown={handleKeydown} bind:innerWidth={viewportWidth} bind:innerHeight={windowHeight} />
 
 {#if licenseState === null}
   <!-- Initial licence check in flight - avoid a flash of the activation gate
@@ -1736,7 +1789,7 @@
           <button
             class="btn-toolbar btn-icon"
             class:btn-icon-active={!leftCollapsed}
-            onclick={() => (leftCollapsed = !leftCollapsed)}
+            onclick={() => toggleSidebar("left")}
             title="Toggle left sidebar"
             aria-label="Toggle left sidebar"
             aria-pressed={!leftCollapsed}
@@ -1749,8 +1802,8 @@
           <button
             class="btn-toolbar btn-icon"
             class:btn-icon-active={!rightCollapsed}
-            onclick={() => (rightCollapsed = !rightCollapsed)}
-            title="Toggle right sidebar (Properties)"
+            onclick={() => toggleSidebar("right")}
+            title="Toggle right sidebar"
             aria-label="Toggle right sidebar"
             aria-pressed={!rightCollapsed}
           >
@@ -1762,7 +1815,7 @@
           <button
             class="btn-toolbar btn-icon"
             class:btn-icon-active={!bottomCollapsed}
-            onclick={() => (bottomCollapsed = !bottomCollapsed)}
+            onclick={toggleBottomPanel}
             title="Toggle markups list / quantities panel"
             aria-label="Toggle markups list / quantities panel"
             aria-pressed={!bottomCollapsed}
@@ -1864,211 +1917,134 @@
   <!-- Main 3-column body -->
   <div class="body-row">
     <!-- Left panel -->
-    {#if !leftCollapsed}
-      <aside class="panel panel-left" data-testid="panel-left">
-        <!-- Search (search-parity: current doc / open docs / folder+subfolders). Placed
-             first — the toolbar Find button / Cmd-Ctrl-F is the primary way in.
+    <!-- Sidebars (spec §17). Owner terminology: the left/right columns are SIDEBARS, the
+         modules stacked in them are PANELS. Which sidebar each panel sits in, its order,
+         height share, collapsed state and the sidebar widths all live in panelLayout
+         (src/lib/panel-layout.ts) and persist across restarts; Sidebar.svelte renders the
+         stack, the splitters and the move/drag affordances (owner defect 2026-11-04:
+         panels could not be resized or moved and clipped their content). The bodies below
+         are plain snippets so any panel can render in either sidebar.
 
-             Owner-reported defects (2026-09-08, v0.3.20 live use), both fixed here.
-             Terminology (owner-set): the left/right panel-left/panel-right elements are
-             SIDEBARS; the collapsible modules stacked inside one (Search, Tool Chest,
-             Properties, etc.) are PANELS. Existing identifiers (panel-left,
-             --panel-left-width, .panel-section, data-testid="panel-left") are unchanged -
-             only new prose uses the new words.
-             1) "opening the search panel changes the sidebar to a different width" -
-                sidebar width is a property of the SIDEBAR, not of whichever panel happens
-                to be showing. The old class:panel-left--search width override (and the
-                --panel-left-width-search token) is gone; panel-left keeps ONE width
-                (--panel-left-width) whether or not Search is open, matching the
-                persisted/default sidebar width like every other panel switch.
-             2) "the other panel boxes" (Recent Documents / Tool Chest / Navigator) "get
-                hidden behind search" - per spec §17 a sidebar hosts a STACK of
-                individually collapsible panels, so Search no longer swaps them out via
-                {:else}; it renders ABOVE them with a bounded height
-                (.panel-section--search, capped so it can't crowd the rest of the stack
-                out) while its own result list (.search-groups) scrolls internally -
-                Recent Documents/Tool Chest/Navigator stay visible and reachable below
-                it, with their existing Accordion collapse/expand affordances untouched.
-                One side effect worth knowing: these three panels no longer unmount when
-                Search opens (they used to live behind the {:else} branch) - they now
-                stay mounted the whole time, which is strictly safer for their Accordion
-                sessionStorage-backed collapsed state (see ToolChestPanel.svelte's
-                comment) than the old unmount/remount cycle was.
+         Earlier owner fixes this keeps: sidebar width is a property of the SIDEBAR, not of
+         whichever panel is open (2026-09-08), and Search stacks above the other panels
+         instead of replacing them (2026-09-08). -->
+    {#snippet searchBody()}
+      <SearchPanel
+        store={searchStore}
+        folderPath={searchFolderPath}
+        folderIndexStatus={searchFolderIndexStatus}
+        onSearch={runSearch}
+        onPickFolder={pickSearchFolder}
+        onJump={handleSearchJump}
+        onHighlightChecked={applyHighlightToChecked}
+        highlightCheckedAlreadyApplied={checkedAlreadyHighlighted}
+      />
+    {/snippet}
+    {#snippet recentBody()}
+      <DocumentHistoryPanel recentDocs={recentDocs} onOpen={openFilePath} />
+    {/snippet}
+    <!-- Tool Chest (spec "Tools & Tool Sets") - Tool Sets are a workspace resource, not
+         per-document, so it is usable with no document open. -->
+    {#snippet toolChestBody()}
+      <ToolChestPanel toolChest={toolChestStore} markupStore={activeTab?.store ?? null} />
+    {/snippet}
+    <!-- Bookmarks and Links (docs/navigation.md "Document structure"). -->
+    {#snippet bookmarksBody()}
+      {#if activeTab}
+        <BookmarksPanel
+          nav={activeTab.navStore}
+          pageCount={activeTab.doc.page_count}
+          currentPage={activeTab.viewportSnapshot.pageIndex}
+          onfollow={followTarget}
+          {getCurrentView}
+          getSelectionBookmark={selectionBookmark}
+        />
+      {:else}
+        <p class="panel-hint muted">Open a PDF to begin.</p>
+      {/if}
+    {/snippet}
+    {#snippet linksBody()}
+      {#if activeTab}
+        <LinksPanel
+          nav={activeTab.navStore}
+          onjump={jumpTo}
+          onfollow={followTarget}
+          onedit={(l) => (editingLink = l)}
+        />
+      {:else}
+        <p class="panel-hint muted">Open a PDF to begin.</p>
+      {/if}
+    {/snippet}
+    <!-- Navigator: page thumbnails (PR-B, 2026-09-15). -->
+    {#snippet navigatorBody()}
+      {#if activeTab}
+        <ThumbnailPanel
+          docId={activeTab.docId}
+          pageCount={activeTab.doc.page_count}
+          currentPage={activeTab.viewportSnapshot.pageIndex}
+          onjump={(idx) => {
+            searchJumpNonce += 1;
+            viewportJumpRequest = { page: idx, nonce: searchJumpNonce };
+          }}
+          onextract={(indices) => (extractPagesDialogIndices = indices)}
+          onPageOp={handleThumbnailPageOp}
+          labels={activeTab.navStore.labels}
+          onnumber={(sel) => (numberPages = { selected: sel })}
+          onrenamelabel={renamePageLabel}
+        />
+      {:else}
+        <p class="panel-hint muted">Open a PDF to begin.</p>
+      {/if}
+    {/snippet}
+    <!-- Layers: the PDF's optional content groups. Show/hide is a view setting (not
+         written to the file); see docs/layers.md. -->
+    {#snippet layersBody()}
+      {#if activeTab}
+        {#key activeTab.docId}
+          <LayersPanel
+            docId={activeTab.docId}
+            sync={{
+              flush: () => activeTab.store.flush(),
+              clearDirty: () => activeTab.store.clearDirty(),
+            }}
+          />
+        {/key}
+      {:else}
+        <p class="panel-hint muted">Open a PDF to see its layers.</p>
+      {/if}
+    {/snippet}
+    <!-- History: version snapshots (automatic before every in-place Flatten / Optimise /
+         Redactions, plus manual). The key re-lists versions after an automatic snapshot. -->
+    {#snippet historyBody()}
+      {#if activeTab}
+        {#key activeTab.docId + ":" + historyNonce}
+          <VersionPanel
+            docId={activeTab.docId}
+            hasUnsavedMarkups={activeTab.store.dirty}
+            onRestore={handleVersionRestore}
+          />
+        {/key}
+      {:else}
+        <p class="panel-hint muted">Open a PDF to see its saved versions.</p>
+      {/if}
+    {/snippet}
+    {#snippet propertiesBody()}
+      {#if activeTab}
+        <PropertiesPanel store={activeTab.store} takeoffStore={activeTab.takeoffStore} currentPage={activeTab.viewportSnapshot.pageIndex} />
+      {:else}
+        <p class="panel-hint muted">Select a markup to edit its properties.</p>
+      {/if}
+    {/snippet}
 
-             (Superseded 2026-09-07 comment: Search "takes over the whole left column" (the
-             pre-2026-09-08 wording for this sidebar) - no longer true, see above.) -->
-        {#if searchPanelVisible}
-          <div class="panel-section panel-section--search">
-            <div class="panel-header">
-              Search
-              <button class="btn-icon-close" onclick={() => (searchPanelVisible = false)} aria-label="Close search">✕</button>
-            </div>
-            <div class="panel-body panel-body-flush">
-              <SearchPanel
-                store={searchStore}
-                folderPath={searchFolderPath}
-                folderIndexStatus={searchFolderIndexStatus}
-                onSearch={runSearch}
-                onPickFolder={pickSearchFolder}
-                onJump={handleSearchJump}
-                onHighlightChecked={applyHighlightToChecked}
-                highlightCheckedAlreadyApplied={checkedAlreadyHighlighted}
-              />
-            </div>
-          </div>
-        {/if}
-        <!-- Document History section (MRU list). Owner defect (2026-09-07):
-             "the recent documents panel needs to be able to accordion -
-             actually, all subpanels in the side panels" - every left/right
-             panel section below is now collapsible via the shared Accordion
-             component (src/components/Accordion.svelte), remembering its
-             state for this app session via sessionStorage (storageKey).
-             Always rendered (stacked below Search when it's open - see the
-             panel-section--search comment above). -->
-        <div class="panel-section panel-section--recent">
-          <Accordion
-            title="Recent Documents"
-            storageKey="left-recent-docs"
-            bodyClass="panel-body panel-body-flush"
-            testId="accordion-recent-docs"
-          >
-            <DocumentHistoryPanel
-              recentDocs={recentDocs}
-              onOpen={openFilePath}
-            />
-          </Accordion>
-        </div>
-        <!-- Tool Chest (spec "Tools & Tool Sets") - Tool Sets + Recent Tools; click a
-             tool to make it active. Discoverable here regardless of which doc tab is
-             active (Tool Sets are a workspace resource, not per-document). -->
-        <div class="panel-section panel-section--secondary">
-          <Accordion
-            title="Tool Chest"
-            storageKey="left-toolchest"
-            bodyClass="panel-body panel-body-flush"
-            testId="accordion-tool-chest"
-          >
-            <ToolChestPanel toolChest={toolChestStore} markupStore={activeTab?.store ?? null} />
-          </Accordion>
-        </div>
-        <!-- Bookmarks and Links (docs/navigation.md "Document structure"). -->
-        <div class="panel-section panel-section--nav">
-          <Accordion
-            title="Bookmarks"
-            storageKey="left-bookmarks"
-            bodyClass="panel-body panel-body-flush"
-            testId="accordion-bookmarks"
-          >
-            {#if activeTab}
-              <BookmarksPanel
-                nav={activeTab.navStore}
-                pageCount={activeTab.doc.page_count}
-                currentPage={activeTab.viewportSnapshot.pageIndex}
-                onfollow={followTarget}
-                {getCurrentView}
-                getSelectionBookmark={selectionBookmark}
-              />
-            {:else}
-              <p class="panel-hint muted">Open a PDF to begin.</p>
-            {/if}
-          </Accordion>
-        </div>
-        <div class="panel-section panel-section--nav">
-          <Accordion
-            title="Links"
-            storageKey="left-links"
-            defaultCollapsed={true}
-            bodyClass="panel-body panel-body-flush"
-            testId="accordion-links"
-          >
-            {#if activeTab}
-              <LinksPanel
-                nav={activeTab.navStore}
-                onjump={jumpTo}
-                onfollow={followTarget}
-                onedit={(l) => (editingLink = l)}
-              />
-            {:else}
-              <p class="panel-hint muted">Open a PDF to begin.</p>
-            {/if}
-          </Accordion>
-        </div>
-        <!-- Navigator: page thumbnails (PR-B, 2026-09-15). -->
-        <div class="panel-section panel-section--secondary">
-          <Accordion
-            title="Navigator"
-            storageKey="left-navigator"
-            bodyClass="panel-body panel-body-flush"
-            testId="accordion-navigator"
-          >
-            {#if activeTab}
-              <ThumbnailPanel
-                docId={activeTab.docId}
-                pageCount={activeTab.doc.page_count}
-                currentPage={activeTab.viewportSnapshot.pageIndex}
-                onjump={(idx) => {
-                  searchJumpNonce += 1;
-                  viewportJumpRequest = { page: idx, nonce: searchJumpNonce };
-                }}
-                onextract={(indices) => (extractPagesDialogIndices = indices)}
-                onPageOp={handleThumbnailPageOp}
-                labels={activeTab.navStore.labels}
-                onnumber={(sel) => (numberPages = { selected: sel })}
-                onrenamelabel={renamePageLabel}
-              />
-            {:else}
-              <p class="panel-hint muted">Open a PDF to begin.</p>
-            {/if}
-          </Accordion>
-        </div>
-        <!-- Layers: the PDF's optional content groups. Show/hide is a view setting (not
-             written to the file); see docs/layers.md. -->
-        <div class="panel-section panel-section--secondary">
-          <Accordion
-            title="Layers"
-            storageKey="left-layers"
-            bodyClass="panel-body panel-body-flush"
-            testId="accordion-layers"
-          >
-            {#if activeTab}
-              {#key activeTab.docId}
-                <LayersPanel
-                  docId={activeTab.docId}
-                  sync={{
-                    flush: () => activeTab.store.flush(),
-                    clearDirty: () => activeTab.store.clearDirty(),
-                  }}
-                />
-              {/key}
-            {:else}
-              <p class="panel-hint muted">Open a PDF to see its layers.</p>
-            {/if}
-          </Accordion>
-        </div>
-        <!-- History: version snapshots (automatic before every in-place Flatten /
-             Optimise / Redactions, plus manual). Makes the restore path reachable (UX
-             audit F1). The key re-lists versions after an automatic snapshot. -->
-        <div class="panel-section panel-section--secondary">
-          <Accordion
-            title="History"
-            storageKey="left-history"
-            bodyClass="panel-body panel-body-flush"
-            testId="accordion-history"
-          >
-            {#if activeTab}
-              {#key activeTab.docId + ":" + historyNonce}
-                <VersionPanel
-                  docId={activeTab.docId}
-                  hasUnsavedMarkups={activeTab.store.dirty}
-                  onRestore={handleVersionRestore}
-                />
-              {/key}
-            {:else}
-              <p class="panel-hint muted">Open a PDF to see its saved versions.</p>
-            {/if}
-          </Accordion>
-        </div>
-      </aside>
+    {#if !panelLayout.layout.left.hidden}
+      <Sidebar
+        side="left"
+        store={panelLayout}
+        content={{ search: searchBody, recent: recentBody, toolchest: toolChestBody, bookmarks: bookmarksBody, links: linksBody, navigator: navigatorBody, layers: layersBody, history: historyBody, properties: propertiesBody }}
+        shown={panelShown}
+        onclose={sidebarClose}
+        testId="panel-left"
+      />
     {/if}
 
     <!-- Centre viewport — only one Viewport/ReadingView mounted at a time. Mode is a
@@ -2114,28 +2090,29 @@
       {/if}
     </main>
 
-    <!-- Right panel -->
-    {#if !rightCollapsed}
-      <aside class="panel panel-right">
-        <Accordion
-          title="Properties"
-          storageKey="right-properties"
-          bodyClass="panel-body panel-body-flush"
-          testId="accordion-properties"
-        >
-          {#if activeTab}
-            <PropertiesPanel store={activeTab.store} takeoffStore={activeTab.takeoffStore} currentPage={activeTab.viewportSnapshot.pageIndex} />
-          {:else}
-            <p class="panel-hint muted">Select a markup to edit its properties.</p>
-          {/if}
-        </Accordion>
-      </aside>
+    {#if !panelLayout.layout.right.hidden}
+      <Sidebar
+        side="right"
+        store={panelLayout}
+        content={{ search: searchBody, recent: recentBody, toolchest: toolChestBody, bookmarks: bookmarksBody, links: linksBody, navigator: navigatorBody, layers: layersBody, history: historyBody, properties: propertiesBody }}
+        shown={panelShown}
+        onclose={sidebarClose}
+        testId="panel-right"
+      />
     {/if}
   </div>
 
   <!-- Bottom panel - Markups List / Measurement quantities (spec §17) -->
   {#if !bottomCollapsed}
-    <div class="bottom-panel" class:bottom-panel-tall={bottomTab === "markups"}>
+    <div class="bottom-panel" style="height: {bottomHeight}px" data-testid="bottom-panel">
+      <ResizeHandle
+        orientation="horizontal"
+        label="Resize markups list / quantities panel"
+        value={bottomHeight}
+        min={BOTTOM_MIN_HEIGHT}
+        onresize={resizeBottomPanel}
+        testId="resize-bottom-panel"
+      />
       <div class="bottom-tabs" role="tablist" aria-label="Bottom panel">
         <button role="tab" class="bottom-tab" aria-selected={bottomTab === "markups"}
           class:active={bottomTab === "markups"} onclick={() => (bottomTab = "markups")}>Markups</button>
@@ -2489,96 +2466,14 @@
     overflow: hidden;
   }
 
-  /* --- Panels --- */
-  .panel {
-    background: var(--color-bg-panel);
-    border-right: 1px solid var(--color-border);
-    display: flex;
-    flex-direction: column;
-    flex-shrink: 0;
-    overflow: hidden;
-  }
-  /* Fixed sidebar width regardless of which panel(s) are showing (owner defect fix,
-     2026-09-08) - width is a property of the sidebar, not of the panel. */
-  .panel-left  { width: var(--panel-left-width); }
-  .panel-right { width: var(--panel-right-width); border-right: none; border-left: 1px solid var(--color-border); }
-
-  .panel-header {
-    font-size: var(--font-size-xs);
-    font-weight: 600;
-    color: var(--color-text-secondary);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--color-border);
-    flex-shrink: 0;
-  }
-  /* .panel-body / .panel-body-flush moved to src/lib/styles.css (global) -
-     Accordion.svelte applies them via its `bodyClass` prop to an element IT
-     creates, so a component-scoped rule here would not match (Svelte's
-     scoped-CSS hash only reaches elements the OWNING component's own
-     template renders directly). See Accordion.svelte's header comment. */
+  /* --- Sidebar panel hints (sidebar/panel layout itself: Sidebar.svelte) --- */
   .panel-hint {
     font-size: var(--font-size-sm);
     color: var(--color-text-secondary);
-    margin: 0 0 var(--space-2);
+    margin: 0;
+    padding: var(--space-3);
   }
   .panel-hint.muted { color: var(--color-text-muted); }
-
-  /* --- Left sidebar panels (search + history + tool chest + navigator, stacked) --- */
-  .panel-section {
-    display: flex;
-    flex-direction: column;
-    border-bottom: 1px solid var(--color-border);
-    flex-shrink: 0;
-  }
-  /* Recent Documents gets more room than Tool Chest/Navigator, but never all of it -
-     keyed off its own class (not :first-child) because Search can render above it. */
-  .panel-section--recent {
-    flex: 1;
-    overflow: hidden;
-    max-height: 55%;
-  }
-  .panel-section--secondary {
-    flex: 1;
-    overflow: hidden;
-  }
-  /* Bookmarks and Links size to their content (a collapsed one is just its header) up to
-     a share of the sidebar, then scroll inside - they must not each claim an equal slice
-     of the column like the other stacked panels do. */
-  .panel-section.panel-section--nav {
-    flex: 0 1 auto;
-    min-height: 0;
-    max-height: 45%;
-    overflow: hidden;
-  }
-  /* Search stacks ABOVE Recent Documents/Tool Chest/Navigator (owner defect fix,
-     2026-09-08 - see the panel-section--search comment in the template), not instead
-     of them - bounded to a fraction of the sidebar so the rest of the stack stays
-     visible/reachable below it. Its own result list (.search-groups, SearchPanel.svelte)
-     already scrolls internally within this box. */
-  .panel-section.panel-section--search {
-    flex: 1;
-    max-height: 45%;
-    overflow: hidden;
-  }
-  .panel-section--search .panel-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-  .btn-icon-close {
-    background: none;
-    border: none;
-    color: inherit;
-    cursor: pointer;
-    font-size: inherit;
-    line-height: 1;
-    padding: 0;
-  }
-  .btn-icon-close:hover {
-    color: var(--color-text);
-  }
 
   /* --- Viewport container --- */
   .viewport-container {
@@ -2601,10 +2496,6 @@
   .empty-state p { font-size: var(--font-size-lg); margin: 0; }
 
   /* --- Bottom panel --- */
-  .bottom-panel.bottom-panel-tall {
-    height: 300px;
-  }
-
   .bottom-tabs {
     display: flex;
     gap: var(--space-1);
@@ -2635,8 +2526,8 @@
     overflow: auto;
   }
 
+  /* Height comes from the persisted layout (resizable via the handle on its top edge). */
   .bottom-panel {
-    height: var(--bottom-panel-height);
     border-top: 1px solid var(--color-border);
     background: var(--color-bg-panel);
     display: flex;

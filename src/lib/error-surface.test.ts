@@ -5,7 +5,7 @@
  * without needing a real ErrorEvent/PromiseRejectionEvent from a browser engine.
  */
 import { describe, it, expect, vi } from "vitest";
-import { formatUncaughtError, installGlobalErrorHandlers } from "./error-surface";
+import { formatUncaughtError, installGlobalErrorHandlers, surfaceError } from "./error-surface";
 
 describe("formatUncaughtError", () => {
   it("formats a window 'error' event with message + source location", () => {
@@ -72,5 +72,13 @@ describe("installGlobalErrorHandlers", () => {
     window.dispatchEvent(new ErrorEvent("error", { message: "after uninstall" }));
 
     expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("shows a handled error passed to surfaceError verbatim", () => {
+    const onError = vi.fn();
+    const uninstall = installGlobalErrorHandlers(onError);
+    surfaceError("Could not save the panel layout");
+    expect(onError).toHaveBeenCalledWith("Could not save the panel layout");
+    uninstall();
   });
 });

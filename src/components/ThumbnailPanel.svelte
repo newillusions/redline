@@ -149,8 +149,8 @@
   // Thumbnail rendering (lazy, cached per page index)
   // ---------------------------------------------------------------------------
 
-  /** Target CSS width of a thumbnail's rendered raster - the panel's own width (see
-   *  --panel-left-width) sets the visual size; this only needs to be "small enough to
+  /** Target CSS width of a thumbnail's rendered raster - the panel's own width (the
+   *  hosting sidebar's resizable width) sets the visual size; this only needs to be "small enough to
    *  render cheaply, sharp enough to read at that size". */
   const THUMBNAIL_WIDTH_CSS = 140;
   /** Thumbnails never need more than one small tile - caps pageTileSizeCss well below
@@ -436,7 +436,9 @@
     background: var(--color-bg-panel);
     border-right: 1px solid var(--color-border);
     overflow-y: auto;
-    width: var(--panel-left-width);
+    /* Fill whichever sidebar hosts it, at whatever width the user dragged it to. */
+    width: 100%;
+    min-width: 0;
     flex-shrink: 0;
   }
 

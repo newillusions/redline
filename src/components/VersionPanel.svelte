@@ -216,6 +216,8 @@
 
   .version-panel__label-input {
     flex: 1;
+    /* Let the input shrink in a narrow sidebar instead of pushing the button off the edge. */
+    min-width: 0;
     padding: var(--space-1, 4px) var(--space-2, 8px);
     border: 1px solid var(--color-border, #d1d5db);
     border-radius: var(--radius-sm, 4px);

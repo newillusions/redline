@@ -74,9 +74,15 @@ function installMockTauri() {
     save_recent_docs: () => null,
     check_file_exists: () => true,
     search_document: () => [],
+    list_document_versions: () => [],
   };
 
   window.__TAURI_INTERNALS__ = {
+    // getCurrentWindow() reads these (the close guard in App.svelte).
+    metadata: {
+      currentWindow: { label: "main" },
+      currentWebview: { label: "main", windowLabel: "main" },
+    },
     transformCallback(cb) {
       const id = (window.__cbid = (window.__cbid || 0) + 1);
       window[`__cb_${id}`] = cb;
