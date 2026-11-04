@@ -51,7 +51,13 @@
   // ---------------------------------------------------------------------------
   function handleActivate(tool: Tool) {
     if (!markupStore) return;
+    // The panel records the real, named tool below, so the activeTool watcher must not add a
+    // duplicate plain entry. Only mark a skip when activeTool actually changes: if it does not
+    // (chest tool A -> chest tool B, same kind), no watcher run would consume the mark and it
+    // would swallow the user's next real pick.
+    const before = markupStore.activeTool;
     activateTool(tool, markupStore);
+    markupStore.skipRecentKind = markupStore.activeTool !== before ? markupStore.activeTool : null;
     void toolChest.recordRecent(tool);
   }
 

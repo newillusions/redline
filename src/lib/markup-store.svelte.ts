@@ -117,6 +117,25 @@ export class MarkupStore implements MarkupSink {
    *  cleared) by Viewport's onOverlayClick - staying armed lets the user place several
    *  copies in a row, matching how the drag-draw tools stay active after one shape. */
   pendingPlacementTool = $state<Tool | null>(null);
+  /** The tool kind whose NEXT activeTool change must not be recorded in Recent (the change was
+   *  not the user picking a tool: Space-pan restore, Tool Chest activation, reading-mode
+   *  disarm). Consumed by the App's activeTool watcher in the same flush as the change. */
+  skipRecentKind: ToolKind | null = null;
+  /** Set the active tool without it counting as a "use" for Recent. */
+  setToolSilently(kind: ToolKind): void {
+    if (this.activeTool === kind) return;
+    this.skipRecentKind = kind;
+    this.activeTool = kind;
+  }
+  /** Called by the activeTool watcher with the new kind: true when this change is to be kept
+   *  out of Recent. Always clears the mark, so a stale one can never swallow a later pick. */
+  consumeSkipRecent(kind: ToolKind): boolean {
+    const skip = this.skipRecentKind === kind;
+    this.skipRecentKind = null;
+    return skip;
+  }
+  /** True while the palette's Stamp picker is open (opened by the Stamp button or the S key). */
+  stampPickerOpen = $state(false);
   mirrorError = $state<string | null>(null);
   /** True when markups have changed since the last save (or since the doc was opened). */
   dirty = $state(false);

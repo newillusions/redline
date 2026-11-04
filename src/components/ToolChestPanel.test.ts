@@ -140,3 +140,41 @@ describe("ToolChestPanel — overflow (owner defect, 2026-09-07)", () => {
     expect(getComputedStyle(root).overflowY).toBe("auto");
   });
 });
+
+describe("ToolChestPanel activation vs Recent skip mark", () => {
+  const drawing = (id: string, name: string): Tool => ({ ...tool(id, name), placement_mode: "Drawing", geometry: { Point: { x: 1, y: 1 } } });
+
+  it("chest tool A then chest tool B (activeTool unchanged) leaves no mark to swallow the next real pick", async () => {
+    const { MarkupStore } = await import("$lib/markup-store.svelte");
+    const ms = new MarkupStore("d1", { add: vi.fn(async () => {}), update: vi.fn(async () => {}), remove: vi.fn(async () => {}) });
+    const store = new ToolChestStore();
+    store.sets = [{ id: "s", name: "S", tools: [drawing("a", "A"), drawing("b", "B")] }];
+    const { container } = render(ToolChestPanel, { props: { toolChest: store, markupStore: ms } });
+    await tick();
+    const chips = container.querySelectorAll<HTMLElement>(".tc-tool-btn");
+    expect(chips.length).toBeGreaterThanOrEqual(2);
+
+    await fireEvent.click(chips[0]);
+    expect(ms.activeTool).toBe("placeTool");
+    expect(ms.consumeSkipRecent("placeTool")).toBe(true); // the watcher run for A
+    await fireEvent.click(chips[1]); // B: activeTool stays placeTool, no watcher run
+    expect(ms.skipRecentKind).toBeNull();
+    // The user now presses R: the watcher must record it.
+    ms.activeTool = "Rectangle";
+    expect(ms.consumeSkipRecent("Rectangle")).toBe(false);
+  });
+});
+
+describe("MarkupStore.setToolSilently (Space-pan restore)", () => {
+  it("marks the change for skipping once, and is a no-op when unchanged", async () => {
+    const { MarkupStore } = await import("$lib/markup-store.svelte");
+    const ms = new MarkupStore("d1", { add: vi.fn(async () => {}), update: vi.fn(async () => {}), remove: vi.fn(async () => {}) });
+    ms.activeTool = "Rectangle";
+    ms.setToolSilently("hand");
+    ms.setToolSilently("Rectangle"); // restore after Space released
+    expect(ms.consumeSkipRecent("Rectangle")).toBe(true);
+    expect(ms.consumeSkipRecent("Rectangle")).toBe(false);
+    ms.setToolSilently("Rectangle");
+    expect(ms.skipRecentKind).toBeNull();
+  });
+});

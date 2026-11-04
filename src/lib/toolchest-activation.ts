@@ -23,6 +23,7 @@ const DRAWABLE_MARKUP_TYPES: ReadonlySet<string> = new Set<ToolKind>([
   "Rectangle", "Ellipse", "Line", "Arrow", "Highlight", "Polyline", "Polygon", "Cloud",
   "Ink", "Text", "Callout", "MeasurementLength", "MeasurementArea", "MeasurementCount",
   "MeasurementPerimeter", "MeasurementVolume", "MeasurementAngle", "MeasurementRadius",
+  "Underline", "StrikeOut", "Squiggly", "Note",
 ]);
 
 /**

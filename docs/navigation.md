@@ -87,7 +87,9 @@ mode is a separate sibling component, not a rewrite of the tiled viewer.
   rasters in memory. See `ReadingView.svelte`'s header comment for the full scoping
   rationale, including the extreme-zoom raster cap on very large sheets.
 - **Scope** — read/navigate only: markup creation and editing are not available in reading
-  mode in this release; switch to single-page mode for markup work.
+  mode in this release; switch to single-page mode for markup work. The palette's tools are
+  disabled in reading mode, with the hint "Switch to page view to mark up", so a drag never
+  silently does nothing.
 
 ## Discoverability
 
@@ -106,7 +108,7 @@ follow-up asking for the toolbar itself to be hideable and movable):
   tile" render-time stat and the "[B] bench" hint now live inside the `B`-key bench overlay
   instead, visible only while that's toggled on.
 - The zoom toolbar (Fit W / Fit H / 100% / zoom-percent input) can be **collapsed** via its
-  own `×` button or the `T` key, leaving a small `⚙` re-open handle at the same corner —
+  own `×` button or the `Z` key (was `T` until 2026-11-04; `T` is now the Text Box tool), leaving a small `⚙` re-open handle at the same corner —
   and **repositioned** by dragging its `⠿` grip to any of the 4 viewport corners, snapping
   to the nearest one on release. Both the collapsed state and the chosen corner persist
   (`$lib/viewport.ts`'s `loadToolbarPrefs`/`persistToolbarPrefs`, localStorage — the same

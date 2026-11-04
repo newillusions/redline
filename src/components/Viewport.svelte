@@ -98,6 +98,7 @@
   import { getPageSnapTargets, findNearestSnap, type SnapTarget } from "$lib/snap";
   import CalibrationDialog from "./CalibrationDialog.svelte";
   import StampPromptDialog from "./StampPromptDialog.svelte";
+  import { toolForKeyEvent, TOOL_KEY_BINDINGS } from "$lib/tool-keys";
   import ArrangeBar from "./ArrangeBar.svelte";
   import { nativeEditingOwnsClipboardKeys } from "$lib/keyboard-shortcuts";
   import { markupClipboard } from "$lib/markup-clipboard.svelte";
@@ -1261,7 +1262,13 @@
   let spacePanPreviousTool: ToolKind | null = null;
 
   function isTypingTarget(target: EventTarget | null): boolean {
-    return target instanceof HTMLElement && (target.tagName === "INPUT" || target.tagName === "TEXTAREA");
+    return target instanceof HTMLElement
+      && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable);
+  }
+
+  /** Focus is on a control inside the stamp menu or a dialog: tool keys must not fire there. */
+  function isInOverlayControl(target: EventTarget | null): boolean {
+    return target instanceof Element && target.closest('[role="menu"], dialog, [role="dialog"], [aria-modal="true"]') !== null;
   }
 
   function onSpaceKeyDown(e: KeyboardEvent) {
@@ -1270,14 +1277,15 @@
     if (isTypingTarget(e.target)) return; // e.g. the zoom-percent toolbar input
     if (spacePanPreviousTool !== null) return; // already held (key-repeat) — no-op
     spacePanPreviousTool = store.activeTool;
-    store.activeTool = "hand";
+    store.setToolSilently("hand");
     e.preventDefault();
   }
 
   function onSpaceKeyUp(e: KeyboardEvent) {
     if (e.code !== "Space") return;
     if (spacePanPreviousTool === null) return;
-    store.activeTool = spacePanPreviousTool;
+    // Restoring the tool held before Space-pan is not a new pick: keep it out of Recent.
+    store.setToolSilently(spacePanPreviousTool);
     spacePanPreviousTool = null;
   }
 
@@ -1381,9 +1389,10 @@
       e.preventDefault();
       showShortcuts = !showShortcuts;
     }
-    // "T" toggles the zoom toolbar's collapsed state (owner feedback 2026-09-15 -
-    // hideable/re-showable via a collapse handle OR this key).
-    if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === "t" || e.key === "T")) {
+    // "Z" toggles the zoom toolbar's collapsed state (owner feedback 2026-09-15 -
+    // hideable/re-showable via a collapse handle OR this key). Was T until 2026-11-04; T is
+    // now Text Box, as in Revu (lib/tool-keys.ts).
+    if (!e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && (e.key === "z" || e.key === "Z")) {
       e.preventDefault();
       setToolbarCollapsed(!zoomToolbarCollapsed);
     }
@@ -1439,26 +1448,15 @@
     // Don't fire the shortcuts below when the text editor is open — the textarea
     // handles its own keys (typing must not be hijacked).
     if (editor) return;
-    // V — jump straight to the select / pointer tool (no modifier; Cmd/Ctrl+V is paste).
-    if (!e.metaKey && !e.ctrlKey && !e.altKey && (e.key === "v" || e.key === "V")) {
+    // Single-key tool shortcuts, Revu's letter set (lib/tool-keys.ts). No Cmd/Ctrl/Alt, so
+    // Cmd/Ctrl+V (paste), Cmd/Ctrl+C etc. are untouched.
+    // Not while focus is on a control inside the stamp menu or a dialog (keys there belong to it).
+    const keyAction = isInOverlayControl(e.target) ? null : toolForKeyEvent(e);
+    if (keyAction) {
       e.preventDefault();
-      store.activeTool = "select";
+      if (keyAction === "stamp") { if (!e.repeat) store.stampPickerOpen = !store.stampPickerOpen; }
+      else store.activeTool = keyAction;
       return;
-    }
-    // Revu single-key mark-up tool shortcuts (support.bluebeam.com/revu/resources/keyboard-
-    // shortcuts.html): U Underline, D Strikethrough, Shift+U Squiggly, N Note, Y Cloud, K Cloud+. No Cmd/Ctrl/Alt.
-    if (!e.metaKey && !e.ctrlKey && !e.altKey) {
-      // Decide by Shift, not by the character's case: with Caps Lock on, a plain U arrives
-      // as "U" (and Shift+U as "u"), and a plain U must still pick Underline.
-      const k = e.key.toLowerCase();
-      const tool: ToolKind | null =
-        k === "u" ? (e.shiftKey ? "Squiggly" : "Underline") : k === "d" ? "StrikeOut" : k === "n" ? "Note"
-        : k === "y" ? "Cloud" : k === "k" ? "CloudPlus" : null;
-      if (tool) {
-        e.preventDefault();
-        store.activeTool = tool;
-        return;
-      }
     }
     // Delete / Backspace: remove the active vertex of a single multipoint markup if one is
     // engaged; otherwise remove the whole selection (one undo frame).
@@ -1536,6 +1534,7 @@
       return;
     }
     if (e.key === "Escape") {
+      store.stampPickerOpen = false;
       resetMultiClick();
       store.resetCountRun();
       cancelDraw();
@@ -3979,7 +3978,7 @@
         class="shortcuts-card"
         role="dialog"
         tabindex="-1"
-        aria-label="Pan and zoom shortcuts"
+        aria-label="Keyboard shortcuts"
         onclick={(e) => e.stopPropagation()}
         onkeydown={(e) => e.stopPropagation()}
       >
@@ -3993,9 +3992,14 @@
         <div class="shortcuts-row"><span>⌘/Ctrl + 0</span><span>Fit width</span></div>
         <div class="shortcuts-row"><span>⌘/Ctrl + 9</span><span>Fit height</span></div>
         <div class="shortcuts-row"><span>⌘/Ctrl + 8</span><span>Actual size (100%)</span></div>
-        <div class="shortcuts-row"><span>T</span><span>Show/hide the zoom toolbar</span></div>
-        <div class="shortcuts-row"><span>U / Shift+U / D</span><span>Underline / Squiggly / Strikethrough</span></div>
-        <div class="shortcuts-row"><span>N</span><span>Sticky Note</span></div>
+        <div class="shortcuts-row"><span>Z</span><span>Show/hide the zoom toolbar</span></div>
+        <div class="shortcuts-title">Tools (same keys as Bluebeam Revu)</div>
+        {#each TOOL_KEY_BINDINGS.filter((b) => !b.alias) as b (b.label)}
+          <div class="shortcuts-row"><span>{b.shift ? "Shift+" : ""}{b.key.toUpperCase()}</span><span>{b.label}</span></div>
+        {/each}
+        <div class="shortcuts-row"><span>Y</span><span>Cloud (second key)</span></div>
+        <div class="shortcuts-row"><span>Esc</span><span>Back to Select</span></div>
+        <div class="shortcuts-title">Markups</div>
         <div class="shortcuts-row"><span>⌘/Ctrl + C / X / V</span><span>Copy / cut / paste markups (paste lands at the pointer)</span></div>
         <div class="shortcuts-row"><span>⌘/Ctrl + Shift + V</span><span>Paste markups in place</span></div>
         <div class="shortcuts-row"><span>⌘/Ctrl + D</span><span>Duplicate the selected markups</span></div>
@@ -4371,6 +4375,8 @@
     border-radius: var(--radius-md);
     padding: var(--space-4);
     min-width: 280px;
+    max-height: 80vh;
+    overflow-y: auto;
     color: var(--color-text-secondary);
     font-size: var(--font-size-sm);
     box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
@@ -4380,6 +4386,7 @@
     font-weight: 600;
     margin-bottom: var(--space-2);
   }
+  .shortcuts-title:not(:first-child) { margin-top: var(--space-3); }
   .shortcuts-row {
     display: flex;
     justify-content: space-between;

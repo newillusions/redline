@@ -30,7 +30,7 @@ describe("ToolPalette", () => {
     const user = userEvent.setup();
     render(ToolPalette, { props: { store } });
 
-    const btn = screen.getByTitle("Rectangle");
+    const btn = screen.getByTitle("Rectangle (R)");
     await user.click(btn);
 
     expect(store.activeTool).toBe("Rectangle");
@@ -40,7 +40,7 @@ describe("ToolPalette", () => {
     const user = userEvent.setup();
     render(ToolPalette, { props: { store } });
 
-    const btn = screen.getByTitle("Rectangle");
+    const btn = screen.getByTitle("Rectangle (R)");
     await user.click(btn);
 
     // @testing-library sets aria-pressed as a string attribute
@@ -51,12 +51,12 @@ describe("ToolPalette", () => {
     const user = userEvent.setup();
     render(ToolPalette, { props: { store } });
 
-    await user.click(screen.getByTitle("Rectangle"));
+    await user.click(screen.getByTitle("Rectangle (R)"));
 
     // Every other tool button must report aria-pressed=false
     for (const title of [
-      "Pan (Hand)", "Select / Pointer (V)", "Ellipse", "Line", "Arrow",
-      "Highlight (freeform box - for text, use Select Text)",
+      "Pan (Hand)", "Select / Pointer (V)", "Ellipse (E)", "Line (L)", "Arrow (A)",
+      "Highlight (H) - freeform box; for text, use Select Text",
     ]) {
       expect(screen.getByTitle(title)).toHaveAttribute("aria-pressed", "false");
     }
@@ -76,12 +76,12 @@ describe("ToolPalette", () => {
     const user = userEvent.setup();
     render(ToolPalette, { props: { store } });
 
-    await user.click(screen.getByTitle("Rectangle"));
+    await user.click(screen.getByTitle("Rectangle (R)"));
     expect(store.activeTool).toBe("Rectangle");
 
-    await user.click(screen.getByTitle("Ellipse"));
+    await user.click(screen.getByTitle("Ellipse (E)"));
     expect(store.activeTool).toBe("Ellipse");
-    expect(screen.getByTitle("Rectangle")).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByTitle("Rectangle (R)")).toHaveAttribute("aria-pressed", "false");
   });
 
   it("default active tool is hand", () => {
@@ -101,7 +101,7 @@ describe("ToolPalette", () => {
 
   it("MeasurementLength tool button is present", () => {
     render(ToolPalette, { props: { store } });
-    expect(screen.getByTitle("Measure Length")).toBeTruthy();
+    expect(screen.getByTitle("Measure Length (M)")).toBeTruthy();
   });
 
   it("Select / Pointer tool button is present and activates the select tool", async () => {

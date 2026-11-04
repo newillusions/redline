@@ -6,6 +6,8 @@
  */
 import type { Tool, ToolSet, PlacementMode, ImportReport } from "./ipc";
 import * as ipc from "./ipc";
+import { recentToolFor } from "./recent-tools";
+import type { ToolKind } from "./markup-store.svelte";
 
 export class ToolChestStore {
   sets = $state<ToolSet[]>([]);
@@ -80,6 +82,18 @@ export class ToolChestStore {
   async recordRecent(tool: Tool): Promise<void> {
     await ipc.recordRecentTool(tool);
     this.recent = [tool, ...this.recent.filter((t) => t.id !== tool.id)].slice(0, 20);
+  }
+
+  /**
+   * Record the active draw tool as a Recent entry, whichever entry point selected it
+   * (palette button, tool key, Tool Chest). Call when `MarkupStore.activeTool` changes.
+   * No-op for tools that are not markup styles, and when `skip` is set (the change was not a
+   * user pick: see `MarkupStore.skipRecentKind`).
+   */
+  async noteActiveTool(kind: ToolKind, appearance: ipc.Appearance, skip = false): Promise<void> {
+    if (skip) return;
+    const tool = recentToolFor(kind, appearance);
+    if (tool) await this.recordRecent(tool).catch(() => {});
   }
 
   /**

@@ -1506,9 +1506,9 @@ describe("Viewport zoom toolbar: HUD removal, collapse, reposition", () => {
     expect(container.querySelector(".zoom-controls")).not.toBeNull();
   });
 
-  it("the T key toggles the toolbar collapsed state, and persists across a remount", async () => {
+  it("the Z key toggles the toolbar collapsed state, and persists across a remount", async () => {
     const { container } = await mountViewport(store);
-    await fireEvent.keyDown(window, { key: "t" });
+    await fireEvent.keyDown(window, { key: "z" });
     await tick();
     expect(container.querySelector(".zoom-controls")).toBeNull();
 
@@ -1518,13 +1518,62 @@ describe("Viewport zoom toolbar: HUD removal, collapse, reposition", () => {
     expect(container2.querySelector(".toolbar-reopen")).not.toBeNull();
   });
 
-  it("typing 't' into the zoom-percent input does not collapse the toolbar (isTypingTarget guard)", async () => {
+  it("typing 'z' into the zoom-percent input does not collapse the toolbar (isTypingTarget guard)", async () => {
     const { container } = await mountViewport(store);
     const input = container.querySelector('input[aria-label="Zoom percent"]') as HTMLInputElement;
 
-    await fireEvent.keyDown(input, { key: "t" });
+    await fireEvent.keyDown(input, { key: "z" });
     await tick();
     expect(container.querySelector(".zoom-controls")).not.toBeNull();
+  });
+
+  it("T picks the Text Box tool (Revu) and no longer collapses the toolbar", async () => {
+    const { container } = await mountViewport(store);
+    await fireEvent.keyDown(window, { key: "t" });
+    await tick();
+    expect(store.activeTool).toBe("Text");
+    expect(container.querySelector(".zoom-controls")).not.toBeNull();
+  });
+
+  it("S ignores key-repeat, and tool keys do not fire from a control inside the stamp menu or a dialog", async () => {
+    await mountViewport(store);
+    await fireEvent.keyDown(window, { key: "s" });
+    expect(store.stampPickerOpen).toBe(true);
+    await fireEvent.keyDown(window, { key: "s", repeat: true });
+    expect(store.stampPickerOpen).toBe(true); // a held S must not flicker the picker closed
+    store.stampPickerOpen = false;
+
+    for (const html of ['<div role="menu"><button id="x">Approved</button></div>', '<dialog open><button id="x">OK</button></dialog>']) {
+      document.body.insertAdjacentHTML("beforeend", html);
+      const btn = document.getElementById("x")!;
+      store.activeTool = "select";
+      await fireEvent.keyDown(btn, { key: "r" });
+      expect(store.activeTool).toBe("select");
+      btn.parentElement!.remove();
+    }
+  });
+
+  it("Revu tool keys pick their tools; S opens the stamp picker; typing in the zoom input does not", async () => {
+    const { container } = await mountViewport(store);
+    for (const [key, tool] of [["r", "Rectangle"], ["e", "Ellipse"], ["c", "Cloud"], ["q", "Callout"], ["h", "Highlight"], ["p", "Ink"]] as const) {
+      await fireEvent.keyDown(window, { key });
+      expect(store.activeTool).toBe(tool);
+    }
+    await fireEvent.keyDown(window, { key: "P", shiftKey: true });
+    expect(store.activeTool).toBe("Polygon");
+    // Ctrl/Cmd+C is copy, not Cloud.
+    store.activeTool = "select";
+    await fireEvent.keyDown(window, { key: "c", ctrlKey: true });
+    expect(store.activeTool).toBe("select");
+    await fireEvent.keyDown(window, { key: "s" });
+    expect(store.stampPickerOpen).toBe(true);
+    store.stampPickerOpen = false;
+
+    const input = container.querySelector('input[aria-label="Zoom percent"]') as HTMLInputElement;
+    await fireEvent.keyDown(input, { key: "r" });
+    await fireEvent.keyDown(input, { key: "s" });
+    expect(store.activeTool).toBe("select");
+    expect(store.stampPickerOpen).toBe(false);
   });
 
   it("dragging the grip to a corner snaps and persists the toolbar's position", async () => {

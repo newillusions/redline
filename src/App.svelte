@@ -23,7 +23,7 @@
    * Svelte 5 runes: $state / $derived / $effect throughout.
    */
   import "$lib/styles.css";
-  import { onMount, onDestroy, tick } from "svelte";
+  import { onMount, onDestroy, tick, untrack } from "svelte";
   import Viewport from "./components/Viewport.svelte";
   import ToolPalette from "./components/ToolPalette.svelte";
   import PropertiesPanel from "./components/PropertiesPanel.svelte";
@@ -160,6 +160,31 @@
   // Tool Chest (spec "Tools & Tool Sets") - workspace-level, not per-document; one
   // instance lives for the app's lifetime and is shared across every open tab.
   const toolChestStore = new ToolChestStore();
+  // Recent Tools from every entry point: whenever the active tool changes (palette click, tool
+  // key, Tool Chest), mirror it into Recent. Only the tool kind is tracked; the appearance is
+  // read untracked so restyling a tool does not re-record it.
+  let recentWatchTab: unknown = null;
+  $effect(() => {
+    const store = activeTab?.store;
+    if (!store) return;
+    const kind = store.activeTool;
+    // Switching tabs changes which store is watched; that is not the user picking a tool.
+    if (recentWatchTab !== store) { recentWatchTab = store; store.skipRecentKind = null; return; }
+    const skip = untrack(() => store.consumeSkipRecent(kind));
+    void toolChestStore.noteActiveTool(kind, untrack(() => store.draftAppearance), skip);
+  });
+  // Reading mode cannot draw: disarm any active draw tool (and armed placement) so nothing is
+  // left selected that the disabled palette no longer shows as reachable.
+  $effect(() => {
+    if (viewerMode !== "reading") return;
+    const store = activeTab?.store;
+    if (!store) return;
+    untrack(() => {
+      store.pendingPlacementTool = null;
+      store.stampPickerOpen = false;
+      store.setToolSilently("select");
+    });
+  });
 
   // ---------------------------------------------------------------------------
   // Search (search-parity dispatch: current doc / open docs / folder+subfolders,
@@ -1881,7 +1906,7 @@
   {/if}
 
   {#if activeTab}
-    <ToolPalette store={activeTab.store} navStore={activeTab.navStore} />
+    <ToolPalette store={activeTab.store} navStore={activeTab.navStore} toolChest={toolChestStore} readOnlyView={viewerMode === "reading"} />
   {/if}
 
   {#if openError}
