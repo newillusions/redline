@@ -40,7 +40,7 @@
   import { dropLayerStore, layerStoreFor } from "$lib/layers-store.svelte";
   import ToolbarMenu from "./components/ToolbarMenu.svelte";
   import type { ToolbarMenuItem } from "./components/ToolbarMenu.svelte";
-  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listMarkups, listScales, saveDocument, saveDocumentAs, saveDocumentAsRebuild, canRebuildFromOriginal, reloadKeepingMarkups, isDiskChangedError, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, reorderMarkups, flattenDocument, optimizeDocument, redactDocument, snapshotVersion, exportMarkupList, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity, getPageCount, putScale, takeScaleNotices, type ScaleRecord } from "$lib/ipc";
+  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listMarkups, listScales, saveDocument, saveDocumentAs, saveDocumentAsRebuild, canRebuildFromOriginal, reloadKeepingMarkups, isDiskChangedError, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, reorderMarkups, flattenDocument, optimizeDocument, redactDocument, snapshotVersion, exportMarkupList, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity, getPageCount, putScale, type ScaleRecord } from "$lib/ipc";
   import { normaliseMeasurements } from "$lib/polylength";
   import type { IndexStatus, OcrProgressEvent } from "$lib/ipc";
   import { listen } from "@tauri-apps/api/event";
@@ -68,6 +68,7 @@
   import UpdateNotification from "./components/UpdateNotification.svelte";
   import ErrorBanner from "./components/ErrorBanner.svelte";
   import { surfaceError } from "$lib/error-surface";
+  import { drainScaleNotices } from "$lib/viewport-actions";
   import { handleCloseRequested } from "$lib/window-close";
   import ToolChestPanel from "./components/ToolChestPanel.svelte";
   import Accordion from "./components/Accordion.svelte";
@@ -95,7 +96,10 @@
     resolveUndoRedoShortcut,
     resolveSearchShortcut,
     resolveViewerModeToggleShortcut,
+    isEditableTarget,
   } from "$lib/keyboard-shortcuts";
+  import { numberedToolIndex } from "$lib/tool-keys";
+  import { activateAndRecord, numberedTools } from "$lib/toolchest-activation";
   import { runDocOpAndReseed, optimiseSummary } from "$lib/docops-handlers";
   import {
     baseName,
@@ -935,9 +939,7 @@
         .then(([m, scales]) => {
           ts.seedScales(scales);
           // E.g. the PDF's own viewports could not be saved next to it: say so, never only log.
-          takeScaleNotices(doc.doc_id)
-            .then((notes) => notes.forEach((n) => surfaceError(n)))
-            .catch(() => {});
+          void drainScaleNotices(doc.doc_id);
           store.seed(normaliseMeasurements(m, scales));
         })
         .catch((e) => { openError = `Load markups failed: ${e}`; });
@@ -1154,7 +1156,8 @@
     if (tab) {
       listScales(docId)
         .then((scales) => tab.takeoffStore.seedScales(scales))
-        .catch((e) => console.error("Failed to refresh scales after a page operation:", e));
+        .catch((e) => console.error("Failed to refresh scales after a page operation:", e))
+        .finally(() => void drainScaleNotices(docId));
     }
     // The open viewport holds the old page sizes and cached tiles (a rotate swaps width and
     // height without changing the page count). Remount it; the tab's viewportSnapshot restores
@@ -1701,6 +1704,19 @@
       if (undoRedoAction === "undo") activeTab?.store.undo();
       else activeTab?.store.redo();
       return;
+    }
+
+    // 1-9 — activate the first nine tools of the first Tool Set (Revu: "My Tools" hot keys).
+    // Bare digits only: never while typing, inside a dialog or menu, or in reading mode.
+    const digit = numberedToolIndex(e);
+    if (digit !== null && activeTab && viewerMode !== "reading" && !isEditableTarget(e.target) && !(e.target instanceof HTMLSelectElement) &&
+        !(e.target instanceof Element && e.target.closest('[role="menu"], dialog, [role="dialog"], [aria-modal="true"]'))) {
+      const tool = numberedTools(toolChestStore.sets)[digit];
+      if (tool) {
+        e.preventDefault();
+        activateAndRecord(tool, activeTab.store, toolChestStore);
+        return;
+      }
     }
 
     // Cmd/Ctrl+S — save active tab

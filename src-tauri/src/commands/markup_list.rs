@@ -219,6 +219,40 @@ fn parse_columns(keys: &[String]) -> Result<Vec<ListColumn>, String> {
     keys.iter().map(|k| ListColumn::parse(k)).collect()
 }
 
+/// The view as plain text: header cells, one row of cells per picked mark-up (in view order,
+/// quantities recomputed under `scales`, count items carrying their group total), and a
+/// relative width weight per column. Shared by the PDF summary.
+pub(crate) fn view_table(
+    all: &[Markup],
+    scales: &[crate::takeoff::ScaleRecord],
+    ids: &[String],
+    column_keys: &[String],
+    labels: &[String],
+) -> Result<(Vec<String>, Vec<Vec<String>>, Vec<f32>), String> {
+    let mut recomputed = all.to_vec();
+    crate::takeoff::recompute_all(&mut recomputed, scales);
+    let cols = parse_columns(column_keys)?;
+    let picked = pick(&recomputed, ids);
+    let with_totals = crate::takeoff::count::with_group_totals(&recomputed, &picked);
+    let headers = cols.iter().map(|c| c.header()).collect();
+    let rows = with_totals
+        .iter()
+        .enumerate()
+        .map(|(i, m)| cols.iter().map(|c| cell(m, i + 1, c, labels)).collect())
+        .collect();
+    let weights = cols
+        .iter()
+        .map(|c| match c {
+            ListColumn::Comment => 4.0,
+            ListColumn::Subject => 2.0,
+            ListColumn::Number | ListColumn::Page | ListColumn::Replies => 0.6,
+            ListColumn::Date | ListColumn::Modified | ListColumn::StatusAt => 1.4,
+            _ => 1.2,
+        })
+        .collect();
+    Ok((headers, rows, weights))
+}
+
 /// Write the view to `path`. Returns the number of rows written.
 pub fn export_view_to(
     all: &[Markup],
@@ -346,6 +380,37 @@ pub async fn export_markups_view(
         format,
         &crate::commands::navigation::labels_for(&state, &doc_id),
     )
+}
+
+/// Export the Markups List view as a PDF comment summary (the file clients and contractors
+/// expect). `path` is the absolute output path chosen by the user. Returns the rows written.
+#[tauri::command]
+pub async fn export_markups_summary_pdf(
+    state: State<'_, AppState>,
+    doc_id: String,
+    path: String,
+    ids: Vec<String>,
+    columns: Vec<String>,
+) -> Result<usize, String> {
+    let all = state.markups.list(&doc_id)?;
+    crate::commands::takeoff::ensure_scales_loaded(&state, &doc_id);
+    let scales = state.scales.lock().unwrap().list(&doc_id).to_vec();
+    let labels = crate::commands::navigation::labels_for(&state, &doc_id);
+    let title = state
+        .markups
+        .path(&doc_id)
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "Document".into());
+    let (headers, rows, weights) = view_table(&all, &scales, &ids, &columns, &labels)?;
+    super::markup_list_pdf::write_summary_pdf(
+        &PathBuf::from(&path),
+        &format!("Markups summary: {title}"),
+        &headers,
+        &rows,
+        &weights,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    Ok(rows.len())
 }
 
 #[cfg(test)]
@@ -810,5 +875,33 @@ mod tests {
             ExportFormat::Csv,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn view_table_follows_view_order_and_column_pick_for_the_pdf_summary() {
+        let a = mk(0, "first", "Ann");
+        let b = mk(1, "second", "Bob");
+        let ids = vec![b.id().to_string(), a.id().to_string(), "gone".to_string()];
+        let (headers, rows, weights) = view_table(
+            &[a, b],
+            &[],
+            &ids,
+            &keys(&["number", "comment", "author"]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(headers.len(), 3);
+        assert_eq!(weights.len(), 3);
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "second".into(), "Bob".into()],
+                vec!["2".to_string(), "first".into(), "Ann".into()],
+            ]
+        );
+        assert!(
+            view_table(&[], &[], &[], &[], &[]).is_err(),
+            "no columns is an error"
+        );
     }
 }

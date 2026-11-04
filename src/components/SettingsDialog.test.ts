@@ -187,3 +187,22 @@ describe("SettingsDialog - Auto-OCR toggle (Phase 2c-ii)", () => {
     );
   });
 });
+
+describe("SettingsDialog - tool reuse and shortcuts", () => {
+  beforeEach(() => {
+    mockGetLicenseInfo.mockReset().mockResolvedValue(validInfo());
+  });
+
+  it("toggles Reuse tools straight away and lists the full shortcut table", async () => {
+    const { uiPrefs } = await import("$lib/ui-prefs.svelte");
+    uiPrefs.setReuseTools(true);
+    const { getByLabelText, findByText } = render(SettingsDialog, { props: { onClose: () => {} } });
+    const box = (await waitFor(() => getByLabelText(/Reuse tools/))) as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    await fireEvent.click(box);
+    expect(uiPrefs.reuseTools).toBe(false);
+    expect(await findByText("Paste that format onto the selected markups")).toBeTruthy();
+    expect(await findByText("Next / previous tab")).toBeTruthy();
+    uiPrefs.setReuseTools(true);
+  });
+});

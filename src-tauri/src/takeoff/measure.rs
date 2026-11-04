@@ -534,11 +534,14 @@ fn viewport_target(f: &PdfViewport, viewport_id: String, named: &mut usize) -> S
 /// entry now is in `found` (read back after the operation): a reorder changes the page, a
 /// rotation the page-space rectangle. A redline-written entry is found by its id; an
 /// unedited imported one (kept byte for byte) by its `/BBox`. A viewport whose entry is
-/// gone (its page was deleted) is dropped; a retired (deleted) one is kept as it is.
+/// gone (its page was deleted) is dropped; a retired (deleted) one is kept as it is, and so
+/// is one in `unsynced` (see [`unsynced_viewport_ids`]): its `/VP` entry was never written,
+/// so its absence from `found` says nothing about its page.
 pub fn follow_viewports(
     scales: &[ScaleRecord],
     seen: &[ViewportKey],
     found: &[PdfViewport],
+    unsynced: &[String],
 ) -> (Vec<ScaleRecord>, Vec<ViewportKey>) {
     let mut seen = seen.to_vec();
     let mut out = Vec::new();
@@ -550,7 +553,7 @@ pub fn follow_viewports(
             out.push(s.clone());
             continue;
         };
-        if s.retired {
+        if s.retired || unsynced.contains(viewport_id) {
             out.push(s.clone());
             continue;
         }
@@ -590,6 +593,21 @@ pub fn follow_viewports(
     (out, seen)
 }
 
+/// Ids of the live viewport scales on the zero-based `pages` that [`sync_viewports`]
+/// skipped: they were not written to the PDF, so they must survive [`follow_viewports`].
+pub fn unsynced_viewport_ids(scales: &[ScaleRecord], pages: &[u32]) -> Vec<String> {
+    scales
+        .iter()
+        .filter(|s| !s.retired)
+        .filter_map(|s| match &s.applies_to {
+            ScaleTarget::Viewport {
+                page, viewport_id, ..
+            } if pages.contains(page) => Some(viewport_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Bring every page's `/VP` array in line with the document's viewport scales, in drawing
 /// order after the entries kept:
 /// - viewports redline wrote earlier (`/RLViewportId`) are replaced by the current ones;
@@ -600,12 +618,14 @@ pub fn follow_viewports(
 ///   another application's viewports never imported - is kept as it is.
 ///
 /// Retired (deleted) viewport scales are not written. A page whose geometry cannot be read
-/// is skipped (logged), not a reason to fail the save.
+/// is skipped (logged), not a reason to fail the save; its zero-based index is returned so
+/// the caller can keep that page's viewport scales and tell the user.
 pub fn sync_viewports(
     doc: &mut Document,
     scales: &[ScaleRecord],
     seen: &[ViewportKey],
-) -> Result<()> {
+) -> Result<Vec<u32>> {
+    let mut skipped = Vec::new();
     let pages = doc.get_pages();
     for (page_no, page_id) in pages {
         let page = page_no - 1;
@@ -627,6 +647,7 @@ pub fn sync_viewports(
             Ok(sp) => sp,
             Err(e) => {
                 log::warn!("measurement viewports: page {page} skipped: {e:#}");
+                skipped.push(page);
                 continue;
             }
         };
@@ -688,7 +709,7 @@ pub fn sync_viewports(
             page_dict.set("VP", Object::Array(kept));
         }
     }
-    Ok(())
+    Ok(skipped)
 }
 
 // ---------------------------------------------------------------------------
@@ -925,7 +946,7 @@ mod tests {
         // After a reorder the same entry is read back on page 3.
         let mut moved = found.clone();
         moved[0].page = 3;
-        let (after, seen) = follow_viewports(&recs, &keys, &moved);
+        let (after, seen) = follow_viewports(&recs, &keys, &moved, &[]);
         assert_eq!(after.len(), 1, "not dropped: matched by its /BBox");
         assert!(matches!(
             after[0].applies_to,
@@ -939,13 +960,34 @@ mod tests {
     }
 
     #[test]
+    fn a_page_whose_geometry_cannot_be_read_is_reported_and_its_viewport_survives_follow() {
+        let (mut doc, page_id) = one_page_doc();
+        doc.get_dictionary_mut(page_id).unwrap().remove(b"MediaBox");
+        let v = vp_scale(0, "v", "V", [10.0, 10.0, 100.0, 100.0], 0.02);
+        let skipped = sync_viewports(&mut doc, std::slice::from_ref(&v), &[]).unwrap();
+        assert_eq!(
+            skipped,
+            vec![0],
+            "the page was skipped, not silently ignored"
+        );
+        let unsynced = unsynced_viewport_ids(std::slice::from_ref(&v), &skipped);
+        assert_eq!(unsynced, vec!["v".to_string()]);
+        // Nothing was written, so nothing is read back; without the exemption the scale
+        // would be dropped as "its page went".
+        let (dropped, _) = follow_viewports(std::slice::from_ref(&v), &[], &[], &[]);
+        assert!(dropped.is_empty());
+        let (kept, _) = follow_viewports(std::slice::from_ref(&v), &[], &[], &unsynced);
+        assert_eq!(kept, vec![v]);
+    }
+
+    #[test]
     fn retired_viewports_are_not_written_and_survive_a_page_op() {
         let (mut doc, _) = one_page_doc();
         let mut v = vp_scale(0, "v", "V", [10.0, 10.0, 100.0, 100.0], 0.02);
         v.retired = true;
         sync_viewports(&mut doc, std::slice::from_ref(&v), &[]).unwrap();
         assert!(read_viewports(&doc).is_empty());
-        let (after, _) = follow_viewports(std::slice::from_ref(&v), &[], &[]);
+        let (after, _) = follow_viewports(std::slice::from_ref(&v), &[], &[], &[]);
         assert_eq!(after, vec![v], "kept so its measurements keep their scale");
     }
 
@@ -1327,7 +1369,7 @@ mod tests {
             label: "1:20".into(),
             precision: 3,
         }];
-        let (after, _) = follow_viewports(&[d.clone(), a.clone(), b], &[], &found);
+        let (after, _) = follow_viewports(&[d.clone(), a.clone(), b], &[], &found, &[]);
         assert_eq!(after.len(), 2, "b's page is gone");
         assert_eq!(after[0], d);
         assert!(

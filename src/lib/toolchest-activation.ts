@@ -4,7 +4,8 @@
  * no network calls - callers (ToolChestPanel.svelte) separately fire-and-forget the
  * `recordRecent` IPC call, which does not need to block activation.
  */
-import type { Tool } from "./ipc";
+import type { Tool, ToolSet } from "./ipc";
+import { NUMBERED_TOOL_COUNT } from "./tool-keys";
 import type { MarkupStore, ToolKind } from "./markup-store.svelte";
 
 /**
@@ -51,4 +52,30 @@ export function activateTool(tool: Tool, store: MarkupStore): void {
     store.pendingPlacementTool = null;
     store.activeTool = tool.markup_type as ToolKind;
   }
+}
+
+/**
+ * The tools that answer to the digit keys 1 to 9: the first nine tools of the first Tool Set
+ * (Revu assigns "My Tools" hot keys by position; Redline uses the first set so the keys are
+ * predictable and the panel can number them).
+ */
+export function numberedTools(sets: readonly ToolSet[]): Tool[] {
+  return (sets[0]?.tools ?? []).slice(0, NUMBERED_TOOL_COUNT);
+}
+
+/**
+ * Activate `tool` and record it as the real, named Recent entry. The change of active tool
+ * must not also add a plain duplicate entry (see `MarkupStore.skipRecentKind`), and the skip
+ * is set only when the tool kind actually changes: otherwise no watcher run would consume it
+ * and it would swallow the user's next real pick.
+ */
+export function activateAndRecord(
+  tool: Tool,
+  store: MarkupStore,
+  toolChest: { recordRecent(tool: Tool): Promise<void> },
+): void {
+  const before = store.activeTool;
+  activateTool(tool, store);
+  store.skipRecentKind = store.activeTool !== before ? store.activeTool : null;
+  void toolChest.recordRecent(tool).catch(() => {});
 }

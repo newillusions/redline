@@ -101,9 +101,12 @@
   import { getPageSnapTargets, findNearestSnap, type SnapTarget } from "$lib/snap";
   import CalibrationDialog from "./CalibrationDialog.svelte";
   import ViewportDialog from "./ViewportDialog.svelte";
-  import { commitViewportChange, reportViewportError } from "$lib/viewport-actions";
+  import { commitViewportChange, drainScaleNotices, reportRotateError, reportViewportError, viewportDragOutcome, VIEWPORT_VANISHED_MESSAGE } from "$lib/viewport-actions";
+  import { surfaceError } from "$lib/error-surface";
+  import { uiPrefs } from "$lib/ui-prefs.svelte";
+  import ShortcutList from "./ShortcutList.svelte";
   import StampPromptDialog from "./StampPromptDialog.svelte";
-  import { toolForKeyEvent, TOOL_KEY_BINDINGS } from "$lib/tool-keys";
+  import { toolForKeyEvent } from "$lib/tool-keys";
   import ArrangeBar from "./ArrangeBar.svelte";
   import { nativeEditingOwnsClipboardKeys } from "$lib/keyboard-shortcuts";
   import { markupClipboard } from "$lib/markup-clipboard.svelte";
@@ -115,6 +118,7 @@
     markupMenuItems, canvasMenuItems, type MenuItem,
   } from "$lib/context-menu";
   import { runMarkupCommand, selectAllOnPage } from "$lib/context-actions";
+  import { copyFormat, pasteFormat, formatClipboard } from "$lib/format-painter";
   import { ViewHistory, isLargeZoomChange, type ViewEntry } from "$lib/view-history";
   import LinkOverlay from "./LinkOverlay.svelte";
   import type { NavigationStore } from "$lib/navigation-store.svelte";
@@ -1420,6 +1424,7 @@
         count: sel.length,
         anyLocked: sel.some((m) => isMarkupLocked(m) || isMarkupContentsLocked(m)),
         commonStatus: statuses.size === 1 ? [...statuses][0] : undefined,
+        canPasteFormat: formatClipboard.format !== null,
       });
     }
     return canvasMenuItems({
@@ -1488,7 +1493,7 @@
     try {
       await rotatePage({ doc_id: docInfo.doc_id, page_idx: pageIndex, degrees });
     } catch (e) {
-      console.error("rotatePage failed:", e);
+      reportRotateError(pageIndex, e);
       return;
     }
     onpageop?.();
@@ -1579,6 +1584,20 @@
         e.preventDefault();
         copyTextSelection();
         return;
+      }
+      // Format painter: Ctrl/Cmd+Shift+C copies the selected markup's look, Ctrl/Cmd+Alt+V
+      // pastes it onto the selection (`code`: Alt rewrites `key` on macOS keyboards).
+      if (!isTextSelTool(store.activeTool)
+          && !nativeEditingOwnsClipboardKeys(document.activeElement, window.getSelection(), containerEl)) {
+        const painter = e.shiftKey && !e.altKey && e.code === "KeyC" ? copyFormat
+          : e.altKey && !e.shiftKey && e.code === "KeyV" ? pasteFormat
+          : null;
+        if (painter) {
+          const r = painter(arrangeCtx());
+          if (r.ok) e.preventDefault();
+          showArrangeNotice(r);
+          return;
+        }
       }
       // Copy / Cut / Paste / Paste in place / Duplicate the selected markups (docs/arrange.md).
       // Copy only reaches here when there is no text selection (handled above).
@@ -2899,14 +2918,21 @@
       // A click (no real drag) makes nothing.
       if (!p || Math.abs(p.x - start.x) * zoom < CLOUD_DRAG_PX || Math.abs(p.y - start.y) * zoom < CLOUD_DRAG_PX) return;
       const bbox: BBox = [Math.min(start.x, p.x), Math.min(start.y, p.y), Math.max(start.x, p.x), Math.max(start.y, p.y)];
-      const redraw = tool === "viewportRedraw" ? takeoffStore.redrawViewportId : null;
-      const old = redraw ? takeoffStore.scales.find((x) => x.id === redraw) ?? null : null;
-      if (old) {
+      const outcome = viewportDragOutcome(tool, takeoffStore.redrawViewportId, takeoffStore.scales);
+      if (outcome.kind === "vanished") {
+        takeoffStore.redrawViewportId = null;
+        store.activeTool = "hand";
+        surfaceError(VIEWPORT_VANISHED_MESSAGE);
+      } else if (outcome.kind === "redraw") {
+        const old = outcome.old;
         // Redraw: the new rectangle - on THIS page - replaces the viewport's (one undo step).
         takeoffStore.redrawViewportId = null;
         store.activeTool = "hand";
         void updateViewport(docInfo.doc_id, old.id, { bbox, page: pageIndex })
-          .then((rec) => commitViewportChange(store, takeoffStore, old, rec, identity))
+          .then((rec) => {
+            commitViewportChange(store, takeoffStore, old, rec, identity);
+            void drainScaleNotices(docInfo.doc_id);
+          })
           .catch((err) => reportViewportError("Redrawing the viewport", err));
       } else {
         pendingViewport = { page: pageIndex, bbox };
@@ -4145,9 +4171,11 @@
               ? await addViewport(docInfo.doc_id, { page: target.page, name: target.name, bbox: target.bbox, ...cal })
               : await updateViewport(docInfo.doc_id, target.scaleId, cal);
             commitViewportChange(store, takeoffStore, old, rec, identity);
+            void drainScaleNotices(docInfo.doc_id);
           } else {
             const rec = await addScale(docInfo.doc_id, null, result.ratio, result.unit, result.label, result.precision);
             takeoffStore.addScale(rec);
+            void drainScaleNotices(docInfo.doc_id);
             // Bring existing measurements under the new calibration as ONE undo step.
             if (identity) {
               store.applyBatch(recomputeAll(store.markups, takeoffStore.scales, identity, new Date().toISOString()));
@@ -4187,6 +4215,7 @@
           // One undo step: the viewport plus any unscaled measurement in it taking its scale.
           // Measurements taken under another scale keep it (Re-apply is explicit).
           commitViewportChange(store, takeoffStore, null, rec, identity);
+          void drainScaleNotices(docInfo.doc_id);
         } catch (err) {
           reportViewportError("Creating the viewport", err);
         }
@@ -4295,6 +4324,15 @@
           }}
         />
         <button
+          class="btn-zoom btn-reuse"
+          class:active={uiPrefs.reuseTools}
+          aria-pressed={uiPrefs.reuseTools}
+          title={uiPrefs.reuseTools
+            ? "Reuse tools is on: a tool stays active after each markup. Click to return to Select after each markup."
+            : "Reuse tools is off: back to Select after each markup. Click to keep the tool active."}
+          onclick={() => uiPrefs.setReuseTools(!uiPrefs.reuseTools)}
+        >Reuse</button>
+        <button
           class="btn-zoom btn-shortcuts"
           title={SHORTCUTS_TITLE}
           aria-label="Show pan and zoom shortcuts"
@@ -4302,7 +4340,7 @@
         >?</button>
         <button
           class="btn-zoom toolbar-collapse-btn"
-          title="Hide zoom toolbar (T)"
+          title="Hide zoom toolbar (Z)"
           aria-label="Hide zoom toolbar"
           onclick={() => setToolbarCollapsed(true)}
         >×</button>
@@ -4310,7 +4348,7 @@
     {:else}
       <button
         class="btn-zoom toolbar-reopen"
-        title="Show zoom toolbar (T)"
+        title="Show zoom toolbar (Z)"
         aria-label="Show zoom toolbar"
         onclick={() => setToolbarCollapsed(false)}
       >⚙</button>
@@ -4336,29 +4374,7 @@
         onclick={(e) => e.stopPropagation()}
         onkeydown={(e) => e.stopPropagation()}
       >
-        <div class="shortcuts-title">Pan &amp; zoom</div>
-        <div class="shortcuts-row"><span>Two-finger swipe / mouse wheel</span><span>Pan</span></div>
-        <div class="shortcuts-row"><span>Pinch (trackpad)</span><span>Zoom at fingers</span></div>
-        <div class="shortcuts-row"><span>Shift + scroll</span><span>Zoom at cursor</span></div>
-        <div class="shortcuts-row"><span>⌘/Ctrl + scroll</span><span>Zoom at cursor</span></div>
-        <div class="shortcuts-row"><span>⌘/Ctrl + / −</span><span>Zoom in / out</span></div>
-        <div class="shortcuts-row"><span>Space + drag</span><span>Pan with any tool</span></div>
-        <div class="shortcuts-row"><span>⌘/Ctrl + 0</span><span>Fit width</span></div>
-        <div class="shortcuts-row"><span>⌘/Ctrl + 9</span><span>Fit height</span></div>
-        <div class="shortcuts-row"><span>⌘/Ctrl + 8</span><span>Actual size (100%)</span></div>
-        <div class="shortcuts-row"><span>Z</span><span>Show/hide the zoom toolbar</span></div>
-        <div class="shortcuts-title">Tools (same keys as Bluebeam Revu)</div>
-        {#each TOOL_KEY_BINDINGS.filter((b) => !b.alias) as b (b.label)}
-          <div class="shortcuts-row"><span>{b.shift ? "Shift+" : ""}{b.key.toUpperCase()}</span><span>{b.label}</span></div>
-        {/each}
-        <div class="shortcuts-row"><span>Y</span><span>Cloud (second key)</span></div>
-        <div class="shortcuts-row"><span>Esc</span><span>Back to Select</span></div>
-        <div class="shortcuts-title">Markups</div>
-        <div class="shortcuts-row"><span>⌘/Ctrl + C / X / V</span><span>Copy / cut / paste markups (paste lands at the pointer)</span></div>
-        <div class="shortcuts-row"><span>⌘/Ctrl + Shift + V</span><span>Paste markups in place</span></div>
-        <div class="shortcuts-row"><span>⌘/Ctrl + D</span><span>Duplicate the selected markups</span></div>
-        <div class="shortcuts-row"><span>Alt + ← / →</span><span>Previous / next view (after a jump or big zoom)</span></div>
-        <div class="shortcuts-row"><span>Right-click · Shift+F10</span><span>Context menu for a markup or the page</span></div>
+        <ShortcutList />
         <div class="shortcuts-hint">Esc or click outside to close</div>
       </div>
     </div>
@@ -4734,6 +4750,7 @@
     outline: 1px solid var(--color-border);
   }
 
+  .btn-reuse.active { color: var(--color-text); }
   .btn-shortcuts {
     font-weight: 600;
     min-width: 1.6em;
@@ -4764,22 +4781,6 @@
     font-size: var(--font-size-sm);
     box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
   }
-  .shortcuts-title {
-    color: var(--color-text);
-    font-weight: 600;
-    margin-bottom: var(--space-2);
-  }
-  .shortcuts-title:not(:first-child) { margin-top: var(--space-3); }
-  .shortcuts-row {
-    display: flex;
-    justify-content: space-between;
-    gap: var(--space-4);
-    padding: var(--space-1) 0;
-    border-bottom: 1px solid var(--color-border);
-  }
-  .shortcuts-row:last-of-type { border-bottom: none; }
-  .shortcuts-row span:first-child { color: var(--color-text-secondary); }
-  .shortcuts-row span:last-child { color: var(--color-text-muted); font-family: var(--font-mono); font-size: var(--font-size-xs); }
   .shortcuts-hint {
     margin-top: var(--space-2);
     color: var(--color-text-muted);

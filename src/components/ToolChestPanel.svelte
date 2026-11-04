@@ -12,7 +12,7 @@
   import { onMount } from "svelte";
   import { open } from "@tauri-apps/plugin-dialog";
   import { ToolChestStore } from "$lib/toolchest-store.svelte";
-  import { activateTool } from "$lib/toolchest-activation";
+  import { activateAndRecord, numberedTools } from "$lib/toolchest-activation";
   import { reorderAfterDrag } from "$lib/toolchest-reorder";
   import type { MarkupStore } from "$lib/markup-store.svelte";
   import type { Tool, ToolSet, PlacementMode, MarkupType } from "$lib/ipc";
@@ -60,14 +60,13 @@
   // ---------------------------------------------------------------------------
   function handleActivate(tool: Tool) {
     if (!markupStore || readOnlyView) return;
-    // The panel records the real, named tool below, so the activeTool watcher must not add a
-    // duplicate plain entry. Only mark a skip when activeTool actually changes: if it does not
-    // (chest tool A -> chest tool B, same kind), no watcher run would consume the mark and it
-    // would swallow the user's next real pick.
-    const before = markupStore.activeTool;
-    activateTool(tool, markupStore);
-    markupStore.skipRecentKind = markupStore.activeTool !== before ? markupStore.activeTool : null;
-    void toolChest.recordRecent(tool);
+    activateAndRecord(tool, markupStore, toolChest);
+  }
+
+  /** The digit (1-9) that selects `tool`, when it is among the numbered tools; else null. */
+  function digitFor(tool: Tool): number | null {
+    const i = numberedTools(toolChest.sets).findIndex((t) => t.id === tool.id);
+    return i < 0 ? null : i + 1;
   }
 
   // Set collapse/expand is now owned by the shared Accordion component
@@ -259,10 +258,11 @@
                   <span class="tc-drag-handle" aria-hidden="true" title="Drag to reorder">⠿</span>
                   <button
                     class="tc-tool-btn"
-                    title={toolTitle(tool)}
+                    title={digitFor(tool) ? `${toolTitle(tool)} - key ${digitFor(tool)}` : toolTitle(tool)}
                     onclick={() => handleActivate(tool)}
                     disabled={!markupStore || readOnlyView}
                   >
+                    {#if digitFor(tool)}<span class="tc-digit" aria-hidden="true">{digitFor(tool)}</span>{/if}
                     <span class="tc-glyph">{glyph(tool.markup_type)}</span>
                     <span class="tc-tool-name">{tool.name}</span>
                   </button>
@@ -474,6 +474,15 @@
     cursor: not-allowed;
   }
 
+  .tc-digit {
+    min-width: 1.1em;
+    padding: 0 var(--space-1);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    font-size: var(--font-size-xs);
+    color: var(--color-text-secondary);
+    text-align: center;
+  }
   .tc-glyph {
     flex-shrink: 0;
   }

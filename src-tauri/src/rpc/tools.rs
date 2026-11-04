@@ -554,10 +554,40 @@ pub struct AddScaleParams {
     pub doc_id: String,
     #[serde(default)]
     pub applies_to_page: Option<u32>,
+    /// With `viewport_bbox`: make this a measurement viewport (a named rectangle of
+    /// `applies_to_page` with its own scale) instead of a page or document scale.
+    #[serde(default)]
+    pub viewport_name: Option<String>,
+    /// `[x0, y0, x1, y1]` in page space (the space markup geometry uses).
+    #[serde(default)]
+    pub viewport_bbox: Option<[f64; 4]>,
     pub ratio: f64,
     pub unit: String,
     pub label: String,
     pub precision: u8,
+}
+
+/// The scales an MCP caller sees: retired viewports (deleted, kept only so the measurements
+/// taken under them keep their values) are not usable or deletable, so they are left out.
+pub fn live_scales(all: Vec<crate::takeoff::ScaleRecord>) -> Vec<crate::takeoff::ScaleRecord> {
+    all.into_iter().filter(|s| !s.retired).collect()
+}
+
+impl AddScaleParams {
+    /// The viewport this call describes: `Ok(None)` when neither viewport field is given,
+    /// an error when only one is, or when no page says where the rectangle is.
+    pub fn viewport(&self) -> Result<Option<(u32, &str, [f64; 4])>, String> {
+        match (
+            &self.viewport_name,
+            self.viewport_bbox,
+            self.applies_to_page,
+        ) {
+            (None, None, _) => Ok(None),
+            (Some(name), Some(bbox), Some(page)) => Ok(Some((page, name.as_str(), bbox))),
+            (Some(_), Some(_), None) => Err("a viewport needs applies_to_page".into()),
+            _ => Err("a viewport needs both viewport_name and viewport_bbox".into()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -761,6 +791,53 @@ mod phase2b_param_tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("ratio"));
+    }
+
+    #[test]
+    fn list_scales_leaves_out_retired_viewports() {
+        use crate::takeoff::{ScaleMethod, ScaleRecord, ScaleTarget};
+        let mk = |retired: bool| {
+            let mut r = ScaleRecord::new(
+                ScaleTarget::DocumentDefault,
+                ScaleMethod::Preset,
+                0.01,
+                "m".into(),
+                "1:100".into(),
+                2,
+            );
+            r.retired = retired;
+            r
+        };
+        let live = mk(false);
+        let out = live_scales(vec![live.clone(), mk(true)]);
+        assert_eq!(out, vec![live]);
+    }
+
+    #[test]
+    fn add_scale_viewport_fields_need_name_bbox_and_page_together() {
+        let parse = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "doc_id": "d1", "ratio": 0.02, "unit": "m", "label": "1:20", "precision": 2
+            });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<AddScaleParams>(v).unwrap()
+        };
+        assert_eq!(parse(serde_json::json!({})).viewport(), Ok(None));
+        let full = parse(serde_json::json!({
+            "applies_to_page": 2, "viewport_name": "Detail A", "viewport_bbox": [1.0, 2.0, 30.0, 40.0]
+        }));
+        assert_eq!(
+            full.viewport(),
+            Ok(Some((2, "Detail A", [1.0, 2.0, 30.0, 40.0])))
+        );
+        let no_page = parse(serde_json::json!({
+            "viewport_name": "Detail A", "viewport_bbox": [1.0, 2.0, 30.0, 40.0]
+        }));
+        assert!(no_page.viewport().unwrap_err().contains("applies_to_page"));
+        let no_bbox = parse(serde_json::json!({"applies_to_page": 2, "viewport_name": "A"}));
+        assert!(no_bbox.viewport().is_err());
     }
 
     #[test]

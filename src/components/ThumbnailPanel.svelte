@@ -32,6 +32,7 @@
   import { onDestroy } from "svelte";
   import { labelOf } from "$lib/navigation";
   import ContextMenu from "./ContextMenu.svelte";
+  import { uiPrefs, THUMB_MIN, THUMB_MAX } from "$lib/ui-prefs.svelte";
   import { thumbnailMenuItems } from "$lib/context-menu";
 
   interface Props {
@@ -220,7 +221,7 @@
   /** Target CSS width of a thumbnail's rendered raster - the panel's own width (the
    *  hosting sidebar's resizable width) sets the visual size; this only needs to be "small enough to
    *  render cheaply, sharp enough to read at that size". */
-  const THUMBNAIL_WIDTH_CSS = 140;
+  const THUMBNAIL_WIDTH_CSS = 220;
   /** Thumbnails never need more than one small tile - caps pageTileSizeCss well below
    *  ReadingView's full-resolution cap. */
   const THUMBNAIL_MAX_TILE_CSS = 600;
@@ -442,7 +443,27 @@
   </div>
 {/if}
 <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
-<aside class="thumbnail-panel" aria-label="Page thumbnails" tabindex="0" onkeydown={onPanelKeyDown}>
+<aside
+  class="thumbnail-panel"
+  aria-label="Page thumbnails"
+  tabindex="0"
+  onkeydown={onPanelKeyDown}
+  style={`--thumb-min: ${uiPrefs.thumbnailSize}px`}
+>
+  <div class="thumbnail-size-row">
+    <label for="thumb-size">Size</label>
+    <input
+      id="thumb-size"
+      type="range"
+      min={THUMB_MIN}
+      max={THUMB_MAX}
+      step="10"
+      value={uiPrefs.thumbnailSize}
+      aria-label="Thumbnail size"
+      title="Thumbnail size: smaller shows more sheets at once"
+      oninput={(e) => uiPrefs.setThumbnailSize(Number((e.target as HTMLInputElement).value))}
+    />
+  </div>
   {#each Array.from({ length: pageCount }, (_, i) => i) as idx (idx)}
     <div
       class="thumbnail"
@@ -528,8 +549,10 @@
 
 <style>
   .thumbnail-panel {
-    display: flex;
-    flex-direction: column;
+    /* As many columns of at least --thumb-min as fit: a small size shows many sheets. */
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(var(--thumb-min, 180px), 1fr));
+    align-content: start;
     gap: var(--space-2);
     padding: var(--space-2);
     background: var(--color-bg-panel);
@@ -540,6 +563,16 @@
     min-width: 0;
     flex-shrink: 0;
   }
+
+  .thumbnail-size-row {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--font-size-xs);
+    color: var(--color-text-secondary);
+  }
+  .thumbnail-size-row input[type="range"] { flex: 1; min-width: 0; }
 
   .thumbnail {
     display: flex;

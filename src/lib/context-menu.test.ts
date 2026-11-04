@@ -8,11 +8,12 @@ const actions = (items: MenuItem[]) => items.filter((i): i is ActionItem => i.ki
 const byId = (items: MenuItem[], id: string) => actions(items).find((i) => i.id === id);
 
 describe("markupMenuItems", () => {
-  it("offers status, properties, copy/duplicate, order, save as tool and delete", () => {
+  it("offers status, properties, copy/duplicate, format painter, order, save as tool and delete", () => {
     const ids = actions(markupMenuItems({ count: 1, anyLocked: false })).map((i) => i.id);
     expect(ids).toEqual([
       "status:Accepted", "status:Rejected", "status:Cancelled", "status:Completed", "status:None",
-      "properties", "save-as-tool", "copy", "cut", "duplicate", "bring-to-front", "send-to-back", "delete",
+      "properties", "save-as-tool", "copy", "cut", "duplicate", "copy-format", "paste-format", "use-as-default",
+      "bring-to-front", "send-to-back", "delete",
     ]);
   });
   it("greys out edits on a locked markup but leaves copy and properties", () => {

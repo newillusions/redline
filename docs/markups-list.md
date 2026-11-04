@@ -78,7 +78,7 @@ Nothing here comes from decompiling or instrumenting Bluebeam software.
 | Behaviour | Revu | Redline |
 |---|---|---|
 | Export the list from its menu | V c16Kk8Cffcc@115-150 | "Export CSV" / "Export XLSX" write the **current view**: only the rows that pass the filter, in the sorted order, with the visible columns in their order |
-| Summary report with chosen fields (CSV/XML/PDF) | V G-i9S5o-BDw@148-175 | CSV and XLSX only. XML and PDF are not built |
+| Summary report with chosen fields (CSV/XML/PDF) | V G-i9S5o-BDw@148-175 | CSV, XLSX and PDF. "Export PDF" writes the same view (filter, sort, visible columns) as a landscape A4 table with the header on every page and "Page n of N" (`commands/markup_list_pdf.rs`); text only in Helvetica, characters outside Latin-1 print as `?`, cells over 12 lines are cut. XML is not built |
 | Formula injection | n/a | **CSV only.** Text that came from the PDF (subject, comments, author, layer, colour, status-set-by, custom columns) and every header cell (custom column names are PDF data) is prefixed with `'` when its left-trimmed value starts with `= + - @`, TAB, CR or the full-width forms; the same helper protects the fixed whole-document CSV export. XLSX cells are plain strings (never formulas) and carry no visible quote. App-formatted cells (page, replies, dates, measurement incl. a negative quantity) are untouched. Custom column names over 64 characters or with control characters are refused |
 | Date column | U | Created date, UTC, `YYYY-MM-DD HH:MM` (same text as the existing fixed export). A separate Modified column is available |
 

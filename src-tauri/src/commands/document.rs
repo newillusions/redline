@@ -555,7 +555,8 @@ async fn save_inner(
         let store = state.scales.lock().unwrap();
         (store.list(doc_id).to_vec(), store.seen(doc_id).to_vec())
     };
-    {
+    let scales_for_notice = scales.clone();
+    let skipped_pages = {
         let staged = staged.clone();
         tokio::task::spawn_blocking(move || {
             save_with_markups_synced(
@@ -569,7 +570,16 @@ async fn save_inner(
         })
         .await
         .map_err(|e| e.to_string())?
-        .map_err(|e| format!("{e:#}"))?;
+        .map_err(|e| format!("{e:#}"))?
+    };
+    if !skipped_pages.is_empty() {
+        let n = crate::takeoff::unsynced_viewport_ids(&scales_for_notice, &skipped_pages).len();
+        if n > 0 {
+            state.scales.lock().unwrap().push_notice(
+                doc_id,
+                format!("{n} measurement viewport(s) could not be written into the PDF because their page geometry could not be read. They are kept in the document's scale data."),
+            );
+        }
     }
 
     // Scale calibration lives in the sidecar next to the PDF, not in the PDF: a Save As must
@@ -820,8 +830,12 @@ pub(crate) async fn apply_page_edit_opts(
     let src2 = src.clone();
     let (markups, removed) = (snap.markups.clone(), snap.removed.clone());
     let sync_scales = scales.clone();
+    // Pages whose /VP could not be written: their viewport scales are kept as they are.
+    let skipped_pages = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+    let skipped_in_op = skipped_pages.clone();
     let op = move |doc: &mut lopdf::Document| {
-        crate::takeoff::sync_viewports(doc, &sync_scales, &seen)?;
+        let skipped = crate::takeoff::sync_viewports(doc, &sync_scales, &seen)?;
+        *skipped_in_op.lock().unwrap() = skipped;
         op(doc)
     };
     let written = tokio::task::spawn_blocking(move || {
@@ -860,10 +874,14 @@ pub(crate) async fn apply_page_edit_opts(
     .await;
     // The op moved the /VP entries with their pages (written just before it): follow them,
     // so each viewport scale stays on its page (and in the right place on a rotated one).
+    let skipped_pages = skipped_pages.lock().unwrap().clone();
     let refreshed = refreshed.map(|(markups, viewports)| {
-        if let Err(e) =
-            crate::commands::takeoff::follow_viewports_after_page_op(state, doc_id, &viewports)
-        {
+        if let Err(e) = crate::commands::takeoff::follow_viewports_after_page_op(
+            state,
+            doc_id,
+            &viewports,
+            &skipped_pages,
+        ) {
             log::warn!("updating the measurement viewports after a page operation failed: {e}");
         }
         markups

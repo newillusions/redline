@@ -552,7 +552,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "list_scales",
-            "description": "List all saved calibration scales for the document. Read-only.",
+            "description": "List the document's saved calibration scales (page, document-default and measurement-viewport scales; deleted viewports are not listed). Read-only.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "doc_id": {"type": "string"} },
@@ -561,12 +561,14 @@ fn tool_defs() -> Value {
         },
         {
             "name": "add_scale",
-            "description": "Add (or replace, by applies_to target) a calibration scale for the document. WRITES IMMEDIATELY to the document's sidecar metadata file - not gated behind save_document, unlike markup create/update/delete. Fails if doc_id is unknown.",
+            "description": "Add (or replace, by applies_to target) a calibration scale for the document. Give viewport_name + viewport_bbox (with applies_to_page) to scale one rectangle of a sheet instead of the whole page. WRITES IMMEDIATELY to the document's sidecar metadata file - not gated behind save_document, unlike markup create/update/delete. Fails if doc_id is unknown.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "doc_id": {"type": "string"},
                     "applies_to_page": {"type": "integer", "description": "Zero-based page index. Omit for the document-default scale."},
+                    "viewport_name": {"type": "string", "description": "Name of a measurement viewport on applies_to_page. Needs viewport_bbox."},
+                    "viewport_bbox": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "[x0, y0, x1, y1] in page space, the space markup geometry uses. Needs viewport_name."},
                     "ratio": {"type": "number", "description": "Real-world units per PDF point."},
                     "unit": {"type": "string"},
                     "label": {"type": "string"},

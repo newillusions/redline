@@ -663,6 +663,19 @@ export async function exportMarkupsView(
   return invoke<number>("export_markups_view", { docId: doc_id, path, format, ids, columns });
 }
 
+/**
+ * Export the Markups List view as a PDF comment summary (landscape table, header on every
+ * page). Same ids/columns as `exportMarkupsView`. Returns the number of rows written.
+ */
+export async function exportMarkupsSummaryPdf(
+  doc_id: string,
+  path: string,
+  ids: string[],
+  columns: string[]
+): Promise<number> {
+  return invoke<number>("export_markups_summary_pdf", { docId: doc_id, path, ids, columns });
+}
+
 // ---------------------------------------------------------------------------
 // Page operation commands (M4 S1)
 // ---------------------------------------------------------------------------

@@ -28,7 +28,7 @@ pub use math::{
 };
 pub use measure::{
     applicable_scales, find_scale, plan_viewport_import, read_viewports, sync_viewports,
-    write_measure_dict, PdfViewport, ViewportKey,
+    unsynced_viewport_ids, write_measure_dict, PdfViewport, ViewportKey,
 };
 pub use scale::{
     page_scale, scale_at, viewport_at, BBox, ScaleMethod, ScaleRecord, ScaleStore, ScaleTarget,

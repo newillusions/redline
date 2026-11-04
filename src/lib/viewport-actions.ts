@@ -4,7 +4,7 @@
  * measurement updates it implies, so undo restores both together - no measurement is ever
  * left pointing at a scale that is gone, and nothing is recalculated behind the user's back.
  */
-import type { ScaleRecord, UserRef } from "./ipc";
+import { takeScaleNotices, type ScaleRecord, type UserRef } from "./ipc";
 import type { MarkupStore } from "./markup-store.svelte";
 import type { TakeoffStore } from "./takeoff-store.svelte";
 import { recomputeAll } from "./polylength";
@@ -46,4 +46,49 @@ export function commitViewportChange(
 /** Show a failed viewport action in the error banner (never only the console). */
 export function reportViewportError(action: string, e: unknown): void {
   surfaceError(`${action} failed: ${e instanceof Error ? e.message : String(e)}`);
+}
+
+/**
+ * Show the document's queued scale notices (e.g. viewports that could not be saved next to
+ * the file, or could not follow a page operation) in the error banner. Call after any scale
+ * operation or page operation: the backend queues them, nothing else drains them.
+ */
+export async function drainScaleNotices(docId: string): Promise<void> {
+  try {
+    (await takeScaleNotices(docId)).forEach((n) => surfaceError(n));
+  } catch {
+    // A failed read of the notices must not turn a finished operation into an error.
+  }
+}
+
+/** What a rectangle drag with the viewport tool means. */
+export type ViewportDragOutcome =
+  | { kind: "new" }
+  | { kind: "redraw"; old: ScaleRecord }
+  | { kind: "vanished" };
+
+/**
+ * A "viewportRedraw" drag replaces the rectangle of the viewport being redrawn. If that
+ * viewport is gone by the time the drag ends (deleted, undone, its page removed) the drag
+ * must say so - never fall through to creating a new viewport, which opens a dialog the
+ * user did not ask for.
+ */
+export function viewportDragOutcome(
+  tool: string,
+  redrawViewportId: string | null,
+  scales: ScaleRecord[],
+): ViewportDragOutcome {
+  if (tool !== "viewportRedraw") return { kind: "new" };
+  const old = redrawViewportId
+    ? scales.find((x) => x.id === redrawViewportId && !x.retired && x.applies_to.kind === "Viewport")
+    : undefined;
+  return old ? { kind: "redraw", old } : { kind: "vanished" };
+}
+
+export const VIEWPORT_VANISHED_MESSAGE =
+  "The viewport you were redrawing no longer exists (it was deleted or undone), so nothing was changed. Draw a new viewport instead.";
+
+/** Show a failed page rotation in the error banner (never only the console). */
+export function reportRotateError(pageIndex: number, e: unknown): void {
+  surfaceError(`Could not rotate page ${pageIndex + 1}: ${e instanceof Error ? e.message : String(e)}`);
 }

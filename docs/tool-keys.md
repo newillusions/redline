@@ -59,6 +59,25 @@ UUID ids (Rust `Tool.id` is a Uuid), so re-using a tool moves it to the front. A
 activation is recorded once, as the real named tool, not twice. Switching document tabs is not
 recorded.
 
+## Reuse tools, digit keys, format painter, thumbnails, shortcut table
+
+Added 2026-11-05 (UX benchmark should-fix 2, 3, 4, 5, 8, 7-first-step).
+
+- **Reuse tools** (`lib/ui-prefs.svelte.ts`, `lib/tool-reuse.ts`). On by default: a draw tool stays active after each markup, as
+  before. Off: the tool drops back to Select once the markup is made (`MarkupStore.create` /
+  `createMany`). The Count tool always keeps counting. Toggle: Settings, or the "Reuse" button on
+  the zoom bar. Stored in localStorage (`redline.reuseTools`).
+- **Digit keys 1-9** activate the first nine tools of the FIRST Tool Set (Revu: "My Tools" hot
+  keys by position). The Tool Chest shows the digit next to each. Bare digits only: not while
+  typing, in a dialog or menu, or in reading mode. Cmd/Ctrl+digit stays zoom.
+- **Format painter** (`lib/format-painter.ts`). Ctrl/Cmd+Shift+C copies the selected markup's look,
+  Ctrl/Cmd+Alt+V pastes it onto the selection (one undo step; the font only reaches markups that
+  already have one; locked markups are skipped). The markup right-click menu has Copy Format,
+  Paste Format and "Use as Default Appearance" (sets the look of new markups).
+- **Thumbnail size**: a slider at the top of the Pages panel sets the minimum thumbnail width
+  (70-240 px); thumbnails flow into as many columns as fit. Stored in localStorage.
+- **Shortcut table** (`lib/shortcuts.ts`): one list for the `?` overlay and Settings.
+
 ## Checks
 
 `tools/gui-harness-tool-keys.mjs` (real browser, mocked IPC) covers keys, typing guard, Z vs T, the

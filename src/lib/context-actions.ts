@@ -10,6 +10,7 @@ import {
 } from "./arrange-actions";
 import { patchStatus } from "./markup-properties";
 import { statusFromId } from "./context-menu";
+import { copyFormat, pasteFormat, useAsDefault } from "./format-painter";
 
 /** Set `status` on the selected markups as ONE undo step; locked ones are skipped and counted. */
 export function setSelectionStatus(c: ArrangeCtx, status: MarkupStatus): ActionResult {
@@ -45,6 +46,9 @@ export function runMarkupCommand(id: string, c: ArrangeCtx): ActionResult | null
     case "bring-to-front": return orderSelection(c, "front");
     case "send-to-back": return orderSelection(c, "back");
     case "paste": return pasteClipboard(c, "cursor");
+    case "copy-format": return copyFormat(c);
+    case "paste-format": return pasteFormat(c);
+    case "use-as-default": return useAsDefault(c);
     default: return null;
   }
 }

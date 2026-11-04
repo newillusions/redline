@@ -339,13 +339,27 @@ pub fn follow_viewports_after_page_op(
     state: &AppState,
     doc_id: &str,
     found: &[crate::takeoff::PdfViewport],
+    skipped_pages: &[u32],
 ) -> Result<(), String> {
     ensure_scales_loaded(state, doc_id);
     let (before, seen_before) = {
         let store = state.scales.lock().unwrap();
         (store.list(doc_id).to_vec(), store.seen(doc_id).to_vec())
     };
-    let (after, seen) = crate::takeoff::measure::follow_viewports(&before, &seen_before, found);
+    // A page whose /VP could not be written has nothing to read back: keep its viewports
+    // (positions are those from before the operation) and say so.
+    let unsynced = crate::takeoff::unsynced_viewport_ids(&before, skipped_pages);
+    if !unsynced.is_empty() {
+        state.scales.lock().unwrap().push_notice(
+            doc_id,
+            format!(
+                "{} measurement viewport(s) could not be moved with their pages because the page geometry could not be read; check their position.",
+                unsynced.len()
+            ),
+        );
+    }
+    let (after, seen) =
+        crate::takeoff::measure::follow_viewports(&before, &seen_before, found, &unsynced);
     if after == before && seen == seen_before {
         return Ok(());
     }
@@ -363,7 +377,9 @@ pub fn follow_viewports_after_page_op(
     Ok(())
 }
 
-/// List all scale records for the document.
+/// List all scale records for the document, including retired viewports (deleted, kept so the
+/// measurements taken under them keep their values): those carry `retired: true`, and the
+/// GUI needs them. MCP/RPC callers get the live ones only (`rpc::dispatch`).
 #[tauri::command]
 pub async fn list_scales(
     state: State<'_, AppState>,

@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { activateTool } from "./toolchest-activation";
+import { activateTool, activateAndRecord, numberedTools } from "./toolchest-activation";
 import { MarkupStore, type MarkupIpc } from "./markup-store.svelte";
-import type { Tool, Appearance } from "./ipc";
+import type { Tool, ToolSet, Appearance } from "./ipc";
 
 const NOOP_IPC: MarkupIpc = {
   add: async () => {},
@@ -83,5 +83,46 @@ describe("activateTool (Tool Chest -> MarkupStore wiring)", () => {
     activateTool(tool({ markup_type: "Ellipse", placement_mode: "Properties" }), store);
     expect(store.pendingPlacementTool).toBeNull();
     expect(store.activeTool).toBe("Ellipse");
+  });
+});
+
+describe("numbered tools (digit keys)", () => {
+  const set = (id: string, n: number): ToolSet => ({
+    id,
+    name: id,
+    tools: Array.from({ length: n }, (_, i) => tool({ id: `${id}-${i}`, name: `${id} ${i}` })),
+  });
+
+  it("are the first nine tools of the first set, in order", () => {
+    const out = numberedTools([set("a", 12), set("b", 3)]);
+    expect(out).toHaveLength(9);
+    expect(out[0].id).toBe("a-0");
+    expect(out[8].id).toBe("a-8");
+  });
+
+  it("are empty with no sets, and short for a short first set", () => {
+    expect(numberedTools([])).toEqual([]);
+    expect(numberedTools([set("a", 2), set("b", 9)])).toHaveLength(2);
+  });
+});
+
+describe("activateAndRecord", () => {
+  it("activates the tool and records it once, marking the change to be kept out of the plain Recent", () => {
+    const store = new MarkupStore("d1", NOOP_IPC);
+    store.activeTool = "hand";
+    const recorded: string[] = [];
+    activateAndRecord(tool({ id: "x", markup_type: "Ellipse" }), store, {
+      recordRecent: async (t) => { recorded.push(t.id); },
+    });
+    expect(store.activeTool).toBe("Ellipse");
+    expect(store.skipRecentKind).toBe("Ellipse");
+    expect(recorded).toEqual(["x"]);
+  });
+
+  it("does not leave a stale skip mark when the tool kind does not change", () => {
+    const store = new MarkupStore("d1", NOOP_IPC);
+    store.activeTool = "Rectangle";
+    activateAndRecord(tool({ markup_type: "Rectangle" }), store, { recordRecent: async () => {} });
+    expect(store.skipRecentKind).toBeNull();
   });
 });

@@ -79,7 +79,7 @@ keep their values and the delete can be undone).
 
 Commands: `add_viewport`, `update_viewport` (rename / page + bbox / recalibrate, keeps the
 id), `put_scale` (exact put or removal, no recompute: what undo/redo replays),
-`delete_scale` (a viewport is retired), `list_scales`, `take_scale_notices`. The MCP `list_scales` / `delete_scale` tools see viewports too.
+`delete_scale` (a viewport is retired), `list_scales`, `take_scale_notices`. The MCP `list_scales` lists live viewports too (retired ones, kept only for their measurements, are left out); MCP `add_scale` creates a viewport when given `applies_to_page` + `viewport_name` + `viewport_bbox`. A page whose geometry cannot be read when `/VP` is synced keeps its viewport scales through a page operation and queues a notice (shown after any scale or page operation).
 
 ## Storage
 

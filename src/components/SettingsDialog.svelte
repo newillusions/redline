@@ -17,6 +17,8 @@
   import { getLicenseInfo, activateLicense, deactivateLicense } from "$lib/license";
   import type { LicenseInfo, LicenseState } from "$lib/license";
   import ConfirmDialog from "./ConfirmDialog.svelte";
+  import ShortcutList from "./ShortcutList.svelte";
+  import { uiPrefs } from "$lib/ui-prefs.svelte";
 
   const {
     onClose,
@@ -218,6 +220,7 @@
     aria-label="Settings"
   >
     <h3 class="dialog-title">Settings</h3>
+    <div class="dialog-body">
 
     {#if loading}
       <p class="dialog-hint">Loading...</p>
@@ -262,7 +265,21 @@
         <input id="settings-auto-ocr" type="checkbox" bind:checked={autoOcrOnOpen} />
         Auto-OCR on open when the document has no text layer
       </label>
+
+      <label class="field-checkbox-label" for="settings-reuse-tools">
+        <input
+          id="settings-reuse-tools"
+          type="checkbox"
+          checked={uiPrefs.reuseTools}
+          onchange={(e) => uiPrefs.setReuseTools((e.target as HTMLInputElement).checked)}
+        />
+        Keep a drawing tool selected after each markup (Reuse tools; off = back to Select). Applies immediately.
+      </label>
     {/if}
+
+    <hr class="section-divider" />
+    <h4 class="section-title">Keyboard shortcuts</h4>
+    <ShortcutList />
 
     <hr class="section-divider" />
     <h4 class="section-title">Licence</h4>
@@ -326,6 +343,8 @@
       {/if}
     {/if}
 
+    </div>
+
     <div class="dialog-actions">
       <button class="btn-secondary" onclick={onClose} disabled={saving}>Cancel</button>
       <button class="btn-primary" onclick={save} disabled={loading || saving}>
@@ -361,6 +380,14 @@
     min-width: 360px;
     display: flex; flex-direction: column; gap: var(--space-2);
     box-shadow: 0 8px 32px rgba(0 0 0 / 0.25);
+    /* Title and Save/Cancel stay put; the body between them scrolls. */
+    max-height: 90vh;
+    box-sizing: border-box;
+    overflow: hidden;
+  }
+  .dialog-body {
+    display: flex; flex-direction: column; gap: var(--space-2);
+    flex: 1 1 auto; min-height: 0; overflow-y: auto;
   }
   .dialog-title { margin: 0 0 var(--space-2); font-size: var(--font-size-lg); color: var(--color-text); }
   .dialog-hint { margin: 0; color: var(--color-text-muted); font-size: var(--font-size-sm); }

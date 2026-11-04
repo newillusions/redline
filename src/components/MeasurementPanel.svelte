@@ -17,13 +17,13 @@
   import type { Markup, UserRef } from "$lib/ipc";
   import { exportMarkupList, getPageSize, getUserIdentity, updateViewport, type ExportFormat, type ScaleRecord } from "$lib/ipc";
   import { measurementsUsing, reapplyViewport } from "$lib/polylength";
-  import { commitViewportChange, reportViewportError } from "$lib/viewport-actions";
+  import { commitViewportChange, drainScaleNotices, reportViewportError } from "$lib/viewport-actions";
   import type { ViewportDialogResult } from "$lib/scale-presets";
   import ConfirmDialog from "./ConfirmDialog.svelte";
   import ViewportDialog from "./ViewportDialog.svelte";
   import { legendFromCountSets } from "$lib/legend";
   import { onMount } from "svelte";
-  import { countSubtotalsByPage } from "$lib/measurement-tools";
+  import { countSubtotalsByPage, totalsByUnit } from "$lib/measurement-tools";
   import { countGroups as groupCounts, groupKey, resumeRun } from "$lib/count-groups";
   import { countSymbolRender, COUNT_MARKER_RADIUS } from "$lib/markup-render";
   import { save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -114,17 +114,9 @@
     countMessage = null;
   }
 
-  const totalLength = $derived(
-    measurements
-      .filter((m: Markup) => m.markup_type === "MeasurementLength")
-      .reduce((sum: number, m: Markup) => sum + (m.measurement?.computed_quantity ?? 0), 0)
-  );
-
-  const totalArea = $derived(
-    measurements
-      .filter((m: Markup) => m.markup_type === "MeasurementArea")
-      .reduce((sum: number, m: Markup) => sum + (m.measurement?.computed_quantity ?? 0), 0)
-  );
+  // Grouped by unit: metres and feet (or a viewport at another unit) are never summed together.
+  const lengthTotals = $derived(totalsByUnit(measurements, "MeasurementLength"));
+  const areaTotals = $derived(totalsByUnit(measurements, "MeasurementArea"));
 
   // Per-set count subtotals (spec §7): group MeasurementCount markups by their count set,
   // with per-page breakdown for the quantities panel.
@@ -180,6 +172,7 @@
           viewportMessage = `Click two points of a known length to calibrate ${r.name}.`;
         }
       }
+      void drainScaleNotices(docId);
     } catch (e) {
       reportViewportError("Changing the viewport", e);
     }
@@ -358,18 +351,22 @@
         {/each}
       </tbody>
       <tfoot>
-        <tr class="totals-row">
-          <td colspan="2">Totals</td>
-          <td class="num-col">{totalLength.toFixed(2)}</td>
-          <td>{scale?.unit ?? "pt"} (length)</td>
-          <td></td>
-        </tr>
-        <tr class="totals-row">
-          <td colspan="2"></td>
-          <td class="num-col">{totalArea.toFixed(2)}</td>
-          <td>{scale ? `${scale.unit}²` : "pt²"} (area)</td>
-          <td></td>
-        </tr>
+        {#each lengthTotals.length > 0 ? lengthTotals : [{ unit: scale?.unit ?? "pt", total: 0 }] as t, i (t.unit)}
+          <tr class="totals-row" data-total="length" data-unit={t.unit}>
+            <td colspan="2">{i === 0 ? "Totals" : ""}</td>
+            <td class="num-col">{t.total.toFixed(2)}</td>
+            <td>{t.unit} (length)</td>
+            <td></td>
+          </tr>
+        {/each}
+        {#each areaTotals.length > 0 ? areaTotals : [{ unit: scale?.unit ?? "pt", total: 0 }] as t (t.unit)}
+          <tr class="totals-row" data-total="area" data-unit={t.unit}>
+            <td colspan="2"></td>
+            <td class="num-col">{t.total.toFixed(2)}</td>
+            <td>{t.unit}² (area)</td>
+            <td></td>
+          </tr>
+        {/each}
         {#each countGroups as g (g.setId ?? "__unassigned")}
           {@const r = swatch(g.symbol)}
           <tr class="totals-row count-subtotal">

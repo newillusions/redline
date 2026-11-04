@@ -73,3 +73,17 @@ export function keyLabelFor(action: ToolKeyAction): string | null {
   if (!b) return null;
   return `${b.shift ? "Shift+" : ""}${b.key.toUpperCase()}`;
 }
+
+/** How many tools of the first Tool Chest set get a bare digit key (1 to 9). */
+export const NUMBERED_TOOL_COUNT = 9;
+
+/**
+ * The zero-based position a bare digit key press selects in the numbered tool set, or null.
+ * Modified presses never match (Cmd/Ctrl+digit is zoom; Alt+digit is the OS's). Shift is
+ * rejected too: Shift+1 is "!" on most layouts, never a tool.
+ */
+export function numberedToolIndex(e: KeyLike): number | null {
+  if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return null;
+  if (!/^[1-9]$/.test(e.key)) return null;
+  return Number(e.key) - 1;
+}

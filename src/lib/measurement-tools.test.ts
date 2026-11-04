@@ -8,6 +8,7 @@ import {
   formatQuantity,
   countSubtotals,
   countSubtotalsByPage,
+  totalsByUnit,
 } from "./measurement-tools";
 import type { CountSet, Markup, ScaleRecord } from "./ipc";
 
@@ -258,5 +259,39 @@ describe("formatQuantity", () => {
   it("respects precision 0", () => {
     const s = scale(1 / 100, "cm", 0);
     expect(formatQuantity(300, s, false)).toBe("3 cm");
+  });
+});
+
+describe("totalsByUnit", () => {
+  const meas = (id: string, type: string, unit: string, q: number): Markup => {
+    const m = countMarkup(id, 1, null);
+    m.markup_type = type as Markup["markup_type"];
+    m.measurement = { ...m.measurement!, unit, computed_quantity: q };
+    return m;
+  };
+
+  it("never adds metres to feet: one total per unit, first-seen order", () => {
+    const out = totalsByUnit(
+      [
+        meas("a", "MeasurementLength", "m", 10),
+        meas("b", "MeasurementLength", "ft", 3),
+        meas("c", "MeasurementLength", "m", 5),
+      ],
+      "MeasurementLength",
+    );
+    expect(out).toEqual([
+      { unit: "m", total: 15 },
+      { unit: "ft", total: 3 },
+    ]);
+  });
+
+  it("only sums the requested type and has no entry when there is none", () => {
+    const list = [meas("a", "MeasurementArea", "m", 20), meas("b", "MeasurementLength", "m", 2)];
+    expect(totalsByUnit(list, "MeasurementArea")).toEqual([{ unit: "m", total: 20 }]);
+    expect(totalsByUnit([], "MeasurementLength")).toEqual([]);
+  });
+
+  it("a measurement with no unit counts as points", () => {
+    expect(totalsByUnit([meas("a", "MeasurementLength", "", 4)], "MeasurementLength")).toEqual([{ unit: "pt", total: 4 }]);
   });
 });

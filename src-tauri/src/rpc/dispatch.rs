@@ -299,22 +299,49 @@ pub async fn dispatch(app: &AppHandle, req: RpcRequest) -> Result<Value, Value> 
         "list_scales" => {
             let p: tools::ListScalesParams = parse(req.params)?;
             let state = app.state::<AppState>();
-            let result = crate::commands::takeoff::list_scales(state, p.doc_id).await;
+            // Retired viewports (deleted, kept only for their measurements) are not scales
+            // a caller can use or delete.
+            let result = crate::commands::takeoff::list_scales(state, p.doc_id)
+                .await
+                .map(tools::live_scales);
             to_value(result)
         }
         "add_scale" => {
             let p: tools::AddScaleParams = parse(req.params)?;
             let state = app.state::<AppState>();
-            let result = crate::commands::takeoff::add_scale(
-                state,
-                p.doc_id,
-                p.applies_to_page,
-                p.ratio,
-                p.unit,
-                p.label,
-                p.precision,
-            )
-            .await;
+            let viewport = p
+                .viewport()
+                .map(|v| v.map(|(page, name, bbox)| (page, name.to_string(), bbox)));
+            let result = match viewport {
+                Err(e) => Err(e),
+                Ok(Some((page, name, bbox))) => {
+                    crate::commands::takeoff::add_viewport(
+                        state,
+                        p.doc_id,
+                        page,
+                        name,
+                        bbox,
+                        p.ratio,
+                        p.unit,
+                        p.label,
+                        p.precision,
+                        true,
+                    )
+                    .await
+                }
+                Ok(None) => {
+                    crate::commands::takeoff::add_scale(
+                        state,
+                        p.doc_id,
+                        p.applies_to_page,
+                        p.ratio,
+                        p.unit,
+                        p.label,
+                        p.precision,
+                    )
+                    .await
+                }
+            };
             to_value(result)
         }
         "delete_scale" => {

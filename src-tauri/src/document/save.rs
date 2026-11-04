@@ -90,12 +90,13 @@ pub fn save_with_markups_scaled(
     removed: &HashSet<crate::markup::SourceRef>,
     scales: &[crate::takeoff::ScaleRecord],
 ) -> Result<()> {
-    save_with_markups_synced(src, dest, markups, removed, scales, None)
+    save_with_markups_synced(src, dest, markups, removed, scales, None).map(|_| ())
 }
 
 /// [`save_with_markups_scaled`] that, given the document's imported `/VP` keys
 /// (`viewports_seen`), also writes its measurement viewports to the pages' `/VP` arrays
-/// (`takeoff::sync_viewports`). `None` leaves `/VP` as the source file has it.
+/// (`takeoff::sync_viewports`). `None` leaves `/VP` as the source file has it. Returns the
+/// zero-based pages whose `/VP` could not be written (their viewports are not in the file).
 pub fn save_with_markups_synced(
     src: &Path,
     dest: &Path,
@@ -103,7 +104,7 @@ pub fn save_with_markups_synced(
     removed: &HashSet<crate::markup::SourceRef>,
     scales: &[crate::takeoff::ScaleRecord],
     viewports_seen: Option<&[crate::takeoff::ViewportKey]>,
-) -> Result<()> {
+) -> Result<Vec<u32>> {
     let mut doc = Document::load(src).with_context(|| format!("load {}", src.display()))?;
     if doc.is_encrypted() {
         anyhow::bail!(
@@ -112,9 +113,10 @@ pub fn save_with_markups_synced(
         );
     }
     write_markups_scaled(&mut doc, markups, removed, scales)?;
-    if let Some(seen) = viewports_seen {
-        crate::takeoff::sync_viewports(&mut doc, scales, seen)?;
-    }
+    let skipped = match viewports_seen {
+        Some(seen) => crate::takeoff::sync_viewports(&mut doc, scales, seen)?,
+        None => Vec::new(),
+    };
 
     let dir = dest.parent().context("dest has no parent dir")?;
     let tmp = dir.join(format!(
@@ -142,7 +144,7 @@ pub fn save_with_markups_synced(
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    result
+    result.map(|()| skipped)
 }
 
 /// Save an unprotected copy of an encrypted `src` PDF to `dest`, decrypted

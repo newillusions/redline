@@ -179,3 +179,25 @@ export function formatQuantity(rawMeasure: number, scale: ScaleRecord, isArea: b
   const unit = isArea ? `${scale.unit}²` : scale.unit;
   return `${formatted} ${unit}`;
 }
+
+/** One total of a measurement type, in one unit. */
+export interface UnitTotal {
+  /** The measurement's own unit ("m", "ft", ...), or "pt" for one with no scale. */
+  unit: string;
+  total: number;
+}
+
+/**
+ * The total quantity of every measurement of `type`, grouped by unit in order of first
+ * appearance. Lengths in metres and in feet are never added together: that number would
+ * mean nothing. (A measurement carries the unit of the scale it was taken under.)
+ */
+export function totalsByUnit(markups: Markup[], type: string): UnitTotal[] {
+  const totals = new Map<string, number>();
+  for (const m of markups) {
+    if (m.markup_type !== type) continue;
+    const unit = m.measurement?.unit || "pt";
+    totals.set(unit, (totals.get(unit) ?? 0) + (m.measurement?.computed_quantity ?? 0));
+  }
+  return [...totals].map(([unit, total]) => ({ unit, total }));
+}

@@ -9,6 +9,8 @@ import { History, CreateCmd, UpdateCmd, DeleteCmd, ReorderCmd, ScaleCmd, refillO
 import type { CountRun } from "./count-groups";
 import { fitLegendGeometry } from "./legend";
 import { onNewMarkup } from "./layers-store.svelte";
+import { uiPrefs } from "./ui-prefs.svelte";
+import { finishesTool } from "./tool-reuse";
 
 /**
  * Up-front lock refusal message for `m`, or `null` if unlocked. Checked BEFORE any
@@ -258,7 +260,22 @@ export class MarkupStore implements MarkupSink {
   }
 
   // --- Mutations (undoable + mirrored) ---
-  create(m: Markup) { m = onNewMarkup(this.docId, m); this.dirty = true; this.enqueue(this.history.push(new CreateCmd(m))); this.historyVersion++; }
+  create(m: Markup) {
+    m = onNewMarkup(this.docId, m);
+    this.dirty = true;
+    this.enqueue(this.history.push(new CreateCmd(m)));
+    this.historyVersion++;
+    this.dropToolIfSingleUse([m]);
+  }
+
+  /** With "Reuse tools" off, the markup just made finishes the active tool: back to Select. */
+  private dropToolIfSingleUse(made: Markup[]) {
+    if (uiPrefs.reuseTools) return;
+    if (made.some((m) => finishesTool(this.activeTool, m.markup_type))) {
+      this.pendingPlacementTool = null;
+      this.activeTool = "select";
+    }
+  }
 
   /** Create several markups as ONE undo frame (e.g. a Cloud+ : cloud and callout together). */
   createMany(ms: Markup[]) {
@@ -267,6 +284,7 @@ export class MarkupStore implements MarkupSink {
     const ops = this.history.pushBatch(ms.map((m) => new CreateCmd(onNewMarkup(this.docId, m))));
     ops.forEach((op) => this.enqueue(op));
     this.historyVersion++;
+    this.dropToolIfSingleUse(ms);
   }
 
   /** Refuses (sets `mirrorError`, no-op) if `before` is locked - see `lockRefusalMessage`. */

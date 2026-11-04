@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { toolForKeyEvent, keyLabelFor, TOOL_KEY_BINDINGS } from "./tool-keys";
+import { toolForKeyEvent, keyLabelFor, numberedToolIndex, TOOL_KEY_BINDINGS } from "./tool-keys";
 
 const ev = (key: string, mods: Partial<{ shiftKey: boolean; metaKey: boolean; ctrlKey: boolean; altKey: boolean }> = {}) =>
   ({ key, shiftKey: false, metaKey: false, ctrlKey: false, altKey: false, ...mods });
@@ -55,5 +55,20 @@ describe("tool keys (Bluebeam Revu defaults)", () => {
     expect(keyLabelFor("Polygon")).toBe("Shift+P");
     expect(keyLabelFor("stamp")).toBe("S");
     expect(keyLabelFor("hand")).toBeNull();
+  });
+});
+
+describe("numbered tool keys", () => {
+  it("bare 1-9 select positions 0-8", () => {
+    expect(numberedToolIndex(ev("1"))).toBe(0);
+    expect(numberedToolIndex(ev("9"))).toBe(8);
+  });
+  it("0, modified digits and non-digits select nothing (Cmd/Ctrl+digit is zoom)", () => {
+    expect(numberedToolIndex(ev("0"))).toBeNull();
+    expect(numberedToolIndex(ev("1", { ctrlKey: true }))).toBeNull();
+    expect(numberedToolIndex(ev("2", { metaKey: true }))).toBeNull();
+    expect(numberedToolIndex(ev("3", { altKey: true }))).toBeNull();
+    expect(numberedToolIndex(ev("!", { shiftKey: true }))).toBeNull();
+    expect(numberedToolIndex(ev("a"))).toBeNull();
   });
 });

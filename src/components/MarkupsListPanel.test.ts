@@ -10,13 +10,14 @@ import { tick } from "svelte";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import MarkupsListPanel from "./MarkupsListPanel.svelte";
 import { MarkupStore } from "$lib/markup-store.svelte";
-import { exportMarkupsView } from "$lib/ipc";
+import { exportMarkupsView, exportMarkupsSummaryPdf } from "$lib/ipc";
 import { mk } from "$lib/markups-list.test-util";
 import type { Markup } from "$lib/ipc";
 
 vi.mock("$lib/ipc", async (importOriginal) => ({
   ...(await importOriginal<typeof import("$lib/ipc")>()),
   exportMarkupsView: vi.fn(async () => 2),
+  exportMarkupsSummaryPdf: vi.fn(async () => 2),
   getUserIdentity: vi.fn(async () => ({ user_id: "me", display_name: "Me" })),
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ save: vi.fn(async () => "/tmp/out.csv") }));
@@ -258,6 +259,21 @@ describe("MarkupsListPanel", () => {
     expect(args[2]).toBe("Csv");
     expect(args[3]).toEqual(["b", "a"]);
     expect(args[4]).toEqual(["subject", "page", "comment", "author", "date", "status", "replies", "layer"]);
+  });
+
+  it("Export PDF sends the same filtered, sorted ids and visible columns to the PDF summary", async () => {
+    vi.mocked(saveDialog).mockResolvedValueOnce("/tmp/summary.pdf");
+    const store = makeStore(data());
+    render(MarkupsListPanel, { store, docId: "doc1" });
+    await fireEvent.input(screen.getByLabelText("Filter by page"), { target: { value: "1-3" } });
+    await fireEvent.click(screen.getByRole("columnheader", { name: /^Page/ }));
+    await fireEvent.click(screen.getByText("Export PDF"));
+    await vi.waitFor(() => expect(exportMarkupsSummaryPdf).toHaveBeenCalled());
+    const args = vi.mocked(exportMarkupsSummaryPdf).mock.calls[0];
+    expect(args[0]).toBe("doc1");
+    expect(args[1]).toBe("/tmp/summary.pdf");
+    expect(args[2]).toEqual(["b", "a"]);
+    expect(args[3]).toContain("comment");
   });
 
   it("renders hostile text as text, never as HTML", () => {

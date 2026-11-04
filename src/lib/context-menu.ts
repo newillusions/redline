@@ -39,6 +39,8 @@ export interface MarkupMenuState {
   anyLocked: boolean;
   /** The one status all selected markups share, when they share one. */
   commonStatus?: MarkupStatus;
+  /** A format has been copied (format painter), so Paste Format has something to paste. */
+  canPasteFormat?: boolean;
 }
 
 export function markupMenuItems(s: MarkupMenuState): MenuItem[] {
@@ -56,6 +58,10 @@ export function markupMenuItems(s: MarkupMenuState): MenuItem[] {
     item("copy", "Copy", { shortcut: "Ctrl+C" }),
     item("cut", "Cut", { shortcut: "Ctrl+X", disabled: edit }),
     item("duplicate", "Duplicate", { shortcut: "Ctrl+D" }),
+    SEP,
+    item("copy-format", "Copy Format", { shortcut: "Ctrl+Shift+C", disabled: many }),
+    item("paste-format", "Paste Format", { shortcut: "Ctrl+Alt+V", disabled: edit || !s.canPasteFormat }),
+    item("use-as-default", "Use as Default Appearance", { disabled: many }),
     SEP,
     item("bring-to-front", "Bring to Front", { disabled: edit }),
     item("send-to-back", "Send to Back", { disabled: edit }),
