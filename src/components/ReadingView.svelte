@@ -25,11 +25,13 @@
    *    sizes track the live continuous zoom; the `<img>` naturally CSS-scales between
    *    raster refreshes, so zooming still feels smooth without re-fetching on every wheel
    *    tick.
-   *  - Read/navigate only in this PR: no markup rendering, creation, or editing in reading
-   *    mode. That was not in the four requested reading-mode behaviours (column, page
-   *    indicator, thumbnails, extract) and porting markup hit-testing/tool state across a
-   *    multi-page virtualized column is a materially larger effort — switching to
-   *    single-page mode is the path for markup work, unchanged.
+   *  - Mark-up (2026-11-05, docs/continuous-markup.md): every mounted page box hosts a
+   *    Viewport.svelte in page-slot mode as its mark-up layer - the same tools, selection,
+   *    measurement, viewports and right-click menu as single-page view, acting on that
+   *    page. The page under the pointer is the active one (keys and page commands go to
+   *    it); while a page holds an unfinished gesture it stays active and mounted and the
+   *    other pages ignore the pointer, so a gesture never crosses pages. Slots draw no
+   *    tiles, so scrolling still only fetches this file's one raster per page.
    *  - Page sizes for the whole document are fetched once on mount (chunked, not one
    *    giant `Promise.all`, so an extremely long document doesn't fire hundreds of
    *    concurrent IPC calls at once) — metadata-only, cheap, and the render engine's own
@@ -39,6 +41,8 @@
   import { getPageSize, renderTile, type DocumentInfo, type RenderedTile } from "$lib/ipc";
   import {
     fitWidthZoom,
+    fitHeightZoom,
+    ACTUAL_SIZE_ZOOM,
     quantizeZoom,
     clampTileDpr,
     parseZoomPercent,
@@ -56,18 +60,51 @@
     type PageLayout,
   } from "$lib/reading-mode";
   import { BoundedTileCache, DEFAULT_TILE_CACHE_CAP_BYTES } from "$lib/tile-cache";
+  import {
+    pageLeftsCss,
+    readingContentWidthCss,
+    pageAtPoint,
+    resolveActivePage,
+    type SlotCommand,
+  } from "$lib/reading-mode";
   import { layerStoreFor } from "$lib/layers-store.svelte";
+  import Viewport from "./Viewport.svelte";
+  import type { MarkupStore } from "$lib/markup-store.svelte";
+  import { TakeoffStore } from "$lib/takeoff-store.svelte";
+  import type { NavigationStore } from "$lib/navigation-store.svelte";
+  import type { NavTarget } from "$lib/navigation-ipc";
+  import { getUserIdentity, type SearchHit, type UserRef } from "$lib/ipc";
 
   // ---------------------------------------------------------------------------
   // Props
   // ---------------------------------------------------------------------------
   const {
     docInfo,
+    store = undefined,
+    takeoffStore = new TakeoffStore(),
+    navStore = undefined,
+    searchHits = [],
+    activeSearchHitIdx = null,
     initialState = undefined,
     onviewportchange = undefined,
+    onsearchtext = undefined,
+    onfollowlink = undefined,
+    onrequestpanel = undefined,
+    onpageop = undefined,
     jumpRequest = null,
   }: {
     docInfo: DocumentInfo;
+    /** The tab's mark-ups. Without one the column is read-only (no mark-up layer). */
+    store?: MarkupStore;
+    takeoffStore?: TakeoffStore;
+    navStore?: NavigationStore;
+    searchHits?: SearchHit[];
+    activeSearchHitIdx?: number | null;
+    onsearchtext?: (text: string) => void;
+    onfollowlink?: (target: NavTarget) => void;
+    onrequestpanel?: (panel: "properties" | "toolchest") => void;
+    /** A page operation run from a page's menu (rotate) changed the file. */
+    onpageop?: () => void;
     /** Restored zoom/scroll on mount (tab-switch parity with Viewport.svelte). */
     initialState?: ViewportSnapshot;
     /** Fired on every zoom/scroll change — App.svelte saves it into the tab snapshot,
@@ -75,7 +112,13 @@
     onviewportchange?: (s: ViewportSnapshot) => void;
     /** Page-jump request (from PageIndicator, or a future thumbnail click) — bump
      *  `nonce` on every request, including a repeat jump to the same page. */
-    jumpRequest?: { page: number; nonce: number } | null;
+    jumpRequest?: {
+      page: number;
+      rect?: [number, number, number, number];
+      markupId?: string;
+      view?: { left: number; top: number; zoom: number | null };
+      nonce: number;
+    } | null;
   } = $props();
 
   // ---------------------------------------------------------------------------
@@ -102,6 +145,16 @@
   let rasterByPage = $state<Record<number, PageRaster>>({});
 
   const pageCache = new BoundedTileCache<PageRaster>(DEFAULT_TILE_CACHE_CAP_BYTES);
+  /** One user-identity lookup for every page's mark-up layer (each slot reports a failure),
+   *  made when the first layer mounts. */
+  let identityLookup: Promise<UserRef> | null = null;
+  function sharedIdentity(): Promise<UserRef> {
+    if (!identityLookup) {
+      identityLookup = getUserIdentity();
+      identityLookup.catch(() => {});
+    }
+    return identityLookup;
+  }
   const pendingKeys = new Set<string>();
   const dpr = clampTileDpr(typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1);
 
@@ -113,6 +166,8 @@
   let zoomInputDraft = $state("");
 
   const layout: PageLayout = $derived(computePageLayout(pageDims, zoom));
+  const contentWidth = $derived(readingContentWidthCss(layout, containerWidth));
+  const lefts = $derived(pageLeftsCss(layout, contentWidth));
   const currentPage = $derived(pageAtScrollTop(layout, scrollTop));
   const zoomInputDisplay = $derived(zoomInputFocused ? zoomInputDraft : String(Math.round(zoom * 100)));
 
@@ -260,7 +315,15 @@
   function handleScroll() {
     if (!scrollEl) return;
     scrollTop = scrollEl.scrollTop;
+    // Retarget once the scroll settles, not per frame: the page under a resting pointer
+    // would otherwise mount its mark-up layer mid-fling (see layerReady).
+    if (retargetTimer !== null) clearTimeout(retargetTimer);
+    retargetTimer = setTimeout(() => {
+      retargetTimer = null;
+      retargetAfterScroll();
+    }, 100);
   }
+  let retargetTimer: ReturnType<typeof setTimeout> | null = null;
 
   $effect(() => {
     onviewportchange?.({ zoom, pageIndex: currentPage, scrollX: 0, scrollY: scrollTop });
@@ -270,13 +333,176 @@
   // Jump requests (PageIndicator, future thumbnail click)
   // ---------------------------------------------------------------------------
   $effect(() => {
-    if (!jumpRequest || jumpRequest.nonce === lastJumpNonce) return;
-    lastJumpNonce = jumpRequest.nonce;
+    const req = jumpRequest;
+    if (!req || req.nonce === lastJumpNonce) return;
     if (layout.topsCss.length === 0 || !scrollEl) return;
-    const top = scrollTopForPage(layout, jumpRequest.page);
-    scrollEl.scrollTop = top;
-    scrollTop = top;
+    lastJumpNonce = req.nonce;
+    // A jump moves the view away from the page the pointer was last over.
+    if (busyPage === null) hoverPage = null;
+    const page = Math.max(0, Math.min(req.page, layout.topsCss.length - 1));
+    const dims = pageDims[page];
+    let left: number | null = null;
+    if (req.view?.zoom && req.view.zoom > 0) zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, req.view.zoom));
+    // Recompute from the (possibly new) zoom: layout is derived, so read it fresh.
+    const lay = computePageLayout(pageDims, zoom);
+    const lft = pageLeftsCss(lay, readingContentWidthCss(lay, containerWidth));
+    let top = lay.topsCss[page];
+    if (dims && req.rect) {
+      // Centre a search hit's rect in the view.
+      const [x0, y0, x1, y1] = req.rect;
+      top += (dims.height_pts - (y0 + y1) / 2) * zoom - containerHeight / 2;
+      left = lft[page] + ((x0 + x1) / 2) * zoom - containerWidth / 2;
+    } else if (dims && req.view) {
+      // A bookmark / link destination: its point at the top-left of the view.
+      top += (dims.height_pts - req.view.top) * zoom;
+      left = lft[page] + req.view.left * zoom;
+    }
+    scrollEl.scrollTop = Math.max(0, top);
+    if (left !== null) scrollEl.scrollLeft = Math.max(0, left);
+    scrollTop = scrollEl.scrollTop;
+    if (req.markupId && store) {
+      // Select tool first: Viewport clears the selection under any other tool.
+      store.activeTool = "select";
+      store.selectedIds = new Set([req.markupId]);
+    }
   });
+
+  // ---------------------------------------------------------------------------
+  // Mark-up: which page is active (docs/continuous-markup.md)
+  // ---------------------------------------------------------------------------
+  /** Last page the pointer was over (null until it has been over one). */
+  let hoverPage = $state<number | null>(null);
+  /** The page holding an unfinished gesture, if any: it stays active and mounted, and the
+   *  other pages ignore the pointer until it is done. */
+  let busyPage = $state<number | null>(null);
+  /** The page that takes keys and page commands. A remembered hover page counts only while it
+   *  is still in the render window: after a jump (search hit, Markups list, thumbnail) or a
+   *  long scroll it may be far away and unmounted, and then no page would take the keys. */
+  const activePage = $derived(resolveActivePage({ busyPage, hoverPage, currentPage, window: renderWindow }));
+  /** Pages with a mounted page box: the render window, plus a busy page scrolled out of it
+   *  (unmounting it would drop the half-made mark-up). */
+  const mountedPages = $derived.by(() => {
+    const out: number[] = [];
+    for (let i = renderWindow.first; i <= renderWindow.last; i++) out.push(i);
+    if (busyPage !== null && !out.includes(busyPage) && busyPage < layout.topsCss.length) out.push(busyPage);
+    return out;
+  });
+
+  // A page's mark-up layer is a full Viewport; mounting one costs a few milliseconds, which a
+  // fast scroll through a sheet set would pay on every frame that brings a page into the
+  // window. So layers mount when the browser is idle (one per idle slice, nearest page
+  // first), like tiles sharpening after a zoom: a fling shows the rasters at full frame rate
+  // and the mark-ups follow as it settles. The page under the pointer and a busy page mount
+  // at once - those are the ones being worked on.
+  let layerReady = $state<ReadonlySet<number>>(new Set());
+  let layerIdleHandle: number | null = null;
+  const requestIdle: (cb: () => void) => number =
+    typeof window !== "undefined" && "requestIdleCallback" in window
+      ? (cb) => window.requestIdleCallback(cb, { timeout: 250 })
+      : (cb) => window.setTimeout(cb, 16);
+  const cancelIdle: (h: number) => void =
+    typeof window !== "undefined" && "cancelIdleCallback" in window
+      ? (h) => window.cancelIdleCallback(h)
+      : (h) => window.clearTimeout(h);
+
+  $effect(() => {
+    if (!store) return;
+    const wanted = mountedPages;
+    const ready = layerReady;
+    // Drop layers that left the window (their page box is gone anyway).
+    const kept = [...ready].filter((p) => wanted.includes(p));
+    if (kept.length !== ready.size) {
+      layerReady = new Set(kept);
+      return;
+    }
+    const pending = wanted.filter((p) => !ready.has(p));
+    if (pending.length === 0 || layerIdleHandle !== null) return;
+    const anchor = currentPage;
+    pending.sort((a, b) => Math.abs(a - anchor) - Math.abs(b - anchor));
+    layerIdleHandle = requestIdle(() => {
+      layerIdleHandle = null;
+      layerReady = new Set([...layerReady, pending[0]]);
+    });
+  });
+
+  function hasLayer(page: number): boolean {
+    return layerReady.has(page) || page === hoverPage || page === busyPage || page === activePage;
+  }
+
+  function pageUnder(clientX: number, clientY: number): number | null {
+    if (!scrollEl) return null;
+    const r = scrollEl.getBoundingClientRect();
+    return pageAtPoint(layout, lefts, clientX - r.left + scrollEl.scrollLeft, clientY - r.top + scrollEl.scrollTop);
+  }
+
+  /** Last pointer position over the column: a wheel scroll moves pages under a still pointer. */
+  let lastPointer: { x: number; y: number; buttons: number } | null = null;
+
+  function retargetAfterScroll() {
+    if (!lastPointer || busyPage !== null || lastPointer.buttons !== 0) return;
+    const p = pageUnder(lastPointer.x, lastPointer.y);
+    if (p !== null) hoverPage = p;
+  }
+
+  function trackPointer(e: PointerEvent) {
+    lastPointer = { x: e.clientX, y: e.clientY, buttons: e.buttons };
+    // Never retarget mid-drag or mid-gesture: the page the gesture started on keeps it.
+    if (busyPage !== null || e.buttons !== 0) return;
+    const p = pageUnder(e.clientX, e.clientY);
+    if (p !== null) hoverPage = p;
+  }
+
+  function onPointerDownCapture(e: PointerEvent) {
+    if (busyPage !== null) return;
+    const p = pageUnder(e.clientX, e.clientY);
+    if (p !== null) hoverPage = p;
+  }
+
+  function onSlotBusy(page: number, busy: boolean) {
+    if (busy) busyPage = page;
+    else if (busyPage === page) busyPage = null;
+  }
+
+  function onSlotCommand(cmd: SlotCommand) {
+    const dims = pageDims[activePage];
+    switch (cmd) {
+      case "fit-width": if (dims) zoom = fitWidthZoom(dims.width_pts, containerWidth); return;
+      case "fit-height": if (dims) zoom = fitHeightZoom(dims.height_pts, containerHeight); return;
+      case "actual-size": zoom = ACTUAL_SIZE_ZOOM; return;
+      case "zoom-in": zoom = Math.min(ZOOM_MAX, zoom * 1.1); return;
+      case "zoom-out": zoom = Math.max(ZOOM_MIN, zoom / 1.1); return;
+      case "prev-page": scrollToPage(currentPage - 1); return;
+      case "next-page": scrollToPage(currentPage + 1); return;
+    }
+  }
+
+  function scrollToPage(page: number) {
+    if (!scrollEl || layout.topsCss.length === 0) return;
+    scrollEl.scrollTop = scrollTopForPage(layout, page);
+    scrollTop = scrollEl.scrollTop;
+  }
+
+  // Hand tool: a drag pans the column (the slots leave panning to it).
+  let panFrom: { x: number; y: number; left: number; top: number } | null = null;
+  function onMouseDown(e: MouseEvent) {
+    if (!scrollEl || e.button !== 0 || (store && store.activeTool !== "hand")) return;
+    if (e.target instanceof Element && e.target.closest(".reading-zoom-toolbar, button, input, a")) return;
+    panFrom = { x: e.clientX, y: e.clientY, left: scrollEl.scrollLeft, top: scrollEl.scrollTop };
+    window.addEventListener("mousemove", onPanMove);
+    window.addEventListener("mouseup", endPan);
+    window.addEventListener("blur", endPan);
+  }
+  function onPanMove(e: MouseEvent) {
+    if (!panFrom || !scrollEl) return;
+    scrollEl.scrollLeft = panFrom.left - (e.clientX - panFrom.x);
+    scrollEl.scrollTop = panFrom.top - (e.clientY - panFrom.y);
+  }
+  function endPan() {
+    panFrom = null;
+    window.removeEventListener("mousemove", onPanMove);
+    window.removeEventListener("mouseup", endPan);
+    window.removeEventListener("blur", endPan);
+  }
 
   // ---------------------------------------------------------------------------
   // Zoom controls (toolbar overlay — Fit Width, zoom-percent input; wheel-zoom via
@@ -323,35 +549,66 @@
 
   onDestroy(() => {
     resizeObserver?.disconnect();
+    endPan();
+    if (layerIdleHandle !== null) cancelIdle(layerIdleHandle);
+    if (retargetTimer !== null) clearTimeout(retargetTimer);
     pageCache.clear();
     pendingKeys.clear();
   });
 </script>
 
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions (pointer tracking and hand-tool
+     pan for the mark-up layers; the column itself is a document, not a control) -->
 <div
   class="reading-scroll"
   data-doc-id={docInfo.doc_id}
   bind:this={scrollEl}
   onscroll={handleScroll}
   onwheel={onWheel}
+  onpointermove={trackPointer}
+  onpointerleave={() => { lastPointer = null; if (busyPage === null) hoverPage = null; }}
+  onpointerdowncapture={onPointerDownCapture}
+  onmousedown={onMouseDown}
   role="document"
   aria-label="Continuous PDF reading view — scroll to move between pages"
 >
-  <div class="reading-content" style={`height:${layout.totalHeightCss}px`}>
+  <div class="reading-content" style={`height:${layout.totalHeightCss}px; width:${contentWidth}px`}>
     {#if !pageSizesLoaded && pageDims.length === 0}
       <div class="reading-loading">Loading pages…</div>
     {/if}
-    {#each Array.from({ length: Math.max(0, renderWindow.last - renderWindow.first + 1) }, (_, k) => renderWindow.first + k) as idx (idx)}
+    {#each mountedPages as idx (idx)}
       {#if layout.topsCss[idx] !== undefined}
         <div
           class="reading-page"
+          class:reading-page-active={store !== undefined && idx === activePage}
           data-page-index={idx}
-          style={`top:${layout.topsCss[idx]}px; width:${layout.widthsCss[idx]}px; height:${layout.heightsCss[idx]}px;`}
+          style={`top:${layout.topsCss[idx]}px; left:${lefts[idx]}px; width:${layout.widthsCss[idx]}px; height:${layout.heightsCss[idx]}px;`}
         >
           {#if rasterByPage[idx]}
-            <img src={rasterByPage[idx].src} alt={`Page ${idx + 1}`} class="reading-page-image" />
+            <img src={rasterByPage[idx].src} alt={`Page ${idx + 1}`} class="reading-page-image" draggable="false" />
           {:else}
             <div class="reading-page-placeholder" aria-hidden="true"></div>
+          {/if}
+          {#if store && hasLayer(idx)}
+            <!-- This page's mark-up layer (Viewport in page-slot mode). -->
+            <div class="reading-page-markup">
+              <Viewport
+                {docInfo}
+                {store}
+                {takeoffStore}
+                {navStore}
+                {searchHits}
+                {activeSearchHitIdx}
+                {onsearchtext}
+                {onfollowlink}
+                {onrequestpanel}
+                {onpageop}
+                slot={{ page: idx, zoom, active: idx === activePage, inert: busyPage !== null && busyPage !== idx }}
+                sharedIdentity={sharedIdentity()}
+                onslotbusy={(busy) => onSlotBusy(idx, busy)}
+                onslotcommand={onSlotCommand}
+              />
+            </div>
           {/if}
         </div>
       {/if}
@@ -404,10 +661,10 @@
     font-size: var(--font-size-sm);
   }
 
+  /* No transform here: a mark-up layer's right-click menu is position: fixed, which a
+     transformed ancestor would turn into page-relative. */
   .reading-page {
     position: absolute;
-    left: 50%;
-    transform: translateX(-50%);
     background: #fff;
     box-shadow: 0 0 0 1px var(--color-border-subtle);
   }
@@ -416,6 +673,11 @@
     display: block;
     width: 100%;
     height: 100%;
+  }
+
+  .reading-page-markup {
+    position: absolute;
+    inset: 0;
   }
 
   .reading-page-placeholder {

@@ -21,20 +21,15 @@
   const {
     toolChest,
     markupStore = null,
-    readOnlyView = false,
   }: {
     toolChest: ToolChestStore;
     /** The active document tab's markup store, or null when no document is open. Needed
      *  to activate a tool and to read the current selection for "save as tool". */
     markupStore?: MarkupStore | null;
-    /** True in reading mode: tools cannot draw there, so activation is disabled with a hint. */
-    readOnlyView?: boolean;
   } = $props();
 
-  const READ_ONLY_HINT = "Switch to page view to mark up";
   function toolTitle(tool: Tool): string {
-    const base = `${tool.name} (${tool.placement_mode})`;
-    return readOnlyView ? `${base} - ${READ_ONLY_HINT}` : base;
+    return `${tool.name} (${tool.placement_mode})`;
   }
 
   onMount(() => {
@@ -59,7 +54,7 @@
   // Activation
   // ---------------------------------------------------------------------------
   function handleActivate(tool: Tool) {
-    if (!markupStore || readOnlyView) return;
+    if (!markupStore) return;
     activateAndRecord(tool, markupStore, toolChest);
   }
 
@@ -205,7 +200,7 @@
             class="tc-tool-chip"
             title={toolTitle(tool)}
             onclick={() => handleActivate(tool)}
-            disabled={!markupStore || readOnlyView}
+            disabled={!markupStore}
           >
             <span class="tc-glyph">{glyph(tool.markup_type)}</span>
             <span class="tc-tool-name">{tool.name}</span>
@@ -260,7 +255,7 @@
                     class="tc-tool-btn"
                     title={digitFor(tool) ? `${toolTitle(tool)} - key ${digitFor(tool)}` : toolTitle(tool)}
                     onclick={() => handleActivate(tool)}
-                    disabled={!markupStore || readOnlyView}
+                    disabled={!markupStore}
                   >
                     {#if digitFor(tool)}<span class="tc-digit" aria-hidden="true">{digitFor(tool)}</span>{/if}
                     <span class="tc-glyph">{glyph(tool.markup_type)}</span>

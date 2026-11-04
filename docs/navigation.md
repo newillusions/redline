@@ -86,10 +86,11 @@ mode is a separate sibling component, not a rewrite of the tiled viewer.
   cached — scrolling through a long document never holds more than a handful of page
   rasters in memory. See `ReadingView.svelte`'s header comment for the full scoping
   rationale, including the extreme-zoom raster cap on very large sheets.
-- **Scope** — read/navigate only: markup creation and editing are not available in reading
-  mode in this release; switch to single-page mode for markup work. The palette's tools are
-  disabled in reading mode, with the hint "Switch to page view to mark up", so a drag never
-  silently does nothing.
+- **Mark-up** (as of 2026-11-05) — every tool, selection, measurement (including
+  measurement viewports), the right-click menus and page rotation work while scrolling the
+  column, on the page under the pointer; a gesture never crosses pages. Design and limits:
+  `docs/continuous-markup.md`. (Until 2026-11-05 reading mode was read-only and the palette
+  showed "Switch to page view to mark up".)
 
 ## Discoverability
 

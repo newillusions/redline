@@ -183,29 +183,18 @@ describe("ToolChestPanel - reading mode", () => {
   // Minimal stand-in: the panel only needs a truthy store to enable its buttons here.
   const stubStore = { activeTool: "hand", selectedMarkups: [] } as unknown as import("$lib/markup-store.svelte").MarkupStore;
 
-  it("disables tool activation with the palette hint in reading mode", async () => {
+  // Mark-up works in continuous scroll (docs/continuous-markup.md): the panel has no
+  // reading-mode state at all, so its tools are always enabled with a document open.
+  it("keeps tool activation enabled (reading mode can mark up)", async () => {
     const store = new ToolChestStore();
     store.sets = [setWithTools()];
     const { container } = render(ToolChestPanel, {
-      props: { toolChest: store, markupStore: stubStore, readOnlyView: true },
+      props: { toolChest: store, markupStore: stubStore },
     });
     await tick();
     const btns = container.querySelectorAll<HTMLButtonElement>(".tc-tool-btn");
     expect(btns.length).toBe(3);
     btns.forEach((b) => {
-      expect(b.disabled).toBe(true);
-      expect(b.title).toContain("Switch to page view to mark up");
-    });
-  });
-
-  it("keeps tool activation enabled outside reading mode", async () => {
-    const store = new ToolChestStore();
-    store.sets = [setWithTools()];
-    const { container } = render(ToolChestPanel, {
-      props: { toolChest: store, markupStore: stubStore, readOnlyView: false },
-    });
-    await tick();
-    container.querySelectorAll<HTMLButtonElement>(".tc-tool-btn").forEach((b) => {
       expect(b.disabled).toBe(false);
       expect(b.title).not.toContain("Switch to page view");
     });

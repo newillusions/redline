@@ -116,6 +116,8 @@ const DEFAULT_APPEARANCE: Appearance = {
   outline_color: null, fill_opacity: null,
 };
 
+const NO_MARKUPS: readonly Markup[] = Object.freeze([]);
+
 export class MarkupStore implements MarkupSink {
   markups = $state<Markup[]>([]);
   selectedIds = $state<Set<string>>(new Set());
@@ -318,8 +320,52 @@ export class MarkupStore implements MarkupSink {
   get canRedo() { void this.historyVersion; return this.history.canRedo; }
 
   /** The markups that are currently selected. */
-  get selectedMarkups(): Markup[] {
-    return this.markups.filter((m) => this.selectedIds.has(m.id));
+  /** The selected markups, in store (z-) order. Derived once per change and shared by every
+   *  reader: in reading mode each visible page's mark-up layer reads it. */
+  readonly selectedMarkups: Markup[] = $derived(this.markups.filter((m) => this.selectedIds.has(m.id)));
+
+  /** Markups grouped by page, in store (z-) order. Derived once per change, so the several
+   *  page mark-up layers of reading mode do not each walk the whole document's markups. */
+  readonly #byPage = $derived.by(() => {
+    const out = new Map<number, Markup[]>();
+    for (const m of this.markups) {
+      const list = out.get(m.page);
+      if (list) list.push(m);
+      else out.set(m.page, [m]);
+    }
+    return out;
+  });
+
+  /** The Legend markups. A fresh array on every markup change, so a reader (the legend
+   *  sync effect) still re-runs on any add/edit/delete, but walks only the legends. */
+  readonly #legends = $derived(this.markups.filter((m) => m.markup_type === "Legend"));
+
+  /** The tool held before a Space-bar temporary pan, or null when no Space-pan is on. Kept
+   *  here, not in a Viewport, because reading mode has one Viewport per visible page: the
+   *  page that armed the pan may unmount, or another page may see the key repeat. */
+  spacePanTool: ToolKind | null = null;
+
+  /** Space pressed: switch to Hand until Space is released. A held key's auto-repeat, or a
+   *  second Viewport seeing the same key, does nothing - the first tool is kept. */
+  beginSpacePan(): boolean {
+    if (this.spacePanTool !== null) return false;
+    this.spacePanTool = this.activeTool;
+    this.setToolSilently("hand");
+    return true;
+  }
+
+  /** Space released: restore the tool held before the pan, once. Restoring it is not a new
+   *  pick, so it stays out of Recent. */
+  endSpacePan(): void {
+    const tool = this.spacePanTool;
+    if (tool === null) return;
+    this.spacePanTool = null;
+    this.setToolSilently(tool);
+  }
+
+  /** The markups on `page`, in store (z-) order. Do not mutate the returned array. */
+  onPage(page: number): readonly Markup[] {
+    return this.#byPage.get(page) ?? NO_MARKUPS;
   }
 
   /**
@@ -380,8 +426,8 @@ export class MarkupStore implements MarkupSink {
    * settles after one pass.
    */
   syncLegends(): void {
-    for (const l of this.markups) {
-      if (l.markup_type !== "Legend" || isMarkupLocked(l)) continue;
+    for (const l of this.#legends) {
+      if (isMarkupLocked(l)) continue;
       const fitted = fitLegendGeometry(l, this.markups);
       if (fitted !== l) this.replace(fitted);
     }

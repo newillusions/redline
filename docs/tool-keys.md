@@ -47,8 +47,8 @@ appearance and the label text is the markup contents. No date / user field yet.
 
 ## Reading mode
 
-Reading mode cannot draw. Every palette tool (and the Stamp and Link buttons) is disabled and a
-"Switch to page view to mark up" hint shows in the palette.
+Reading mode marks up like page view (as of 2026-11-05, `docs/continuous-markup.md`): the
+palette stays enabled and the tool keys work there, acting on the page under the pointer.
 
 ## Recent tools
 
@@ -81,4 +81,4 @@ Added 2026-11-05 (UX benchmark should-fix 2, 3, 4, 5, 8, 7-first-step).
 ## Checks
 
 `tools/gui-harness-tool-keys.mjs` (real browser, mocked IPC) covers keys, typing guard, Z vs T, the
-Stamp picker placing a stamp, Recent, and reading-mode disabling.
+Stamp picker placing a stamp, Recent, and the palette staying live in reading mode.

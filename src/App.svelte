@@ -177,19 +177,6 @@
     const skip = untrack(() => store.consumeSkipRecent(kind));
     void toolChestStore.noteActiveTool(kind, untrack(() => store.draftAppearance), skip);
   });
-  // Reading mode cannot draw: disarm any active draw tool (and armed placement) so nothing is
-  // left selected that the disabled palette no longer shows as reachable.
-  $effect(() => {
-    if (viewerMode !== "reading") return;
-    const store = activeTab?.store;
-    if (!store) return;
-    untrack(() => {
-      store.pendingPlacementTool = null;
-      store.stampPickerOpen = false;
-      // Keep the hand tool (it works in reading mode); disarm everything else.
-      if (store.activeTool !== "hand") store.setToolSilently("select");
-    });
-  });
 
   // ---------------------------------------------------------------------------
   // Search (search-parity dispatch: current doc / open docs / folder+subfolders,
@@ -1952,7 +1939,7 @@
   {/if}
 
   {#if activeTab}
-    <ToolPalette store={activeTab.store} navStore={activeTab.navStore} toolChest={toolChestStore} readOnlyView={viewerMode === "reading"} />
+    <ToolPalette store={activeTab.store} navStore={activeTab.navStore} toolChest={toolChestStore} />
   {/if}
 
   {#if openError}
@@ -2017,7 +2004,7 @@
     <!-- Tool Chest (spec "Tools & Tool Sets") - Tool Sets are a workspace resource, not
          per-document, so it is usable with no document open. -->
     {#snippet toolChestBody()}
-      <ToolChestPanel toolChest={toolChestStore} markupStore={activeTab?.store ?? null} readOnlyView={viewerMode === "reading"} />
+      <ToolChestPanel toolChest={toolChestStore} markupStore={activeTab?.store ?? null} />
     {/snippet}
     <!-- Bookmarks and Links (docs/navigation.md "Document structure"). -->
     {#snippet bookmarksBody()}
@@ -2126,14 +2113,22 @@
              so initialState (zoom/page/scroll snapshot) takes effect fresh either way. -->
         {#key activeTab.docId + ":" + viewerMode + ":" + reloadNonce}
           {#if viewerMode === "reading"}
-            <!-- ReadingView has no MarkupStore/ToolPalette - the I-beam text-selection
-                 tool (and its onsearchtext callback) doesn't exist in this mode, so
-                 there is nothing to wire here (redline#text-select-ux). -->
+            <!-- Continuous column; each page box carries a full mark-up layer
+                 (docs/continuous-markup.md), so it takes the same stores and callbacks. -->
             <ReadingView
               docInfo={activeTab.doc}
+              store={activeTab.store}
+              takeoffStore={activeTab.takeoffStore}
               initialState={activeTab.viewportSnapshot}
               onviewportchange={handleViewportChange}
-              jumpRequest={viewportJumpRequest ? { page: viewportJumpRequest.page, nonce: viewportJumpRequest.nonce } : null}
+              onsearchtext={handleSearchTextSelection}
+              jumpRequest={viewportJumpRequest}
+              searchHits={searchOverlay.hits}
+              activeSearchHitIdx={searchOverlay.activeIdx}
+              navStore={activeTab.navStore}
+              onfollowlink={followTarget}
+              onrequestpanel={revealPanel}
+              onpageop={handleThumbnailPageOp}
             />
           {:else}
             <Viewport

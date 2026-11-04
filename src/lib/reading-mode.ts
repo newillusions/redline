@@ -184,3 +184,100 @@ export function pageTileSizeCss(
   const h = Math.max(0, pageHeightPts) * zoom;
   return Math.min(maxTileCss, Math.ceil(Math.max(w, h, 1)));
 }
+
+// ---------------------------------------------------------------------------
+// Mark-up in continuous scroll (docs/continuous-markup.md). Each page box in the column
+// hosts its own mark-up layer; these helpers say which page a column point falls on and
+// where that point is in the page's own PDF user space. A rotated page needs no special
+// case: the render engine reports a rotated page's dimensions already swapped, and mark-ups
+// live in that page's (rotated) user space, exactly as in single-page view.
+// ---------------------------------------------------------------------------
+
+/** Width of the scrolled column: the view's width, or the widest page if that is wider
+ *  (a zoomed-in sheet then scrolls sideways instead of being clipped on the left). */
+export function readingContentWidthCss(layout: PageLayout, viewWidthCss: number): number {
+  return Math.max(Math.max(0, viewWidthCss), ...layout.widthsCss, 0);
+}
+
+/** Left edge of each page box, CSS px from the column's left edge: each page is centred
+ *  on its own, so mixed sheet sizes stack on one centre line. */
+export function pageLeftsCss(layout: PageLayout, contentWidthCss: number): number[] {
+  return layout.widthsCss.map((w) => Math.max(0, (contentWidthCss - w) / 2));
+}
+
+/** Index of the page whose box contains the column point (x, y) (CSS px, column
+ *  coordinates), or null when the point is in a gap, beside a narrower page, or past the
+ *  last page. This is the "page under the pointer" every gesture and page command targets. */
+export function pageAtPoint(layout: PageLayout, leftsCss: readonly number[], x: number, y: number): number | null {
+  const { topsCss, heightsCss, widthsCss } = layout;
+  // topsCss is sorted ascending: the candidate is the last page whose top is at or above y.
+  let lo = 0;
+  let hi = topsCss.length - 1;
+  let candidate = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (topsCss[mid] <= y) {
+      candidate = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (candidate < 0) return null;
+  const left = leftsCss[candidate] ?? 0;
+  if (y > topsCss[candidate] + heightsCss[candidate]) return null;
+  if (x < left || x > left + widthsCss[candidate]) return null;
+  return candidate;
+}
+
+/** A column point (CSS px) in page `pageIndex`'s PDF user space (points, bottom-left
+ *  origin). The inverse of the page's own pdfUserSpaceToScreen with no scroll offset. */
+export function columnPointToPdf(
+  layout: PageLayout,
+  leftsCss: readonly number[],
+  pages: readonly PageDims[],
+  pageIndex: number,
+  x: number,
+  y: number,
+): { x: number; y: number } {
+  const dims = pages[pageIndex];
+  const w = layout.widthsCss[pageIndex];
+  const h = layout.heightsCss[pageIndex];
+  const zoomX = dims.width_pts > 0 ? w / dims.width_pts : 1;
+  const zoomY = dims.height_pts > 0 ? h / dims.height_pts : 1;
+  return {
+    x: (x - (leftsCss[pageIndex] ?? 0)) / zoomX,
+    y: dims.height_pts - (y - layout.topsCss[pageIndex]) / zoomY,
+  };
+}
+
+/** Pull a PDF point back onto the page: a drag that leaves its page ends at that page's
+ *  edge instead of carrying the mark-up onto the next sheet. */
+export function clampToPage(p: { x: number; y: number }, dims: PageDims): { x: number; y: number } {
+  return {
+    x: Math.max(0, Math.min(dims.width_pts, p.x)),
+    y: Math.max(0, Math.min(dims.height_pts, p.y)),
+  };
+}
+
+/** View commands a page's mark-up layer hands to the column, which owns zoom and scroll
+ *  (keyboard zoom and fit keys, the page menu's fit items, Cmd/Ctrl+Arrow page keys). */
+export type SlotCommand = "fit-width" | "fit-height" | "actual-size" | "zoom-in" | "zoom-out" | "prev-page" | "next-page";
+
+/**
+ * The page that takes keys and page commands in reading mode: a page with an unfinished
+ * gesture, else the page last under the pointer while it is still mounted (in `window`),
+ * else the current (topmost) page. A remembered hover page that has left the window - after a
+ * jump from a search hit, the Markups list or a thumbnail - would leave no mounted page to
+ * take the keys.
+ */
+export function resolveActivePage(s: {
+  busyPage: number | null;
+  hoverPage: number | null;
+  currentPage: number;
+  window: RenderWindow;
+}): number {
+  if (s.busyPage !== null) return s.busyPage;
+  if (s.hoverPage !== null && s.hoverPage >= s.window.first && s.hoverPage <= s.window.last) return s.hoverPage;
+  return s.currentPage;
+}

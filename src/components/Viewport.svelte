@@ -13,6 +13,14 @@
    * Geometry / snapping: queries Rust snap-target index in PDF user space (M2).
    *
    * Svelte 5 runes throughout.
+   *
+   * Page-slot mode (`slot` prop, docs/continuous-markup.md): ReadingView.svelte mounts one
+   * Viewport per page box in its continuous column, as that page's mark-up layer. The slot
+   * draws no tiles (the column already shows the page raster), never scrolls or zooms by
+   * itself (the column does; the slot reports view commands up via `onslotcommand`), shows
+   * no toolbars, and takes keyboard input only while it is the active page. Everything
+   * else - every tool, selection, measurement, viewports, the right-click menu, page
+   * rotation - is this same code, acting on the slot's own page.
    */
   import { onMount, onDestroy, untrack } from "svelte";
   import {
@@ -122,6 +130,7 @@
   import { ViewHistory, isLargeZoomChange, type ViewEntry } from "$lib/view-history";
   import LinkOverlay from "./LinkOverlay.svelte";
   import type { NavigationStore } from "$lib/navigation-store.svelte";
+  import { clampToPage, type SlotCommand } from "$lib/reading-mode";
   import type { LinkView, NavTarget } from "$lib/navigation-ipc";
   import { linksOnPage } from "$lib/navigation";
 
@@ -142,6 +151,10 @@
     onfollowlink = undefined,
     onrequestpanel = undefined,
     onpageop = undefined,
+    slot = undefined,
+    sharedIdentity = undefined,
+    onslotbusy = undefined,
+    onslotcommand = undefined,
   }: {
     docInfo: DocumentInfo;
     store: MarkupStore;
@@ -196,6 +209,21 @@
     /** Called after a page operation run from this viewport (rotate) has been applied to the
      *  document, so the host can refresh page counts and remount the view. */
     onpageop?: () => void;
+    /**
+     * Page-slot mode (see the header comment): this Viewport is the mark-up layer of one
+     * page box in ReadingView's continuous column, sized to that box. `active` = the page
+     * under the pointer (or the one being worked on), the only slot that takes keys;
+     * `inert` = another page owns an unfinished gesture, so this one ignores the pointer.
+     */
+    slot?: { page: number; zoom: number; active: boolean; inert: boolean };
+    /** Page-slot mode: the column's one user-identity lookup, shared by every page slot
+     *  instead of an IPC call per page mount. */
+    sharedIdentity?: Promise<UserRef>;
+    /** Page-slot mode: a gesture (drag, multi-click run, editor, dialog, menu) started or
+     *  ended on this page. While busy, the column keeps this page active and mounted. */
+    onslotbusy?: (busy: boolean) => void;
+    /** Page-slot mode: a view command the column carries out (it owns zoom and scroll). */
+    onslotcommand?: (cmd: SlotCommand) => void;
   } = $props();
 
   // ---------------------------------------------------------------------------
@@ -206,10 +234,21 @@
 
   // Initialised from initialState when the tab is switched back to, so zoom/page/scroll
   // are restored. Default to 1/0/0/0 when opening fresh.
-  let zoom      = $state(initialState?.zoom      ?? 1.0);
-  let scrollX   = $state(initialState?.scrollX   ?? 0);
-  let scrollY   = $state(initialState?.scrollY   ?? 0);
-  let pageIndex = $state(initialState?.pageIndex ?? 0);
+  // A page slot starts at its page and the column's zoom, unscrolled (read once: a slot's
+  // page never changes, the column keys page boxes by page index).
+  const startView = (): ViewportSnapshot =>
+    slot
+      ? { zoom: slot.zoom, pageIndex: slot.page, scrollX: 0, scrollY: 0 }
+      : { zoom: initialState?.zoom ?? 1.0, pageIndex: initialState?.pageIndex ?? 0, scrollX: initialState?.scrollX ?? 0, scrollY: initialState?.scrollY ?? 0 };
+  let zoom      = $state(startView().zoom);
+  let scrollX   = $state(startView().scrollX);
+  let scrollY   = $state(startView().scrollY);
+  let pageIndex = $state(startView().pageIndex);
+  // Page-slot mode: the column owns zoom; the slot's page box is the whole view (no scroll).
+  $effect.pre(() => {
+    if (!slot) return;
+    zoom = slot.zoom;
+  });
 
   // Guard against loadPageSize() resetting scroll to 0 on the very first load
   // when an initialState scroll position should be preserved.
@@ -425,7 +464,8 @@
     cloudVerts?: { x: number; y: number }[];
   } | null>(null);
   let editorText = $state("");
-  let calloutTarget: { x: number; y: number } | null = null; // first Callout click (leader start)
+  // $state.raw: read by `slotBusy` (a pending first Callout click keeps its page active).
+  let calloutTarget = $state.raw<{ x: number; y: number } | null>(null); // first Callout click (leader start)
 
   // --- Select tool gesture state ---
   /** Tolerance in screen pixels: pointer must be within this many px of a markup to hit it. */
@@ -501,6 +541,7 @@
    *  text-selection tool (not a create/select tool in the drawn-shape sense, but
    *  still needs pointer capture for its own drag gesture). */
   const overlayActive = $derived(isCreateTool() || isSelectTool() || isTextSelTool());
+
 
   /** Cursor for the markup-overlay SVG. undefined for every tool except the
    *  I-beam text-selection tool - CSS's `.markup-overlay.capture { cursor:
@@ -599,8 +640,8 @@
   // zooming redraw the table without recomputing it.
   const legendRows = $derived.by(() => {
     const out = new Map<string, LegendRow[]>();
-    for (const m of store.markups) {
-      if (m.markup_type === "Legend" && m.legend && m.page === pageIndex) {
+    for (const m of store.onPage(pageIndex)) {
+      if (m.markup_type === "Legend" && m.legend) {
         out.set(m.id, computeRows(m.page, sanitizeLegend(m.legend), store.markups, navStore?.labels ?? []));
       }
     }
@@ -612,13 +653,13 @@
   const layerView = $derived(layerStoreFor(docInfo.doc_id));
   /** The mark-ups of the current page that the layer view shows. */
   function shownOnPage(): Markup[] {
-    return store.markups.filter((m) => m.page === pageIndex && layerView.isShown(m));
+    return store.onPage(pageIndex).filter((m) => layerView.isShown(m));
   }
 
   const pageShapes = $derived.by<SvgShape[]>(() => {
     const previewIds = new Set(dragPreview?.map((m) => m.id) ?? []);
-    const committed = store.markups
-      .filter((m) => m.page === pageIndex && !previewIds.has(m.id) && layerView.isShown(m))
+    const committed = store.onPage(pageIndex)
+      .filter((m) => !previewIds.has(m.id) && layerView.isShown(m))
       .map((m) => markupToSvg(m, viewState, legendRows.get(m.id)));
     const preview = (dragPreview ?? [])
       .filter((m) => m.page === pageIndex)
@@ -630,6 +671,8 @@
   // The call READS every mark-up (so any add/edit/delete re-runs it) and writes only when a
   // rectangle actually changes, so it settles after one extra pass.
   $effect(() => {
+    // Page-slot mode: one slot (the active page) keeps the document's legends in sync.
+    if (slot && !slot.active) return;
     store.syncLegends();
   });
 
@@ -668,8 +711,8 @@
   // (while its second ray is being dragged), same list-then-append shape as pageShapes above.
   const angleLabels = $derived.by<{ id: string; x: number; y: number; text: string }[]>(() => {
     const labels: { id: string; x: number; y: number; text: string }[] = [];
-    for (const m of store.markups) {
-      if (m.page !== pageIndex || !layerView.isShown(m)) continue;
+    for (const m of store.onPage(pageIndex)) {
+      if (!layerView.isShown(m)) continue;
       const lbl = angleLabelFor(m);
       if (lbl) labels.push(lbl);
     }
@@ -1209,6 +1252,7 @@
   }
 
   function onMouseDown(e: MouseEvent) {
+    if (slot) return; // the column pans (ReadingView's hand-tool drag)
     // Don't start pan when any creation tool or select tool is active (overlay captures those events)
     if (isCreateTool() || isSelectTool()) return;
     if (e.button !== 0) return;
@@ -1303,7 +1347,6 @@
   // capturing pointer events and onMouseDown's drag-pan path opens up automatically,
   // with no special-casing needed anywhere else.
   // ---------------------------------------------------------------------------
-  let spacePanPreviousTool: ToolKind | null = null;
 
   function isTypingTarget(target: EventTarget | null): boolean {
     return target instanceof HTMLElement
@@ -1319,18 +1362,15 @@
     if (e.code !== "Space") return;
     if (editor) return; // Text/Callout inline editor — Space must type a literal space
     if (isTypingTarget(e.target)) return; // e.g. the zoom-percent toolbar input
-    if (spacePanPreviousTool !== null) return; // already held (key-repeat) — no-op
-    spacePanPreviousTool = store.activeTool;
-    store.setToolSilently("hand");
-    e.preventDefault();
+    if (e.repeat) { if (store.spacePanTool !== null) e.preventDefault(); return; } // key-repeat — no-op
+    // The saved tool lives in the store: in reading mode every visible page has a Viewport,
+    // and whichever one sees the key-up must restore it, once (MarkupStore.endSpacePan).
+    if (store.beginSpacePan()) e.preventDefault();
   }
 
   function onSpaceKeyUp(e: KeyboardEvent) {
     if (e.code !== "Space") return;
-    if (spacePanPreviousTool === null) return;
-    // Restoring the tool held before Space-pan is not a new pick: keep it out of Recent.
-    store.setToolSilently(spacePanPreviousTool);
-    spacePanPreviousTool = null;
+    store.endSpacePan();
   }
 
   // ---------------------------------------------------------------------------
@@ -1429,7 +1469,7 @@
     }
     return canvasMenuItems({
       canPaste: markupClipboard.size > 0,
-      hasMarkups: store.markups.some((m) => m.page === pageIndex),
+      hasMarkups: store.onPage(pageIndex).length > 0,
       canBack: viewNav.back,
       canForward: viewNav.forward,
     });
@@ -1534,11 +1574,13 @@
     // bare-key branches below were guarded only by `editor`, not this check, so typing
     // into the new zoom-percent input could still trigger them.
     if (isTypingTarget(e.target)) return;
+    // Page-slot mode: every visible page has a slot; only the active one owns the keys.
+    if (slot && !slot.active) return;
     onSpaceKeyDown(e);
     // Developer metrics overlay: Ctrl+Alt+Shift+B (was a bare "B", which a user could hit by
     // accident in production - UX audit F8). `code` is checked because Alt rewrites `key` on
     // macOS keyboards.
-    if (e.ctrlKey && e.altKey && e.shiftKey && (e.code === "KeyB" || e.key.toLowerCase() === "b")) {
+    if (!slot && e.ctrlKey && e.altKey && e.shiftKey && (e.code === "KeyB" || e.key.toLowerCase() === "b")) {
       e.preventDefault();
       benchOverlay = !benchOverlay;
       return;
@@ -1551,7 +1593,7 @@
       return;
     }
     // Previous view / Next view (Revu and PDF-XChange: Alt+Left / Alt+Right).
-    if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+    if (!slot && e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
       if (editor || e.defaultPrevented) return; // e.g. Bookmarks uses Alt+Left/Right to outdent/indent
       e.preventDefault();
       if (e.key === "ArrowLeft") previousView();
@@ -1561,14 +1603,14 @@
     // "?" toggles the pan/zoom shortcuts cheat-sheet (discoverability - see showShortcuts'
     // declaration). e.key already reflects Shift (browsers report the produced character),
     // so no separate e.shiftKey check is needed.
-    if (e.key === "?") {
+    if (!slot && e.key === "?") {
       e.preventDefault();
       showShortcuts = !showShortcuts;
     }
     // "Z" toggles the zoom toolbar's collapsed state (owner feedback 2026-09-15 -
     // hideable/re-showable via a collapse handle OR this key). Was T until 2026-11-04; T is
     // now Text Box, as in Revu (lib/tool-keys.ts).
-    if (!e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && (e.key === "z" || e.key === "Z")) {
+    if (!slot && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && (e.key === "z" || e.key === "Z")) {
       e.preventDefault();
       setToolbarCollapsed(!zoomToolbarCollapsed);
     }
@@ -1619,8 +1661,18 @@
           return;
         }
       }
-      if (e.key === "=" || e.key === "+") { e.preventDefault(); applyZoom(zoom * 1.1, containerWidth / 2, containerHeight / 2); return; }
-      if (e.key === "-" || e.key === "_") { e.preventDefault(); applyZoom(zoom / 1.1, containerWidth / 2, containerHeight / 2); return; }
+      if (e.key === "=" || e.key === "+") {
+        e.preventDefault();
+        if (slot) onslotcommand?.("zoom-in");
+        else applyZoom(zoom * 1.1, containerWidth / 2, containerHeight / 2);
+        return;
+      }
+      if (e.key === "-" || e.key === "_") {
+        e.preventDefault();
+        if (slot) onslotcommand?.("zoom-out");
+        else applyZoom(zoom / 1.1, containerWidth / 2, containerHeight / 2);
+        return;
+      }
       // Fit-width: Cmd/Ctrl+1 (legacy) or Cmd/Ctrl+0
       if (e.key === "1") { e.preventDefault(); fitWidth(); return; }
       if (!e.shiftKey && e.key === "0") { e.preventDefault(); fitWidth(); return; }
@@ -1845,16 +1897,19 @@
 
   /** Fit the page width to the viewport (Cmd/Ctrl+1). */
   function fitWidth() {
+    if (slot) { onslotcommand?.("fit-width"); return; }
     if (pageWidthPts <= 0) return;
     applySnapZoom(fitWidthZoom(pageWidthPts, containerWidth), "width");
   }
   /** Fit the page height to the viewport (Cmd/Ctrl+2). */
   function fitHeight() {
+    if (slot) { onslotcommand?.("fit-height"); return; }
     if (pageHeightPts <= 0) return;
     applySnapZoom(fitHeightZoom(pageHeightPts, containerHeight), "height");
   }
   /** Snap to 1:1 / 100% (Cmd/Ctrl+8; legacy alias Cmd/Ctrl+Shift+0). */
   function actualSize() {
+    if (slot) { onslotcommand?.("actual-size"); return; }
     applySnapZoom(ACTUAL_SIZE_ZOOM, "actual");
   }
 
@@ -1874,6 +1929,7 @@
    * $lib/viewport for the actual pan-vs-zoom decision table and its rationale.
    */
   function onWheel(e: WheelEvent) {
+    if (slot) return; // the column scrolls and zooms (ReadingView.onWheel)
     e.preventDefault();
     if (!containerEl) return;
     // A macOS pinch fires ctrlKey-true wheel events AND gesturechange events for the same
@@ -1998,6 +2054,7 @@
   // Page navigation
   // ---------------------------------------------------------------------------
   function prevPage() {
+    if (slot) { onslotcommand?.("prev-page"); return; }
     if (pageIndex > 0) {
       pageIndex -= 1;
       invalidateTiles();
@@ -2005,6 +2062,7 @@
     }
   }
   function nextPage() {
+    if (slot) { onslotcommand?.("next-page"); return; }
     if (pageIndex < docInfo.page_count - 1) {
       pageIndex += 1;
       invalidateTiles();
@@ -2033,8 +2091,11 @@
   function clientToPdf(clientX: number, clientY: number): { x: number; y: number } | null {
     if (!containerEl) return null;
     const r = containerEl.getBoundingClientRect();
-    const p = screenToPdfUserSpace(clientX - r.left, clientY - r.top, viewState);
-    if (!p) return p;
+    const raw = screenToPdfUserSpace(clientX - r.left, clientY - r.top, viewState);
+    if (!raw) return raw;
+    // Page-slot mode: a gesture belongs to the page it started on - a drag carried past the
+    // page edge (into the gap, or onto the next sheet) ends at this page's edge.
+    const p = slot ? clampToPage(raw, { width_pts: pageWidthPts, height_pts: pageHeightPts }) : raw;
     if (SNAP_ELIGIBLE_TOOLS.has(store.activeTool) && snapTargets.length > 0) {
       const hit = findNearestSnap(snapTargets, p, SNAP_TOLERANCE_PX / zoom);
       if (hit) {
@@ -2462,6 +2523,13 @@
     // dependencies of this $effect (they're read inside commitEditor). Without it, the
     // effect re-runs when e.g. identity loads and would prematurely cancel a just-opened editor.
     untrack(() => commitEditor());
+    // A two-point calibration lives only while its tool is on (like a viewport Redraw): leaving
+    // the Calibrate tool between the two clicks drops the first point. Once both points are in,
+    // the scale dialog owns it (it confirms or cancels), so that state is left alone.
+    untrack(() => {
+      const cal = takeoffStore.calibrationState;
+      if (tool !== "calibrate" && cal && cal.p2 === undefined) takeoffStore.cancelCalibration();
+    });
     // Clear marquee + move/resize/vertex transient state on any tool switch.
     marquee = null;
     marqueeAdditive = false;
@@ -2726,6 +2794,8 @@
     if (tool === "calibrate") {
       const p = localPdf(e);
       if (!p) return;
+      // Page-slot mode: both points of a calibration are on one page.
+      if (slot && takeoffStore.calibrationState?.p1 && takeoffStore.calibrationState.params.page !== pageIndex) return;
       const step = takeoffStore.calibrationState?.step;
       if (!step) {
         // First pointer-down: start calibration if not yet started.
@@ -2861,8 +2931,13 @@
       }
       if (marquee) {
         const r = containerEl?.getBoundingClientRect();
-        const sx = r ? e.clientX - r.left : e.clientX;
-        const sy = r ? e.clientY - r.top : e.clientY;
+        let sx = r ? e.clientX - r.left : e.clientX;
+        let sy = r ? e.clientY - r.top : e.clientY;
+        // Page-slot mode: the band stops at the page edge, like the selection it makes.
+        if (slot) {
+          sx = Math.max(0, Math.min(containerWidth, sx));
+          sy = Math.max(0, Math.min(containerHeight, sy));
+        }
         marquee = { ...marquee, x1: sx, y1: sy };
       }
       return;
@@ -3663,6 +3738,22 @@
     }
   }
 
+  /** Page-slot mode: an unfinished gesture on this page (between clicks of a multi-click
+   *  run, a drag, an open editor, dialog or menu). Drags hold pointer capture anyway; this
+   *  covers the gaps between clicks, when the pointer is free to wander onto another page. */
+  const slotBusy = $derived(
+    drawing || mcVerts.length > 0 || inkStroke.length > 0 || cloudPlusVerts !== null || calloutTarget !== null ||
+    editor !== null || dragPreview !== null || marquee !== null || textSelDragging || viewportDraft !== null ||
+    showCalibDialog || pendingViewport !== null || pendingStampPrompt !== null || ctxMenu !== null ||
+    (store.activeTool === "calibrate" && takeoffStore.calibrationState?.p1 !== undefined &&
+      takeoffStore.calibrationState.params.page === pageIndex),
+  );
+  $effect(() => {
+    if (!slot) return;
+    const busy = slotBusy;
+    untrack(() => onslotbusy?.(busy));
+  });
+
   // ---------------------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------------------
@@ -3687,6 +3778,8 @@
     if (containerEl) {
       resizeObserver = new ResizeObserver(onResize);
       resizeObserver.observe(containerEl);
+    }
+    if (containerEl && !slot) {
       // WebKit-only pinch events (see onGestureStart/Change/End) — inert on Chromium
       // (Windows WebView2), which never dispatches them.
       containerEl.addEventListener("gesturestart", onGestureStart);
@@ -3701,7 +3794,7 @@
     loadPageSize();
     // Load user identity for markup authoring. On failure, surface a notice so the
     // crosshair-but-nothing-happens state isn't silent.
-    getUserIdentity()
+    (sharedIdentity ?? getUserIdentity())
       .then((u) => (identity = u))
       .catch(() => (identityError = true));
   });
@@ -3726,7 +3819,10 @@
 
 <div
   class="viewport-root"
+  class:page-slot={slot !== undefined}
+  class:slot-inert={slot?.inert === true}
   data-doc-id={docInfo.doc_id}
+  data-slot-page={slot?.page}
   bind:this={containerEl}
   onmousedown={onMouseDown}
   oncontextmenu={onContextMenu}
@@ -3737,7 +3833,9 @@
   aria-label="PDF viewport — two-finger swipe or wheel to pan, pinch or Ctrl/Cmd/Shift+scroll to zoom, Space+drag to pan with any tool"
 >
   <!-- Tile canvas (Rust-rendered, display only) -->
-  <canvas bind:this={canvasEl} class="tile-canvas"></canvas>
+  {#if !slot}
+    <canvas bind:this={canvasEl} class="tile-canvas"></canvas>
+  {/if}
 
   <!-- Markup overlay — SVG, drawn on top of tiles (spec §6).
        Captures pointer events only when a drag-draw tool is active (.capture class).
@@ -4258,12 +4356,13 @@
   {/if}
 
   <!-- Identity-load failure: a creation tool is selected but authoring can't proceed. -->
-  {#if identityError && isCreateTool()}
+  {#if identityError && isCreateTool() && (!slot || slot.active)}
     <div class="draw-unavailable">
       Markup authoring unavailable — user identity failed to load.
     </div>
   {/if}
 
+  {#if !slot}
   <!-- Page navigation -->
   <nav class="page-nav">
     <button
@@ -4355,6 +4454,8 @@
     {/if}
   </div>
 
+  {/if}
+
   <!-- Pan/zoom shortcuts cheat-sheet overlay (discoverability - see showShortcuts'
        declaration above). Dismiss on Esc (onKeyDown) or a click outside the card. -->
   {#if showShortcuts}
@@ -4431,7 +4532,7 @@
 
   <!-- Copy / paste / Multiply / align / order (docs/arrange.md). Select tool only, and only
        when there is something to act on. -->
-  {#if isSelectTool() && (store.selectedIds.size > 0 || markupClipboard.size > 0)}
+  {#if isSelectTool() && (store.selectedIds.size > 0 || markupClipboard.size > 0) && (!slot || slot.active)}
     <ArrangeBar {store} getCtx={arrangeCtx} notice={arrangeNotice} />
   {/if}
 
@@ -4466,6 +4567,15 @@
     background: var(--color-bg);
   }
   .viewport-root:active { cursor: grabbing; }
+  /* Page-slot mode: the mark-up layer of one page box in the reading column - the page
+     raster shows through, and the column (not the slot) scrolls, so no grab cursor. */
+  .viewport-root.page-slot {
+    background: transparent;
+    cursor: default;
+  }
+  .viewport-root.page-slot:active { cursor: default; }
+  .viewport-root.slot-inert,
+  .viewport-root.slot-inert .markup-overlay { pointer-events: none; }
 
   .tile-canvas {
     position: absolute;

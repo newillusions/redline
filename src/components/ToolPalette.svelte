@@ -9,17 +9,12 @@
     store,
     navStore = undefined,
     toolChest = undefined,
-    readOnlyView = false,
   }: {
     store: MarkupStore;
     navStore?: NavigationStore;
     /** Source of saved stamp tools for the Stamp picker. */
     toolChest?: ToolChestStore;
-    /** True in reading mode: tools cannot draw there, so they are disabled with a hint. */
-    readOnlyView?: boolean;
   } = $props();
-
-  const READ_ONLY_HINT = "Switch to page view to mark up";
 
   // Stamp picker: choosing a stamp arms Drawing-mode placement (next click drops it), the
   // same path as a Tool Chest Drawing-mode tool (Viewport.placeToolCopy).
@@ -41,9 +36,6 @@
       store.stampPickerOpen = false;
     }
   }
-  // Leaving the document view (reading mode) must not leave the picker open.
-  $effect(() => { if (readOnlyView) store.stampPickerOpen = false; });
-
   // The Link tool is not a mark-up tool: it draws a Link annotation (docs/navigation.md
   // RH1). It rides on the Hand tool, so choosing it selects Hand first; choosing any
   // mark-up tool leaves link mode (Viewport watches for that).
@@ -109,7 +101,7 @@
     const key = keyLabelFor(t.kind);
     // Key goes before the first " - " description, else at the end: "Cloud (C) - drag ...".
     const withKey = !key ? t.title : t.title.includes(" - ") ? t.title.replace(" - ", ` (${key}) - `) : `${t.title} (${key})`;
-    return readOnlyView ? `${withKey} - ${READ_ONLY_HINT}` : withKey;
+    return withKey;
   }
 </script>
 <svelte:window onpointerdown={(e) => {
@@ -126,7 +118,6 @@
       class:icon-squiggly={t.iconClass === "icon-squiggly"}
       title={toolTitle(t)}
       aria-pressed={store.activeTool === t.kind}
-      disabled={readOnlyView}
       onclick={() => (store.activeTool = t.kind)}
     >{t.label}</button>
     {#if t.kind === "Squiggly"}
@@ -134,13 +125,12 @@
         <button
           class="tool-btn"
           class:active={stampActive || store.stampPickerOpen}
-          title={readOnlyView ? `Stamp (S) - ${READ_ONLY_HINT}` : "Stamp (S) - choose a stamp, then click to place it"}
+          title="Stamp (S) - choose a stamp, then click to place it"
           aria-label="Stamp tool"
           aria-haspopup="menu"
           aria-expanded={store.stampPickerOpen}
           aria-pressed={stampActive}
           data-testid="tool-stamp"
-          disabled={readOnlyView}
           onclick={() => (store.stampPickerOpen = !store.stampPickerOpen)}
         >&#x1F5B9;</button>
         {#if store.stampPickerOpen}
@@ -170,12 +160,9 @@
       title="Link - drag a rectangle, then choose a page or web address (Esc to stop)"
       aria-label="Link tool"
       aria-pressed={navStore.linkMode}
-      disabled={readOnlyView || (!navStore.fileEditable && !navStore.linkMode)}
+      disabled={!navStore.fileEditable && !navStore.linkMode}
       onclick={toggleLinkTool}
     >&#x1F517;</button>
-  {/if}
-  {#if readOnlyView}
-    <span class="read-only-hint" role="status" data-testid="palette-read-only-hint">{READ_ONLY_HINT}</span>
   {/if}
 </div>
 <style>
@@ -195,10 +182,6 @@
   }
   .tool-btn:disabled { opacity: 0.45; cursor: not-allowed; }
   .tool-btn:disabled:hover { background: var(--color-bg-active); }
-  .read-only-hint {
-    align-self: center; margin-left: var(--space-2);
-    font-size: var(--font-size-sm); color: var(--color-text-secondary);
-  }
   .stamp-wrap { position: relative; display: inline-flex; }
   .stamp-menu {
     position: absolute; top: 100%; left: 0; z-index: 50; margin-top: var(--space-1);

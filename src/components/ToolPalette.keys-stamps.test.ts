@@ -14,17 +14,14 @@ function store() {
   return new MarkupStore("d1", { add: vi.fn(async () => {}), update: vi.fn(async () => {}), remove: vi.fn(async () => {}) });
 }
 
-describe("ToolPalette in reading mode", () => {
-  it("disables every tool button and shows the hint", () => {
-    const { container } = render(ToolPalette, { store: store(), readOnlyView: true });
+// Mark-up works in continuous scroll (docs/continuous-markup.md): the palette has no
+// reading-mode state, so it is the same enabled palette in both views.
+describe("ToolPalette in either view", () => {
+  it("is enabled, with no read-only hint", () => {
+    const { container } = render(ToolPalette, { store: store() });
     const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>(".tool-btn"));
     expect(buttons.length).toBeGreaterThan(20);
-    expect(buttons.every((b) => b.disabled)).toBe(true);
-    expect(screen.getByTestId("palette-read-only-hint").textContent).toBe("Switch to page view to mark up");
-  });
-  it("is enabled, with no hint, in page view", () => {
-    const { container } = render(ToolPalette, { store: store() });
-    expect(Array.from(container.querySelectorAll<HTMLButtonElement>(".tool-btn")).some((b) => b.disabled)).toBe(false);
+    expect(buttons.some((b) => b.disabled)).toBe(false);
     expect(screen.queryByTestId("palette-read-only-hint")).toBeNull();
   });
 });
@@ -87,8 +84,8 @@ describe("ToolPalette Stamp picker", () => {
     expect(s.stampPickerOpen).toBe(false);
   });
 
-  it("is disabled in reading mode", () => {
-    render(ToolPalette, { store: store(), readOnlyView: true });
-    expect((screen.getByLabelText("Stamp tool") as HTMLButtonElement).disabled).toBe(true);
+  it("is enabled", () => {
+    render(ToolPalette, { store: store() });
+    expect((screen.getByLabelText("Stamp tool") as HTMLButtonElement).disabled).toBe(false);
   });
 });

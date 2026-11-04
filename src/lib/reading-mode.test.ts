@@ -6,9 +6,16 @@ import {
   visiblePageRange,
   parsePageJumpInput,
   pageTileSizeCss,
+  pageLeftsCss,
+  readingContentWidthCss,
+  pageAtPoint,
+  columnPointToPdf,
+  clampToPage,
+  resolveActivePage,
   READING_PAGE_GAP_CSS,
   type PageDims,
 } from "./reading-mode";
+import { pdfUserSpaceToScreen } from "./viewport";
 
 const LETTER: PageDims = { width_pts: 612, height_pts: 792 };
 const A0_LANDSCAPE: PageDims = { width_pts: 3370, height_pts: 2384 };
@@ -186,5 +193,125 @@ describe("pageTileSizeCss", () => {
 
   it("never returns 0 or a negative size", () => {
     expect(pageTileSizeCss(0, 0, 1.0)).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mark-up in continuous scroll (docs/continuous-markup.md): which page is under the
+// pointer, and where a point inside it lands in that page's PDF user space.
+// ---------------------------------------------------------------------------
+const A3_PORTRAIT: PageDims = { width_pts: 842, height_pts: 1191 };
+// A landscape A0 sheet rotated 90 degrees: the render engine reports the rotated
+// (swapped) dimensions, so the column lays it out portrait.
+const A0_ROTATED: PageDims = { width_pts: 2384, height_pts: 3370 };
+
+describe("pageLeftsCss / readingContentWidthCss", () => {
+  it("centres each page in a column wider than every page", () => {
+    const layout = computePageLayout([LETTER, A3_PORTRAIT], 1.0);
+    const width = readingContentWidthCss(layout, 1000);
+    expect(width).toBe(1000);
+    expect(pageLeftsCss(layout, width)).toEqual([(1000 - 612) / 2, (1000 - 842) / 2]);
+  });
+
+  it("widens the column to the widest page, so a zoomed-in sheet scrolls instead of clipping", () => {
+    const layout = computePageLayout([LETTER, A0_LANDSCAPE], 1.0);
+    const width = readingContentWidthCss(layout, 1000);
+    expect(width).toBe(3370);
+    const lefts = pageLeftsCss(layout, width);
+    expect(lefts[1]).toBe(0);
+    expect(lefts[0]).toBe((3370 - 612) / 2);
+  });
+});
+
+describe("pageAtPoint", () => {
+  const pages = [LETTER, A0_ROTATED, A3_PORTRAIT];
+  const layout = computePageLayout(pages, 0.5);
+  const width = readingContentWidthCss(layout, 1400);
+  const lefts = pageLeftsCss(layout, width);
+
+  it("returns the page whose box contains the point", () => {
+    expect(pageAtPoint(layout, lefts, lefts[0] + 5, 5)).toBe(0);
+    expect(pageAtPoint(layout, lefts, lefts[1] + 10, layout.topsCss[1] + 10)).toBe(1);
+    expect(pageAtPoint(layout, lefts, lefts[2] + 1, layout.topsCss[2] + layout.heightsCss[2] - 1)).toBe(2);
+  });
+
+  it("returns null in the gap between pages and beside a narrower page", () => {
+    const gapY = layout.topsCss[1] - READING_PAGE_GAP_CSS / 2;
+    expect(pageAtPoint(layout, lefts, lefts[0] + 5, gapY)).toBeNull();
+    expect(pageAtPoint(layout, lefts, lefts[0] - 5, 5)).toBeNull();
+    expect(pageAtPoint(layout, lefts, 5, layout.topsCss[2] + 5)).toBeNull();
+  });
+
+  it("returns null past the last page and for an empty layout", () => {
+    expect(pageAtPoint(layout, lefts, lefts[2] + 5, layout.totalHeightCss + 5)).toBeNull();
+    expect(pageAtPoint(computePageLayout([], 1), [], 0, 0)).toBeNull();
+  });
+});
+
+describe("columnPointToPdf", () => {
+  it("maps a page's top-left corner to (0, height) and its bottom-right to (width, 0)", () => {
+    const layout = computePageLayout([LETTER, A3_PORTRAIT], 2);
+    const lefts = pageLeftsCss(layout, readingContentWidthCss(layout, 800));
+    const tl = columnPointToPdf(layout, lefts, [LETTER, A3_PORTRAIT], 1, lefts[1], layout.topsCss[1]);
+    expect(tl).toEqual({ x: 0, y: 1191 });
+    const br = columnPointToPdf(layout, lefts, [LETTER, A3_PORTRAIT], 1, lefts[1] + layout.widthsCss[1], layout.topsCss[1] + layout.heightsCss[1]);
+    expect(br.x).toBeCloseTo(842);
+    expect(br.y).toBeCloseTo(0);
+  });
+
+  it("uses the rotated sheet's own (swapped) dimensions", () => {
+    const pages = [LETTER, A0_ROTATED];
+    const layout = computePageLayout(pages, 0.25);
+    const lefts = pageLeftsCss(layout, readingContentWidthCss(layout, 1200));
+    // The centre of the rotated sheet's box is the centre of its 2384 x 3370 page.
+    const c = columnPointToPdf(layout, lefts, pages, 1, lefts[1] + layout.widthsCss[1] / 2, layout.topsCss[1] + layout.heightsCss[1] / 2);
+    expect(c.x).toBeCloseTo(1192);
+    expect(c.y).toBeCloseTo(1685);
+  });
+
+  it("inverts pdfUserSpaceToScreen for the page's own view (round trip)", () => {
+    const pages = [A3_PORTRAIT, LETTER];
+    const zoom = 1.37;
+    const layout = computePageLayout(pages, zoom);
+    const lefts = pageLeftsCss(layout, readingContentWidthCss(layout, 1000));
+    const p = { x: 300.5, y: 412.25 };
+    const s = pdfUserSpaceToScreen(p.x, p.y, {
+      canvasWidthCss: layout.widthsCss[1], canvasHeightCss: layout.heightsCss[1], zoom, dpr: 1,
+      scrollX: 0, scrollY: 0, pageWidthPts: 612, pageHeightPts: 792,
+    });
+    const back = columnPointToPdf(layout, lefts, pages, 1, lefts[1] + s.x, layout.topsCss[1] + s.y);
+    expect(back.x).toBeCloseTo(p.x, 9);
+    expect(back.y).toBeCloseTo(p.y, 9);
+  });
+});
+
+describe("clampToPage", () => {
+  it("leaves a point on the page alone", () => {
+    expect(clampToPage({ x: 10, y: 20 }, LETTER)).toEqual({ x: 10, y: 20 });
+  });
+
+  it("pulls a point dragged off the page back to its edge (a gesture never crosses pages)", () => {
+    expect(clampToPage({ x: -4, y: 900 }, LETTER)).toEqual({ x: 0, y: 792 });
+    expect(clampToPage({ x: 700, y: -30 }, LETTER)).toEqual({ x: 612, y: 0 });
+  });
+
+  it("uses the rotated sheet's swapped dimensions", () => {
+    expect(clampToPage({ x: 3000, y: 3000 }, A0_ROTATED)).toEqual({ x: 2384, y: 3000 });
+  });
+});
+
+describe("resolveActivePage", () => {
+  const win = { first: 58, last: 62 };
+  it("a busy page wins", () => {
+    expect(resolveActivePage({ busyPage: 3, hoverPage: 60, currentPage: 59, window: win })).toBe(3);
+  });
+  it("the hover page counts while it is mounted", () => {
+    expect(resolveActivePage({ busyPage: null, hoverPage: 61, currentPage: 59, window: win })).toBe(61);
+  });
+  it("after a jump, a hover page left far behind gives way to the current page (review finding 1, PR #168)", () => {
+    expect(resolveActivePage({ busyPage: null, hoverPage: 4, currentPage: 60, window: win })).toBe(60);
+  });
+  it("no hover: the current page", () => {
+    expect(resolveActivePage({ busyPage: null, hoverPage: null, currentPage: 60, window: win })).toBe(60);
   });
 });

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Real-browser check of the Revu-aligned tool keys, the Stamp tool, reading-mode disabling and
+// Real-browser check of the Revu-aligned tool keys, the Stamp tool, the reading-mode palette and
 // Recent Tools (benchmark must-fix items 1, 3, 5, 6; /Users/martin/dev-reports/2026-11-04/
 // redline-ux-benchmark.md). The real Svelte app in headless Chromium over a MOCK Tauri IPC.
 //
@@ -10,7 +10,7 @@
 //   4. S opens the Stamp picker; choosing "Approved" and clicking the page places a
 //      StampDynamic markup;
 //   5. palette clicks and key presses both land in the Tool Chest Recent list;
-//   6. in reading mode every palette tool is disabled and the hint is visible.
+//   6. in reading mode the palette stays enabled (mark-up works there) and R picks Rectangle.
 //
 // Run:  npm run dev                       (serves the frontend at :1421)
 //       node tools/gui-harness-tool-keys.mjs
@@ -204,9 +204,13 @@ const browser = await chromium.launch();
   const page = await openApp(browser, "reading");
   await page.waitForTimeout(500);
   const states = await page.locator(".tool-strip .tool-btn").evaluateAll((els) => els.map((e) => e.disabled));
-  check(states.length > 20 && states.every(Boolean), `reading mode: all ${states.length} palette buttons disabled`, `reading mode: disabled = ${JSON.stringify(states)}`);
-  const hint = (await page.locator('[data-testid="palette-read-only-hint"]').textContent().catch(() => "")) || "";
-  check(hint.trim() === "Switch to page view to mark up", `hint shown: "${hint.trim()}"`, `hint missing/wrong: "${hint}"`);
+  // Mark-up works in continuous scroll (docs/continuous-markup.md): the palette stays live.
+  check(states.length > 20 && !states.some(Boolean), `reading mode: all ${states.length} palette buttons enabled`, `reading mode: disabled = ${JSON.stringify(states)}`);
+  const hints = await page.locator('[data-testid="palette-read-only-hint"]').count();
+  check(hints === 0, "reading mode: no read-only hint", `read-only hint still shown (${hints})`);
+  await page.keyboard.press("r");
+  const rOn = await page.locator('.tool-strip .tool-btn[title^="Rectangle"]').getAttribute("aria-pressed");
+  check(rOn === "true", "reading mode: R picks Rectangle", `reading mode: Rectangle aria-pressed=${rOn}`);
   await page.context().close();
 }
 
@@ -215,4 +219,4 @@ if (failed) {
   console.log("FAIL: see lines above.");
   process.exit(1);
 }
-console.log("PASS: Revu tool keys select their tools and stay inert while typing; Z (not T) toggles the zoom toolbar; the Stamp picker places a stamp; palette and key use feed Recent; reading mode disables the palette with a hint.");
+console.log("PASS: Revu tool keys select their tools and stay inert while typing; Z (not T) toggles the zoom toolbar; the Stamp picker places a stamp; palette and key use feed Recent; reading mode keeps the palette live.");

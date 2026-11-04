@@ -605,3 +605,49 @@ describe("MarkupStore.applyEdits (update + create as ONE undo frame)", () => {
     expect(s.canUndo).toBe(false);
   });
 });
+
+// Reading mode mounts one mark-up layer per visible page; they read these shared views
+// instead of each walking the whole document (docs/continuous-markup.md).
+describe("MarkupStore.onPage / selectedMarkups", () => {
+  const on = (id: string, page: number): Markup => ({ ...mk(id), page });
+
+  it("groups markups by page in store (z-) order and follows changes", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    s.seed([on("a", 0), on("b", 2), on("c", 0), on("d", 2)]);
+    expect(s.onPage(0).map((m) => m.id)).toEqual(["a", "c"]);
+    expect(s.onPage(2).map((m) => m.id)).toEqual(["b", "d"]);
+    expect(s.onPage(1)).toEqual([]);
+    s.create(on("e", 1));
+    expect(s.onPage(1).map((m) => m.id)).toEqual(["e"]);
+    s.selectedIds = new Set(["b"]);
+    s.deleteSelected();
+    expect(s.onPage(2).map((m) => m.id)).toEqual(["d"]);
+  });
+
+  it("selectedMarkups tracks the selection and the markups", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    s.seed([on("a", 0), on("b", 1), on("c", 1)]);
+    s.selectedIds = new Set(["c", "a"]);
+    expect(s.selectedMarkups.map((m) => m.id)).toEqual(["a", "c"]);
+    s.replace({ ...on("c", 1), contents: "x" });
+    expect(s.selectedMarkups.find((m) => m.id === "c")?.contents).toBe("x");
+    s.selectedIds = new Set();
+    expect(s.selectedMarkups).toEqual([]);
+  });
+});
+
+describe("MarkupStore Space-pan", () => {
+  it("saves the tool once and restores it once", () => {
+    const s = new MarkupStore("doc1", fakeIpc());
+    s.activeTool = "Rectangle";
+    expect(s.beginSpacePan()).toBe(true);
+    expect(s.activeTool).toBe("hand");
+    // A second Viewport (or a key-repeat) does not overwrite the saved tool with "hand".
+    expect(s.beginSpacePan()).toBe(false);
+    s.endSpacePan();
+    expect(s.activeTool).toBe("Rectangle");
+    s.activeTool = "Ellipse";
+    s.endSpacePan(); // a second key-up listener: nothing left to restore
+    expect(s.activeTool).toBe("Ellipse");
+  });
+});
