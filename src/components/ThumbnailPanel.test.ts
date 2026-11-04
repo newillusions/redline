@@ -189,6 +189,32 @@ describe("ThumbnailPanel", () => {
     });
   });
 
+  describe("context menu", () => {
+    it("Shift+F10 opens one menu and the key does not reach window handlers", async () => {
+      render(ThumbnailPanel, { props: { docId: "doc-1", pageCount: 3, currentPage: 0 } });
+      const reached = vi.fn();
+      window.addEventListener("keydown", reached);
+      await fireEvent.keyDown(screen.getByLabelText("Page thumbnails"), { key: "F10", shiftKey: true });
+      window.removeEventListener("keydown", reached);
+      expect(screen.getAllByRole("menu")).toHaveLength(1);
+      expect(reached).not.toHaveBeenCalled();
+    });
+
+    it("shows an error when rotate or delete is rejected, and does not refresh", async () => {
+      const onPageOp = vi.fn();
+      mockRotatePage.mockRejectedValueOnce(new Error("disk full"));
+      mountPanel(3, onPageOp);
+      await fireEvent.click(screen.getByLabelText("Rotate page 2 90 degrees clockwise"));
+      await tick();
+      expect(screen.getByRole("alert").textContent).toContain("Could not rotate page 2: disk full");
+      mockDeletePage.mockRejectedValueOnce(new Error("locked"));
+      await fireEvent.click(screen.getByLabelText("Delete page 1"));
+      await tick();
+      expect(screen.getByRole("alert").textContent).toContain("Could not delete page 1: locked");
+      expect(onPageOp).not.toHaveBeenCalled();
+    });
+  });
+
   describe("drag-to-reorder", () => {
     it("drop from page 0 onto page 2 calls reorderPages with correct permutation", async () => {
       mountPanel(3);

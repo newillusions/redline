@@ -407,6 +407,15 @@
     }
   }
 
+  /** Show a sidebar panel wherever the user has put it (right-click menu: Properties, Tool Chest). */
+  function revealPanel(id: PanelId) {
+    panelLayout.update((l) => {
+      const side = sideOf(l, id);
+      const shown = l[side].hidden ? setSidebarHidden(l, side, false) : l;
+      return shown.collapsed[id] ? setCollapsed(shown, id, false) : shown;
+    });
+  }
+
   /** Open the search panel (toolbar button / Cmd/Ctrl+F), auto-expanding the left panel. */
   async function openSearchPanel() {
     searchPanelVisible = true;
@@ -2102,6 +2111,7 @@
               activeSearchHitIdx={searchOverlay.activeIdx}
               navStore={activeTab.navStore}
               onfollowlink={followTarget}
+              onrequestpanel={revealPanel}
             />
           {/if}
         {/key}

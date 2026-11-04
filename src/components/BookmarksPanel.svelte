@@ -331,6 +331,7 @@
         e.key === "ArrowUp" ? "up" : e.key === "ArrowDown" ? "down" : e.key === "ArrowRight" ? "indent" : e.key === "ArrowLeft" ? "outdent" : null;
       if (op) {
         e.preventDefault();
+        e.stopPropagation(); // not also Previous/Next view in the viewport's window handler
         void move(op);
         return;
       }

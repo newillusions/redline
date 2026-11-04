@@ -32,6 +32,8 @@
     type DynamicField,
     type StampAsset,
     type StampDef,
+    isMarkupLocked,
+    isMarkupContentsLocked,
   } from "$lib/ipc";
   import {
     TILE_SIZE_CSS,
@@ -105,6 +107,12 @@
   import {
     copySelection, cutSelection, pasteClipboard, duplicateSelection, type ArrangeCtx, type ActionResult,
   } from "$lib/arrange-actions";
+  import ContextMenu from "./ContextMenu.svelte";
+  import {
+    markupMenuItems, canvasMenuItems, type MenuItem,
+  } from "$lib/context-menu";
+  import { runMarkupCommand, selectAllOnPage } from "$lib/context-actions";
+  import { ViewHistory, isLargeZoomChange, type ViewEntry } from "$lib/view-history";
   import LinkOverlay from "./LinkOverlay.svelte";
   import type { NavigationStore } from "$lib/navigation-store.svelte";
   import type { LinkView, NavTarget } from "$lib/navigation-ipc";
@@ -125,6 +133,7 @@
     onsearchtext = undefined,
     navStore = undefined,
     onfollowlink = undefined,
+    onrequestpanel = undefined,
   }: {
     docInfo: DocumentInfo;
     store: MarkupStore;
@@ -174,6 +183,8 @@
     /** A link was clicked in the Hand tool: run its target (App.svelte owns the confirm
      *  dialog for web addresses). */
     onfollowlink?: (target: NavTarget) => void;
+    /** The right-click menu asks App.svelte to reveal a sidebar panel (Properties, Tool Chest). */
+    onrequestpanel?: (panel: "properties" | "toolchest") => void;
   } = $props();
 
   // ---------------------------------------------------------------------------
@@ -886,6 +897,7 @@
     view?: { left: number; top: number; zoom: number | null };
   }) {
     const target = Math.max(0, Math.min(req.page, docInfo.page_count - 1));
+    recordView();
     if (target !== pageIndex) {
       pageIndex = target;
       invalidateTiles();
@@ -905,6 +917,8 @@
       store.activeTool = "select";
       store.selectedIds = new Set([req.markupId]);
     }
+    // The zoom a destination applies is part of the jump already recorded above.
+    zoomGestureStart = null;
   }
 
   // Fires whenever App.svelte issues a new navigation request (nonce bumped on
@@ -1362,6 +1376,110 @@
     arrangeNoticeTimer = setTimeout(() => { arrangeNotice = null; }, 3500);
   }
 
+  // ---------------------------------------------------------------------------
+  // Right-click menu (markup / empty page area). One shared component; every item runs a
+  // command that already exists (`$lib/context-actions`, the zoom presets, view history).
+  // ---------------------------------------------------------------------------
+  let ctxMenu = $state<{ kind: "markup" | "canvas"; x: number; y: number } | null>(null);
+  /** Page point under the right-click: where Paste from the menu lands (not where the pointer
+   *  is by the time the item is chosen). Null for a keyboard-opened menu. */
+  let ctxPdfPoint: { x: number; y: number } | null = null;
+
+  const ctxItems = $derived.by<MenuItem[]>(() => {
+    if (!ctxMenu) return [];
+    if (ctxMenu.kind === "markup") {
+      const sel = store.selectedMarkups;
+      const statuses = new Set(sel.map((m) => m.workflow.status));
+      return markupMenuItems({
+        count: sel.length,
+        anyLocked: sel.some((m) => isMarkupLocked(m) || isMarkupContentsLocked(m)),
+        commonStatus: statuses.size === 1 ? [...statuses][0] : undefined,
+      });
+    }
+    return canvasMenuItems({
+      canPaste: markupClipboard.size > 0,
+      hasMarkups: store.markups.some((m) => m.page === pageIndex),
+      canBack: viewNav.back,
+      canForward: viewNav.forward,
+    });
+  });
+
+  // A markup menu on a selection that has since gone (deleted, undone) has nothing to act on.
+  $effect(() => {
+    if (ctxMenu?.kind === "markup" && store.selectedIds.size === 0) ctxMenu = null;
+  });
+
+  function closeCtx() {
+    ctxMenu = null;
+  }
+
+  /** Open the menu for what is under (clientX, clientY): a markup, else the page area. */
+  function openContextMenuAt(clientX: number, clientY: number) {
+    if (!containerEl || editor || drawing || mcVerts.length > 0) return;
+    const r = containerEl.getBoundingClientRect();
+    const p = screenToPdfUserSpace(clientX - r.left, clientY - r.top, viewState);
+    const hit = p ? hitTest(shownOnPage(), p, SELECT_GRAB_PX / zoom) : null;
+    ctxPdfPoint = p ? { x: p.x, y: p.y } : null;
+    if (hit !== null) {
+      // The select tool owns selection (a separate effect drops it under any other tool).
+      store.activeTool = "select";
+      if (!store.selectedIds.has(hit)) store.selectedIds = expandSelectionToGroups(store.markups, new Set([hit]));
+      ctxMenu = { kind: "markup", x: clientX, y: clientY };
+    } else {
+      ctxMenu = { kind: "canvas", x: clientX, y: clientY };
+    }
+  }
+
+  function onContextMenu(e: MouseEvent) {
+    const t = e.target;
+    // Only the page itself: toolbars, the Arrange bar and the inline editor keep the default.
+    const onPage = t === containerEl || t === canvasEl || (t instanceof Element && t.closest(".markup-overlay") !== null);
+    if (!onPage) return;
+    e.preventDefault();
+    openContextMenuAt(e.clientX, e.clientY);
+  }
+
+  /** Shift+F10 / the Menu key: open at the selected markup, else at the middle of the view. */
+  function openContextMenuFromKeyboard() {
+    if (!containerEl) return;
+    ctxPdfPoint = null;
+    const r = containerEl.getBoundingClientRect();
+    const first = store.selectedMarkups.find((m) => m.page === pageIndex);
+    let x = r.left + containerWidth / 2;
+    let y = r.top + containerHeight / 2;
+    if (first) {
+      const b = boundsOf(first);
+      const c = pdfUserSpaceToScreen((b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2, viewState);
+      x = r.left + Math.max(0, Math.min(containerWidth, c.x));
+      y = r.top + Math.max(0, Math.min(containerHeight, c.y));
+      ctxMenu = { kind: "markup", x, y };
+    } else {
+      ctxMenu = { kind: "canvas", x, y };
+    }
+  }
+
+  function onContextSelect(id: string) {
+    closeCtx();
+    switch (id) {
+      case "properties": onrequestpanel?.("properties"); return;
+      case "save-as-tool": onrequestpanel?.("toolchest"); return;
+      case "delete": store.deleteSelected(); return;
+      case "select-all": {
+        store.activeTool = "select";
+        showArrangeNotice(selectAllOnPage(arrangeCtx(), shownOnPage().map((m) => m.id)));
+        return;
+      }
+      case "fit-width": fitWidth(); return;
+      case "fit-height": fitHeight(); return;
+      case "actual-size": actualSize(); return;
+      case "prev-view": previousView(); return;
+      case "next-view": nextView(); return;
+    }
+    const c = arrangeCtx();
+    const r = runMarkupCommand(id, id === "paste" && ctxPdfPoint ? { ...c, cursor: ctxPdfPoint } : c);
+    if (r) showArrangeNotice(r);
+  }
+
   // Keyboard handler: bench overlay toggle + multi-click finish/cancel.
   function onKeyDown(e: KeyboardEvent) {
     // Every shortcut below (bare-key AND modifier) is this component's own feature
@@ -1380,6 +1498,21 @@
     if (e.ctrlKey && e.altKey && e.shiftKey && (e.code === "KeyB" || e.key.toLowerCase() === "b")) {
       e.preventDefault();
       benchOverlay = !benchOverlay;
+      return;
+    }
+    // Context menu from the keyboard (the Menu key, or Shift+F10).
+    if (e.key === "ContextMenu" || (e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && e.key === "F10")) {
+      if (editor || e.defaultPrevented) return; // a focused panel (Navigator) already handled it
+      e.preventDefault();
+      openContextMenuFromKeyboard();
+      return;
+    }
+    // Previous view / Next view (Revu and PDF-XChange: Alt+Left / Alt+Right).
+    if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+      if (editor || e.defaultPrevented) return; // e.g. Bookmarks uses Alt+Left/Right to outdent/indent
+      e.preventDefault();
+      if (e.key === "ArrowLeft") previousView();
+      else nextView();
       return;
     }
     // "?" toggles the pan/zoom shortcuts cheat-sheet (discoverability - see showShortcuts'
@@ -1583,6 +1716,7 @@
   function applyZoom(newZoom: number, anchorX: number, anchorY: number) {
     newZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newZoom));
     if (newZoom === zoom) return;
+    zoomGestureStart ??= snapshotView();
     const ratio = newZoom / zoom;
     // Keep the anchor point stationary: new scroll = (scroll + anchor)·ratio − anchor.
     scrollX = (scrollX + anchorX) * ratio - anchorX;
@@ -1613,6 +1747,12 @@
     if (zoomSettleTimer) clearTimeout(zoomSettleTimer);
     zoomSettleTimer = setTimeout(() => {
       zoomSettleTimer = null;
+      const start = zoomGestureStart;
+      zoomGestureStart = null;
+      if (start && start.pageIndex === pageIndex && isLargeZoomChange(start.zoom, zoom)) {
+        viewHistory.record(start);
+        syncViewNav();
+      }
       // NOTE: no unconditional invalidateTiles() here (Windows-freeze fix) - requestTiles()
       // itself now bumps the epoch only when the quantized renderZoom bucket actually
       // changes, and cache hygiene comes from the bounded LRU (tile-cache.ts) rather than a
@@ -1633,6 +1773,7 @@
    * Reuses the same placeholder + debounced sharp re-render path as wheel/keyboard zoom.
    */
   function applySnapZoom(newZoom: number, mode: "width" | "height" | "actual") {
+    zoomGestureStart ??= snapshotView();
     zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newZoom));
     const pageW = pageWidthPts * zoom;
     const pageH = pageHeightPts * zoom;
@@ -1744,6 +1885,56 @@
     e.preventDefault();
     gestureActive = false;
     gestureGraceUntil = Date.now() + GESTURE_TRAILING_GRACE_MS;
+  }
+
+  // ---------------------------------------------------------------------------
+  // View history: Previous view / Next view (Alt+Left / Alt+Right)
+  // ---------------------------------------------------------------------------
+  const viewHistory = new ViewHistory();
+  /** Mirrors of `viewHistory.canBack/canForward` so the toolbar buttons and menu re-render. */
+  let viewNav = $state({ back: false, forward: false });
+  /** The view a zoom gesture started from; recorded when it settles if the zoom changed a lot. */
+  let zoomGestureStart: ViewEntry | null = null;
+
+  function syncViewNav() {
+    viewNav = { back: viewHistory.canBack, forward: viewHistory.canForward };
+  }
+  function snapshotView(): ViewEntry {
+    return { pageIndex, zoom, scrollX, scrollY };
+  }
+  /** Remember where the reader is, before a link / bookmark / search-hit / page jump leaves it. */
+  function recordView() {
+    viewHistory.record(snapshotView());
+    syncViewNav();
+  }
+
+  async function restoreView(e: ViewEntry) {
+    zoomGestureStart = null;
+    const page = Math.max(0, Math.min(e.pageIndex, docInfo.page_count - 1));
+    if (page !== pageIndex) {
+      pageIndex = page;
+      invalidateTiles();
+      await loadPageSize();
+    }
+    zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, e.zoom));
+    scrollX = e.scrollX;
+    scrollY = e.scrollY;
+    clampScroll();
+    zoomStartTs = performance.now();
+    applyZoomPlaceholder();
+    scheduleZoomCommit();
+    zoomGestureStart = null;
+  }
+
+  function previousView() {
+    const target = viewHistory.back(snapshotView());
+    syncViewNav();
+    if (target) void restoreView(target);
+  }
+  function nextView() {
+    const target = viewHistory.forward(snapshotView());
+    syncViewNav();
+    if (target) void restoreView(target);
   }
 
   // ---------------------------------------------------------------------------
@@ -2279,6 +2470,9 @@
   }
 
   function onOverlayPointerDown(e: PointerEvent) {
+    // Only the primary button (left mouse, touch, pen contact) starts a gesture: a right press
+    // opens the context menu and must not move, resize, marquee or delete anything.
+    if (e.button !== 0) return;
     const tool = store.activeTool;
 
     // Persist-on-click-outside: a pointer-down anywhere on the canvas commits an open
@@ -3429,6 +3623,7 @@
   data-doc-id={docInfo.doc_id}
   bind:this={containerEl}
   onmousedown={onMouseDown}
+  oncontextmenu={onContextMenu}
   onwheel={onWheel}
   onpointermove={trackArrangeCursor}
   onpointerleave={() => { arrangeCursor = null; }}
@@ -3899,11 +4094,27 @@
 
   <!-- Page navigation -->
   <nav class="page-nav">
+    <button
+      class="btn-nav"
+      title="Previous view (Alt+Left)"
+      aria-label="Previous view"
+      data-testid="prev-view"
+      onclick={previousView}
+      disabled={!viewNav.back}
+    >⟲</button>
     <button class="btn-nav" onclick={prevPage} disabled={pageIndex === 0}>‹</button>
     <span class="page-label">
       Page {pageIndex + 1} / {docInfo.page_count}
     </span>
     <button class="btn-nav" onclick={nextPage} disabled={pageIndex >= docInfo.page_count - 1}>›</button>
+    <button
+      class="btn-nav"
+      title="Next view (Alt+Right)"
+      aria-label="Next view"
+      data-testid="next-view"
+      onclick={nextView}
+      disabled={!viewNav.forward}
+    >⟳</button>
   </nav>
 
   <!-- Zoom-snap presets: full-width, full-height, 1:1 (key-commands ⌘/Ctrl 0/9/8), plus a
@@ -4003,6 +4214,8 @@
         <div class="shortcuts-row"><span>⌘/Ctrl + C / X / V</span><span>Copy / cut / paste markups (paste lands at the pointer)</span></div>
         <div class="shortcuts-row"><span>⌘/Ctrl + Shift + V</span><span>Paste markups in place</span></div>
         <div class="shortcuts-row"><span>⌘/Ctrl + D</span><span>Duplicate the selected markups</span></div>
+        <div class="shortcuts-row"><span>Alt + ← / →</span><span>Previous / next view (after a jump or big zoom)</span></div>
+        <div class="shortcuts-row"><span>Right-click · Shift+F10</span><span>Context menu for a markup or the page</span></div>
         <div class="shortcuts-hint">Esc or click outside to close</div>
       </div>
     </div>
@@ -4044,6 +4257,17 @@
         targets: pan ≤33ms · settle ≤250ms · tile ≤60ms · RSS ≤2048MB
       </div>
     </div>
+  {/if}
+
+  {#if ctxMenu}
+    <ContextMenu
+      items={ctxItems}
+      x={ctxMenu.x}
+      y={ctxMenu.y}
+      label={ctxMenu.kind === "markup" ? "Markup menu" : "Page menu"}
+      onselect={onContextSelect}
+      onclose={closeCtx}
+    />
   {/if}
 
   <!-- Copy / paste / Multiply / align / order (docs/arrange.md). Select tool only, and only

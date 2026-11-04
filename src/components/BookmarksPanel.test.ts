@@ -241,6 +241,17 @@ describe("BookmarksPanel", () => {
     expect(edit).toHaveBeenCalledTimes(2);
   });
 
+  it("Alt+Left in the tree outdents only: the event never reaches the viewport's window handler", async () => {
+    const { edit } = setup(tree());
+    await fireEvent.click(screen.getByText("Level 2"));
+    const reached = vi.fn();
+    window.addEventListener("keydown", reached);
+    await fireEvent.keyDown(screen.getByRole("tree"), { key: "ArrowLeft", altKey: true });
+    window.removeEventListener("keydown", reached);
+    await waitFor(() => expect(edit).toHaveBeenCalledTimes(1));
+    expect(reached).not.toHaveBeenCalled();
+  });
+
   it("dragging one bookmark onto another moves it", async () => {
     const { edit } = setup(tree());
     const from = screen.getByText("Details").closest("[role=treeitem]")!;

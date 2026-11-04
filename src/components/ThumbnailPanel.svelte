@@ -31,6 +31,8 @@
   import { pageTileSizeCss } from "$lib/reading-mode";
   import { onDestroy } from "svelte";
   import { labelOf } from "$lib/navigation";
+  import ContextMenu from "./ContextMenu.svelte";
+  import { thumbnailMenuItems } from "$lib/context-menu";
 
   interface Props {
     docId: string;
@@ -90,7 +92,73 @@
     el.select();
   }
 
+  // ---------------------------------------------------------------------------
+  // Right-click menu (page operations that already exist on this panel)
+  // ---------------------------------------------------------------------------
+  let thumbMenu = $state<{ page: number; x: number; y: number } | null>(null);
+
+  /** Pages the page-wide actions apply to: the selection when the page is in it, else just it. */
+  function menuTargets(idx: number): number[] {
+    return selected.has(idx) ? Array.from(selected).sort((a, b) => a - b) : [idx];
+  }
+
+  const thumbMenuItemsList = $derived(
+    thumbMenu
+      ? thumbnailMenuItems({
+          page: thumbMenu.page,
+          targetCount: menuTargets(thumbMenu.page).length,
+          canDelete: pageCount > 1,
+          canRename: !!onrenamelabel,
+          canExtract: !!onextract,
+          canNumber: !!onnumber,
+        })
+      : [],
+  );
+
+  function openThumbMenu(idx: number, x: number, y: number) {
+    if (renamingIdx !== null) return;
+    // Right-clicking a page outside the selection selects just that page (no navigation).
+    if (!selected.has(idx)) {
+      selected = new Set([idx]);
+      selectionAnchor = idx;
+    }
+    thumbMenu = { page: idx, x, y };
+  }
+
+  function onThumbContextMenu(e: MouseEvent, idx: number) {
+    if (e.target instanceof Element && e.target.closest("input")) return;
+    e.preventDefault();
+    openThumbMenu(idx, e.clientX, e.clientY);
+  }
+
+  function onThumbMenuSelect(id: string) {
+    const m = thumbMenu;
+    thumbMenu = null;
+    if (!m) return;
+    const idx = m.page;
+    const targets = menuTargets(idx);
+    switch (id) {
+      case "go-to-page": onjump?.(idx); break;
+      case "rotate-cw": void handleRotate(idx, 90); break;
+      case "rotate-ccw": void handleRotate(idx, -90); break;
+      case "extract": onextract?.(targets); break;
+      case "number-pages": onnumber?.(targets); break;
+      case "rename-label": startRename(idx); break;
+      case "delete-page": void handleDelete(idx); break;
+    }
+  }
+
   function onPanelKeyDown(e: KeyboardEvent) {
+    if (renamingIdx === null && (e.key === "ContextMenu" || (e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && e.key === "F10"))) {
+      const target = selected.size === 1 ? [...selected][0] : currentPage;
+      if (target === null || target === undefined) return;
+      e.preventDefault();
+      e.stopPropagation(); // the viewport's window handler must not open its own menu too
+      const el = (e.currentTarget as HTMLElement).querySelector(`[data-page-idx="${target}"]`);
+      const r = el?.getBoundingClientRect();
+      openThumbMenu(target, r ? r.left + r.width / 2 : 0, r ? r.top + Math.min(r.height / 2, 40) : 0);
+      return;
+    }
     if (renamingIdx !== null || e.key !== "F2") return;
     const target = selected.size === 1 ? [...selected][0] : currentPage;
     if (target === null || target === undefined) return;
@@ -323,8 +391,17 @@
   // Rotation
   // ---------------------------------------------------------------------------
 
+  let opError = $state<string | null>(null);
+  const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
   async function handleRotate(idx: number, degrees: number) {
-    await rotatePage({ doc_id: docId, page_idx: idx, degrees });
+    opError = null;
+    try {
+      await rotatePage({ doc_id: docId, page_idx: idx, degrees });
+    } catch (e) {
+      opError = `Could not rotate page ${idx + 1}: ${errText(e)}`;
+      return;
+    }
     invalidateAllThumbnails();
     // Rotation doesn't shift any index - selection stays valid and is left alone.
     onPageOp?.();
@@ -338,13 +415,22 @@
     if (pageCount <= 1) return; // guard: cannot delete the only page
     const confirmed = window.confirm(`Delete page ${idx + 1}? This cannot be undone.`);
     if (!confirmed) return;
-    await deletePage({ doc_id: docId, page_idx: idx });
+    opError = null;
+    try {
+      await deletePage({ doc_id: docId, page_idx: idx });
+    } catch (e) {
+      opError = `Could not delete page ${idx + 1}: ${errText(e)}`;
+      return;
+    }
     invalidateAllThumbnails();
     clearSelection(); // every index at/after the deleted page has shifted
     onPageOp?.();
   }
 </script>
 
+{#if opError}
+  <div class="op-error" role="alert">{opError}</div>
+{/if}
 {#if selected.size > 0}
   <div class="extract-action-bar">
     <span class="extract-count">{selected.size} page{selected.size === 1 ? "" : "s"} selected</span>
@@ -369,6 +455,8 @@
       aria-current={currentPage === idx ? "page" : undefined}
       aria-selected={selected.has(idx)}
       role="listitem"
+      data-page-idx={idx}
+      oncontextmenu={(e) => onThumbContextMenu(e, idx)}
       onclick={(e) => handleThumbnailClick(e, idx)}
       ondragstart={(e) => handleDragStart(e, idx)}
       ondragover={(e) => handleDragOver(e, idx)}
@@ -426,6 +514,17 @@
     </div>
   {/each}
 </aside>
+
+{#if thumbMenu}
+  <ContextMenu
+    items={thumbMenuItemsList}
+    x={thumbMenu.x}
+    y={thumbMenu.y}
+    label={`Page ${thumbMenu.page + 1} menu`}
+    onselect={onThumbMenuSelect}
+    onclose={() => (thumbMenu = null)}
+  />
+{/if}
 
 <style>
   .thumbnail-panel {
@@ -507,6 +606,11 @@
     font-size: var(--font-size-sm);
   }
 
+  .op-error {
+    padding: var(--space-2);
+    color: var(--color-danger);
+    font-size: var(--font-size-sm);
+  }
   .extract-action-bar {
     display: flex;
     align-items: center;
