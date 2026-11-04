@@ -236,12 +236,49 @@ fn find_snippet(
             .unwrap_or(haystack.len());
         let prefix = if start > 0 { "…" } else { "" };
         let suffix = if end < haystack.len() { "…" } else { "" };
-        let raw = &haystack[start..end];
-        return Some(format!(
-            "{prefix}{}{suffix}",
-            raw.split_whitespace().collect::<Vec<_>>().join(" ")
-        ));
+        // Emit the same safe-HTML contract as the Tantivy path: everything is
+        // escaped, and only the matched term is wrapped in <b>. Lowercasing can
+        // change byte lengths, so fall back to an un-highlighted (still
+        // escaped) snippet when the match range is not valid on the original.
+        let match_end = idx + n.len();
+        let body = if start <= idx
+            && match_end <= end
+            && haystack.is_char_boundary(idx)
+            && haystack.is_char_boundary(match_end)
+        {
+            format!(
+                "{}<b>{}</b>{}",
+                escape_html(&haystack[start..idx]),
+                escape_html(&haystack[idx..match_end]),
+                escape_html(&haystack[match_end..end]),
+            )
+        } else {
+            escape_html(&haystack[start..end])
+        };
+        return Some(format!("{prefix}{}{suffix}", collapse_whitespace(&body)));
     }
+}
+
+/// Escape the five HTML-significant characters so text can be embedded in
+/// element content or a quoted attribute without being parsed as markup.
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Collapse whitespace runs to a single space and trim the ends.
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +329,35 @@ mod tests {
             snippet.ends_with('…'),
             "expected trailing ellipsis: {snippet}"
         );
-        assert!(snippet.contains("needle"));
+        assert!(snippet.contains("<b>needle</b>"));
+    }
+
+    #[test]
+    fn find_snippet_escapes_html_and_bolds_only_the_match() {
+        let s = find_snippet("a <img src=x onerror=alert(1)> b", "src", false, false).unwrap();
+        assert_eq!(s, "a &lt;img <b>src</b>=x onerror=alert(1)&gt; b");
+        assert!(!s.contains("<img"));
+    }
+
+    #[test]
+    fn find_snippet_neutralises_script_ampersand_and_quotes() {
+        let s = find_snippet("<script>x</script> & \"q\" 'z' tail", "tail", false, false).unwrap();
+        assert!(!s.contains("<script"));
+        assert!(s.contains("&lt;script&gt;"));
+        assert!(s.contains("&amp;"));
+        assert!(s.contains("&quot;q&quot;"));
+        assert!(s.contains("&#39;z&#39;"));
+        assert!(s.ends_with("<b>tail</b>"));
+    }
+
+    #[test]
+    fn find_snippet_match_inside_escaped_sequence_does_not_split_entity() {
+        // Needle "amp" must match the raw text, not the "&amp;" we emit.
+        let s = find_snippet("x &amp; y", "amp", false, false).unwrap();
+        assert_eq!(s, "x &amp;<b>amp</b>; y");
+        // Needle "<b>" in the source is data, not our markup.
+        let s = find_snippet("1 <b>bold</b> 2", "<b>", false, false).unwrap();
+        assert_eq!(s, "1 <b>&lt;b&gt;</b>bold&lt;/b&gt; 2");
     }
 
     #[tokio::test]

@@ -25,6 +25,7 @@
   import type { SearchStore, SearchScope, UnifiedSearchHit, SearchGroup } from "$lib/search-store.svelte";
   import type { IndexStatus } from "$lib/ipc";
   import Accordion from "./Accordion.svelte";
+  import { sanitizeSnippetHtml } from "$lib/sanitize-snippet";
 
   interface Props {
     store: SearchStore;
@@ -350,9 +351,9 @@
                       <span class="search-result-kind" title="Markup comment/note">markup</span>
                     {/if}
                     {#if hit.snippetHtml}
-                      <!-- Tantivy snippet HTML: only <b> tags, safe to render. -->
+                      <!-- Escaped snippet HTML from the backend; re-sanitised to bare <b>/<mark> only. -->
                       <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                      <span class="search-result-snippet">{@html hit.snippet}</span>
+                      <span class="search-result-snippet">{@html sanitizeSnippetHtml(hit.snippet)}</span>
                     {:else}
                       <span class="search-result-snippet">{hit.snippet}</span>
                     {/if}
@@ -384,9 +385,9 @@
                     <span class="search-result-kind" title="Markup comment/note">markup</span>
                   {/if}
                   {#if hit.snippetHtml}
-                    <!-- Tantivy snippet HTML: only <b> tags, safe to render. -->
+                    <!-- Escaped snippet HTML from the backend; re-sanitised to bare <b>/<mark> only. -->
                     <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-                    <span class="search-result-snippet">{@html hit.snippet}</span>
+                    <span class="search-result-snippet">{@html sanitizeSnippetHtml(hit.snippet)}</span>
                   {:else}
                     <span class="search-result-snippet">{hit.snippet}</span>
                   {/if}

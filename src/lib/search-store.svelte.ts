@@ -168,6 +168,9 @@ function fromFolderHit(h: FolderSearchHit): UnifiedSearchHit {
     kind: "text",
     page: h.page_number - 1,
     snippet: h.snippet,
+    // Backend contract: both folder (Tantivy to_html) and Recents (find_snippet)
+    // snippets are escaped HTML with <b> around the match. The render site
+    // re-sanitises regardless (sanitize-snippet.ts).
     snippetHtml: true,
     filePath: h.file_path,
     checked: false,
