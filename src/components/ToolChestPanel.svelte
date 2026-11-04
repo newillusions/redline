@@ -21,12 +21,21 @@
   const {
     toolChest,
     markupStore = null,
+    readOnlyView = false,
   }: {
     toolChest: ToolChestStore;
     /** The active document tab's markup store, or null when no document is open. Needed
      *  to activate a tool and to read the current selection for "save as tool". */
     markupStore?: MarkupStore | null;
+    /** True in reading mode: tools cannot draw there, so activation is disabled with a hint. */
+    readOnlyView?: boolean;
   } = $props();
+
+  const READ_ONLY_HINT = "Switch to page view to mark up";
+  function toolTitle(tool: Tool): string {
+    const base = `${tool.name} (${tool.placement_mode})`;
+    return readOnlyView ? `${base} - ${READ_ONLY_HINT}` : base;
+  }
 
   onMount(() => {
     void toolChest.load();
@@ -50,7 +59,7 @@
   // Activation
   // ---------------------------------------------------------------------------
   function handleActivate(tool: Tool) {
-    if (!markupStore) return;
+    if (!markupStore || readOnlyView) return;
     // The panel records the real, named tool below, so the activeTool watcher must not add a
     // duplicate plain entry. Only mark a skip when activeTool actually changes: if it does not
     // (chest tool A -> chest tool B, same kind), no watcher run would consume the mark and it
@@ -195,9 +204,9 @@
         {#each toolChest.recent as tool (tool.id)}
           <button
             class="tc-tool-chip"
-            title="{tool.name} ({tool.placement_mode})"
+            title={toolTitle(tool)}
             onclick={() => handleActivate(tool)}
-            disabled={!markupStore}
+            disabled={!markupStore || readOnlyView}
           >
             <span class="tc-glyph">{glyph(tool.markup_type)}</span>
             <span class="tc-tool-name">{tool.name}</span>
@@ -250,9 +259,9 @@
                   <span class="tc-drag-handle" aria-hidden="true" title="Drag to reorder">⠿</span>
                   <button
                     class="tc-tool-btn"
-                    title="{tool.name} ({tool.placement_mode})"
+                    title={toolTitle(tool)}
                     onclick={() => handleActivate(tool)}
-                    disabled={!markupStore}
+                    disabled={!markupStore || readOnlyView}
                   >
                     <span class="tc-glyph">{glyph(tool.markup_type)}</span>
                     <span class="tc-tool-name">{tool.name}</span>

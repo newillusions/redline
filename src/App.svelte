@@ -182,7 +182,8 @@
     untrack(() => {
       store.pendingPlacementTool = null;
       store.stampPickerOpen = false;
-      store.setToolSilently("select");
+      // Keep the hand tool (it works in reading mode); disarm everything else.
+      if (store.activeTool !== "hand") store.setToolSilently("select");
     });
   });
 
@@ -1139,6 +1140,10 @@
     }
     // Page labels and links follow the page order, and the undo history was cleared.
     void tabStore.tabs.find((t) => t.docId === docId)?.navStore.refresh();
+    // The open viewport holds the old page sizes and cached tiles (a rotate swaps width and
+    // height without changing the page count). Remount it; the tab's viewportSnapshot restores
+    // the page, zoom and scroll.
+    reloadNonce += 1;
   }
 
   // ---------------------------------------------------------------------------
@@ -1980,7 +1985,7 @@
     <!-- Tool Chest (spec "Tools & Tool Sets") - Tool Sets are a workspace resource, not
          per-document, so it is usable with no document open. -->
     {#snippet toolChestBody()}
-      <ToolChestPanel toolChest={toolChestStore} markupStore={activeTab?.store ?? null} />
+      <ToolChestPanel toolChest={toolChestStore} markupStore={activeTab?.store ?? null} readOnlyView={viewerMode === "reading"} />
     {/snippet}
     <!-- Bookmarks and Links (docs/navigation.md "Document structure"). -->
     {#snippet bookmarksBody()}
@@ -2112,6 +2117,7 @@
               navStore={activeTab.navStore}
               onfollowlink={followTarget}
               onrequestpanel={revealPanel}
+              onpageop={handleThumbnailPageOp}
             />
           {/if}
         {/key}

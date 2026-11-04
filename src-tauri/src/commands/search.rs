@@ -212,7 +212,9 @@ fn find_snippet(
                 .map(|c| !is_word_char(c))
                 .unwrap_or(true);
             if !before_ok || !after_ok {
-                from = idx + 1;
+                // Advance by one char, not one byte: idx + 1 can land inside a
+                // multibyte char and panic on the next slice.
+                from = idx + h[idx..].chars().next().map_or(1, char::len_utf8);
                 if from >= h.len() {
                     return None;
                 }
@@ -305,6 +307,15 @@ mod tests {
         assert!(find_snippet("reinforced concrete works", "crete", false, true).is_none());
         assert!(find_snippet("reinforced concrete works", "crete", false, false).is_some());
         assert!(find_snippet("reinforced concrete works", "concrete", false, true).is_some());
+    }
+
+    #[test]
+    fn find_snippet_whole_word_retry_is_multibyte_safe() {
+        // Rejected match at a multibyte char must not slice mid-char on retry.
+        assert!(find_snippet("éé", "é", false, true).is_none());
+        assert!(find_snippet("日本語", "日", false, true).is_none());
+        assert!(find_snippet("éé é", "é", false, true).is_some());
+        assert!(find_snippet("日本 日", "日", false, true).is_some());
     }
 
     #[test]

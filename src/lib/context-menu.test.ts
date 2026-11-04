@@ -52,6 +52,12 @@ describe("canvasMenuItems", () => {
     expect(byId(m, "next-view")?.disabled).toBe(false);
     expect(byId(m, "fit-width")?.disabled).toBeFalsy();
   });
+
+  it("offers Rotate Page Clockwise / Counterclockwise", () => {
+    const m = canvasMenuItems({ canPaste: true, hasMarkups: true, canBack: true, canForward: true });
+    expect(byId(m, "rotate-page-cw")?.label).toBe("Rotate Page Clockwise");
+    expect(byId(m, "rotate-page-ccw")?.label).toBe("Rotate Page Counterclockwise");
+  });
 });
 
 describe("thumbnailMenuItems", () => {

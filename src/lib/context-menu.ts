@@ -82,6 +82,9 @@ export function canvasMenuItems(s: CanvasMenuState): MenuItem[] {
     SEP,
     item("prev-view", "Previous View", { shortcut: "Alt+Left", disabled: !s.canBack }),
     item("next-view", "Next View", { shortcut: "Alt+Right", disabled: !s.canForward }),
+    SEP,
+    item("rotate-page-cw", "Rotate Page Clockwise"),
+    item("rotate-page-ccw", "Rotate Page Counterclockwise"),
   ];
 }
 

@@ -18,6 +18,7 @@
   import {
     renderTile,
     getPageSize,
+    rotatePage,
     processRssMb,
     getUserIdentity,
     composeStampText,
@@ -134,6 +135,7 @@
     navStore = undefined,
     onfollowlink = undefined,
     onrequestpanel = undefined,
+    onpageop = undefined,
   }: {
     docInfo: DocumentInfo;
     store: MarkupStore;
@@ -185,6 +187,9 @@
     onfollowlink?: (target: NavTarget) => void;
     /** The right-click menu asks App.svelte to reveal a sidebar panel (Properties, Tool Chest). */
     onrequestpanel?: (panel: "properties" | "toolchest") => void;
+    /** Called after a page operation run from this viewport (rotate) has been applied to the
+     *  document, so the host can refresh page counts and remount the view. */
+    onpageop?: () => void;
   } = $props();
 
   // ---------------------------------------------------------------------------
@@ -1458,6 +1463,16 @@
     }
   }
 
+  async function rotateCurrentPage(degrees: number) {
+    try {
+      await rotatePage({ doc_id: docInfo.doc_id, page_idx: pageIndex, degrees });
+    } catch (e) {
+      console.error("rotatePage failed:", e);
+      return;
+    }
+    onpageop?.();
+  }
+
   function onContextSelect(id: string) {
     closeCtx();
     switch (id) {
@@ -1474,6 +1489,8 @@
       case "actual-size": actualSize(); return;
       case "prev-view": previousView(); return;
       case "next-view": nextView(); return;
+      case "rotate-page-cw": void rotateCurrentPage(90); return;
+      case "rotate-page-ccw": void rotateCurrentPage(-90); return;
     }
     const c = arrangeCtx();
     const r = runMarkupCommand(id, id === "paste" && ctxPdfPoint ? { ...c, cursor: ctxPdfPoint } : c);

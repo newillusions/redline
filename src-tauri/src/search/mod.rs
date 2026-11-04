@@ -56,7 +56,8 @@ pub struct FolderSearchHit {
     /// 1-based page number within `file_path`.
     pub page_number: u64,
     /// HTML snippet with matched terms wrapped in `<b>` tags.
-    /// Render with `{@html hit.snippet}` in Svelte.
+    /// Derived from untrusted document text: the frontend must run it through
+    /// `sanitizeSnippetHtml` before `{@html}`.
     pub snippet: String,
     /// Text extraction source: "lopdf", "ocr", or "pdfium".
     pub source: String,

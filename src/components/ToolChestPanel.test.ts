@@ -178,3 +178,36 @@ describe("MarkupStore.setToolSilently (Space-pan restore)", () => {
     expect(ms.skipRecentKind).toBeNull();
   });
 });
+
+describe("ToolChestPanel - reading mode", () => {
+  // Minimal stand-in: the panel only needs a truthy store to enable its buttons here.
+  const stubStore = { activeTool: "hand", selectedMarkups: [] } as unknown as import("$lib/markup-store.svelte").MarkupStore;
+
+  it("disables tool activation with the palette hint in reading mode", async () => {
+    const store = new ToolChestStore();
+    store.sets = [setWithTools()];
+    const { container } = render(ToolChestPanel, {
+      props: { toolChest: store, markupStore: stubStore, readOnlyView: true },
+    });
+    await tick();
+    const btns = container.querySelectorAll<HTMLButtonElement>(".tc-tool-btn");
+    expect(btns.length).toBe(3);
+    btns.forEach((b) => {
+      expect(b.disabled).toBe(true);
+      expect(b.title).toContain("Switch to page view to mark up");
+    });
+  });
+
+  it("keeps tool activation enabled outside reading mode", async () => {
+    const store = new ToolChestStore();
+    store.sets = [setWithTools()];
+    const { container } = render(ToolChestPanel, {
+      props: { toolChest: store, markupStore: stubStore, readOnlyView: false },
+    });
+    await tick();
+    container.querySelectorAll<HTMLButtonElement>(".tc-tool-btn").forEach((b) => {
+      expect(b.disabled).toBe(false);
+      expect(b.title).not.toContain("Switch to page view");
+    });
+  });
+});

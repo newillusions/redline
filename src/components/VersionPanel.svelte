@@ -228,7 +228,7 @@
 
   .version-panel__snapshot-btn {
     padding: var(--space-1, 4px) var(--space-2, 8px);
-    background: var(--color-primary);
+    background: var(--color-primary-strong);
     color: var(--color-text);
     border: none;
     border-radius: var(--radius-sm, 4px);
