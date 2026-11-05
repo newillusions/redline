@@ -2702,6 +2702,97 @@ mod tests {
         );
     }
 
+    // --- Ground truth from a REAL Acrobat-regenerated defect artifact ---------------------
+    //
+    // 2026-08-31: the owner opened a pre-fix redline PDF in Acrobat, moved the FreeText
+    // comment, and saved. The resulting file
+    // (`Sync/claude/redline markup tests/redline-crossviewer - moved in actobat.pdf`) was
+    // dumped with pikepdf and its FreeText annotation dict quoted verbatim in PR #88. The
+    // literal values below are copied from that dump (not re-derived), and are the same
+    // fixture values `document::annots::tests::fidelity_matrix`'s `full_appearance()`
+    // produces (color "#3366ff", fill "#ffeecc") - this artifact was generated from that
+    // exact test fixture, exported, and round-tripped through real Acrobat.
+    //
+    // Values as dumped: `/C [0.2 0.4 1.0]`, `/IC [1.0 0.93333334 0.8]`,
+    // `/DA "/Helv 14 Tf 0.200 0.400 1.000 rg"`, `/RLType /Text`, NO `/RLTextColor` (this
+    // predates the fix). Every other `/RL*` key (`/RLOutlineColor "#112233"`,
+    // `/RLFillOpacity 0.4`, `/RLOpacity 0.8`, ...) survived Acrobat's edit untouched -
+    // Acrobat only regenerated `/AP` and updated `/M`, it did not rewrite `/C` itself. That
+    // is the forensic proof of the root cause: `/C` in the artifact is bit-for-bit the
+    // pre-fix stroke colour (`0.2,0.4,1.0` == hex_to_rgb("#3366ff")), which is exactly what
+    // Acrobat then painted as the annotation's background - Acrobat did not invent a wrong
+    // colour, it correctly read `/C` as ISO 32000-1 §12.5.6.6 background and rendered
+    // precisely what was there.
+    #[test]
+    fn legacy_freetext_matches_real_acrobat_regenerated_artifact_ground_truth() {
+        let mut d = Dictionary::new();
+        d.set("Subtype", name("FreeText"));
+        d.set(
+            "Rect",
+            Object::Array(vec![
+                real(31.5963),
+                real(24.0208),
+                real(232.096),
+                real(123.646),
+            ]),
+        );
+        d.set("RLType", name("Text"));
+        d.set("RLPage", Object::Integer(0));
+        d.set(
+            "C",
+            Object::Array(vec![real(0.2), real(0.4), real(1.0)]), // pre-fix: stroke colour
+        );
+        d.set(
+            "IC",
+            Object::Array(vec![real(1.0), real(0.93333334), real(0.8)]), // real background
+        );
+        d.set(
+            "DA",
+            Object::string_literal("/Helv 14 Tf 0.200 0.400 1.000 rg"),
+        );
+        d.set("RLOutlineColor", Object::string_literal("#112233"));
+        d.set("RLFillOpacity", real(0.4));
+
+        // Redline's own read path must reconstruct the ORIGINAL truth exactly - the file
+        // still has `/RLType` and no `/RLTextColor`, so this hits the legacy-compat branch:
+        // /C read as glyph colour (matches what the user actually authored), /IC as
+        // background (Acrobat never touched it, so it is exact). This is precisely why
+        // redline's own renderer never showed the reported bug when REOPENING this exact
+        // artifact: it never read /C as a background in the first place.
+        let back = Markup::from_annotation_dict(&d);
+        assert_eq!(
+            back.appearance.color, "#3366ff",
+            "must recover the original glyph colour from /C on this legacy file"
+        );
+        assert_eq!(
+            back.appearance.fill.as_deref(),
+            Some("#ffeecc"),
+            "must recover the original background from /IC, untouched by Acrobat's edit"
+        );
+
+        // Self-heal: redline re-saving this exact artifact must now emit /RLTextColor and
+        // move /C to background semantics, so the NEXT Acrobat edit does not reproduce the
+        // defect this file is ground truth for.
+        let healed = back.to_annotation_dict();
+        assert_eq!(
+            get_string(&healed, b"RLTextColor").as_deref(),
+            Some("#3366ff"),
+            "self-heal must add /RLTextColor from this real artifact"
+        );
+        assert_eq!(
+            get_reals(&healed, b"C").map(|c| rgb_to_hex(&c)).as_deref(),
+            Some("#ffeecc"),
+            "self-heal must move /C to the real background - never the stroke colour that \
+             caused the artifact's defect"
+        );
+        assert_ne!(
+            get_reals(&healed, b"C").map(|c| rgb_to_hex(&c)),
+            Some("#3366ff".to_string()),
+            "the healed /C must NEVER again equal the stroke colour - that is the exact \
+             defect this artifact documents"
+        );
+    }
+
     #[test]
     fn markup_without_outline_or_fill_opacity_omits_keys_and_defaults_to_none() {
         // A plain markup with neither field set must not emit the private keys, and a
