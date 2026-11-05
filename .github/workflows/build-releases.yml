@@ -893,46 +893,9 @@ jobs:
           name: update-manifest
           path: update.json
 
-      - name: Push to Gitea via API
-        continue-on-error: true
-        run: |
-          echo "Attempting to push update.json to Gitea..."
-
-          RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITEA_TOKEN }}" \
-            "${{ env.GITEA_SERVER }}/api/v1/repos/${{ env.GITEA_OWNER }}/${{ env.GITEA_REPO }}/contents/update.json?ref=main")
-
-          SHA=$(echo "$RESPONSE" | jq -r '.sha // empty')
-
-          if [ -n "$SHA" ]; then
-            echo "Updating existing file (SHA: $SHA)"
-            PAYLOAD=$(jq -n \
-              --arg content "${{ steps.generate.outputs.content }}" \
-              --arg message "chore: Update manifest for v${{ steps.version.outputs.VERSION }}" \
-              --arg sha "$SHA" \
-              '{content: $content, message: $message, sha: $sha}')
-          else
-            echo "Creating new file"
-            PAYLOAD=$(jq -n \
-              --arg content "${{ steps.generate.outputs.content }}" \
-              --arg message "chore: Update manifest for v${{ steps.version.outputs.VERSION }}" \
-              '{content: $content, message: $message}')
-          fi
-
-          RESULT=$(curl -s -X PUT \
-            -H "Authorization: token ${{ secrets.GITEA_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            "${{ env.GITEA_SERVER }}/api/v1/repos/${{ env.GITEA_OWNER }}/${{ env.GITEA_REPO }}/contents/update.json" \
-            -d "$PAYLOAD")
-
-          echo "API Response: $RESULT"
-
-          if echo "$RESULT" | jq -e '.content.sha' > /dev/null 2>&1; then
-            echo "Successfully pushed update.json to Gitea"
-          else
-            echo "Failed to push to Gitea (may need manual update)"
-            echo "The update.json artifact is available for manual upload"
-          fi
-
+      # No Forgejo write: Forgejo main is branch-protected (PR-only). The updater
+      # endpoint is GitHub raw (tauri.conf.json plugins.updater.endpoints), so the
+      # GitHub commit below is the served copy; the artifact above is the fallback.
       # The updater endpoint reads update.json from THIS repo's main branch on
       # raw.githubusercontent.com - commit it back here so released clients see
       # new versions (e-fees relies on a manual sync for this step and its GitHub
