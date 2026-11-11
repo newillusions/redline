@@ -126,6 +126,12 @@ Register-Leg -Name "$TaskPrefix-acrobat" -ScriptName 'AcrobatLeg.ps1' `
 Register-Leg -Name "$TaskPrefix-acrobat-one" -ScriptName 'AcrobatLeg.ps1' `
     -ExtraArgs "-InputDir `"$StagingRoot\in-one`" -OutputDir `"$StagingRoot\out\acrobat-one`" -TargetDevice \\.\DISPLAY1 -LaunchViaCommandLine" -LogName 'acrobat-one.log'
 
+# PHASE 1 of the two-pass run (two-pass.mjs): IAC annotation counts only, no capture.
+# Protected Mode stays on; the render phase is the -acrobat-one task above, driven once per
+# file, with Acrobat closed and verified gone between every launch.
+Register-Leg -Name "$TaskPrefix-acrobat-counts" -ScriptName 'AcrobatLeg.ps1' `
+    -ExtraArgs "-InputDir `"$StagingRoot\in`" -OutputDir `"$StagingRoot\out\acrobat-counts`" -CountsOnly" -LogName 'acrobat-counts.log'
+
 Register-Leg -Name "$TaskPrefix-bluebeam" -ScriptName 'BluebeamLeg.ps1' `
     -ExtraArgs "-InputDir `"$StagingRoot\in`" -OutputDir `"$StagingRoot\out\bluebeam`"" -LogName 'bluebeam.log'
 
@@ -136,8 +142,9 @@ Register-Leg -Name "$TaskPrefix-bluebeam" -ScriptName 'BluebeamLeg.ps1' `
 Register-Leg -Name "$TaskPrefix-bluebeam-gui" -ScriptName 'BluebeamGuiLeg.ps1' `
     -ExtraArgs "-InputDir `"$StagingRoot\in`" -OutputDir `"$StagingRoot\out\bluebeam-gui`"" -LogName 'bluebeam-gui.log'
 
+# Closes ONLY the pids the orchestrator wrote to close-pids.json (the ones the legs launched).
 Register-Leg -Name "$TaskPrefix-cleanup" -ScriptName 'CloseAcrobat.ps1' `
-    -ExtraArgs '' -LogName 'cleanup.log'
+    -ExtraArgs "-PidFile `"$StagingRoot\state\close-pids.json`"" -LogName 'cleanup.log'
 
 # Diagnostic: reports the REAL monitor layout. Worth running on any new machine before the
 # first batch - display enumeration over SSH lies (Session 0 pseudo-display), so this is the

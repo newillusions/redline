@@ -30,7 +30,8 @@ harness targets those two specifically.
 | `win/Register-CrossviewerTask.ps1` | mr-desktop | Registers the Session-1 scheduled tasks (one-shot, idempotent) |
 | `win/AcrobatLeg.ps1` | mr-desktop | Drives Acrobat over COM/IAC: open, page count, annotation scan, PNG export |
 | `win/BluebeamLeg.ps1` | mr-desktop | Bluebeam leg - currently a licence probe, see below |
-| `win/CloseAcrobat.ps1` | mr-desktop | Recovery: close leftover documents and exit Acrobat, API-only |
+| `win/CloseAcrobat.ps1` | mr-desktop | Gracefully closes ONLY the Acrobat pids the legs launched (from `-PidFile`); no COM, never a kill, never touches another Acrobat. Used between the two passes |
+| `two-pass.mjs` | Mac | Two-pass Acrobat orchestration logic (unit-tested in `src/lib/crossviewer-two-pass.test.js`) |
 | `win/Capture.ps1` | mr-desktop | Shared window-capture + z-order helpers; `Save-WindowCapture -Method` (CopyFromScreen / PrintWindow / Wgc / Auto) |
 | `win/WgcCapture.ps1` | mr-desktop | Windows.Graphics.Capture method - EXPERIMENTAL, lazily loaded, not in the default chain (see Status below) |
 | `win/CaptureSelfTest.ps1` | mr-desktop | Proves a capture method against a known composited window before it is trusted on Acrobat |
@@ -48,6 +49,24 @@ backdrop, the synthetic blank backdrop, and redline-resaved round-trips of the t
 Bluebeam reference files. The two round-trips and the real backdrop require
 `bench/corpus/bb-ref/` (gitignored, machine-local); without it you get 26 and the emitters
 say so rather than failing silently.
+
+## Two-pass Acrobat run (default)
+
+IAC (annotation counts) and a command-line launch (renders) are mutually exclusive on
+mr-desktop, and Acrobat's Protected Mode stays ON, so the Acrobat leg runs as two separate
+Acrobat lifetimes: `AcrobatLeg.ps1 -CountsOnly` (task `-acrobat-counts`), Acrobat closed and
+verified gone (`tasklist /FI "IMAGENAME eq Acrobat.exe"`; only the pids the legs launched are ever closed), then `-LaunchViaCommandLine` once
+per file (task `-acrobat-one`) with the same close-and-verify after each file. Results merge
+into `out/acrobat/acrobat-results.json`. A failed phase is reported per file and in the report
+(`PARTIAL`), never swallowed. Command-line mode photographs only the open page, so a
+multi-page document is flagged "captured 1 of N". `--single-pass` restores the old combined run.
+
+**Owner-session safety:** if any `Acrobat.exe` is running before the run (the owner's session), the whole Acrobat leg is skipped and reported (`skipped: Acrobat already running (owner session)`); nothing is closed. `AcrobatLeg.ps1` also refuses to start with a pre-existing Acrobat process.
+
+**Do not use Acrobat on mr-desktop while the counts or render tasks run.** Acrobat is single-instance: a PDF the owner opens meanwhile lands in the harness's own Acrobat, and `App.Exit()` (counts pass) would close it. The legs report only the pids captured at launch (`launched_pids`), so an Acrobat the owner starts as its own process is never closed, but it can still collide with the run.
+
+**Live run: GUI automation on mr-desktop is serialised and owner-scheduled; do not run it ad hoc.**
+`node tools/crossviewer/run-crossviewer.mjs --skip-vision` after the orchestrator schedules it.
 
 ## Running it
 

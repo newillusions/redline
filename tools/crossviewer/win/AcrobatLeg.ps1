@@ -74,6 +74,13 @@ param(
     # is ever created, so there is nothing that could paint. This switch tests whether a
     # normal file-open (the path a human takes) produces the window IAC does not.
     [switch]$LaunchViaCommandLine,
+    # PHASE 1 of the two-pass run (run-crossviewer.mjs, two-pass.mjs): IAC only. Opens each
+    # file over AcroExch, records pages and per-page annotation counts, closes it, and does
+    # NOT place, photograph or capture anything. Acrobat's Protected Mode stays ON: IAC and a
+    # command-line launch are mutually exclusive on mr-desktop (AcroExch.App fails 0x80080005
+    # once Acrobat is started normally), so counts and renders cannot share one Acrobat
+    # process. Phase 2 is a separate -LaunchViaCommandLine run per file.
+    [switch]$CountsOnly,
     [string]$AcrobatExe = 'C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe'
 )
 
@@ -286,6 +293,7 @@ function Save-SettledCapture {
     return [pscustomobject]@{ path = $lastGood; method = $lastMethod; settled = $false; attempts = $attempts; error = "did not stabilise within ${TimeoutSec}s" }
 }
 
+if ($CountsOnly -and $LaunchViaCommandLine) { throw '-CountsOnly (IAC phase) and -LaunchViaCommandLine (render phase) are mutually exclusive - they are the two separate passes' }
 if (-not (Test-Path -LiteralPath $InputDir)) { throw "InputDir not found: $InputDir" }
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 
@@ -303,18 +311,59 @@ $results     = @()
 # Physical pixels, not scaled ones - must happen before any window rectangle is read.
 Enable-DpiAwareness
 
+# OWNER-SESSION GUARD (process level). This leg launches its own Acrobat; any Acrobat.exe that
+# exists BEFORE that launch is not ours (it is the owner's) and must neither be driven nor
+# closed. Refuse rather than share it. The pids captured AT LAUNCH (and still alive at the end)
+# are reported as launched_pids in the results JSON - the only pids the orchestrator will ever
+# ask CloseAcrobat.ps1 to close.
+$baselineAcrobatPids = @(Get-Process -Name 'Acrobat' -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+if ($baselineAcrobatPids.Count -gt 0) {
+    throw "Acrobat.exe already running (pid(s): $($baselineAcrobatPids -join ', ')) - not launched by this harness; refusing so the owner's session is not disturbed"
+}
+
+# Pids of the Acrobat THIS leg started, captured at launch (never "whatever is alive at the
+# end": an Acrobat the owner opens mid-run, or in the gap after App.Exit(), must never be
+# reported as ours - the orchestrator sends WM_CLOSE to every pid reported here).
+$launchedSnapshot = @()
+
+function Get-DescendantAcrobatPids {
+    <# The root pid plus every Acrobat.exe descended from it (Acrobat DC runs several
+       Acrobat.exe processes under one parent). Ancestry, not image name alone, so an
+       unrelated Acrobat is never included. #>
+    param([Parameter(Mandatory = $true)][int]$RootPid)
+    $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)
+    $found = New-Object System.Collections.Generic.HashSet[int]
+    [void]$found.Add($RootPid)
+    $grew = $true
+    while ($grew) {
+        $grew = $false
+        foreach ($p in $all) {
+            if ($found.Contains([int]$p.ParentProcessId) -and -not $found.Contains([int]$p.ProcessId)) {
+                [void]$found.Add([int]$p.ProcessId); $grew = $true
+            }
+        }
+    }
+    @($all | Where-Object { $found.Contains([int]$_.ProcessId) -and $_.Name -eq 'Acrobat.exe' } |
+        ForEach-Object { [int]$_.ProcessId })
+}
+
 try {
     if ($LaunchViaCommandLine) {
         if ($pdfs.Count -ne 1) { throw "-LaunchViaCommandLine handles exactly one file; got $($pdfs.Count)" }
         if (-not (Test-Path -LiteralPath $AcrobatExe)) { throw "Acrobat not found at $AcrobatExe" }
         Write-Log "launching Acrobat with $($pdfs[0].Name) on the command line"
-        Start-Process -FilePath $AcrobatExe -ArgumentList "`"$($pdfs[0].FullName)`"" | Out-Null
+        $launchProc = Start-Process -FilePath $AcrobatExe -ArgumentList "`"$($pdfs[0].FullName)`"" -PassThru
+        # Record exactly the pid we started, immediately.
+        $launchedSnapshot = @([int]$launchProc.Id)
         $lDeadline = (Get-Date).AddSeconds(40)
         while ((Get-Date) -lt $lDeadline) {
             $c = @(Get-AcrobatWindowCandidates | Where-Object { $_.class -eq 'AcrobatSDIWindow' })
             if ($c.Count -gt 0) { break }
             Start-Sleep -Milliseconds 500
         }
+        # Add Acrobat.exe processes DESCENDED from our launch (helpers of the same instance).
+        try { $launchedSnapshot = @($launchedSnapshot + (Get-DescendantAcrobatPids -RootPid ([int]$launchProc.Id)) | Sort-Object -Unique) }
+        catch { Write-Log "descendant scan: $($_.Exception.Message)" }
         Write-Log 'windows after command-line launch:'
         foreach ($c in @(Get-AcrobatWindowCandidates)) {
             Write-Log "  candidate hwnd=$($c.handle) pid=$($c.pid) $($c.width)x$($c.height) class=$($c.class) title='$($c.title)'"
@@ -332,6 +381,10 @@ try {
         catch { $app = $null; Write-Log "AcroExch.App unavailable after command-line launch: $($_.Exception.Message)" }
     } else {
         $app = New-Object -ComObject AcroExch.App
+        # Snapshot IMMEDIATELY after creation: the pre-launch baseline was empty (guard above),
+        # so every Acrobat.exe present now was started by this call. Pids first seen later are
+        # never ours.
+        $launchedSnapshot = @(Get-Process -Name 'Acrobat' -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.Id })
     }
 
     # IAC attaches to an ALREADY-RUNNING Acrobat rather than starting a private one, so a
@@ -438,6 +491,9 @@ try {
             $entry.annots_total = $total
             Write-Log "$($pdf.Name): pages=$($entry.pages) annots=$total"
 
+            if ($CountsOnly) {
+                Write-Log 'counts-only pass: no render attempted'
+            } else {
             # ---- render: place, fit, photograph -------------------------------------
             # Declared before the try: Set-StrictMode makes the finally below fail on an
             # unassigned variable if the try throws early.
@@ -640,6 +696,7 @@ try {
                     try { Set-WindowTopmost -WindowHandle $win.handle -On $false | Out-Null } catch { }
                 }
             }
+            }
         } catch {
             $entry.open_error = $_.Exception.Message
             Write-Log "FAILED $($pdf.Name): $($_.Exception.Message)"
@@ -669,7 +726,7 @@ try {
             Start-Sleep -Seconds 2
             $survivors = @($preExitPids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
             if ($survivors.Count -gt 0) {
-                Write-Log "App.Exit() did NOT terminate $($survivors.Count) process(es) (pid(s): $($survivors -join ', ')) - left running, never force-killed. Manual recovery: run CloseAcrobat.ps1 (API-only, safe) or, if that hangs too, verify no owner work is open before a manual Stop-Process."
+                Write-Log "App.Exit() did NOT terminate $($survivors.Count) process(es) (pid(s): $($survivors -join ', ')) - left running, never force-killed. Manual recovery: close it by hand or via CloseAcrobat.ps1 with a -PidFile naming only these pids; verify no owner work is open before any manual Stop-Process."
             } else {
                 Write-Log 'Acrobat exited (all tracked processes confirmed gone)'
             }
@@ -677,12 +734,19 @@ try {
     }
 }
 
+# launched_pids = the launch-time snapshot INTERSECTED with what is still alive. Never include
+# a pid first seen after launch.
+$launchedPids = @(Get-Process -Name 'Acrobat' -ErrorAction SilentlyContinue |
+    Where-Object { $launchedSnapshot -contains [int]$_.Id } | ForEach-Object { [string]$_.Id })
+
 $payload = [ordered]@{
     engine     = 'acrobat'
+    launched_pids = $launchedPids
     # The actual per-frame method (PrintWindow or the CopyFromScreen fallback) is recorded
     # per page in each result's render_detail[].capture_method - this field just names the
     # dispatch policy, since Auto can pick either method frame by frame.
-    render_via = 'window-capture (Method=Auto: PrintWindow first, CopyFromScreen fallback)'
+    render_via = if ($CountsOnly) { 'none (counts-only IAC pass)' } else { 'window-capture (Method=Auto: PrintWindow first, CopyFromScreen fallback)' }
+    pass       = if ($CountsOnly) { 'counts' } elseif ($LaunchViaCommandLine) { 'render' } else { 'combined' }
     version    = (Get-Item 'C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe' -ErrorAction SilentlyContinue).VersionInfo.ProductVersion
     machine    = $env:COMPUTERNAME
     started_at = (Get-Date).ToString('o')

@@ -21,15 +21,21 @@
 //
 // Usage:
 //   node tools/crossviewer/run-crossviewer.mjs [--skip-corpus] [--skip-remote] [--skip-vision]
-//                                              [--skip-crop] [--out <dir>] [--model qwen3.8:27b]
+//                                              [--skip-crop] [--single-pass] [--out <dir>] [--model qwen3.8:27b]
+//
+// The Acrobat leg runs TWO-PASS by default (IAC counts, Acrobat closed and verified gone,
+// then one command-line render run per file) because IAC and a command-line launch are
+// mutually exclusive on mr-desktop and Protected Mode stays on. --single-pass restores the
+// old combined run. See two-pass.mjs.
 
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, readFile, writeFile, readdir } from "node:fs/promises";
+import { mkdir, readFile, writeFile, readdir, rename } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { cropOrCopy } from "./crop-to-page.mjs";
 import { compareAllTypes } from "./compare-alltypes.mjs";
+import { runTwoPass, parseTasklistPids } from "./two-pass.mjs";
 
 const execFileP = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -138,6 +144,69 @@ async function runLeg(leg, timeoutMs) {
   }
 }
 
+
+// ---- Acrobat two-pass (see two-pass.mjs) -------------------------------------------------
+async function readRemoteJson(remotePath) {
+  const out = await ps(`Get-Content -Raw -LiteralPath '${remotePath}'`);
+  return JSON.parse(out.replace(/^\uFEFF/, "").trim());
+}
+
+function acrobatTwoPassSteps() {
+  return {
+    // Graceful close of EXACTLY these pids (the ones the legs launched) via the Session-1
+    // cleanup task: CloseMainWindow only, no COM, never a kill. The task reads the pid file.
+    closeAcrobat: async (pids) => {
+      const list = pids.map((p) => String(parseInt(p, 10))).filter((p) => /^\d+$/.test(p));
+      await ps(`
+        New-Item -ItemType Directory -Force -Path '${STAGING}\\state' | Out-Null
+        Set-Content -LiteralPath '${STAGING}\\state\\close-pids.json' -Value '[${list.join(",")}]'
+      `);
+      await runLeg("cleanup", 3 * 60_000);
+    },
+    // Independent verification by EXACT image name, from the SSH session (read-only).
+    listAcrobatProcesses: async () => {
+      const out = await ps(`tasklist /FI "IMAGENAME eq Acrobat.exe" /FO CSV /NH`, 30_000);
+      return parseTasklistPids(out);
+    },
+    countsPass: async () => {
+      if (!(await runLeg("acrobat-counts", 45 * 60_000))) throw new Error("acrobat-counts task timed out");
+      return readRemoteJson(`${STAGING}\\out\\acrobat-counts\\acrobat-results.json`);
+    },
+    renderPass: async (file) => {
+      const stem = file.replace(/\.pdf$/i, "");
+      await ps(`
+        New-Item -ItemType Directory -Force -Path '${STAGING}\\in-one' | Out-Null
+        Remove-Item '${STAGING}\\in-one\\*' -Force -EA SilentlyContinue
+        Remove-Item '${STAGING}\\out\\acrobat-one' -Force -Recurse -EA SilentlyContinue
+        Copy-Item -LiteralPath '${STAGING}\\in\\${file}' -Destination '${STAGING}\\in-one\\${file}'
+      `);
+      if (!(await runLeg("acrobat-one", 10 * 60_000))) throw new Error("acrobat-one task timed out");
+      await ps(`
+        New-Item -ItemType Directory -Force -Path '${STAGING}\\out\\acrobat-render\\${stem}' | Out-Null
+        Copy-Item -Path '${STAGING}\\out\\acrobat-one\\*' -Destination '${STAGING}\\out\\acrobat-render\\${stem}' -Recurse -Force
+      `);
+      return readRemoteJson(`${STAGING}\\out\\acrobat-render\\${stem}\\acrobat-results.json`);
+    },
+  };
+}
+
+// After collect(): MOVE (not copy) the per-file render PNGs into outDir/acrobat/, where
+// compare-alltypes looks, so cropRenders() and the vision review see each render once, and
+// write the merged acrobat-results.json in the shape report() already consumes.
+async function finalizeTwoPass(outDir, payload) {
+  const dest = path.join(outDir, "acrobat");
+  await mkdir(dest, { recursive: true });
+  const base = path.join(outDir, "acrobat-render");
+  let dirs = [];
+  try { dirs = await readdir(base, { withFileTypes: true }); } catch { /* nothing rendered */ }
+  for (const d of dirs.filter((x) => x.isDirectory())) {
+    for (const f of await readdir(path.join(base, d.name))) {
+      if (f.toLowerCase().endsWith(".png")) await rename(path.join(base, d.name, f), path.join(dest, f));
+    }
+  }
+  await writeFile(path.join(dest, "acrobat-results.json"), JSON.stringify(payload, null, 2));
+}
+
 // Register-CrossviewerTask.ps1 registers (and thereby enables) all 5 standard tasks and
 // never disables them again; runLeg() leaves whichever task it drove sitting enabled too
 // (its own polling loop only cares about State === "Ready", which an enabled-but-idle task
@@ -209,6 +278,11 @@ async function report(outDir, visionPath, allTypesVerdict) {
       }
     }
     if (data.reason) lines.push(`**Leg note:** ${data.reason}`, "");
+    if (data.pass === "two-pass") {
+      lines.push(`Two-pass run (IAC counts, Acrobat closed, command-line render per file; Protected Mode unchanged)${data.partial ? " - **PARTIAL**" : ""}`, "");
+      for (const e of data.errors || []) lines.push(`- ${e}`);
+      if ((data.errors || []).length) lines.push("");
+    }
     lines.push("| file | opened | pages | annots | renders | error |", "|---|---|---|---|---|---|");
     for (const r of data.results || []) {
       // The Acrobat leg reports `renders` (an array, one per page) and per-page annotation
@@ -260,6 +334,7 @@ async function main() {
   const model = arg("--model", "qwen3.8:27b");
 
   if (!has("--skip-corpus")) await generateCorpus();
+  let twoPass = null;
   if (!has("--skip-remote")) {
     try {
       await stage();
@@ -268,9 +343,16 @@ async function main() {
       // Legs run one at a time on purpose: both drive GUI windows on the same physical
       // display and screen-capture them, so overlapping them would photograph each other.
       await runLeg("bluebeam", 2 * 60_000);          // licence probe only, seconds
-      await runLeg("acrobat", 45 * 60_000);
+      if (has("--single-pass")) {
+        await runLeg("acrobat", 45 * 60_000);
+      } else {
+        const files = (await readdir(CORPUS_DIR)).filter((f) => f.endsWith(".pdf")).sort();
+        twoPass = await runTwoPass(files, acrobatTwoPassSteps(), (m) => console.log(`   ${m}`));
+        if (!twoPass.ok) console.error(`   acrobat two-pass PARTIAL: ${twoPass.errors.length} problem(s), see report`);
+      }
       await runLeg("bluebeam-gui", 60 * 60_000);
       await collect(outDir);
+      if (twoPass) await finalizeTwoPass(outDir, twoPass.payload);
     } finally {
       // Runs on success AND on any thrown error above - a task must never outlive this
       // script's own run, matching Invoke-CrossviewerTask.ps1's own enable/disable
@@ -300,6 +382,8 @@ async function main() {
   if (allTypesVerdict) console.log(`\nAllTypes lower-left cluster verdict: ${allTypesVerdict.verdict || allTypesVerdict.error}`);
 
   await report(outDir, visionPath, allTypesVerdict);
+  // A partial or skipped Acrobat two-pass must not read as success to a caller.
+  if (twoPass && !twoPass.ok) process.exitCode = 2;
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });
