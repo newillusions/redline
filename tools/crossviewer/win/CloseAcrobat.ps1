@@ -9,21 +9,25 @@
   this script; it closes those pids and nothing else.
 
   SAFETY (owner workstation):
-    - A pid not listed in -PidFile is never touched, whatever it is running.
-    - A listed pid whose process is not named Acrobat is never touched.
+    - A process not listed in -PidFile is never touched, whatever it is running.
+    - A listed entry is {pid, start}: the process must be named Acrobat AND its StartTime (UTC
+      ticks) must equal `start`. A reused pid number with a different start is never touched.
     - No COM, no AVDoc.Close($true): this script never discards changes in a document it
       did not open. It asks each listed Acrobat to close its main window
       (CloseMainWindow = clicking X) and waits; it never terminates a process.
     - Missing or empty -PidFile = nothing to close, exit 0.
   Exit 0 when every listed pid is gone, 3 when one survives. The caller verifies
-  independently (tasklist by exact image name) and must not trust this exit code alone.
+  independently (Get-Process by exact image name, with start times) and must not trust this exit code alone.
 
   Run in an interactive session (Session 1) - same constraint as AcrobatLeg.ps1.
 #>
 [CmdletBinding()]
 param(
     [string]$PidFile = (Join-Path $env:LOCALAPPDATA 'redline-crossviewer\close-pids.json'),
-    [int]$GracefulWaitSec = 25
+    [int]$GracefulWaitSec = 25,
+    # Image name to match. Always 'Acrobat'; a parameter only so the matching logic can be
+    # exercised against a harmless process in a test.
+    [string]$ImageName = 'Acrobat'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,17 +38,21 @@ if (-not (Test-Path -LiteralPath $PidFile)) {
 }
 $raw = (Get-Content -Raw -LiteralPath $PidFile).Trim()
 $targets = @()
-if ($raw) { $targets = @($raw | ConvertFrom-Json | ForEach-Object { [int]$_ }) }
+if ($raw) { $targets = @($raw | ConvertFrom-Json | ForEach-Object { [pscustomobject]@{ pid = [int]$_.pid; start = [string]$_.start } }) }
 if ($targets.Count -eq 0) {
     Write-Output 'pid file empty - nothing to close'
     exit 0
 }
 
-# Only pids that are listed AND currently an Acrobat process.
+# Only entries that are listed AND currently the SAME process (name + pid + start time).
 function Get-Targets {
     @($targets | ForEach-Object {
-        $p = Get-Process -Id $_ -ErrorAction SilentlyContinue
-        if ($null -ne $p -and $p.ProcessName -eq 'Acrobat') { $p }
+        $p = Get-Process -Id $_.pid -ErrorAction SilentlyContinue
+        if ($null -ne $p -and $p.ProcessName -eq $ImageName) {
+            $st = $null
+            try { $st = [string]$p.StartTime.ToUniversalTime().Ticks } catch { }
+            if ($st -eq $_.start) { $p }
+        }
     })
 }
 

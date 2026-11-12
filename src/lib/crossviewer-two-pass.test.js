@@ -1,45 +1,56 @@
 import { describe, it, expect } from "vitest";
-import { runTwoPass, closeAndVerify, parseTasklistPids } from "../../tools/crossviewer/two-pass.mjs";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import process from "node:process";
+import { runTwoPass, closeAndVerify, parseProcessList, procKey } from "../../tools/crossviewer/two-pass.mjs";
 
 const FAST = { settleMs: 0 };
+const P = (pid, start = "100") => ({ pid: String(pid), start: String(start) });
 
-// Fake Acrobat host. `running` is a Set of pids. A leg that launches Acrobat adds a pid
-// and reports it in launched_pids (as the real legs do). closeAcrobat(pids) removes ONLY
-// the pids it is given, so a test can prove nothing else was touched.
+// Fake Acrobat host. `running` maps pid -> start time. A leg that launches Acrobat adds a
+// process (fresh start time) and reports {pid,start} in launched_pids, as the real legs do.
+// closeAcrobat(procs) removes ONLY a process whose pid AND start both match, so a test can
+// prove nothing else was touched.
 function makeSteps(opts = {}) {
   const calls = [];
   const closeArgs = [];
-  const running = new Set(opts.startRunning || []);
+  const running = new Map((opts.startRunning || []).map((p) => [String(p.pid ?? p), String(p.start ?? "1")]));
   let nextPid = 1000;
-  const launch = () => { const p = String(nextPid++); running.add(p); return p; };
+  let clock = 5000;
+  const launch = () => { const pid = String(nextPid++); const start = String(clock++); running.set(pid, start); return { pid, start }; };
+  const alive = (procs) => procs.filter((q) => running.get(q.pid) === q.start);
   const steps = {
     calls,
     closeArgs,
     running,
+    launch,
     async listAcrobatProcesses() {
       calls.push("list");
       if (opts.listThrows) throw new Error("tasklist boom");
-      return [...running];
+      return [...running].map(([pid, start]) => ({ pid, start }));
     },
-    async closeAcrobat(pids) {
+    async closeAcrobat(procs) {
       calls.push("close");
-      closeArgs.push(pids);
+      closeArgs.push(procs);
       if (opts.closeThrows) throw new Error("close boom");
-      if (!opts.neverCloses) for (const p of pids) running.delete(p);
+      if (!opts.neverCloses) for (const q of procs) if (running.get(q.pid) === q.start) running.delete(q.pid);
     },
     // Models the real legs: launched_pids is the launch-time snapshot INTERSECTED with what is
-    // still alive at the end, never "whatever is alive". opts.ownerDuringLeg(running) lets a
-    // test start an owner Acrobat while the leg runs; opts.ownerAfterExit does so in the gap
-    // after the counts leg's App.Exit().
+    // still alive (same pid AND start) at the end, never "whatever is alive".
+    // opts.ownerDuringLeg(running) starts an owner Acrobat while the leg runs; opts.ownerAfterExit
+    // does so in the gap after the counts leg's App.Exit(); opts.reusePidAfterExit(running, snap)
+    // reuses the leg's pid number for a different process.
     async countsPass(files) {
       calls.push("counts");
       const snapshot = [launch()];
       if (opts.ownerDuringLeg) opts.ownerDuringLeg(running);
       if (opts.countsThrows) throw new Error("iac boom");
-      if (!opts.appExitFails) for (const p of snapshot) running.delete(p); // $app.Exit()
+      if (!opts.appExitFails) for (const q of snapshot) running.delete(q.pid); // $app.Exit()
       if (opts.ownerAfterExit) opts.ownerAfterExit(running);
+      if (opts.reusePidAfterExit) opts.reusePidAfterExit(running, snapshot);
       return {
-        launched_pids: snapshot.filter((p) => running.has(p)),
+        launched_pids: opts.reportStale ? snapshot : alive(snapshot),
         results: files.map((f) => ({
           file: f, opened: true, pages: 2, annots_total: 5,
           annots_by_page: [{ page: 0, annots: 3 }, { page: 1, annots: 2 }],
@@ -51,10 +62,14 @@ function makeSteps(opts = {}) {
       calls.push(`render:${file}`);
       if (running.size) throw new Error("render launched while an Acrobat was still running");
       const snapshot = [launch()];
+      if (opts.renderRootReused) { // our Acrobat exits; a later-started owner Acrobat gets the same pid
+        running.delete(snapshot[0].pid);
+        running.set(snapshot[0].pid, "88888");
+      }
       if (opts.renderThrows === file) throw new Error("capture boom");
       const pages = opts.renderPages ?? 2;
       return {
-        launched_pids: snapshot.filter((p) => running.has(p)),
+        launched_pids: alive(snapshot),
         results: [{ file, renders: Array.from({ length: pages }, (_, i) => `${file}-${i}.png`), render_detail: [], render_error: null }],
       };
     },
@@ -65,7 +80,7 @@ const strip = (c) => c.filter((x) => x !== "list");
 
 describe("owner-session safety", () => {
   it("pre-existing Acrobat: counts and render skipped AND close never called", async () => {
-    const s = makeSteps({ startRunning: ["4242"] });
+    const s = makeSteps({ startRunning: [P(4242)] });
     const r = await runTwoPass(["a.pdf", "b.pdf"], s, undefined, FAST);
     expect(s.calls).not.toContain("close");
     expect(s.calls).not.toContain("counts");
@@ -87,29 +102,27 @@ describe("owner-session safety", () => {
     expect(r.payload.results[0].open_error).toMatch(/cannot check for a running Acrobat/);
   });
 
-  it("close only targets harness-launched PIDs", async () => {
+  it("close only targets harness-launched PIDs (pid + start)", async () => {
     const s = makeSteps();
     const r = await runTwoPass(["a.pdf", "b.pdf"], s, undefined, FAST);
     expect(r.ok).toBe(true);
-    // every close was handed exactly the pid the previous leg launched
-    // counts leg exits its own Acrobat (nothing left to close); each render leg leaves one
-    expect(s.closeArgs).toEqual([["1001"], ["1002"]]);
+    // counts leg exits its own Acrobat (nothing to close); each render leg leaves one
+    expect(s.closeArgs).toEqual([[P(1001, 5001)], [P(1002, 5002)]]);
   });
 
   it("an owner Acrobat that appears DURING the leg is not reported as launched and is never closed", async () => {
-    const s = makeSteps({ appExitFails: true, ownerDuringLeg: (r) => r.add("7777") });
+    const s = makeSteps({ appExitFails: true, ownerDuringLeg: (r) => r.set("7777", "900") });
     const r = await runTwoPass(["a.pdf"], s, undefined, FAST);
-    expect(s.closeArgs.flat()).not.toContain("7777");
-    expect(s.closeArgs).toEqual([]); // refuse the whole close: a foreign pid is present
+    expect(s.closeArgs.flat().map((q) => q.pid)).not.toContain("7777");
+    expect(s.closeArgs).toEqual([]); // refuse the whole close: a foreign process is present
     expect(s.running.has("7777")).toBe(true);
     expect(s.calls.some((c) => c.startsWith("render:"))).toBe(false);
     expect(r.payload.results[0].render_error).toMatch(/7777 were not launched by the harness/);
   });
 
   it("post-Exit gap: an owner Acrobat started after App.Exit() is never reported or closed", async () => {
-    const s = makeSteps({ ownerAfterExit: (r) => r.add("8888") });
+    const s = makeSteps({ ownerAfterExit: (r) => r.set("8888", "901") });
     const r = await runTwoPass(["a.pdf"], s, undefined, FAST);
-    expect(s.closeArgs.flat()).not.toContain("8888");
     expect(s.closeArgs).toEqual([]);
     expect(s.running.has("8888")).toBe(true);
     expect(r.ok).toBe(false);
@@ -117,11 +130,50 @@ describe("owner-session safety", () => {
     expect(s.calls.some((c) => c.startsWith("render:"))).toBe(false);
   });
 
+  it("pid reuse: the same pid number with a different start time is not ours and is never closed", async () => {
+    // The counts leg's own Acrobat exits; the OS reuses its pid for an owner Acrobat (new start).
+    // A stale report (pid only matched) would send WM_CLOSE to the owner's window.
+    const s = makeSteps({
+      reportStale: true,
+      reusePidAfterExit: (r, snap) => r.set(snap[0].pid, "99999"),
+    });
+    const r = await runTwoPass(["a.pdf"], s, undefined, FAST);
+    expect(s.closeArgs).toEqual([]);
+    expect(s.running.get("1000")).toBe("99999"); // owner process still there
+    expect(r.payload.results[0].render_error).toMatch(/not launched by the harness/);
+    expect(s.calls.some((c) => c.startsWith("render:"))).toBe(false);
+  });
+
+  it("render root pid reused after launch by a later-started Acrobat: not reported, never closed", async () => {
+    const s = makeSteps({ renderRootReused: true });
+    const r = await runTwoPass(["a.pdf"], s, undefined, FAST);
+    expect(s.closeArgs).toEqual([]); // nothing was reported as ours, nothing closed
+    expect(s.running.get("1001")).toBe("88888"); // the owner's process is still there
+    expect(r.errors.some((x) => x.startsWith("a.pdf [close]") && /not launched by the harness/.test(x))).toBe(true);
+  });
+
   it("a failed leg that reported no pids never causes a close of what is running", async () => {
     const s = makeSteps({ countsThrows: true });
     const r = await runTwoPass(["a.pdf"], s, undefined, FAST);
     expect(s.closeArgs).toEqual([]);
     expect(r.payload.results[0].render_error).toMatch(/not launched by the harness/);
+  });
+
+  it("clears launched after each verified close: an earlier leg's identity is no longer closable", async () => {
+    const s = makeSteps();
+    const base = s.renderPass;
+    let first = null;
+    s.renderPass = async (f) => {
+      const r = await base(f);
+      if (!first) first = r.launched_pids[0];
+      else s.running.set(first.pid, first.start); // file b's leg: first leg's exact identity shows up again
+      return r;
+    };
+    const r = await runTwoPass(["a.pdf", "b.pdf"], s, undefined, FAST);
+    // had `launched` not been cleared after a's verified close, closing b would also have been
+    // handed a's identity; instead the whole close is refused.
+    expect(s.closeArgs).toHaveLength(1); // only a's own close; b's was refused
+    expect(r.errors.some((x) => x.startsWith("b.pdf [close]") && /not launched by the harness/.test(x))).toBe(true);
   });
 });
 
@@ -160,7 +212,7 @@ describe("two-pass orchestration", () => {
     expect(b.phases.counts.ok).toBe(true);
   });
 
-  it("reports a render failure, keeps the other phase's data, and stops rather than close a pid it was not told about", async () => {
+  it("reports a render failure, keeps the other phase's data, and stops rather than close a process it was not told about", async () => {
     const s = makeSteps({ renderThrows: "a.pdf" });
     const r = await runTwoPass(["a.pdf", "b.pdf"], s, undefined, FAST);
     const [a, b] = r.payload.results;
@@ -168,8 +220,6 @@ describe("two-pass orchestration", () => {
     expect(a.annots_total).toBe(5);
     expect(b.annots_total).toBe(5);
     expect(b.render_error).toMatch(/skipped: Acrobat not closed after a.pdf/);
-    // the failed leg's launched pid was not reported, so it is not ours to close: stop safely
-    // rather than kill it, and say so.
     expect(strip(s.calls)).toEqual(["counts", "render:a.pdf"]);
     expect(r.errors.some((x) => x.startsWith("a.pdf [render]"))).toBe(true);
   });
@@ -197,7 +247,7 @@ describe("closeAndVerify", () => {
     expect(r.error).toMatch(/cannot verify/);
   });
   it("includes the close error when the launched Acrobat survives", async () => {
-    const r = await closeAndVerify(makeSteps({ startRunning: ["5"], closeThrows: true }), ["5"], { settleMs: 0 });
+    const r = await closeAndVerify(makeSteps({ startRunning: [P(5, 7)], closeThrows: true }), [P(5, 7)], { settleMs: 0 });
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/close boom/);
   });
@@ -206,21 +256,96 @@ describe("closeAndVerify", () => {
     expect((await closeAndVerify(s, [], { settleMs: 0 })).ok).toBe(true);
     expect(s.closeArgs).toEqual([]);
   });
-  it("refuses when a running pid is not in the launched set", async () => {
-    const s = makeSteps({ startRunning: ["5", "6"] });
-    const r = await closeAndVerify(s, ["5"], { settleMs: 0 });
+  it("refuses when a running process is not in the launched set", async () => {
+    const s = makeSteps({ startRunning: [P(5, 7), P(6, 8)] });
+    const r = await closeAndVerify(s, [P(5, 7)], { settleMs: 0 });
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/6 were not launched by the harness/);
     expect(s.closeArgs).toEqual([]);
   });
+  it("refuses a same-pid, different-start process", async () => {
+    const s = makeSteps({ startRunning: [P(5, 8)] });
+    const r = await closeAndVerify(s, [P(5, 7)], { settleMs: 0 });
+    expect(r.ok).toBe(false);
+    expect(s.closeArgs).toEqual([]);
+  });
+  it("never treats an unknown start time as ours", async () => {
+    const s = makeSteps({ startRunning: [P(5, 7)] });
+    const r = await closeAndVerify(s, [{ pid: "5", start: null }], { settleMs: 0 });
+    expect(r.ok).toBe(false);
+    expect(s.closeArgs).toEqual([]);
+  });
 });
 
-describe("parseTasklistPids", () => {
-  it("matches only the exact image name", () => {
-    const out = '"Acrobat.exe","4120","Console","1","210,000 K"\r\n"AcroCEF.exe","4200","Console","1","1 K"\r\n';
-    expect(parseTasklistPids(out)).toEqual(["4120"]);
+describe("process identity helpers", () => {
+  it("procKey needs pid and start", () => {
+    expect(procKey(P(1, 2))).not.toBe(procKey(P(1, 3)));
+    expect(procKey({ pid: "1", start: null })).toBe("1@?");
   });
-  it("returns none for the no-tasks banner", () => {
-    expect(parseTasklistPids("INFO: No tasks are running which match the specified criteria.")).toEqual([]);
+  it("parseProcessList reads pid|ticks lines and keeps an unreadable start as null", () => {
+    const out = "4120|639299669307893140\r\n77|\r\njunk\r\n";
+    expect(parseProcessList(out)).toEqual([
+      { pid: "4120", start: "639299669307893140" },
+      { pid: "77", start: null },
+    ]);
+  });
+  it("parseProcessList returns none for empty output", () => {
+    expect(parseProcessList("")).toEqual([]);
+  });
+});
+
+// ---- the PowerShell matching logic, exercised for real when pwsh is available ----------------
+const WIN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../tools/crossviewer/win");
+const hasPwsh = spawnSync("pwsh", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.Major"]).status === 0;
+const pw = (script) => spawnSync("pwsh", ["-NoProfile", "-Command", script], { encoding: "utf8" });
+
+describe.skipIf(!hasPwsh)("PowerShell process matching (pwsh)", () => {
+  const load = `. '${path.join(WIN, "AcrobatProcs.ps1")}'; $t0 = [datetime]'2026-11-11T10:00:00Z';
+    function P($id,$par,$sec,$n='Acrobat.exe'){ [pscustomobject]@{ProcessId=$id;ParentProcessId=$par;CreationDate=$t0.AddSeconds($sec);Name=$n} };`;
+
+  it("reports descendants of the launch process and not the root", () => {
+    const r = pw(`${load} (Select-OwnedDescendants -Processes @((P 10 1 0),(P 11 10 1),(P 12 11 2),(P 99 1 5)) -RootPid 10 -RootStart $t0 -LiveStart $t0) -join ','`);
+    expect(r.stdout.trim()).toBe("11,12");
+  });
+
+  it("root pid reused by a later-started process: nothing is walked or reported", () => {
+    const r = pw(`${load} @(Select-OwnedDescendants -Processes @((P 10 1 600),(P 11 10 601)) -RootPid 10 -RootStart $t0 -LiveStart $t0.AddSeconds(600)).Count`);
+    expect(r.stdout.trim()).toBe("0");
+  });
+
+  it("a child that started before its parent (reused parent pid) is rejected, with its subtree", () => {
+    const r = pw(`${load} (Select-OwnedDescendants -Processes @((P 10 5 0),(P 11 10 4),(P 12 11 6)) -RootPid 10 -RootStart $t0.AddSeconds(5) -LiveStart $t0.AddSeconds(5)) -join ','`);
+    expect(r.stdout.trim()).toBe("");
+  });
+
+  it("walks through a non-Acrobat intermediate but reports only Acrobat.exe", () => {
+    const r = pw(`${load} (Select-OwnedDescendants -Processes @((P 10 1 0),(P 11 10 1 'helper.exe'),(P 12 11 2)) -RootPid 10 -RootStart $t0 -LiveStart $t0) -join ','`);
+    expect(r.stdout.trim()).toBe("12");
+  });
+
+  it("counts independent new Acrobat trees (one instance + helpers = 1, plus an owner's = 2)", () => {
+    expect(pw(`${load} Get-NewAcrobatRootCount -Processes @((P 10 1 0),(P 11 10 1))`).stdout.trim()).toBe("1");
+    expect(pw(`${load} Get-NewAcrobatRootCount -Processes @((P 10 1 0),(P 11 10 1),(P 50 2 1))`).stdout.trim()).toBe("2");
+  });
+
+  it("CloseAcrobat.ps1 matches on name + pid + start: wrong start is untouched, right start is a target", async () => {
+    const child = spawn("sleep", ["30"], { stdio: "ignore" });
+    try {
+      const ticks = pw(`(Get-Process -Id ${child.pid}).StartTime.ToUniversalTime().Ticks`).stdout.trim();
+      expect(ticks).toMatch(/^\d+$/);
+      const run = (start) => {
+        const f = path.join(process.env.TMPDIR || "/tmp", `cp-${child.pid}-${start.length}.json`);
+        spawnSync("pwsh", ["-NoProfile", "-Command", `Set-Content -LiteralPath '${f}' -Value '[{"pid":"${child.pid}","start":"${start}"}]'`]);
+        return spawnSync("pwsh", ["-NoProfile", "-File", path.join(WIN, "CloseAcrobat.ps1"), "-PidFile", f, "-ImageName", "sleep", "-GracefulWaitSec", "1"], { encoding: "utf8" });
+      };
+      const wrong = run("1");
+      expect(wrong.status).toBe(0); // not matched: nothing to close
+      const right = run(ticks);
+      expect(right.status).toBe(3); // matched (and, being `sleep`, did not close)
+      expect(right.stdout).toContain(String(child.pid));
+      expect(process.kill(child.pid, 0)).toBe(true); // never killed
+    } finally {
+      child.kill();
+    }
   });
 });

@@ -88,6 +88,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
 . (Join-Path $PSScriptRoot 'Displays.ps1')
+. (Join-Path $PSScriptRoot 'AcrobatProcs.ps1')
 . (Join-Path $PSScriptRoot 'Capture.ps1')
 
 <#
@@ -315,36 +316,60 @@ Enable-DpiAwareness
 # exists BEFORE that launch is not ours (it is the owner's) and must neither be driven nor
 # closed. Refuse rather than share it. The pids captured AT LAUNCH (and still alive at the end)
 # are reported as launched_pids in the results JSON - the only pids the orchestrator will ever
-# ask CloseAcrobat.ps1 to close.
+# ask CloseAcrobat.ps1 to close (pid AND start time).
 $baselineAcrobatPids = @(Get-Process -Name 'Acrobat' -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
 if ($baselineAcrobatPids.Count -gt 0) {
     throw "Acrobat.exe already running (pid(s): $($baselineAcrobatPids -join ', ')) - not launched by this harness; refusing so the owner's session is not disturbed"
 }
 
-# Pids of the Acrobat THIS leg started, captured at launch (never "whatever is alive at the
-# end": an Acrobat the owner opens mid-run, or in the gap after App.Exit(), must never be
-# reported as ours - the orchestrator sends WM_CLOSE to every pid reported here).
+# Processes of the Acrobat THIS leg started, as records {pid, start} (start = StartTime in UTC
+# ticks, as a string), captured at launch - never "whatever is alive at the end": an Acrobat
+# the owner opens mid-run, or in the gap after App.Exit(), must never be reported as ours,
+# and a reused pid number with a different start time is a different process. The
+# orchestrator sends WM_CLOSE to exactly the records reported here.
 $launchedSnapshot = @()
+$launchStamp = $null
+$launchProc = $null
+$launchRootRecord = $null
+$launchRootStart = $null
 
-function Get-DescendantAcrobatPids {
-    <# The root pid plus every Acrobat.exe descended from it (Acrobat DC runs several
-       Acrobat.exe processes under one parent). Ancestry, not image name alone, so an
-       unrelated Acrobat is never included. #>
-    param([Parameter(Mandatory = $true)][int]$RootPid)
-    $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)
-    $found = New-Object System.Collections.Generic.HashSet[int]
-    [void]$found.Add($RootPid)
-    $grew = $true
-    while ($grew) {
-        $grew = $false
-        foreach ($p in $all) {
-            if ($found.Contains([int]$p.ParentProcessId) -and -not $found.Contains([int]$p.ProcessId)) {
-                [void]$found.Add([int]$p.ProcessId); $grew = $true
-            }
+function Get-AcrobatRecord {
+    <# {pid,start} for a live Acrobat process that started at or after $launchStamp, else $null. #>
+    param([Parameter(Mandatory = $true)][int]$ProcId)
+    $p = Get-Process -Id $ProcId -ErrorAction SilentlyContinue
+    if ($null -eq $p -or $p.ProcessName -ne 'Acrobat') { return $null }
+    try { $st = $p.StartTime } catch { return $null }
+    if ($null -ne $launchStamp -and $st -lt $launchStamp) { return $null }   # predates our launch: not ours
+    [pscustomobject]@{ pid = [string]$p.Id; start = [string]$st.ToUniversalTime().Ticks }
+}
+
+function Add-LaunchedRecords {
+    param([int[]]$ProcIds)
+    foreach ($i in $ProcIds) {
+        $r = Get-AcrobatRecord -ProcId $i
+        if ($null -eq $r) { continue }
+        if (-not (@($script:launchedSnapshot) | Where-Object { $_.pid -eq $r.pid -and $_.start -eq $r.start })) {
+            $script:launchedSnapshot = @($script:launchedSnapshot) + $r
         }
     }
-    @($all | Where-Object { $found.Contains([int]$_.ProcessId) -and $_.Name -eq 'Acrobat.exe' } |
-        ForEach-Object { [int]$_.ProcessId })
+}
+
+function Invoke-OwnedDescendantScan {
+    <# Add Acrobat.exe processes descended from the launch process. Runs ONLY while the process
+       at the root pid is exactly the one we launched (same start time); otherwise the pid may
+       have been reused by an Acrobat that is not ours, so nothing is minted. The root itself is
+       never re-minted here - its record was captured at launch. #>
+    if ($null -eq $script:launchRootRecord) { Write-Log 'descendant scan skipped: no launch record'; return }
+    $live = Get-Process -Id ([int]$script:launchRootRecord.pid) -ErrorAction SilentlyContinue
+    if ($null -eq $live -or $live.ProcessName -ne 'Acrobat') { Write-Log 'descendant scan skipped: launch process has exited'; return }
+    try { $liveStart = $live.StartTime } catch { Write-Log 'descendant scan skipped: launch process start time unreadable'; return }
+    if ([string]$liveStart.ToUniversalTime().Ticks -ne $script:launchRootRecord.start) {
+        Write-Log 'descendant scan skipped: the launch pid now belongs to a different process (pid reused)'
+        return
+    }
+    $ids = Select-OwnedDescendants -Processes @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue) `
+        -RootPid ([int]$script:launchRootRecord.pid) -RootStart $script:launchRootStart -LiveStart $liveStart
+    Add-LaunchedRecords -ProcIds @($ids)
 }
 
 try {
@@ -352,9 +377,14 @@ try {
         if ($pdfs.Count -ne 1) { throw "-LaunchViaCommandLine handles exactly one file; got $($pdfs.Count)" }
         if (-not (Test-Path -LiteralPath $AcrobatExe)) { throw "Acrobat not found at $AcrobatExe" }
         Write-Log "launching Acrobat with $($pdfs[0].Name) on the command line"
+        # Timestamp BEFORE the launch: any Acrobat that started earlier is not ours.
+        $launchStamp = Get-Date
         $launchProc = Start-Process -FilePath $AcrobatExe -ArgumentList "`"$($pdfs[0].FullName)`"" -PassThru
-        # Record exactly the pid we started, immediately.
-        $launchedSnapshot = @([int]$launchProc.Id)
+        # Record exactly the process we started (pid + start time), immediately, and keep that
+        # record: later scans run only while this pid still has this exact start time.
+        Add-LaunchedRecords -ProcIds @([int]$launchProc.Id)
+        $launchRootRecord = Get-AcrobatRecord -ProcId ([int]$launchProc.Id)
+        if ($null -ne $launchRootRecord) { $launchRootStart = (Get-Process -Id ([int]$launchProc.Id) -ErrorAction SilentlyContinue).StartTime }
         $lDeadline = (Get-Date).AddSeconds(40)
         while ((Get-Date) -lt $lDeadline) {
             $c = @(Get-AcrobatWindowCandidates | Where-Object { $_.class -eq 'AcrobatSDIWindow' })
@@ -362,8 +392,7 @@ try {
             Start-Sleep -Milliseconds 500
         }
         # Add Acrobat.exe processes DESCENDED from our launch (helpers of the same instance).
-        try { $launchedSnapshot = @($launchedSnapshot + (Get-DescendantAcrobatPids -RootPid ([int]$launchProc.Id)) | Sort-Object -Unique) }
-        catch { Write-Log "descendant scan: $($_.Exception.Message)" }
+        try { Invoke-OwnedDescendantScan } catch { Write-Log "descendant scan: $($_.Exception.Message)" }
         Write-Log 'windows after command-line launch:'
         foreach ($c in @(Get-AcrobatWindowCandidates)) {
             Write-Log "  candidate hwnd=$($c.handle) pid=$($c.pid) $($c.width)x$($c.height) class=$($c.class) title='$($c.title)'"
@@ -380,11 +409,24 @@ try {
         try { $app = New-Object -ComObject AcroExch.App }
         catch { $app = $null; Write-Log "AcroExch.App unavailable after command-line launch: $($_.Exception.Message)" }
     } else {
+        # Timestamp BEFORE the attach/launch: an Acrobat the owner started earlier (the race
+        # between the baseline check and here) predates it and is excluded below.
+        $launchStamp = Get-Date
         $app = New-Object -ComObject AcroExch.App
-        # Snapshot IMMEDIATELY after creation: the pre-launch baseline was empty (guard above),
-        # so every Acrobat.exe present now was started by this call. Pids first seen later are
-        # never ours.
-        $launchedSnapshot = @(Get-Process -Name 'Acrobat' -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.Id })
+        # Snapshot IMMEDIATELY after creation. Pids first seen later are never ours. New Acrobat
+        # processes (started at or after the stamp) must form ONE process tree (one instance
+        # plus its helpers); two independent trees means an Acrobat that is not ours appeared
+        # in the same window, and we refuse rather than guess which is which.
+        $newIds = @(Get-Process -Name 'Acrobat' -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.Id } |
+            Where-Object { $null -ne (Get-AcrobatRecord -ProcId $_) })
+        $newProcs = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | Where-Object { $newIds -contains [int]$_.ProcessId })
+        if ((Get-NewAcrobatRootCount -Processes $newProcs) -gt 1) {
+            # Do NOT Exit(): the COM server may be shared with an Acrobat that is not ours.
+            try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($app) } catch { }
+            $app = $null
+            throw "more than one independent new Acrobat process tree appeared at launch (pid(s): $($newIds -join ', ')) - cannot tell which is ours; refusing without closing anything"
+        }
+        Add-LaunchedRecords -ProcIds $newIds
     }
 
     # IAC attaches to an ALREADY-RUNNING Acrobat rather than starting a private one, so a
@@ -734,10 +776,18 @@ try {
     }
 }
 
-# launched_pids = the launch-time snapshot INTERSECTED with what is still alive. Never include
-# a pid first seen after launch.
-$launchedPids = @(Get-Process -Name 'Acrobat' -ErrorAction SilentlyContinue |
-    Where-Object { $launchedSnapshot -contains [int]$_.Id } | ForEach-Object { [string]$_.Id })
+# Render leg: re-scan descendants of the launch process NOW so helper processes started later
+# are included (walking down from the launch pid only; anything older than $launchStamp is dropped).
+if ($LaunchViaCommandLine) {
+    try { Invoke-OwnedDescendantScan } catch { Write-Log "final descendant scan: $($_.Exception.Message)" }
+}
+
+# launched_pids = the snapshot records still alive with the SAME start time (a reused pid with a
+# different start is a different process). Never include a process first seen after launch.
+$launchedPids = @(@($launchedSnapshot) | ForEach-Object {
+    $live = Get-AcrobatRecord -ProcId ([int]$_.pid)
+    if ($null -ne $live -and $live.start -eq $_.start) { [ordered]@{ pid = $_.pid; start = $_.start } }
+})
 
 $payload = [ordered]@{
     engine     = 'acrobat'

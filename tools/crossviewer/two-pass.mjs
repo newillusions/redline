@@ -23,23 +23,30 @@
 //     never touched: the close is refused and the run stops and reports it.
 //
 // steps = {
-//   listAcrobatProcesses():   Promise<string[]>   pids of Acrobat.exe running (exact image name)
-//   closeAcrobat(pids):       Promise<void>       gracefully close EXACTLY these pids (never a kill)
-//   countsPass(files):        Promise<{results: Entry[], launched_pids?: string[]}>   phase 1; may throw
-//   renderPass(file):         Promise<{results: Entry[], launched_pids?: string[]}>   phase 2, one file; may throw
+//   listAcrobatProcesses():   Promise<Proc[]>     Acrobat.exe running (exact image name)
+//   closeAcrobat(procs):      Promise<void>       gracefully close EXACTLY these processes (never a kill)
+//   countsPass(files):        Promise<{results: Entry[], launched_pids?: Proc[]}>   phase 1; may throw
+//   renderPass(file):         Promise<{results: Entry[], launched_pids?: Proc[]}>   phase 2, one file; may throw
+// Proc = { pid: string, start: string }  start = StartTime in UTC ticks, as a STRING (ticks
+// exceed 2^53). A process is identified by BOTH: a reused pid with a different start is a
+// different process and is never ours.
 // }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Identity of a process: pid AND start time. An unknown start never matches anything. */
+export const procKey = (p) => `${String(p.pid)}@${p.start == null ? "?" : String(p.start)}`;
+const fmt = (ps) => ps.map((p) => `${p.pid}`).join(", ");
+
 /**
  * Close the Acrobat the harness launched and prove it is gone. `launched` is the set of pids
- * the legs reported launching; nothing outside it is ever passed to closeAcrobat(). The
+ * the legs reported launching (pid + start time); nothing outside it is ever passed to closeAcrobat(). The
  * verification is an independent process listing, retried because Acrobat takes a moment to
  * exit. A running Acrobat.exe that is not in `launched` is someone else's: refuse, do not
  * touch it. Returns { ok, remaining } and never throws.
  */
 export async function closeAndVerify(steps, launched = [], { attempts = 3, settleMs = 2000 } = {}) {
-  const mine = new Set(launched.map(String));
+  const mine = new Set(launched.filter((p) => p.start != null).map(procKey));
   let remaining = [];
   let closeError = null;
   for (let i = 0; i < attempts; i++) {
@@ -50,16 +57,16 @@ export async function closeAndVerify(steps, launched = [], { attempts = 3, settl
       return { ok: false, remaining: [], error: `cannot verify Acrobat is closed: ${e.message}` };
     }
     if (remaining.length === 0) return { ok: true, remaining: [] };
-    const foreign = remaining.filter((p) => !mine.has(String(p)));
+    const foreign = remaining.filter((p) => !mine.has(procKey(p)));
     if (foreign.length > 0) {
       return {
         ok: false,
         remaining,
-        error: `Acrobat.exe pid(s) ${foreign.join(", ")} were not launched by the harness (owner session?) - not touching them`,
+        error: `Acrobat.exe pid(s) ${fmt(foreign)} were not launched by the harness (owner session?, or a reused pid) - not touching them`,
       };
     }
     try {
-      await steps.closeAcrobat(remaining.map(String));
+      await steps.closeAcrobat(remaining);
       closeError = null;
     } catch (e) {
       closeError = e.message;
@@ -75,7 +82,7 @@ export async function closeAndVerify(steps, launched = [], { attempts = 3, settl
   return {
     ok: false,
     remaining,
-    error: `Acrobat.exe still running after close (pid(s): ${remaining.join(", ")})${closeError ? `; close step said: ${closeError}` : ""}`,
+    error: `Acrobat.exe still running after close (pid(s): ${fmt(remaining)})${closeError ? `; close step said: ${closeError}` : ""}`,
   };
 }
 
@@ -135,8 +142,8 @@ export async function runTwoPass(files, steps, log = () => {}, { settleMs = 2000
     failAll("render", msg);
     return finish(entries, errors, files, true);
   }
-  const launched = new Set();
-  const note = (r) => { for (const p of (r && r.launched_pids) || []) launched.add(String(p)); };
+  const launched = new Map();
+  const note = (r) => { for (const p of (r && r.launched_pids) || []) if (p && p.start != null) launched.set(procKey(p), p); };
 
   // ---- phase 1: IAC counts -------------------------------------------------------------
   log("phase 1: IAC counts");
@@ -163,7 +170,8 @@ export async function runTwoPass(files, steps, log = () => {}, { settleMs = 2000
   }
 
   // ---- close fully and verify, whether or not phase 1 succeeded -------------------------
-  const mid = await closeAndVerify(steps, [...launched], { settleMs });
+  const mid = await closeAndVerify(steps, [...launched.values()], { settleMs });
+  if (mid.ok) launched.clear(); // verified gone: those processes are not ours to close again
   if (!mid.ok) {
     // Phase 2 launching into a live IAC Acrobat (or alongside someone else's) is exactly the
     // failure this design avoids.
@@ -203,7 +211,8 @@ export async function runTwoPass(files, steps, log = () => {}, { settleMs = 2000
     }
     // Close and verify after EVERY file, including a failed one: the next launch must not
     // attach to this one's process.
-    const v = await closeAndVerify(steps, [...launched], { settleMs });
+    const v = await closeAndVerify(steps, [...launched.values()], { settleMs });
+    if (v.ok) launched.clear();
     if (!v.ok) {
       for (const g of files.slice(i + 1)) fail(g, "render", `skipped: Acrobat not closed after ${f}: ${v.error}`);
       errors.push(`${f} [close]: ${v.error}`);
@@ -233,12 +242,17 @@ function finish(entries, errors, files, skipped = false) {
   };
 }
 
-/** Parse `tasklist /FI "IMAGENAME eq Acrobat.exe" /FO CSV /NH` output into pids. */
-export function parseTasklistPids(out, image = "Acrobat.exe") {
-  const pids = [];
+/**
+ * Parse the output of
+ *   Get-Process -Name Acrobat | % { "$($_.Id)|$($_.StartTime.ToUniversalTime().Ticks)" }
+ * into Procs. A line whose start time could not be read ("pid|") yields start: null, which
+ * matches nothing (treated as not ours).
+ */
+export function parseProcessList(out) {
+  const procs = [];
   for (const line of String(out).split(/\r?\n/)) {
-    const m = line.match(/^"([^"]+)","(\d+)"/);
-    if (m && m[1].toLowerCase() === image.toLowerCase()) pids.push(m[2]);
+    const m = line.trim().match(/^(\d+)\|(\d*)$/);
+    if (m) procs.push({ pid: m[1], start: m[2] === "" ? null : m[2] });
   }
-  return pids;
+  return procs;
 }

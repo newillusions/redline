@@ -35,7 +35,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { cropOrCopy } from "./crop-to-page.mjs";
 import { compareAllTypes } from "./compare-alltypes.mjs";
-import { runTwoPass, parseTasklistPids } from "./two-pass.mjs";
+import { runTwoPass, parseProcessList } from "./two-pass.mjs";
 
 const execFileP = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -98,7 +98,7 @@ async function stage() {
     Remove-Item '${STAGING}\\in\\*' -Force -EA SilentlyContinue
     Remove-Item '${STAGING}\\out\\*' -Force -Recurse -EA SilentlyContinue
   `);
-  for (const f of ["Displays.ps1", "Capture.ps1", "ProbeDisplays.ps1", "AcrobatLeg.ps1", "BluebeamLeg.ps1", "BluebeamGuiLeg.ps1", "CloseAcrobat.ps1", "Register-CrossviewerTask.ps1"]) {
+  for (const f of ["Displays.ps1", "Capture.ps1", "ProbeDisplays.ps1", "AcrobatLeg.ps1", "AcrobatProcs.ps1", "BluebeamLeg.ps1", "BluebeamGuiLeg.ps1", "CloseAcrobat.ps1", "Register-CrossviewerTask.ps1"]) {
     await run("scp", [...SSH, path.join(HERE, "win", f), `${HOST}:${STAGING_POSIX}/scripts/${f}`]);
   }
   const pdfs = (await readdir(CORPUS_DIR)).filter((f) => f.endsWith(".pdf"));
@@ -153,20 +153,26 @@ async function readRemoteJson(remotePath) {
 
 function acrobatTwoPassSteps() {
   return {
-    // Graceful close of EXACTLY these pids (the ones the legs launched) via the Session-1
-    // cleanup task: CloseMainWindow only, no COM, never a kill. The task reads the pid file.
-    closeAcrobat: async (pids) => {
-      const list = pids.map((p) => String(parseInt(p, 10))).filter((p) => /^\d+$/.test(p));
+    // Graceful close of EXACTLY these processes (pid AND start time, as the legs reported
+    // them) via the Session-1 cleanup task: CloseMainWindow only, no COM, never a kill.
+    closeAcrobat: async (procs) => {
+      const list = procs
+        .filter((p) => /^\d+$/.test(String(p.pid)) && /^\d+$/.test(String(p.start)))
+        .map((p) => `{"pid":"${p.pid}","start":"${p.start}"}`);
       await ps(`
         New-Item -ItemType Directory -Force -Path '${STAGING}\\state' | Out-Null
         Set-Content -LiteralPath '${STAGING}\\state\\close-pids.json' -Value '[${list.join(",")}]'
       `);
       await runLeg("cleanup", 3 * 60_000);
     },
-    // Independent verification by EXACT image name, from the SSH session (read-only).
+    // Independent verification by EXACT image name (Get-Process -Name Acrobat), with each
+    // process's start time so a reused pid is told apart. Read-only.
     listAcrobatProcesses: async () => {
-      const out = await ps(`tasklist /FI "IMAGENAME eq Acrobat.exe" /FO CSV /NH`, 30_000);
-      return parseTasklistPids(out);
+      const out = await ps(
+        `Get-Process -Name Acrobat -ErrorAction SilentlyContinue | ForEach-Object { $t = ''; try { $t = $_.StartTime.ToUniversalTime().Ticks } catch { } ; "$($_.Id)|$t" }`,
+        30_000,
+      );
+      return parseProcessList(out);
     },
     countsPass: async () => {
       if (!(await runLeg("acrobat-counts", 45 * 60_000))) throw new Error("acrobat-counts task timed out");
