@@ -17,6 +17,8 @@ Svelte/TypeScript client), re-expressed in Rust where noted, and extended.
 
   src/lib/snap.ts                  <- packages/measure/src/snap.ts
   src-tauri/src/geometry/mod.rs    <- packages/measure/src/snap.ts
+  src/lib/path-array.ts            <- packages/markup/src/cad.ts (divisionPoints, pathArray, pointAlong)
+  src/components/AlongPathDialog.svelte <- packages/markup/src/cad.ts (Divide / Measure / Path Array)
 
 redcolumn is an independent project and is not affiliated with Bluebeam, Inc.
 or Nemetschek SE. Bluebeam and Revu are trademarks of Bluebeam, Inc.

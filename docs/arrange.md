@@ -81,6 +81,20 @@ Sources (raw HTML, `curl`, 2026-10-12):
 - **Keys:** Viewport handles Ctrl/Cmd+C (markups when there is no text selection), X, V, Shift+V, D. They do nothing while a text field has focus.
 - **Backend:** `reorder_markups` (Tauri command) -> `MarkupStore::reorder`.
 
+## 6. Along path: Divide, Measure, Path Array (as of 2026-11-13)
+
+Owner request 2026-11-13 ("port all" redcolumn features). Approach adapted from redcolumn (Apache-2.0), `packages/markup/src/cad.ts` (`divisionPoints`, `pathArray`, `pointAlong`); see `NOTICE`. Not a Bluebeam behaviour, so no V/I rows: these are redline's choices.
+
+- **Selection model:** the FIRST selected markup is the path; the rest are the items (same convention as Align's primary). The originals stay put; copies are new markups made like Multiply's (spec C12), the whole set is one undo step, and the copies are selected afterwards.
+- **Paths:** line, arrow, polyline (open); polygon, cloud, measurement outlines (closed); rectangle (4 corners, closed); ellipse (traced as 96 segments, closed); freehand stroke (single stroke only). Redline has no arc markup, so arcs are drawn as freehand strokes or as polylines.
+- **Divide into N parts:** open path gets N-1 marks between its ends; closed path gets N marks starting at its first point.
+- **Measure every X:** marks every X from the start; an open path skips its start, a closed path marks its first point. X is in pt or the page scale's unit.
+- **Path array, N copies:** N marks from the start to the end inclusive (open) or round the loop without repeating the start (closed).
+- **Placement:** the items' bounding-box centre lands on each mark. **Align** turns the copies by the path direction at each mark relative to the start; only items whose geometry can turn (polyline-based, freehand, counts) are allowed, boxes/text/callouts refuse with a message (redline markups have no rotation property).
+- **Counts:** a count item's copies join its count (as Multiply, M8), so N symbols along a run is one count of N+1.
+- **Limits:** at most 10,000 new markups (marks x items), refused before generating. Copies are not clipped to the page.
+- **Where:** `src/lib/path-array.ts` (pure), `placeAlongPath` in `src/lib/arrange-actions.ts`, `src/components/AlongPathDialog.svelte`, "Along path..." on the Arrange bar.
+
 ## 5. Follow-ups (named, not built)
 
 - OS-clipboard interchange (paste markups into a second redline window).
@@ -88,3 +102,4 @@ Sources (raw HTML, `curl`, 2026-10-12):
 - Format Painter (listed beside copy/paste in the gap matrix).
 - Right-click context menu and Edit menu entries.
 - Convert to / Duplicate as another markup type, Offset (Bluebeam Max).
+- Along path: place on a path while drawing, an arc markup type, spacing by item width, clipping to the page.

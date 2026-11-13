@@ -16,6 +16,7 @@ import {
   type AlignMode, type DistributeAxis, type MultiplySpec, type OrderOp,
 } from "./markup-arrange";
 import { countGroups } from "./count-groups";
+import { canTurn, pathOfMarkup, planAlong, rotateGeometry, type AlongSpec } from "./path-array";
 import { bumpAudit } from "./markup-tools";
 import { effectiveScale } from "./polylength";
 
@@ -201,10 +202,10 @@ export function multiplySelection(c: ArrangeCtx, spec: MultiplySpec): ActionResu
   // the source must carry it too (as Resume does): otherwise the frontend sees one count of N+1
   // while the Rust totals, exports and Markups List see 1 + N (review round 1, F1). A locked
   // source cannot take the stamp, so the whole Multiply is refused.
-  const stamps = sel.filter((m) => m.markup_type === "MeasurementCount" && !m.count_group);
-  if (stamps.some(isLocked)) return refuse("A selected count is locked, so its count cannot be extended. Unlock it first.");
   const now = clock(c);
-  const updates = stamps.map((m) => ({ before: m, after: bumpAudit({ ...m, count_group: m.id }, c.identity!, now) }));
+  const stamped = stampCounts(c, sel, now);
+  if ("error" in stamped) return refuse(stamped.error);
+  const { updates } = stamped;
   const sizes = new Map(countGroups(c.store.markups).map((g) => [g.key, g.ids.length]));
   const countGroupOf = joinCounts(sizes, mint(c));
   const creates: Markup[] = [];
@@ -218,6 +219,72 @@ export function multiplySelection(c: ArrangeCtx, spec: MultiplySpec): ActionResu
   select(c.store, creates);
   const clipped = r.clipped > 0 ? `; ${r.clipped} more would not fit on the page` : "";
   return done(`Made ${noun(creates.length)}${clipped}`);
+}
+
+/**
+ * Stamp every ungrouped count in `items` with its own id as `count_group`, so copies that join
+ * its count and the source are one count (see the Multiply comment). A locked one refuses.
+ */
+function stampCounts(
+  c: ArrangeCtx,
+  items: readonly Markup[],
+  now: string,
+): { updates: { before: Markup; after: Markup }[] } | { error: string } {
+  const stamps = items.filter((m) => m.markup_type === "MeasurementCount" && !m.count_group);
+  if (stamps.some(isLocked)) return { error: "A selected count is locked, so its count cannot be extended. Unlock it first." };
+  return { updates: stamps.map((m) => ({ before: m, after: bumpAudit({ ...m, count_group: m.id }, c.identity!, now) })) };
+}
+
+// --- along a path (divide / measure / path array) --------------------------------------
+
+/**
+ * Place copies of the selected items along the FIRST selected markup, which is the path (a
+ * line, arrow, polyline, polygon, rectangle, ellipse or freehand stroke; docs/arrange.md
+ * section 6). The items are the rest of the selection, on the same page; the originals stay
+ * put. Each copy is positioned so the items' bounding-box centre sits on a mark. `align` turns
+ * the copies to follow the path's direction (refused when an item cannot turn). One undo step;
+ * count items join the source's count, so a row of luminaire symbols is one count.
+ */
+export function placeAlongPath(c: ArrangeCtx, spec: AlongSpec, align: boolean): ActionResult {
+  if (!c.identity) return refuse("The user identity is not loaded yet.");
+  const ordered = selectionInOrder(c.store);
+  if (ordered.length < 2) return refuse("Select the path first, then the items to place along it.");
+  const [pathMarkup, ...rest] = ordered;
+  const path = pathOfMarkup(pathMarkup);
+  if (!path) return refuse("The first selected markup is the path and must be a line, polyline, polygon, rectangle, ellipse or freehand stroke.");
+  const items = inDocumentOrder(c.store, rest).filter(isUsableMarkup);
+  if (items.length === 0) return refuse("Select the items to place along the path.");
+  const page = pathMarkup.page;
+  if (items.some((m) => m.page !== page)) return refuse("The path and its items must be on one page.");
+  if (align && !items.every(canTurn)) {
+    return refuse("Align turns the items, which boxes, text and callouts cannot do. Untick Align, or use lines, arrows, polylines or counts.");
+  }
+  const plan = planAlong(path, spec, Math.floor(MAX_COPY_ITEMS / items.length));
+  if (plan.error) return refuse(plan.error);
+  if (plan.marks.length === 0) return refuse("No marks fall on that path.");
+  const box = unionBounds(items)!;
+  const ref = { x: (box.minX + box.maxX) / 2, y: (box.minY + box.maxY) / 2 };
+  const now = clock(c);
+  const stamped = stampCounts(c, items, now);
+  if ("error" in stamped) return refuse(stamped.error);
+  const sizes = new Map(countGroups(c.store.markups).map((g) => [g.key, g.ids.length]));
+  const countGroupOf = joinCounts(sizes, mint(c));
+  const creates: Markup[] = [];
+  for (const mark of plan.marks) {
+    const copies = copySet(items, {
+      identity: c.identity, now, mintId: mint(c), page,
+      dx: mark.point.x - ref.x, dy: mark.point.y - ref.y, countGroupOf,
+    });
+    const theta = align ? mark.angle - plan.startAngle : 0;
+    for (const m of copies) {
+      const turned = theta === 0 ? null : rotateGeometry(m.geometry, mark.point, theta);
+      creates.push(turned ? { ...m, geometry: turned } : m);
+    }
+  }
+  c.store.adoptCountSets(countSetsOf(creates));
+  c.store.applyEdits({ updates: stamped.updates, creates }); // stamps and copies: ONE undo step
+  select(c.store, creates);
+  return done(`Placed ${noun(creates.length)} at ${plan.marks.length} mark${plan.marks.length === 1 ? "" : "s"} along the path`);
 }
 
 /** The scale that applies to the viewed page, for the Multiply dialog's unit list. */

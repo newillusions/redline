@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * ArrangeBar - copy / cut / paste, Duplicate, Multiply, Align, Distribute and Order for the
+   * ArrangeBar - copy / cut / paste, Duplicate, Multiply, Along path, Align, Distribute and Order for the
    * selected markups (docs/arrange.md). Shown over the page while the Select tool is active.
    * Every button calls a command in `$lib/arrange-actions` and shows its one-line result; the
    * keyboard shortcuts in Viewport call the same commands.
@@ -10,10 +10,11 @@
   import { markupClipboard } from "$lib/markup-clipboard.svelte";
   import {
     alignSelection, copySelection, cutSelection, distributeSelection, duplicateSelection, multiplySelection,
-    orderSelection, pageScale, pasteClipboard, pasteToPages, type ActionResult, type ArrangeCtx,
+    orderSelection, placeAlongPath, pageScale, pasteClipboard, pasteToPages, type ActionResult, type ArrangeCtx,
   } from "$lib/arrange-actions";
   import type { AlignMode, OrderOp } from "$lib/markup-arrange";
   import MultiplyDialog from "./MultiplyDialog.svelte";
+  import AlongPathDialog from "./AlongPathDialog.svelte";
   import PasteToPagesDialog from "./PasteToPagesDialog.svelte";
 
   const {
@@ -28,7 +29,7 @@
     notice?: string | null;
   } = $props();
 
-  let dialog = $state<"multiply" | "pages" | null>(null);
+  let dialog = $state<"multiply" | "pages" | "along" | null>(null);
   let local = $state<string | null>(null);
   let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -69,6 +70,7 @@
     <button class="btn" disabled={!canPaste} title="Paste in place onto chosen pages" onclick={() => (dialog = "pages")}>Paste to pages...</button>
     <button class="btn" disabled={selected < 1} title="Duplicate (Ctrl/Cmd+D)" onclick={() => run(duplicateSelection)}>Duplicate</button>
     <button class="btn" disabled={selected < 1} title="Repeat the selection in a row, column or grid" onclick={() => (dialog = "multiply")}>Multiply...</button>
+    <button class="btn" disabled={selected < 2} title="Divide, measure or array the other selected markups along the first selected line, outline or shape" onclick={() => (dialog = "along")}>Along path...</button>
   </div>
   <div class="group" role="group" aria-label="Align">
     <span class="label">Align</span>
@@ -96,6 +98,18 @@
     onCancel={() => (dialog = null)}
     onSubmit={(spec) => {
       const r = multiplySelection(getCtx(), spec);
+      if (!r.ok) return r.message;
+      say(r);
+      dialog = null;
+      return null;
+    }}
+  />
+{:else if dialog === "along"}
+  <AlongPathDialog
+    scale={pageScale(getCtx())}
+    onCancel={() => (dialog = null)}
+    onSubmit={(spec, align) => {
+      const r = placeAlongPath(getCtx(), spec, align);
       if (!r.ok) return r.message;
       say(r);
       dialog = null;
