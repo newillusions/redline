@@ -1,3 +1,4 @@
+// Adapted from redcolumn (Apache-2.0), packages/measure/src/snap.ts, modified
 //! Geometry module — vector path extraction + spatial snap-target index (spec §4, §5).
 //!
 //! # Precision-critical invariant (spec §5)
@@ -22,26 +23,28 @@
 //! can never work as a standalone function in this module for that reason — it
 //! needs an open `PdfPage` handle, which only the render thread may hold.
 //!
-//! # v1 scope (build_snap_index)
-//! Populates [`SnapKind::Endpoint`] (every distinct vertex) and [`SnapKind::Midpoint`]
-//! (every segment midpoint, including a sub-path's closing segment). Deliberately
-//! does NOT populate `Intersection` or `ArcCenter`:
-//! - `Intersection`: naive pairwise segment-intersection is O(n²) in the segment
-//!   count. redline's own stated target use case (spec: "very large construction
-//!   plan sets") routinely produces pages with thousands of path segments (see the
-//!   §20 C4 "dense A0" bench corpus) — an unaccelerated O(n²) pass risks becoming a
-//!   real interaction-latency regression exactly on the documents this app cares
-//!   most about. Doing it properly needs a spatial-accelerated sweep (e.g. bucket
-//!   candidate segments via the same rstar index before testing pairs), which is a
-//!   scoped v2 effort, not a bounded add-on to this pass.
-//! - `ArcCenter`: PDFium reports circles/arcs as a sequence of `BezierTo` segments
-//!   (see `PdfPagePathObject::circle_to`/`ellipse_to` in pdfium-render — four Bézier
-//!   curves approximating the shape), not as a first-class circle primitive. Finding
-//!   an arc's center therefore needs curve-fitting heuristics over consecutive
-//!   Bézier segments, which is unbuilt. `Subpath` only carries segment *destination*
-//!   points (Bézier control points aren't exposed by pdfium-render's segment API —
-//!   see `PdfPageObjectPrivate::try_copy_impl`'s `BezierControlPointsNotCopyable`
-//!   guard), so there isn't yet enough data flowing through this module to derive it.
+//! # Snap kinds populated by `build_snap_index`
+//! - [`SnapKind::Endpoint`] (every distinct vertex) and [`SnapKind::Midpoint`] (every
+//!   segment midpoint, including a sub-path's closing segment).
+//! - [`SnapKind::Intersection`]: proper crossings between straight segments (interior to
+//!   both; segments that merely meet at an end already snap as endpoints). Candidate pairs
+//!   come from an rstar tree of segment bounding boxes rather than a naive O(n^2) pass, and
+//!   the pass is capped (`MAX_PAIR_TESTS`, `MAX_INTERSECTIONS`) so a pathological page
+//!   degrades to fewer intersection snaps instead of an interaction-latency regression.
+//! - [`SnapKind::ArcCenter`] and [`SnapKind::Quadrant`]: PDFium reports circles/arcs as
+//!   `BezierTo` segments, and pdfium-render exposes only each segment's destination point
+//!   (no Bezier control points). A run of at least three consecutive curve segments whose
+//!   destination points all lie on one circle (tolerance `max(0.25pt, 2% of r)`) is treated
+//!   as an arc: its centre snaps as `ArcCenter`, and the compass points the arc reaches
+//!   snap as `Quadrant`. A single quarter-arc (a rounded corner) has too few points to
+//!   fit and is deliberately ignored.
+//!
+//! `Perpendicular` and nearest-on-segment depend on the cursor and the point being drawn
+//! from, so they are computed client-side (`src/lib/snap.ts`) from the straight segments
+//! this index also exposes (`PageGeometry::segments`).
+//!
+//! Intersection/arc fitting is adapted in approach from redcolumn
+//! (`packages/measure/src/snap.ts`, Apache-2.0); see NOTICE.
 
 use rstar::{PointDistance, RTree, RTreeObject, AABB};
 use serde::{Deserialize, Serialize};
@@ -146,6 +149,8 @@ pub enum SnapKind {
     Intersection,
     /// Centre of a circular arc or circle.
     ArcCenter,
+    /// Compass point (top/bottom/left/right) of a circle or the part of an arc that reaches it.
+    Quadrant,
 }
 
 /// A single snap target: a point + its kind.
@@ -184,6 +189,9 @@ pub struct PageGeometry {
     pub page_index: u32,
     /// r-tree of snap targets, queryable by proximity.
     pub snap_index: RTree<SnapTarget>,
+    /// Straight segments `[x1, y1, x2, y2]` (PDF user space) for client-side
+    /// perpendicular / nearest-on-segment snapping. Curve pieces are excluded.
+    pub segments: Vec<[f64; 4]>,
 }
 
 impl PageGeometry {
@@ -211,19 +219,153 @@ impl PageGeometry {
 pub struct Subpath {
     pub points: Vec<PdfPoint>,
     pub closed: bool,
+    /// Parallel to `points` when non-empty: `curve[i]` is true when point `i` was reached by
+    /// a `BezierTo` (so segment `i-1 -> i` is a curve piece). Empty means all straight.
+    pub curve: Vec<bool>,
+}
+
+impl Subpath {
+    fn is_curve(&self, i: usize) -> bool {
+        self.curve.get(i).copied().unwrap_or(false)
+    }
+}
+
+/// One segment of a flattened sub-path: a straight line, or a cubic Bezier with its two
+/// control points (the on-curve end points live in [`Flat::pts`]).
+#[derive(Debug, Clone, Copy)]
+enum Seg {
+    Line,
+    Cubic(PdfPoint, PdfPoint),
+}
+
+/// A sub-path reduced to on-curve points only. PDFium reports each cubic Bezier as three
+/// consecutive `BezierTo` points (control 1, control 2, end), so control points are folded
+/// into [`Seg::Cubic`] instead of being treated as vertices. `segs.len() == pts.len() - 1`.
+struct Flat {
+    pts: Vec<PdfPoint>,
+    segs: Vec<Seg>,
+}
+
+fn flatten(sub: &Subpath) -> Flat {
+    let p = &sub.points;
+    let mut pts = vec![p[0]];
+    let mut segs = Vec::new();
+    let mut i = 1;
+    while i < p.len() {
+        if sub.is_curve(i) && i + 2 < p.len() && sub.is_curve(i + 1) && sub.is_curve(i + 2) {
+            segs.push(Seg::Cubic(p[i], p[i + 1]));
+            pts.push(p[i + 2]);
+            i += 3;
+        } else {
+            // A straight segment, or a malformed curve run (fewer than three points):
+            // keep the destination point as a vertex rather than dropping it.
+            segs.push(Seg::Line);
+            pts.push(p[i]);
+            i += 1;
+        }
+    }
+    Flat { pts, segs }
+}
+
+/// Point at parameter `t` on the cubic `a, c1, c2, b`.
+fn cubic_at(a: PdfPoint, c1: PdfPoint, c2: PdfPoint, b: PdfPoint, t: f64) -> PdfPoint {
+    let u = 1.0 - t;
+    let (w0, w1, w2, w3) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+    PdfPoint {
+        x: w0 * a.x + w1 * c1.x + w2 * c2.x + w3 * b.x,
+        y: w0 * a.y + w1 * c1.y + w2 * c2.y + w3 * b.y,
+    }
+}
+
+/// Midpoint of segment `i` of `flat` (t = 0.5 for a cubic).
+fn seg_midpoint(flat: &Flat, i: usize) -> PdfPoint {
+    let (a, b) = (flat.pts[i], flat.pts[i + 1]);
+    match flat.segs[i] {
+        Seg::Line => PdfPoint {
+            x: (a.x + b.x) / 2.0,
+            y: (a.y + b.y) / 2.0,
+        },
+        Seg::Cubic(c1, c2) => cubic_at(a, c1, c2, b, 0.5),
+    }
+}
+
+/// Axis-aligned region (PDF user space) outside which snap geometry is dropped or clipped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SnapBounds {
+    pub min_x: f64,
+    pub min_y: f64,
+    pub max_x: f64,
+    pub max_y: f64,
+}
+
+impl SnapBounds {
+    fn contains(&self, p: PdfPoint) -> bool {
+        p.x >= self.min_x && p.x <= self.max_x && p.y >= self.min_y && p.y <= self.max_y
+    }
+}
+
+/// Coordinates beyond this magnitude are treated as corrupt, whatever the page box says.
+const MAX_SANE_COORD: f64 = 1.0e9;
+
+fn sane(p: &PdfPoint) -> bool {
+    p.x.is_finite() && p.y.is_finite() && p.x.abs() < MAX_SANE_COORD && p.y.abs() < MAX_SANE_COORD
+}
+
+/// Liang-Barsky: `seg` clipped to `b`, or `None` when no part lies inside.
+fn clip_segment(seg: [f64; 4], b: &SnapBounds) -> Option<[f64; 4]> {
+    let (x0, y0, dx, dy) = (seg[0], seg[1], seg[2] - seg[0], seg[3] - seg[1]);
+    let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+    for (p, q) in [
+        (-dx, x0 - b.min_x),
+        (dx, b.max_x - x0),
+        (-dy, y0 - b.min_y),
+        (dy, b.max_y - y0),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None;
+            }
+        } else {
+            let r = q / p;
+            if p < 0.0 {
+                t0 = t0.max(r);
+            } else {
+                t1 = t1.min(r);
+            }
+            if t0 > t1 {
+                return None;
+            }
+        }
+    }
+    Some([x0 + t0 * dx, y0 + t0 * dy, x0 + t1 * dx, y0 + t1 * dy])
 }
 
 /// Build a page's snap-target spatial index from its extracted vector sub-paths
-/// (spec §5, M2/v1). See the module doc comment for exactly which `SnapKind`s this
-/// populates and why `Intersection`/`ArcCenter` are deferred.
+/// (spec §5), with no page bounds. See [`build_snap_index_bounded`].
 pub fn build_snap_index(page_index: u32, subpaths: &[Subpath]) -> PageGeometry {
+    build_snap_index_bounded(page_index, subpaths, None)
+}
+
+/// Build a page's snap-target spatial index. See the module doc comment for which
+/// `SnapKind`s this populates. Hostile or broken content is contained here, before it reaches
+/// the r-trees or the client: a sub-path with a non-finite or absurdly large coordinate is
+/// skipped whole, and with `bounds` set, targets outside it are dropped and segments are
+/// clipped to it (so a segment with coordinates around 1e8 cannot make the client rasterise
+/// millions of grid cells).
+pub fn build_snap_index_bounded(
+    page_index: u32,
+    subpaths: &[Subpath],
+    bounds: Option<SnapBounds>,
+) -> PageGeometry {
     let mut targets = Vec::new();
+    let mut segments: Vec<[f64; 4]> = Vec::new();
 
     for sub in subpaths {
-        let pts = &sub.points;
-        if pts.is_empty() {
+        if sub.points.is_empty() || !sub.points.iter().all(sane) {
             continue;
         }
+        let flat = flatten(sub);
+        let pts = &flat.pts;
 
         for p in pts {
             targets.push(SnapTarget {
@@ -232,8 +374,14 @@ pub fn build_snap_index(page_index: u32, subpaths: &[Subpath]) -> PageGeometry {
             });
         }
 
-        for w in pts.windows(2) {
-            targets.push(midpoint_target(w[0], w[1]));
+        for (i, seg) in flat.segs.iter().enumerate() {
+            targets.push(SnapTarget {
+                point: seg_midpoint(&flat, i),
+                kind: SnapKind::Midpoint,
+            });
+            if matches!(seg, Seg::Line) {
+                segments.push([pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y]);
+            }
         }
 
         // Closing segment (last point back to first), only when PDFium marked the
@@ -243,12 +391,210 @@ pub fn build_snap_index(page_index: u32, subpaths: &[Subpath]) -> PageGeometry {
         let last = *pts.last().unwrap();
         if sub.closed && pts.len() > 1 && first != last {
             targets.push(midpoint_target(last, first));
+            segments.push([last.x, last.y, first.x, first.y]);
         }
+
+        fit_arcs(&flat, &mut targets);
     }
+
+    if let Some(b) = bounds {
+        targets.retain(|t| b.contains(t.point));
+        segments = segments
+            .into_iter()
+            .filter_map(|s| clip_segment(s, &b))
+            .collect();
+    }
+    add_intersections(&segments, &mut targets);
 
     PageGeometry {
         page_index,
         snap_index: RTree::bulk_load(targets),
+        segments,
+    }
+}
+
+/// Cap on candidate segment pairs tested per page.
+const MAX_PAIR_TESTS: usize = 4_000_000;
+/// Cap on intersection targets emitted per page.
+const MAX_INTERSECTIONS: usize = 200_000;
+
+/// Segment with its bounding box, for the candidate-pair r-tree.
+struct SegEnv {
+    idx: usize,
+    s: [f64; 4],
+}
+
+impl RTreeObject for SegEnv {
+    type Envelope = AABB<[f64; 2]>;
+    fn envelope(&self) -> Self::Envelope {
+        AABB::from_corners([self.s[0], self.s[1]], [self.s[2], self.s[3]])
+    }
+}
+
+/// Proper intersection of two segments: `Some` only when the crossing lies strictly
+/// inside both (segments meeting at an end are endpoints, not intersections).
+fn proper_intersection(a: &[f64; 4], b: &[f64; 4]) -> Option<PdfPoint> {
+    let (rx, ry) = (a[2] - a[0], a[3] - a[1]);
+    let (qx, qy) = (b[2] - b[0], b[3] - b[1]);
+    let den = rx * qy - ry * qx;
+    let scale = (rx.hypot(ry) * qx.hypot(qy)).max(1e-9);
+    if den.abs() < 1e-9 * scale {
+        return None; // parallel or degenerate
+    }
+    let t = ((b[0] - a[0]) * qy - (b[1] - a[1]) * qx) / den;
+    let u = ((b[0] - a[0]) * ry - (b[1] - a[1]) * rx) / den;
+    let eps = 1e-6;
+    if t > eps && t < 1.0 - eps && u > eps && u < 1.0 - eps {
+        Some(PdfPoint {
+            x: a[0] + t * rx,
+            y: a[1] + t * ry,
+        })
+    } else {
+        None
+    }
+}
+
+fn add_intersections(segments: &[[f64; 4]], targets: &mut Vec<SnapTarget>) {
+    if segments.len() < 2 {
+        return;
+    }
+    let tree = RTree::bulk_load(
+        segments
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| SegEnv { idx, s: *s })
+            .collect::<Vec<_>>(),
+    );
+    let mut tests = 0usize;
+    let mut found = 0usize;
+    for (i, s) in segments.iter().enumerate() {
+        let env = AABB::from_corners([s[0], s[1]], [s[2], s[3]]);
+        for other in tree.locate_in_envelope_intersecting(&env) {
+            if other.idx <= i {
+                continue;
+            }
+            tests += 1;
+            if tests > MAX_PAIR_TESTS {
+                return;
+            }
+            if let Some(point) = proper_intersection(s, &other.s) {
+                targets.push(SnapTarget {
+                    point,
+                    kind: SnapKind::Intersection,
+                });
+                found += 1;
+                if found >= MAX_INTERSECTIONS {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Circle through three points, or `None` when they are (nearly) collinear.
+fn circle_through(a: PdfPoint, b: PdfPoint, c: PdfPoint) -> Option<(f64, f64, f64)> {
+    let d = 2.0 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
+    if d.abs() < 1e-9 {
+        return None;
+    }
+    let (a2, b2, c2) = (
+        a.x * a.x + a.y * a.y,
+        b.x * b.x + b.y * b.y,
+        c.x * c.x + c.y * c.y,
+    );
+    let cx = (a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d;
+    let cy = (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d;
+    let r = (a.x - cx).hypot(a.y - cy);
+    (r.is_finite() && r > 0.0 && r < 1.0e6).then_some((cx, cy, r))
+}
+
+/// Minimum consecutive cubic segments to attempt a circle fit. One cubic (a rounded
+/// corner) is too little evidence; two (a semicircle) are verified against their
+/// midpoints as well as their end points.
+const MIN_ARC_CUBICS: usize = 2;
+
+/// Fit circles to runs of consecutive cubic segments and emit `ArcCenter` + `Quadrant`.
+fn fit_arcs(flat: &Flat, targets: &mut Vec<SnapTarget>) {
+    let n = flat.segs.len();
+    let mut i = 0;
+    while i < n {
+        if !matches!(flat.segs[i], Seg::Cubic(..)) {
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while end + 1 < n && matches!(flat.segs[end + 1], Seg::Cubic(..)) {
+            end += 1;
+        }
+        if end - i + 1 >= MIN_ARC_CUBICS {
+            fit_run(flat, i, end, targets);
+        }
+        i = end + 1;
+    }
+}
+
+/// `first..=last` are consecutive cubic segment indices of `flat`.
+fn fit_run(flat: &Flat, first: usize, last: usize, targets: &mut Vec<SnapTarget>) {
+    // On-curve evidence: every end point of the run plus each cubic's t = 0.5 point.
+    let pts = &flat.pts[first..=last + 1];
+    let mut evidence: Vec<PdfPoint> = pts.to_vec();
+    for k in first..=last {
+        evidence.push(seg_midpoint(flat, k));
+    }
+    let n = pts.len();
+    let Some((cx, cy, r)) = circle_through(pts[0], pts[n / 3], pts[(2 * n) / 3]) else {
+        return;
+    };
+    let tol = (r * 0.02).max(0.25);
+    if !evidence
+        .iter()
+        .all(|p| ((p.x - cx).hypot(p.y - cy) - r).abs() <= tol)
+    {
+        return;
+    }
+    targets.push(SnapTarget {
+        point: PdfPoint { x: cx, y: cy },
+        kind: SnapKind::ArcCenter,
+    });
+
+    // Angular span covered: sum of signed steps between consecutive end points.
+    let ang = |p: &PdfPoint| (p.y - cy).atan2(p.x - cx);
+    let tau = std::f64::consts::TAU;
+    let norm = |mut d: f64| {
+        while d > std::f64::consts::PI {
+            d -= tau;
+        }
+        while d <= -std::f64::consts::PI {
+            d += tau;
+        }
+        d
+    };
+    let a0 = ang(&pts[0]);
+    let mut total = 0.0;
+    for w in pts.windows(2) {
+        total += norm(ang(&w[1]) - ang(&w[0]));
+    }
+    let closed = (pts[0].x - pts[n - 1].x).hypot(pts[0].y - pts[n - 1].y) < 1e-2;
+    let compass = [
+        (0.0, PdfPoint { x: cx + r, y: cy }),
+        (std::f64::consts::FRAC_PI_2, PdfPoint { x: cx, y: cy + r }),
+        (std::f64::consts::PI, PdfPoint { x: cx - r, y: cy }),
+        (-std::f64::consts::FRAC_PI_2, PdfPoint { x: cx, y: cy - r }),
+    ];
+    for (a, point) in compass {
+        // Offset of the compass angle from the arc start, in the arc's sweep direction.
+        let mut off = norm(a - a0);
+        if total < 0.0 && off > 0.0 {
+            off -= tau;
+        } else if total >= 0.0 && off < 0.0 {
+            off += tau;
+        }
+        if closed || off.abs() <= total.abs() + 1e-6 {
+            targets.push(SnapTarget {
+                point,
+                kind: SnapKind::Quadrant,
+            });
+        }
     }
 }
 
@@ -426,6 +772,7 @@ mod tests {
         let geom = PageGeometry {
             page_index: 0,
             snap_index: RTree::bulk_load(targets),
+            segments: Vec::new(),
         };
         // Cursor within 5pt tolerance of first point.
         let result = geom.nearest_snap(PdfPoint { x: 11.0, y: 21.0 }, 5.0);
@@ -442,6 +789,7 @@ mod tests {
         let geom = PageGeometry {
             page_index: 0,
             snap_index: RTree::bulk_load(targets),
+            segments: Vec::new(),
         };
         // Cursor 100pt away — outside any tolerance.
         let result = geom.nearest_snap(PdfPoint { x: 110.0, y: 120.0 }, 5.0);
@@ -453,6 +801,7 @@ mod tests {
         let geom = PageGeometry {
             page_index: 0,
             snap_index: RTree::new(),
+            segments: Vec::new(),
         };
         let result = geom.nearest_snap(PdfPoint { x: 0.0, y: 0.0 }, 10.0);
         assert!(result.is_none());
@@ -472,6 +821,7 @@ mod tests {
                 PdfPoint { x: 10.0, y: 10.0 },
             ],
             closed: false,
+            ..Default::default()
         }];
         let geom = build_snap_index(0, &subpaths);
 
@@ -511,6 +861,7 @@ mod tests {
                 PdfPoint { x: 0.0, y: 10.0 },
             ],
             closed: true,
+            ..Default::default()
         }];
         let geom = build_snap_index(0, &subpaths);
         let midpoints = geom
@@ -536,6 +887,7 @@ mod tests {
                 PdfPoint { x: 0.0, y: 0.0 },
             ],
             closed: true,
+            ..Default::default()
         }];
         let geom = build_snap_index(0, &subpaths);
         let midpoints = geom
@@ -555,6 +907,7 @@ mod tests {
             Subpath {
                 points: vec![PdfPoint { x: 0.0, y: 0.0 }, PdfPoint { x: 1.0, y: 0.0 }],
                 closed: false,
+                ..Default::default()
             },
             Subpath {
                 points: vec![
@@ -562,6 +915,7 @@ mod tests {
                     PdfPoint { x: 101.0, y: 100.0 },
                 ],
                 closed: false,
+                ..Default::default()
             },
         ];
         let geom = build_snap_index(0, &subpaths);
@@ -587,10 +941,12 @@ mod tests {
             Subpath {
                 points: vec![],
                 closed: false,
+                ..Default::default()
             },
             Subpath {
                 points: vec![PdfPoint { x: 5.0, y: 5.0 }],
                 closed: true,
+                ..Default::default()
             },
         ];
         let geom = build_snap_index(0, &subpaths);
@@ -621,12 +977,295 @@ mod tests {
                 PdfPoint { x: 150.0, y: 50.0 },
             ],
             closed: false,
+            ..Default::default()
         }];
         let geom = build_snap_index(3, &subpaths);
         assert_eq!(geom.page_index, 3);
         let hit = geom.nearest_snap(PdfPoint { x: 51.0, y: 50.0 }, 5.0);
         assert!(hit.is_some());
         assert_eq!(hit.unwrap().kind, SnapKind::Endpoint);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Intersection / arc-centre / quadrant snaps
+    // ---------------------------------------------------------------------------
+
+    fn line(a: (f64, f64), b: (f64, f64)) -> Subpath {
+        Subpath {
+            points: vec![pt(a.0, a.1), pt(b.0, b.1)],
+            ..Default::default()
+        }
+    }
+
+    fn of_kind(g: &PageGeometry, kind: SnapKind) -> Vec<PdfPoint> {
+        g.snap_index
+            .iter()
+            .filter(|t| t.kind == kind)
+            .map(|t| t.point)
+            .collect()
+    }
+
+    fn has_near(pts: &[PdfPoint], x: f64, y: f64) -> bool {
+        pts.iter()
+            .any(|p| (p.x - x).abs() < 1e-6 && (p.y - y).abs() < 1e-6)
+    }
+
+    /// PDFium-style points for a circular arc drawn as cubic Beziers, one per quarter
+    /// turn from `start_deg`, `quarters` of them, counter-clockwise (`dir` = 1) or
+    /// clockwise (`dir` = -1): [start, c1, c2, end, c1, c2, end, ...].
+    fn arc_points(cx: f64, cy: f64, r: f64, start_deg: f64, quarters: usize, dir: f64) -> Subpath {
+        let k = 0.552_284_749_8;
+        let at = |deg: f64| {
+            let a = deg.to_radians();
+            (cx + r * a.cos(), cy + r * a.sin())
+        };
+        let tangent = |deg: f64| {
+            let a = deg.to_radians();
+            (-a.sin() * dir, a.cos() * dir)
+        };
+        let mut points = vec![];
+        let mut curve = vec![false];
+        let s = at(start_deg);
+        points.push(pt(s.0, s.1));
+        for q in 0..quarters {
+            let a0 = start_deg + dir * 90.0 * q as f64;
+            let a1 = a0 + dir * 90.0;
+            let (p0, p1) = (at(a0), at(a1));
+            let (t0, t1) = (tangent(a0), tangent(a1));
+            points.push(pt(p0.0 + t0.0 * k * r, p0.1 + t0.1 * k * r));
+            points.push(pt(p1.0 - t1.0 * k * r, p1.1 - t1.1 * k * r));
+            points.push(pt(p1.0, p1.1));
+            curve.extend([true, true, true]);
+        }
+        Subpath {
+            points,
+            closed: false,
+            curve,
+        }
+    }
+
+    #[test]
+    fn crossing_segments_yield_one_intersection() {
+        let g = build_snap_index(
+            0,
+            &[
+                line((0.0, 0.0), (10.0, 10.0)),
+                line((0.0, 10.0), (10.0, 0.0)),
+            ],
+        );
+        let hits = of_kind(&g, SnapKind::Intersection);
+        assert_eq!(hits.len(), 1);
+        assert!(has_near(&hits, 5.0, 5.0));
+    }
+
+    #[test]
+    fn touching_parallel_and_disjoint_segments_yield_no_intersection() {
+        let g = build_snap_index(
+            0,
+            &[
+                line((0.0, 0.0), (10.0, 0.0)),
+                line((10.0, 0.0), (10.0, 10.0)), // meets at an end: an endpoint, not a crossing
+                line((0.0, 5.0), (10.0, 5.0)),   // parallel to the first
+                line((20.0, 20.0), (30.0, 30.0)), // far away
+                line((5.0, 0.0), (5.0, 10.0)), // T onto the first: touches its interior at the end
+            ],
+        );
+        // (5,0)-(5,10) ends on the first segment's interior (u at an end), and crosses the
+        // parallel one at (5,5) properly.
+        let hits = of_kind(&g, SnapKind::Intersection);
+        assert_eq!(hits.len(), 1, "only the proper (5,5) crossing: {hits:?}");
+        assert!(has_near(&hits, 5.0, 5.0));
+    }
+
+    #[test]
+    fn grid_of_lines_yields_every_interior_crossing() {
+        let mut subs = vec![];
+        for i in 0..=5 {
+            let v = i as f64 * 2.0;
+            subs.push(line((0.0, v), (10.0, v)));
+            subs.push(line((v, 0.0), (v, 10.0)));
+        }
+        let g = build_snap_index(0, &subs);
+        // Interior lattice is 4 x 4; the border lines only touch at ends/along edges.
+        assert_eq!(of_kind(&g, SnapKind::Intersection).len(), 16);
+    }
+
+    #[test]
+    fn full_circle_yields_centre_and_four_quadrants_and_no_control_point_endpoints() {
+        let mut c = arc_points(300.0, 400.0, 50.0, 0.0, 4, 1.0);
+        c.closed = true;
+        let g = build_snap_index(0, &[c]);
+        let centres = of_kind(&g, SnapKind::ArcCenter);
+        assert_eq!(centres.len(), 1);
+        assert!(has_near(&centres, 300.0, 400.0));
+        let quads = of_kind(&g, SnapKind::Quadrant);
+        assert_eq!(quads.len(), 4);
+        for (x, y) in [
+            (350.0, 400.0),
+            (300.0, 450.0),
+            (250.0, 400.0),
+            (300.0, 350.0),
+        ] {
+            assert!(has_near(&quads, x, y), "missing quadrant ({x},{y})");
+        }
+        // 4 arc ends + the start point repeated at the close: control points are not vertices.
+        assert_eq!(of_kind(&g, SnapKind::Endpoint).len(), 5);
+        // Midpoint of the first quarter is on the circle at 45 degrees.
+        let mids = of_kind(&g, SnapKind::Midpoint);
+        let d = 50.0 / std::f64::consts::SQRT_2;
+        assert!(mids
+            .iter()
+            .any(|m| (m.x - (300.0 + d)).abs() < 0.2 && (m.y - (400.0 + d)).abs() < 0.2));
+    }
+
+    #[test]
+    fn clockwise_circle_also_fits() {
+        let mut c = arc_points(10.0, 10.0, 8.0, 90.0, 4, -1.0);
+        c.closed = true;
+        let g = build_snap_index(0, &[c]);
+        assert!(has_near(&of_kind(&g, SnapKind::ArcCenter), 10.0, 10.0));
+        assert_eq!(of_kind(&g, SnapKind::Quadrant).len(), 4);
+    }
+
+    #[test]
+    fn semicircle_snaps_only_the_compass_points_it_reaches() {
+        // Counter-clockwise from 0 to 180 degrees: reaches east, north, west, not south.
+        let g = build_snap_index(0, &[arc_points(0.0, 0.0, 20.0, 0.0, 2, 1.0)]);
+        assert!(has_near(&of_kind(&g, SnapKind::ArcCenter), 0.0, 0.0));
+        let quads = of_kind(&g, SnapKind::Quadrant);
+        assert_eq!(quads.len(), 3, "{quads:?}");
+        assert!(has_near(&quads, 20.0, 0.0));
+        assert!(has_near(&quads, 0.0, 20.0));
+        assert!(has_near(&quads, -20.0, 0.0));
+        assert!(!has_near(&quads, 0.0, -20.0));
+    }
+
+    #[test]
+    fn single_quarter_arc_is_not_fitted() {
+        // One cubic is a rounded corner as often as an arc: too little evidence.
+        let g = build_snap_index(0, &[arc_points(0.0, 0.0, 20.0, 0.0, 1, 1.0)]);
+        assert!(of_kind(&g, SnapKind::ArcCenter).is_empty());
+        assert!(of_kind(&g, SnapKind::Quadrant).is_empty());
+    }
+
+    #[test]
+    fn s_curve_is_not_mistaken_for_an_arc() {
+        // Two cubics bending opposite ways.
+        let s = Subpath {
+            points: vec![
+                pt(0.0, 0.0),
+                pt(10.0, 0.0),
+                pt(10.0, 10.0),
+                pt(20.0, 10.0),
+                pt(30.0, 10.0),
+                pt(30.0, 20.0),
+                pt(40.0, 20.0),
+            ],
+            closed: false,
+            curve: vec![false, true, true, true, true, true, true],
+        };
+        let g = build_snap_index(0, &[s]);
+        assert!(of_kind(&g, SnapKind::ArcCenter).is_empty());
+    }
+
+    #[test]
+    fn segments_exclude_curve_pieces_and_include_the_closing_edge() {
+        let tri = Subpath {
+            points: vec![pt(0.0, 0.0), pt(10.0, 0.0), pt(0.0, 10.0)],
+            closed: true,
+            ..Default::default()
+        };
+        let g = build_snap_index(0, &[tri, arc_points(0.0, 0.0, 5.0, 0.0, 4, 1.0)]);
+        assert_eq!(g.segments.len(), 3, "triangle only: {:?}", g.segments);
+        assert!(g.segments.contains(&[0.0, 10.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn many_overlapping_segments_stay_within_the_pair_cap() {
+        // 3000 near-coincident long segments: ~4.5M candidate pairs, above MAX_PAIR_TESTS.
+        // Must terminate, and must not emit more than the intersection cap.
+        let subs: Vec<Subpath> = (0..3000)
+            .map(|i| {
+                line(
+                    (0.0, i as f64 * 1e-3),
+                    (1000.0, 1.0 + i as f64 * 1e-3 + 0.5),
+                )
+            })
+            .collect();
+        let g = build_snap_index(0, &subs);
+        assert!(of_kind(&g, SnapKind::Intersection).len() <= MAX_INTERSECTIONS);
+    }
+
+    // --- hostile / broken content ---
+
+    #[test]
+    fn non_finite_and_absurd_coordinates_skip_the_subpath() {
+        let g = build_snap_index(
+            0,
+            &[
+                line((0.0, 0.0), (f64::NAN, 5.0)),
+                line((0.0, 0.0), (f64::INFINITY, 5.0)),
+                line((0.0, 0.0), (1.0e12, 5.0)),
+                line((0.0, 0.0), (10.0, 0.0)),
+            ],
+        );
+        assert_eq!(g.segments, vec![[0.0, 0.0, 10.0, 0.0]]);
+        assert_eq!(of_kind(&g, SnapKind::Endpoint).len(), 2);
+    }
+
+    #[test]
+    fn bounds_clip_segments_and_drop_outside_targets() {
+        let b = SnapBounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 100.0,
+            max_y: 100.0,
+        };
+        let g = build_snap_index_bounded(
+            0,
+            &[
+                line((-1.0e8, 50.0), (1.0e8, 50.0)),  // spans the page
+                line((200.0, 200.0), (300.0, 300.0)), // wholly outside
+                line((10.0, 10.0), (20.0, 10.0)),
+            ],
+            Some(b),
+        );
+        assert_eq!(g.segments.len(), 2);
+        assert!(
+            g.segments.iter().any(|s| s[0].abs() < 1e-3
+                && (s[2] - 100.0).abs() < 1e-3
+                && (s[1] - 50.0).abs() < 1e-6
+                && (s[3] - 50.0).abs() < 1e-6),
+            "{:?}",
+            g.segments
+        );
+        for t in g.snap_index.iter() {
+            assert!(b.contains(t.point), "{t:?} is outside the bounds");
+        }
+    }
+
+    #[test]
+    fn clip_segment_cases() {
+        let b = SnapBounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 10.0,
+            max_y: 10.0,
+        };
+        assert_eq!(
+            clip_segment([2.0, 2.0, 5.0, 5.0], &b),
+            Some([2.0, 2.0, 5.0, 5.0])
+        );
+        assert_eq!(
+            clip_segment([-5.0, 5.0, 15.0, 5.0], &b),
+            Some([0.0, 5.0, 10.0, 5.0])
+        );
+        assert_eq!(clip_segment([-5.0, -5.0, -1.0, 20.0], &b), None);
+        assert_eq!(clip_segment([20.0, 0.0, 20.0, 10.0], &b), None); // parallel, outside
+        assert_eq!(
+            clip_segment([5.0, 5.0, 5.0, 5.0], &b),
+            Some([5.0, 5.0, 5.0, 5.0])
+        );
     }
 
     // ---------------------------------------------------------------------------

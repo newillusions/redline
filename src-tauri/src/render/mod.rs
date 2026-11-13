@@ -1085,6 +1085,7 @@ impl RenderEngine {
 
         let mut subpaths: Vec<crate::geometry::Subpath> = Vec::new();
         let mut current: Vec<crate::geometry::PdfPoint> = Vec::new();
+        let mut current_curve: Vec<bool> = Vec::new();
         let mut current_closed = false;
 
         for obj in page.objects().iter() {
@@ -1111,13 +1112,20 @@ impl RenderEngine {
                             subpaths.push(crate::geometry::Subpath {
                                 points: std::mem::take(&mut current),
                                 closed: current_closed,
+                                curve: std::mem::take(&mut current_curve),
                             });
                         }
                         current_closed = false;
                         current.push(pt);
+                        current_curve.push(false);
                     }
-                    PdfPathSegmentType::LineTo | PdfPathSegmentType::BezierTo => {
+                    PdfPathSegmentType::LineTo => {
                         current.push(pt);
+                        current_curve.push(false);
+                    }
+                    PdfPathSegmentType::BezierTo => {
+                        current.push(pt);
+                        current_curve.push(true);
                     }
                     PdfPathSegmentType::Unknown => {}
                 }
@@ -1134,12 +1142,36 @@ impl RenderEngine {
                 subpaths.push(crate::geometry::Subpath {
                     points: std::mem::take(&mut current),
                     closed: current_closed,
+                    curve: std::mem::take(&mut current_curve),
                 });
                 current_closed = false;
             }
         }
 
-        let geom = std::sync::Arc::new(crate::geometry::build_snap_index(page_index, &subpaths));
+        // Clip to the media box plus a margin, so corrupt content far off the page cannot
+        // reach the index or the client's segment grid. Unreadable box: no clipping (the
+        // geometry module still drops non-finite and absurd coordinates).
+        let bounds = page.boundaries().media().ok().and_then(|m| {
+            let r = m.bounds;
+            let (l, b, rt, t) = (
+                r.left().value as f64,
+                r.bottom().value as f64,
+                r.right().value as f64,
+                r.top().value as f64,
+            );
+            let margin = (rt - l).max(t - b) * 0.25 + 36.0;
+            (l.is_finite() && b.is_finite() && rt.is_finite() && t.is_finite()).then_some(
+                crate::geometry::SnapBounds {
+                    min_x: l - margin,
+                    min_y: b - margin,
+                    max_x: rt + margin,
+                    max_y: t + margin,
+                },
+            )
+        });
+        let geom = std::sync::Arc::new(crate::geometry::build_snap_index_bounded(
+            page_index, &subpaths, bounds,
+        ));
         doc.snap_cache
             .insert(page_index, std::sync::Arc::clone(&geom));
         Ok(geom)
@@ -1558,6 +1590,13 @@ pub enum RenderCmd {
         page_index: u32,
         reply: oneshot::Sender<Result<Vec<crate::geometry::SnapTarget>>>,
     },
+    /// The page's straight segments `[x1, y1, x2, y2]` (same cached geometry as
+    /// `PageSnapIndex`), for client-side perpendicular / nearest-on-segment snaps.
+    PageSnapSegments {
+        doc_id: String,
+        page_index: u32,
+        reply: oneshot::Sender<Result<Vec<[f64; 4]>>>,
+    },
     /// Rasterize a small, throwaway, in-memory PDF's page 0 to a transparent-background
     /// PNG. See `RenderEngine::rasterize_pdf_bytes`.
     RasterizePdfBytes {
@@ -1716,6 +1755,16 @@ impl RenderHandle {
                             let result = engine
                                 .page_snap_index(&doc_id, page_index)
                                 .map(|geom| geom.snap_index.iter().cloned().collect::<Vec<_>>());
+                            let _ = reply.send(result);
+                        }
+                        RenderCmd::PageSnapSegments {
+                            doc_id,
+                            page_index,
+                            reply,
+                        } => {
+                            let result = engine
+                                .page_snap_index(&doc_id, page_index)
+                                .map(|geom| geom.segments.clone());
                             let _ = reply.send(result);
                         }
                         RenderCmd::RasterizePdfBytes {
@@ -1976,6 +2025,26 @@ impl RenderHandle {
             .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
     }
 
+    /// Return the page's straight segments for client-side perpendicular and
+    /// nearest-on-segment snapping. See [`RenderEngine::page_snap_index`].
+    pub async fn page_snap_segments(
+        &self,
+        doc_id: String,
+        page_index: u32,
+    ) -> Result<Vec<[f64; 4]>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(RenderCmd::PageSnapSegments {
+                doc_id,
+                page_index,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("render thread gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
+    }
+
     /// Rasterize a small, throwaway, in-memory PDF's page 0 to a transparent-background
     /// PNG. See [`RenderEngine::rasterize_pdf_bytes`].
     pub async fn rasterize_pdf_bytes(&self, bytes: Vec<u8>, max_dim_px: u32) -> Result<Vec<u8>> {
@@ -2074,6 +2143,9 @@ fn send_init_error(cmd: RenderCmd, err: &anyhow::Error) {
             let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
         }
         RenderCmd::PageSnapIndex { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+        }
+        RenderCmd::PageSnapSegments { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
         }
         RenderCmd::RasterizePdfBytes { reply, .. } => {
@@ -3171,11 +3243,16 @@ pub(crate) mod tests {
     /// - an OPEN 2-point line: (72,100) -> (300,100)
     /// - a CLOSED triangle: (100,200) -> (200,200) -> (100,300) -> closed
     fn two_path_fixture() -> std::path::PathBuf {
+        snap_fixture(b"72 100 m 300 100 l S 100 200 m 200 200 l 100 300 l h S")
+    }
+
+    /// One-page fixture drawing the given content stream (see `two_path_fixture`).
+    fn snap_fixture(content: &[u8]) -> std::path::PathBuf {
         use lopdf::{dictionary, Document, Object, Stream};
 
         let mut doc = Document::with_version("1.5");
         let pages_id = doc.new_object_id();
-        let content = b"72 100 m 300 100 l S 100 200 m 200 200 l 100 300 l h S".to_vec();
+        let content = content.to_vec();
         let content_id = doc.add_object(Stream::new(dictionary! {}, content));
         let page_id = doc.add_object(dictionary! {
             "Type" => "Page",
@@ -3212,6 +3289,18 @@ pub(crate) mod tests {
         targets
             .iter()
             .any(|t| t.kind == kind && (t.point.x - x).abs() < 1e-6 && (t.point.y - y).abs() < 1e-6)
+    }
+
+    fn near_tol(
+        targets: &[crate::geometry::SnapTarget],
+        x: f64,
+        y: f64,
+        kind: crate::geometry::SnapKind,
+        tol: f64,
+    ) -> bool {
+        targets
+            .iter()
+            .any(|t| t.kind == kind && (t.point.x - x).abs() < tol && (t.point.y - y).abs() < tol)
     }
 
     #[test]
@@ -3274,12 +3363,74 @@ pub(crate) mod tests {
             "missing triangle closing-edge midpoint"
         );
 
-        // No Intersection/ArcCenter targets in v1 (see geometry module doc comment).
+        // The fixture's line and triangle do not cross and contain no arcs, so no
+        // Intersection/ArcCenter/Quadrant targets (see geometry module doc comment).
         assert!(
             flat.iter()
                 .all(|t| matches!(t.kind, SnapKind::Endpoint | SnapKind::Midpoint)),
-            "v1 must not populate Intersection/ArcCenter"
+            "non-crossing, curve-free fixture must yield only Endpoint/Midpoint"
         );
+    }
+
+    #[test]
+    fn page_snap_index_fits_bezier_circle_and_ignores_control_points() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip bezier circle snap: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+        // Circle r=50 at (300,400): four cubic Beziers (kappa 0.5523), closed.
+        let path = snap_fixture(
+            b"350 400 m 350 427.6 327.6 450 300 450 c 272.4 450 250 427.6 250 400 c \
+              250 372.4 272.4 350 300 350 c 327.6 350 350 372.4 350 400 c h S",
+        );
+        let mut e = RenderEngine::new().expect("pdfium");
+        e.open_document(path, "t".into(), None)
+            .and_then(OpenOutcome::into_page_count)
+            .expect("open fixture");
+        let g = e.page_snap_index("t", 0).expect("idx");
+        let flat: Vec<crate::geometry::SnapTarget> = g.snap_index.iter().cloned().collect();
+
+        use crate::geometry::SnapKind;
+        assert!(
+            near_tol(&flat, 300.0, 400.0, SnapKind::ArcCenter, 0.3),
+            "missing circle centre"
+        );
+        for (x, y) in [
+            (350.0, 400.0),
+            (300.0, 450.0),
+            (250.0, 400.0),
+            (300.0, 350.0),
+        ] {
+            assert!(
+                near_tol(&flat, x, y, SnapKind::Quadrant, 0.3),
+                "missing quadrant ({x},{y})"
+            );
+        }
+        // Bezier control points (e.g. 350,427.6) must not appear as vertices.
+        assert!(
+            !near_tol(&flat, 350.0, 427.6, SnapKind::Endpoint, 0.05),
+            "a Bezier control point leaked in as an Endpoint"
+        );
+    }
+
+    #[test]
+    fn page_snap_index_finds_intersection_and_exposes_segments() {
+        if std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH").is_none() {
+            eprintln!("skip intersection snap: no PDFIUM_DYNAMIC_LIB_PATH");
+            return;
+        }
+        let path = snap_fixture(b"100 100 m 200 200 l S 100 200 m 200 100 l S");
+        let mut e = RenderEngine::new().expect("pdfium");
+        e.open_document(path, "t".into(), None)
+            .and_then(OpenOutcome::into_page_count)
+            .expect("open fixture");
+        let g = e.page_snap_index("t", 0).expect("idx");
+        let flat: Vec<crate::geometry::SnapTarget> = g.snap_index.iter().cloned().collect();
+        assert!(
+            near(&flat, 150.0, 150.0, crate::geometry::SnapKind::Intersection),
+            "missing X crossing"
+        );
+        assert_eq!(g.segments.len(), 2);
     }
 
     #[test]

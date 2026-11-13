@@ -439,6 +439,7 @@ pub fn run() {
             commands::text_select::get_text_selection,
             // Vector snap-target index (spec §5, v1)
             commands::geometry::get_page_snap_targets,
+            commands::geometry::get_page_snap_segments,
             // Version snapshot commands (M4 S2)
             commands::versioning::snapshot_version,
             commands::versioning::list_document_versions,

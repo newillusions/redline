@@ -1,8 +1,9 @@
+// Adapted from redcolumn (Apache-2.0), packages/measure/src/snap.ts, modified
 /**
- * Vector snap-target client (spec §5, v1). Fetches + caches a page's snap-target
- * index (Rust `geometry::build_snap_index`, `Endpoint`/`Midpoint` only — see that
- * module's doc comment for exactly what's populated and why `Intersection`/
- * `ArcCenter` are deferred) and finds the nearest target to a PDF-space point
+ * Vector snap-target client (spec §5). Fetches + caches a page's snap-target
+ * index (Rust `geometry::build_snap_index`: Endpoint, Midpoint, Intersection,
+ * ArcCenter, Quadrant - see that module's doc comment) plus its straight segments
+ * (for Perpendicular / Nearest, computed here), and finds the nearest target to a PDF-space point
  * within a tolerance, entirely client-side so a drag gesture never pays an IPC
  * round-trip per pointer-move — `Viewport.svelte` prefetches a page's targets once
  * (on page open / snap-eligible tool activation) and looks up against the cached
@@ -11,14 +12,30 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { PdfPoint } from "./ipc";
 
-export type SnapKind = "Endpoint" | "Midpoint" | "Intersection" | "ArcCenter";
+/**
+ * `Endpoint`, `Midpoint`, `Intersection`, `ArcCenter` and `Quadrant` come from the Rust index;
+ * `Perpendicular` and `Nearest` depend on the cursor and are computed here from the page's
+ * straight segments (see `findBestSnap`).
+ */
+export type SnapKind =
+  | "Endpoint"
+  | "Midpoint"
+  | "Intersection"
+  | "ArcCenter"
+  | "Quadrant"
+  | "Perpendicular"
+  | "Nearest";
 
 export interface SnapTarget {
   point: PdfPoint;
   kind: SnapKind;
 }
 
+/** A straight page segment `[x1, y1, x2, y2]` in PDF user space. */
+export type SnapSegment = readonly [number, number, number, number];
+
 const cache = new Map<string, Promise<SnapTarget[]>>();
+const segmentCache = new Map<string, Promise<SnapSegment[]>>();
 
 function cacheKey(docId: string, pageIndex: number): string {
   return `${docId}#${pageIndex}`;
@@ -64,6 +81,25 @@ export function invalidateSnapCache(docId: string): void {
   for (const key of Array.from(cache.keys())) {
     if (key.startsWith(prefix)) cache.delete(key);
   }
+  for (const key of Array.from(segmentCache.keys())) {
+    if (key.startsWith(prefix)) segmentCache.delete(key);
+  }
+}
+
+/** Fetch (or return the cached) straight segments of a page, for perpendicular and
+ *  nearest-on-segment snapping. Same in-flight-promise caching as `getPageSnapTargets`. */
+export function getPageSnapSegments(docId: string, pageIndex: number): Promise<SnapSegment[]> {
+  const key = cacheKey(docId, pageIndex);
+  const cached = segmentCache.get(key);
+  if (cached) return cached;
+  const req = Promise.resolve(invoke<SnapSegment[]>("get_page_snap_segments", { docId, pageIndex }))
+    .then((result) => result ?? [])
+    .catch((err) => {
+      segmentCache.delete(key);
+      throw err;
+    });
+  segmentCache.set(key, req);
+  return req;
 }
 
 /**
@@ -81,6 +117,7 @@ class SnapGrid {
     private readonly cellSizePts: number,
   ) {
     for (const t of targets) {
+      if (!Number.isFinite(t.point.x) || !Number.isFinite(t.point.y)) continue;
       const key = this.cellKeyFor(t.point.x, t.point.y);
       const bucket = this.cells.get(key);
       if (bucket) bucket.push(t);
@@ -90,6 +127,25 @@ class SnapGrid {
 
   private cellKeyFor(x: number, y: number): string {
     return `${Math.floor(x / this.cellSizePts)},${Math.floor(y / this.cellSizePts)}`;
+  }
+
+  /** Every target within `tolerancePts` of `cursor` (inclusive). */
+  within(cursor: PdfPoint, tolerancePts: number): SnapTarget[] {
+    const cellRadius = Math.max(1, Math.ceil(tolerancePts / this.cellSizePts));
+    const cx = Math.floor(cursor.x / this.cellSizePts);
+    const cy = Math.floor(cursor.y / this.cellSizePts);
+    const out: SnapTarget[] = [];
+    const tol2 = tolerancePts * tolerancePts;
+    for (let gx = cx - cellRadius; gx <= cx + cellRadius; gx++) {
+      for (let gy = cy - cellRadius; gy <= cy + cellRadius; gy++) {
+        for (const t of this.cells.get(`${gx},${gy}`) ?? []) {
+          const dx = t.point.x - cursor.x;
+          const dy = t.point.y - cursor.y;
+          if (dx * dx + dy * dy <= tol2) out.push(t);
+        }
+      }
+    }
+    return out;
   }
 
   /** Nearest target to `cursor` within `tolerancePts`, or `null`. Same tie-break as a full
@@ -158,4 +214,167 @@ export function findNearestSnap(
     gridCache.set(targets, grid);
   }
   return grid.nearest(cursor, tolerancePts);
+}
+
+
+// ---------------------------------------------------------------------------
+// Priority-ranked snapping with cursor-dependent kinds (perpendicular, nearest)
+// ---------------------------------------------------------------------------
+//
+// Adapted from redcolumn (Apache-2.0), packages/measure/src/snap.ts, modified: scoring
+// idea (kind priority dominates, distance breaks ties) and the perpendicular-foot /
+// nearest-point-on-segment maths, re-expressed over Redline's Rust-built target list.
+
+/** Lower wins when several snaps are within range. */
+const SNAP_PRIORITY: Record<SnapKind, number> = {
+  Endpoint: 0,
+  ArcCenter: 0,
+  Intersection: 1,
+  Midpoint: 2,
+  Quadrant: 2,
+  Perpendicular: 2,
+  Nearest: 4,
+};
+
+/** Nearest point on segment `s` to `p`, and its distance. */
+export function nearestOnSegment(
+  p: PdfPoint,
+  s: SnapSegment,
+): { point: PdfPoint; dist: number; t: number } {
+  const dx = s[2] - s[0];
+  const dy = s[3] - s[1];
+  const len2 = dx * dx + dy * dy;
+  const t = len2 ? Math.max(0, Math.min(1, ((p.x - s[0]) * dx + (p.y - s[1]) * dy) / len2)) : 0;
+  const x = s[0] + t * dx;
+  const y = s[1] + t * dy;
+  return { point: { x, y }, dist: Math.hypot(x - p.x, y - p.y), t };
+}
+
+/** Foot of the perpendicular from `from` onto segment `s`, or null when it falls outside the
+ *  segment (or the segment is degenerate). */
+export function perpendicularFoot(from: PdfPoint, s: SnapSegment): PdfPoint | null {
+  const dx = s[2] - s[0];
+  const dy = s[3] - s[1];
+  const len2 = dx * dx + dy * dy;
+  if (len2 === 0) return null;
+  const t = ((from.x - s[0]) * dx + (from.y - s[1]) * dy) / len2;
+  if (t < 0 || t > 1) return null;
+  return { x: s[0] + t * dx, y: s[1] + t * dy };
+}
+
+/** Coordinates at or beyond this magnitude are treated as corrupt. */
+const MAX_SANE_COORD = 1e9;
+/** A segment needing more than this many grid steps is too long to register. */
+const MAX_SEGMENT_STEPS = 512;
+/** Total grid cell registrations per page; beyond it further segments are not registered. */
+const MAX_GRID_REGISTRATIONS = 2_000_000;
+
+/** Uniform grid over segments; a segment is registered in every cell its length crosses. */
+class SegmentGrid {
+  private readonly cells = new Map<string, number[]>();
+  private stamp: Uint32Array;
+  private query = 0;
+
+  constructor(
+    private readonly segments: readonly SnapSegment[],
+    private readonly cell: number,
+  ) {
+    this.stamp = new Uint32Array(segments.length);
+    let registrations = 0;
+    segments.forEach((s, i) => {
+      // Hostile or broken content must degrade, never hang: skip non-finite or absurdly long
+      // segments (the Rust side already clips to the page; this is the backstop), and stop
+      // registering once the per-page budget is spent. Unregistered segments simply do not
+      // offer Nearest/Perpendicular; the endpoint-like targets still snap.
+      if (registrations >= MAX_GRID_REGISTRATIONS) return;
+      if (!(Math.abs(s[0]) < MAX_SANE_COORD && Math.abs(s[1]) < MAX_SANE_COORD && Math.abs(s[2]) < MAX_SANE_COORD && Math.abs(s[3]) < MAX_SANE_COORD)) return;
+      const len = Math.hypot(s[2] - s[0], s[3] - s[1]);
+      if (!(len <= MAX_SEGMENT_STEPS * (cell / 2))) return;
+      const steps = Math.max(1, Math.ceil(len / (cell / 2)));
+      let last = "";
+      for (let k = 0; k <= steps; k++) {
+        const t = k / steps;
+        const key = `${Math.floor((s[0] + (s[2] - s[0]) * t) / cell)},${Math.floor((s[1] + (s[3] - s[1]) * t) / cell)}`;
+        if (key === last) continue;
+        last = key;
+        registrations++;
+        const bucket = this.cells.get(key);
+        if (bucket) {
+          if (bucket[bucket.length - 1] !== i) bucket.push(i);
+        } else this.cells.set(key, [i]);
+      }
+    });
+  }
+
+  /** Segments passing near `p` (within `radius` plus one cell of slack). */
+  near(p: PdfPoint, radius: number): SnapSegment[] {
+    this.query = (this.query + 1) >>> 0 || 1;
+    const out: SnapSegment[] = [];
+    const c = this.cell;
+    for (let gx = Math.floor((p.x - radius) / c) - 1; gx <= Math.floor((p.x + radius) / c) + 1; gx++) {
+      for (let gy = Math.floor((p.y - radius) / c) - 1; gy <= Math.floor((p.y + radius) / c) + 1; gy++) {
+        for (const i of this.cells.get(`${gx},${gy}`) ?? []) {
+          if (this.stamp[i] === this.query) continue;
+          this.stamp[i] = this.query;
+          out.push(this.segments[i]!);
+        }
+      }
+    }
+    return out;
+  }
+}
+
+const segGridCache = new WeakMap<readonly SnapSegment[], SegmentGrid>();
+
+/**
+ * Best snap within `tolerancePts` of `cursor`, ranked like CAD object snaps: kind priority
+ * dominates (Endpoint/ArcCenter, then Intersection, then Midpoint/Quadrant/Perpendicular, then
+ * Nearest) and distance breaks ties within a priority. `Perpendicular` needs `from`, the point
+ * the line being drawn starts at; `Nearest` is the closest point on any straight segment.
+ * Returns `null` when nothing is in range.
+ */
+export function findBestSnap(
+  targets: readonly SnapTarget[],
+  segments: readonly SnapSegment[],
+  cursor: PdfPoint,
+  tolerancePts: number,
+  from: PdfPoint | null = null,
+): SnapTarget | null {
+  let best: SnapTarget | null = null;
+  let bestScore = Infinity;
+  const consider = (point: PdfPoint, kind: SnapKind) => {
+    const d = Math.hypot(point.x - cursor.x, point.y - cursor.y);
+    if (d > tolerancePts) return;
+    const score = SNAP_PRIORITY[kind] * tolerancePts * 10 + d;
+    if (score < bestScore) {
+      bestScore = score;
+      best = { point, kind };
+    }
+  };
+
+  if (targets.length > 0) {
+    let grid = gridCache.get(targets);
+    if (!grid) {
+      grid = new SnapGrid(targets, SNAP_GRID_CELL_SIZE_PTS);
+      gridCache.set(targets, grid);
+    }
+    for (const t of grid.within(cursor, tolerancePts)) consider(t.point, t.kind);
+  }
+
+  if (segments.length > 0) {
+    let sg = segGridCache.get(segments);
+    if (!sg) {
+      sg = new SegmentGrid(segments, SNAP_GRID_CELL_SIZE_PTS);
+      segGridCache.set(segments, sg);
+    }
+    for (const s of sg.near(cursor, tolerancePts)) {
+      const n = nearestOnSegment(cursor, s);
+      if (n.dist <= tolerancePts) consider(n.point, "Nearest");
+      if (from) {
+        const foot = perpendicularFoot(from, s);
+        if (foot) consider(foot, "Perpendicular");
+      }
+    }
+  }
+  return best;
 }

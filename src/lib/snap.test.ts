@@ -1,6 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { getPageSnapTargets, invalidateSnapCache, findNearestSnap } from "./snap";
+import {
+  getPageSnapTargets,
+  getPageSnapSegments,
+  invalidateSnapCache,
+  findNearestSnap,
+  findBestSnap,
+  nearestOnSegment,
+  perpendicularFoot,
+} from "./snap";
+import type { SnapSegment } from "./snap";
 import type { SnapTarget } from "./snap";
 import type { PdfPoint } from "./ipc";
 
@@ -153,5 +162,151 @@ describe("findNearestSnap", () => {
     expect(findNearestSnap(a, { x: 0, y: 0 }, 2)?.point).toEqual({ x: 0, y: 0 });
     expect(findNearestSnap(b, { x: 500, y: 500 }, 2)?.point).toEqual({ x: 500, y: 500 });
     expect(findNearestSnap(b, { x: 0, y: 0 }, 2)).toBeNull();
+  });
+});
+
+describe("getPageSnapSegments", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it("calls get_page_snap_segments and caches per page; invalidate refetches", async () => {
+    mockInvoke.mockResolvedValue([[0, 0, 10, 0]] as never);
+    const a = await getPageSnapSegments("segdoc", 1);
+    const b = await getPageSnapSegments("segdoc", 1);
+    expect(mockInvoke).toHaveBeenCalledWith("get_page_snap_segments", { docId: "segdoc", pageIndex: 1 });
+    expect(mockInvoke).toHaveBeenCalledTimes(1);
+    expect(a).toBe(b);
+    invalidateSnapCache("segdoc");
+    await getPageSnapSegments("segdoc", 1);
+    expect(mockInvoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not cache a rejected request", async () => {
+    mockInvoke.mockRejectedValueOnce(new Error("gone"));
+    await expect(getPageSnapSegments("segErr", 0)).rejects.toThrow("gone");
+    mockInvoke.mockResolvedValueOnce([] as never);
+    await expect(getPageSnapSegments("segErr", 0)).resolves.toEqual([]);
+  });
+});
+
+describe("nearestOnSegment / perpendicularFoot", () => {
+  const seg: SnapSegment = [0, 0, 10, 0];
+
+  it("projects onto the interior and clamps to the ends", () => {
+    expect(nearestOnSegment({ x: 4, y: 3 }, seg)).toMatchObject({ point: { x: 4, y: 0 }, dist: 3 });
+    expect(nearestOnSegment({ x: -5, y: 0 }, seg).point).toEqual({ x: 0, y: 0 });
+    expect(nearestOnSegment({ x: 50, y: 2 }, seg).point).toEqual({ x: 10, y: 0 });
+  });
+
+  it("handles a zero-length segment", () => {
+    expect(nearestOnSegment({ x: 3, y: 4 }, [1, 1, 1, 1]).dist).toBe(Math.hypot(2, 3));
+    expect(perpendicularFoot({ x: 3, y: 4 }, [1, 1, 1, 1])).toBeNull();
+  });
+
+  it("perpendicular foot exists only within the segment", () => {
+    expect(perpendicularFoot({ x: 4, y: 9 }, seg)).toEqual({ x: 4, y: 0 });
+    expect(perpendicularFoot({ x: 14, y: 9 }, seg)).toBeNull();
+    expect(perpendicularFoot({ x: -1, y: 9 }, seg)).toBeNull();
+  });
+});
+
+describe("findBestSnap", () => {
+  const t = (x: number, y: number, kind: SnapTarget["kind"]): SnapTarget => ({ point: { x, y }, kind });
+
+  it("returns null with nothing in range", () => {
+    expect(findBestSnap([t(100, 100, "Endpoint")], [[0, 0, 10, 0]], { x: 50, y: 50 }, 5)).toBeNull();
+    expect(findBestSnap([], [], { x: 0, y: 0 }, 5)).toBeNull();
+  });
+
+  it("kind priority beats distance: an endpoint beats a closer midpoint", () => {
+    const targets = [t(0, 0, "Midpoint"), t(3, 0, "Endpoint")];
+    expect(findBestSnap(targets, [], { x: 0.5, y: 0 }, 5)?.kind).toBe("Endpoint");
+  });
+
+  it("intersection beats midpoint and quadrant; arc centre ranks with endpoint", () => {
+    expect(findBestSnap([t(1, 0, "Midpoint"), t(2, 0, "Intersection")], [], { x: 1, y: 0 }, 5)?.kind).toBe("Intersection");
+    expect(findBestSnap([t(0, 0, "Quadrant"), t(2, 0, "ArcCenter")], [], { x: 0, y: 0 }, 5)?.kind).toBe("ArcCenter");
+  });
+
+  it("within one priority the closer target wins", () => {
+    const hit = findBestSnap([t(4, 0, "Quadrant"), t(1, 0, "Midpoint")], [], { x: 0, y: 0 }, 5);
+    expect(hit?.point).toEqual({ x: 1, y: 0 });
+  });
+
+  it("falls back to Nearest on a segment when no vertex-like target is in range", () => {
+    const hit = findBestSnap([], [[0, 0, 100, 0]], { x: 40, y: 2 }, 5);
+    expect(hit).toEqual({ point: { x: 40, y: 0 }, kind: "Nearest" });
+  });
+
+  it("a static target outranks Nearest on the same line", () => {
+    const hit = findBestSnap([t(41, 0, "Midpoint")], [[0, 0, 100, 0]], { x: 40, y: 1 }, 5);
+    expect(hit?.kind).toBe("Midpoint");
+  });
+
+  it("Perpendicular needs a from-point and beats Nearest when in range", () => {
+    const seg: SnapSegment = [0, 0, 100, 0];
+    expect(findBestSnap([], [seg], { x: 40, y: 1 }, 5, null)?.kind).toBe("Nearest");
+    const hit = findBestSnap([], [seg], { x: 41, y: 1 }, 5, { x: 40, y: 30 });
+    expect(hit).toEqual({ point: { x: 40, y: 0 }, kind: "Perpendicular" });
+  });
+
+  it("no Perpendicular when the foot falls off the segment", () => {
+    const hit = findBestSnap([], [[0, 0, 10, 0]], { x: 11, y: 1 }, 5, { x: 30, y: 30 });
+    expect(hit?.kind).toBe("Nearest");
+  });
+
+  it("finds a segment that passes through the cursor's cell without an end there", () => {
+    // Long diagonal registers in every cell it crosses (cell is 50pt).
+    const hit = findBestSnap([], [[0, 0, 400, 400]], { x: 200, y: 201 }, 4);
+    expect(hit?.kind).toBe("Nearest");
+    expect(hit?.point.x).toBeCloseTo(200.5, 5);
+  });
+});
+
+describe("hostile geometry cannot hang the snap grid", () => {
+  const timed = (fn: () => void) => {
+    const t0 = performance.now();
+    fn();
+    return performance.now() - t0;
+  };
+
+  it("a segment with 1e12 coordinates is skipped quickly; the rest still snap", () => {
+    const segs: SnapSegment[] = [[0, 0, 1e12, 1e12], [-1e12, 5, 1e12, 5], [0, 0, 100, 0]];
+    let hit: ReturnType<typeof findBestSnap> = null;
+    const ms = timed(() => { hit = findBestSnap([], segs, { x: 50, y: 1 }, 4); });
+    expect(ms).toBeLessThan(1000);
+    expect(hit).toEqual({ point: { x: 50, y: 0 }, kind: "Nearest" });
+  });
+
+  it("NaN and Infinity coordinates are ignored, in segments and targets", () => {
+    const segs: SnapSegment[] = [[NaN, 0, 10, 0], [0, 0, Infinity, 0], [0, 0, 100, 0]];
+    const targets: SnapTarget[] = [{ point: { x: NaN, y: 1 }, kind: "Endpoint" }, { point: { x: 3, y: 0 }, kind: "Midpoint" }];
+    let hit: ReturnType<typeof findBestSnap> = null;
+    const ms = timed(() => { hit = findBestSnap(targets, segs, { x: 3, y: 1 }, 4); });
+    expect(ms).toBeLessThan(1000);
+    expect(hit).toEqual({ point: { x: 3, y: 0 }, kind: "Midpoint" });
+  });
+
+  it("100k tiny segments build and query within a time bound", () => {
+    const segs: SnapSegment[] = Array.from({ length: 100_000 }, (_, i) => {
+      const x = (i % 400) * 3;
+      const y = Math.floor(i / 400) * 3;
+      return [x, y, x + 0.5, y + 0.5] as const;
+    });
+    let hit: ReturnType<typeof findBestSnap> = null;
+    const ms = timed(() => {
+      hit = findBestSnap([], segs, { x: 30.2, y: 30.2 }, 2);
+      findBestSnap([], segs, { x: 600, y: 90 }, 2);
+    });
+    expect(ms).toBeLessThan(3000);
+    expect(hit).not.toBeNull();
+  });
+
+  it("past the registration budget it degrades to unregistered segments, never hangs", () => {
+    // Many long (but allowed) segments exceed the 2M-cell budget: must still finish.
+    const segs: SnapSegment[] = Array.from({ length: 3000 }, (_, i) => [0, i * 0.01, 12000, i * 0.01] as const);
+    const ms = timed(() => { findBestSnap([], segs, { x: 5, y: 5 }, 4); });
+    expect(ms).toBeLessThan(6000);
   });
 });

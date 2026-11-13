@@ -31,3 +31,20 @@ pub async fn get_page_snap_targets(
         .await
         .map_err(|e| format!("{e:#}"))
 }
+
+/// Return the page's straight segments as `[x1, y1, x2, y2]` (PDF user space) so the
+/// frontend can compute cursor-dependent snaps (perpendicular, nearest-on-segment)
+/// locally. Curve pieces are excluded. Same cached geometry as
+/// [`get_page_snap_targets`].
+#[tauri::command]
+pub async fn get_page_snap_segments(
+    state: State<'_, AppState>,
+    doc_id: String,
+    page_index: u32,
+) -> Result<Vec<[f64; 4]>, String> {
+    state
+        .render
+        .page_snap_segments(doc_id, page_index)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}

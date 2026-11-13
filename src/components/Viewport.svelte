@@ -106,7 +106,7 @@
   import { nextRun } from "$lib/count-groups";
   import { addScale, addViewport, updateViewport, type BBox, type CalloutProps, type MeasurementPayload, type SearchHit } from "$lib/ipc";
   import { pdfUserSpaceToScreen } from "$lib/viewport";
-  import { getPageSnapTargets, findNearestSnap, type SnapTarget } from "$lib/snap";
+  import { getPageSnapTargets, getPageSnapSegments, findBestSnap, type SnapSegment, type SnapTarget } from "$lib/snap";
   import CalibrationDialog from "./CalibrationDialog.svelte";
   import ViewportDialog from "./ViewportDialog.svelte";
   import { commitViewportChange, drainScaleNotices, reportRotateError, reportViewportError, viewportDragOutcome, VIEWPORT_VANISHED_MESSAGE } from "$lib/viewport-actions";
@@ -556,8 +556,8 @@
   // --- Vector snap (spec §5, v1) ---
   /**
    * Tools whose point-capture benefits from snapping to vector geometry
-   * (endpoints/midpoints - see `$lib/snap` + Rust `geometry` module doc
-   * comment for what's populated). Deliberately narrower than `isCreateTool`:
+   * (endpoint, midpoint, intersection, arc centre, quadrant, perpendicular,
+   * nearest - see `$lib/snap` + Rust `geometry` module doc comment). Deliberately narrower than `isCreateTool`:
    * excludes rect-drag shapes (Rectangle/Ellipse/Highlight), text tools, and
    * stamp placement, where snapping to nearby line geometry isn't the expected
    * behaviour. Calibration is included - snapping the two calibration clicks to
@@ -573,10 +573,14 @@
    *  an active user aid, not a hit-test, so a slightly more generous catch radius helps
    *  more than it causes unwanted jumps. */
   const SNAP_TOLERANCE_PX = 8;
+  /** Kinds drawn with the lighter ring (mid-segment / derived points), vs. vertex-like kinds. */
+  const SOFT_SNAP_KINDS: ReadonlySet<string> = new Set(["Midpoint", "Quadrant", "Perpendicular", "Nearest"]);
   /** Snap-target cache for the CURRENT page, prefetched (once, via `$lib/snap`'s own
    *  cache) whenever a snap-eligible tool is active. Empty ⇒ clientToPdf is a no-op
    *  passthrough, so every other tool/gesture is completely unaffected. */
   let snapTargets: SnapTarget[] = $state([]);
+  /** Straight segments of the current page (perpendicular / nearest-on-segment snaps). */
+  let snapSegments: SnapSegment[] = $state.raw([]);
   /** The target actually snapped to on the last clientToPdf call - screen-space
    *  indicator only, cleared whenever a call doesn't snap. */
   let activeSnapHit: SnapTarget | null = $state(null);
@@ -585,6 +589,7 @@
     const tool = store.activeTool;
     if (!docInfo || !SNAP_ELIGIBLE_TOOLS.has(tool)) {
       snapTargets = [];
+      snapSegments = [];
       activeSnapHit = null;
       return;
     }
@@ -601,6 +606,15 @@
         // Snapping is an aid, not a requirement - a failed fetch just means no
         // snap targets this page (e.g. corrupt/exotic path content); the
         // create-tool flow itself must keep working unsnapped.
+      });
+    void getPageSnapSegments(docId, pg)
+      .then((segments) => {
+        if (docInfo?.doc_id === docId && pageIndex === pg && SNAP_ELIGIBLE_TOOLS.has(store.activeTool)) {
+          snapSegments = segments;
+        }
+      })
+      .catch(() => {
+        // Same posture as the targets fetch: perpendicular/nearest simply stay off.
       });
   });
 
@@ -2106,8 +2120,11 @@
     // Page-slot mode: a gesture belongs to the page it started on - a drag carried past the
     // page edge (into the gap, or onto the next sheet) ends at this page's edge.
     const p = slot ? clampToPage(raw, { width_pts: pageWidthPts, height_pts: pageHeightPts }) : raw;
-    if (SNAP_ELIGIBLE_TOOLS.has(store.activeTool) && snapTargets.length > 0) {
-      const hit = findNearestSnap(snapTargets, p, SNAP_TOLERANCE_PX / zoom);
+    if (SNAP_ELIGIBLE_TOOLS.has(store.activeTool) && (snapTargets.length > 0 || snapSegments.length > 0)) {
+      // The point the line being drawn starts from (drag-draw start, or the last
+      // multi-click vertex): needed for perpendicular snaps.
+      const from = drawing && drawStartPdf ? drawStartPdf : (mcVerts[mcVerts.length - 1] ?? null);
+      const hit = findBestSnap(snapTargets, snapSegments, p, SNAP_TOLERANCE_PX / zoom, from);
       if (hit) {
         activeSnapHit = hit;
         return { x: hit.point.x, y: hit.point.y };
@@ -4185,7 +4202,8 @@
       {@const s = pdfUserSpaceToScreen(activeSnapHit.point.x, activeSnapHit.point.y, viewState)}
       <circle
         class="snap-indicator"
-        class:snap-indicator-midpoint={activeSnapHit.kind === "Midpoint"}
+        class:snap-indicator-midpoint={SOFT_SNAP_KINDS.has(activeSnapHit.kind)}
+        data-snap-kind={activeSnapHit.kind}
         cx={s.x} cy={s.y} r={7}
         pointer-events="none"
       />

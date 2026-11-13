@@ -1,0 +1,22 @@
+Redline
+Third-party attribution
+
+This product includes code adapted from redcolumn.
+
+  redcolumn
+  Copyright 2026 Colby Gallagher and the redcolumn contributors
+  https://github.com/ColbyGallagher/redcolumn
+  Licensed under the Apache License, Version 2.0
+  (full text: third_party/redcolumn/LICENSE)
+  Upstream commit studied: 76b1cce4a1b884090f2beabcfe3f1578bff94731
+
+Files adapted from redcolumn carry a header comment of the form
+"Adapted from redcolumn (Apache-2.0), <upstream path>, modified" and are
+listed below. Changes: ported to Redline's data model (Rust-built snap index,
+Svelte/TypeScript client), re-expressed in Rust where noted, and extended.
+
+  src/lib/snap.ts                  <- packages/measure/src/snap.ts
+  src-tauri/src/geometry/mod.rs    <- packages/measure/src/snap.ts
+
+redcolumn is an independent project and is not affiliated with Bluebeam, Inc.
+or Nemetschek SE. Bluebeam and Revu are trademarks of Bluebeam, Inc.
