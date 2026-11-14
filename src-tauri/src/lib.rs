@@ -43,6 +43,7 @@ pub mod docops;
 pub mod markup;
 pub mod search;
 pub mod storage;
+pub mod symbol_search;
 pub mod takeoff;
 pub mod text;
 pub mod toolchest;
@@ -440,6 +441,8 @@ pub fn run() {
             // Vector snap-target index (spec §5, v1)
             commands::geometry::get_page_snap_targets,
             commands::geometry::get_page_snap_segments,
+            // Symbol Search (find every copy of a boxed luminaire symbol)
+            commands::symbol_search::symbol_search,
             // Version snapshot commands (M4 S2)
             commands::versioning::snapshot_version,
             commands::versioning::list_document_versions,

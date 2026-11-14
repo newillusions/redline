@@ -399,6 +399,97 @@ pub struct RenderEngine {
     pdfium: Pdfium,
 }
 
+/// Walk a page's path objects and collect their *transformed* sub-paths (shared by the
+/// snap index and Symbol Search so both see exactly the same geometry).
+fn extract_subpaths(page: &PdfPage<'static>) -> Vec<crate::geometry::Subpath> {
+    let mut subpaths: Vec<crate::geometry::Subpath> = Vec::new();
+    let mut current: Vec<crate::geometry::PdfPoint> = Vec::new();
+    let mut current_curve: Vec<bool> = Vec::new();
+    let mut current_closed = false;
+
+    for obj in page.objects().iter() {
+        let Some(path_obj) = obj.as_path_object() else {
+            continue;
+        };
+        // Objects with a degenerate/unreadable transform are skipped rather
+        // than erroring the whole extraction — one malformed object shouldn't
+        // deny snapping on an otherwise-good page.
+        let Ok(matrix) = path_obj.matrix() else {
+            continue;
+        };
+
+        for seg in path_obj.segments().transform(matrix).iter() {
+            let (x, y) = seg.point();
+            let pt = crate::geometry::PdfPoint {
+                x: x.value as f64,
+                y: y.value as f64,
+            };
+
+            match seg.segment_type() {
+                PdfPathSegmentType::MoveTo => {
+                    if !current.is_empty() {
+                        subpaths.push(crate::geometry::Subpath {
+                            points: std::mem::take(&mut current),
+                            closed: current_closed,
+                            curve: std::mem::take(&mut current_curve),
+                        });
+                    }
+                    current_closed = false;
+                    current.push(pt);
+                    current_curve.push(false);
+                }
+                PdfPathSegmentType::LineTo => {
+                    current.push(pt);
+                    current_curve.push(false);
+                }
+                PdfPathSegmentType::BezierTo => {
+                    current.push(pt);
+                    current_curve.push(true);
+                }
+                PdfPathSegmentType::Unknown => {}
+            }
+
+            if seg.is_close() {
+                current_closed = true;
+            }
+        }
+
+        // Flush the path object's final pending sub-path before moving to the
+        // next page object — a new object never continues the previous one's
+        // sub-path even without an explicit leading MoveTo.
+        if !current.is_empty() {
+            subpaths.push(crate::geometry::Subpath {
+                points: std::mem::take(&mut current),
+                closed: current_closed,
+                curve: std::mem::take(&mut current_curve),
+            });
+            current_closed = false;
+        }
+    }
+
+    subpaths
+}
+
+/// `(rotation, w0, h0, ox, oy)`: the page's `/Rotate` and TRUE MediaBox size and lower-left
+/// origin, as `search_page` reads them. An unreadable MediaBox gives the identity frame
+/// (rotation 0, zero origin), so a malformed page maps through unchanged.
+fn true_frame(page: &PdfPage<'static>) -> (i32, f64, f64, f64, f64) {
+    let rotation: i32 = match page.rotation() {
+        Ok(PdfPageRenderRotation::Degrees90) => 90,
+        Ok(PdfPageRenderRotation::Degrees180) => 180,
+        Ok(PdfPageRenderRotation::Degrees270) => 270,
+        Ok(PdfPageRenderRotation::None) | Err(_) => 0,
+    };
+    match page.boundaries().media() {
+        Ok(b) => {
+            let (l, r) = (b.bounds.left().value as f64, b.bounds.right().value as f64);
+            let (bo, t) = (b.bounds.bottom().value as f64, b.bounds.top().value as f64);
+            (rotation, (r - l).abs(), (t - bo).abs(), l.min(r), bo.min(t))
+        }
+        Err(_) => (0, 0.0, 0.0, 0.0, 0.0),
+    }
+}
+
 impl RenderEngine {
     /// Create the render engine and load PDFium bindings.
     ///
@@ -1082,71 +1173,7 @@ impl RenderEngine {
         }
 
         let page = doc.page(page_index)?;
-
-        let mut subpaths: Vec<crate::geometry::Subpath> = Vec::new();
-        let mut current: Vec<crate::geometry::PdfPoint> = Vec::new();
-        let mut current_curve: Vec<bool> = Vec::new();
-        let mut current_closed = false;
-
-        for obj in page.objects().iter() {
-            let Some(path_obj) = obj.as_path_object() else {
-                continue;
-            };
-            // Objects with a degenerate/unreadable transform are skipped rather
-            // than erroring the whole extraction — one malformed object shouldn't
-            // deny snapping on an otherwise-good page.
-            let Ok(matrix) = path_obj.matrix() else {
-                continue;
-            };
-
-            for seg in path_obj.segments().transform(matrix).iter() {
-                let (x, y) = seg.point();
-                let pt = crate::geometry::PdfPoint {
-                    x: x.value as f64,
-                    y: y.value as f64,
-                };
-
-                match seg.segment_type() {
-                    PdfPathSegmentType::MoveTo => {
-                        if !current.is_empty() {
-                            subpaths.push(crate::geometry::Subpath {
-                                points: std::mem::take(&mut current),
-                                closed: current_closed,
-                                curve: std::mem::take(&mut current_curve),
-                            });
-                        }
-                        current_closed = false;
-                        current.push(pt);
-                        current_curve.push(false);
-                    }
-                    PdfPathSegmentType::LineTo => {
-                        current.push(pt);
-                        current_curve.push(false);
-                    }
-                    PdfPathSegmentType::BezierTo => {
-                        current.push(pt);
-                        current_curve.push(true);
-                    }
-                    PdfPathSegmentType::Unknown => {}
-                }
-
-                if seg.is_close() {
-                    current_closed = true;
-                }
-            }
-
-            // Flush the path object's final pending sub-path before moving to the
-            // next page object — a new object never continues the previous one's
-            // sub-path even without an explicit leading MoveTo.
-            if !current.is_empty() {
-                subpaths.push(crate::geometry::Subpath {
-                    points: std::mem::take(&mut current),
-                    closed: current_closed,
-                    curve: std::mem::take(&mut current_curve),
-                });
-                current_closed = false;
-            }
-        }
+        let subpaths = extract_subpaths(page);
 
         // Clip to the media box plus a margin, so corrupt content far off the page cannot
         // reach the index or the client's segment grid. Unreadable box: no clipping (the
@@ -1175,6 +1202,32 @@ impl RenderEngine {
         doc.snap_cache
             .insert(page_index, std::sync::Arc::clone(&geom));
         Ok(geom)
+    }
+
+    /// Flat `[x1, y1, x2, y2, ...]` line segments of a page's vector paths, in the same
+    /// page space as the snap index (consecutive sub-path points, plus the closing edge of
+    /// closed sub-paths; Bezier curves reduce to their end points, as in the snap index).
+    /// Not cached: a dense A0 sheet is millions of segments, and Symbol Search over a
+    /// whole set would otherwise pin every page's segments in memory at once.
+    pub fn page_segments(&mut self, doc_id: &str, page_index: u32) -> Result<Vec<f64>> {
+        let doc = self
+            .documents
+            .get_mut(doc_id)
+            .with_context(|| format!("Unknown doc_id: {doc_id}"))?;
+        let page = doc.page(page_index)?;
+        let mut subpaths = extract_subpaths(page);
+        // Path-object coordinates are in the page's TRUE (unrotated, spec-absolute) space; the
+        // template box, markups, raster and viewer all use DISPLAY space (rotation baked in,
+        // MediaBox lower-left as origin). Convert so every Symbol Search path agrees.
+        let (rotation, w0, h0, ox, oy) = true_frame(page);
+        if rotation != 0 || ox != 0.0 || oy != 0.0 {
+            for sub in &mut subpaths {
+                for p in &mut sub.points {
+                    *p = true_to_display(*p, rotation, w0, h0, ox, oy);
+                }
+            }
+        }
+        Ok(crate::symbol_search::subpaths_to_segments(&subpaths))
     }
 
     /// Return the number of pages for an open document.
@@ -1590,6 +1643,12 @@ pub enum RenderCmd {
         page_index: u32,
         reply: oneshot::Sender<Result<Vec<crate::geometry::SnapTarget>>>,
     },
+    /// A page's flat vector line segments for Symbol Search. See `RenderEngine::page_segments`.
+    PageSegments {
+        doc_id: String,
+        page_index: u32,
+        reply: oneshot::Sender<Result<Vec<f64>>>,
+    },
     /// The page's straight segments `[x1, y1, x2, y2]` (same cached geometry as
     /// `PageSnapIndex`), for client-side perpendicular / nearest-on-segment snaps.
     PageSnapSegments {
@@ -1766,6 +1825,13 @@ impl RenderHandle {
                                 .page_snap_index(&doc_id, page_index)
                                 .map(|geom| geom.segments.clone());
                             let _ = reply.send(result);
+                        }
+                        RenderCmd::PageSegments {
+                            doc_id,
+                            page_index,
+                            reply,
+                        } => {
+                            let _ = reply.send(engine.page_segments(&doc_id, page_index));
                         }
                         RenderCmd::RasterizePdfBytes {
                             bytes,
@@ -2045,6 +2111,21 @@ impl RenderHandle {
             .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
     }
 
+    /// See [`RenderEngine::page_segments`].
+    pub async fn page_segments(&self, doc_id: String, page_index: u32) -> Result<Vec<f64>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(RenderCmd::PageSegments {
+                doc_id,
+                page_index,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("render thread gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("render thread dropped reply"))?
+    }
+
     /// Rasterize a small, throwaway, in-memory PDF's page 0 to a transparent-background
     /// PNG. See [`RenderEngine::rasterize_pdf_bytes`].
     pub async fn rasterize_pdf_bytes(&self, bytes: Vec<u8>, max_dim_px: u32) -> Result<Vec<u8>> {
@@ -2143,6 +2224,9 @@ fn send_init_error(cmd: RenderCmd, err: &anyhow::Error) {
             let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
         }
         RenderCmd::PageSnapIndex { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+        }
+        RenderCmd::PageSegments { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
         }
         RenderCmd::PageSnapSegments { reply, .. } => {

@@ -19,6 +19,9 @@ Svelte/TypeScript client), re-expressed in Rust where noted, and extended.
   src-tauri/src/geometry/mod.rs    <- packages/measure/src/snap.ts
   src/lib/path-array.ts            <- packages/markup/src/cad.ts (divisionPoints, pathArray, pointAlong)
   src/components/AlongPathDialog.svelte <- packages/markup/src/cad.ts (Divide / Measure / Path Array)
+  src-tauri/src/symbol_search/vector.rs <- packages/measure/src/visualSearch.ts (ported to Rust)
+  src-tauri/src/symbol_search/raster.rs <- packages/measure/src/rasterSearch.ts (ported to Rust; adds a
+                                           3 x 3 pre-blur, candidate cap, blank-template guard, threaded coarse pass)
 
 redcolumn is an independent project and is not affiliated with Bluebeam, Inc.
 or Nemetschek SE. Bluebeam and Revu are trademarks of Bluebeam, Inc.

@@ -2214,6 +2214,11 @@
               takeoffStore={activeTab.takeoffStore}
               docId={activeTab.docId}
               currentPage={activeTab.viewportSnapshot.pageIndex}
+              pageCount={activeTab.doc.page_count}
+              onjump={(t) => {
+                searchJumpNonce += 1;
+                viewportJumpRequest = { page: t.page, rect: t.rect, nonce: searchJumpNonce };
+              }}
             />
           </Accordion>
         {/if}

@@ -28,13 +28,24 @@
   import { countSymbolRender, COUNT_MARKER_RADIUS } from "$lib/markup-render";
   import { save as saveDialog } from "@tauri-apps/plugin-dialog";
   import CountSetPicker from "./CountSetPicker.svelte";
+  import SymbolSearchPanel from "./SymbolSearchPanel.svelte";
 
   const {
     store,
     takeoffStore,
     docId,
     currentPage = 0,
-  }: { store: MarkupStore; takeoffStore: TakeoffStore; docId: string; currentPage?: number } = $props();
+    pageCount = 1,
+    onjump,
+  }: {
+    store: MarkupStore;
+    takeoffStore: TakeoffStore;
+    docId: string;
+    currentPage?: number;
+    /** Pages in the document (Symbol Search "all pages" scope). */
+    pageCount?: number;
+    onjump?: (target: { page: number; rect: [number, number, number, number] }) => void;
+  } = $props();
 
   const MEASUREMENT_TYPES = new Set([
     "MeasurementLength", "MeasurementArea", "MeasurementCount",
@@ -252,6 +263,8 @@
   {#if exportError}
     <div class="export-error">{exportError}</div>
   {/if}
+
+  <SymbolSearchPanel {store} {docId} {currentPage} {pageCount} {identity} {onjump} />
 
   <section class="viewports" aria-label="Viewports">
     <div class="viewports-head">

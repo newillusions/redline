@@ -18,6 +18,7 @@ pub mod recent_docs;
 pub mod render;
 pub mod search;
 pub mod settings;
+pub mod symbol_search;
 pub mod takeoff;
 pub mod text;
 pub mod text_select;
