@@ -24,6 +24,7 @@ pub mod callout;
 pub mod foreign;
 pub mod legend;
 pub(crate) mod replies;
+pub mod xfdf;
 
 /// v1 markup types (spec §12 decision a — locked).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

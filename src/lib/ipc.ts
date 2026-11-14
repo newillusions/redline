@@ -676,6 +676,14 @@ export async function exportMarkupsSummaryPdf(
   return invoke<number>("export_markups_summary_pdf", { docId: doc_id, path, ids, columns });
 }
 
+/**
+ * Export every mark-up of the document (ignoring the list's filter) as XFDF, replies and
+ * statuses included. Returns the number of mark-ups written.
+ */
+export async function exportMarkupsXfdf(doc_id: string, path: string): Promise<number> {
+  return invoke<number>("export_markups_xfdf", { docId: doc_id, path });
+}
+
 // ---------------------------------------------------------------------------
 // Page operation commands (M4 S1)
 // ---------------------------------------------------------------------------

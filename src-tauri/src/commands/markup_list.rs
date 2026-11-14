@@ -418,6 +418,26 @@ pub async fn export_markups_summary_pdf(
     Ok(rows.len())
 }
 
+/// Export EVERY mark-up of the document (not just the filtered view) as XFDF, with replies
+/// and statuses. `path` is the absolute output path chosen by the user. Returns the number of
+/// mark-ups written.
+#[tauri::command]
+pub async fn export_markups_xfdf(
+    state: State<'_, AppState>,
+    doc_id: String,
+    path: String,
+) -> Result<usize, String> {
+    let all = state.markups.list(&doc_id)?;
+    let source = state
+        .markups
+        .path(&doc_id)
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let xml = crate::markup::xfdf::export_xfdf(&all, &source);
+    std::fs::write(&path, xml).map_err(|e| format!("could not write {path}: {e}"))?;
+    Ok(all.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

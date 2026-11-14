@@ -10,7 +10,7 @@
   import { onMount } from "svelte";
   import { save as saveDialog } from "@tauri-apps/plugin-dialog";
   import type { Markup, MarkupStatus, UserRef } from "$lib/ipc";
-  import { exportMarkupsView, exportMarkupsSummaryPdf, getUserIdentity, isMarkupContentsLocked, isMarkupLocked } from "$lib/ipc";
+  import { exportMarkupsView, exportMarkupsSummaryPdf, exportMarkupsXfdf, getUserIdentity, isMarkupContentsLocked, isMarkupLocked } from "$lib/ipc";
   import type { MarkupStore } from "$lib/markup-store.svelte";
   import { boundsOf } from "$lib/markup-select";
   import { expandCountSelection } from "$lib/count-groups";
@@ -219,19 +219,21 @@
 
   // ---- export -----------------------------------------------------------------------
 
-  async function doExport(ext: "csv" | "xlsx" | "pdf") {
+  async function doExport(ext: "csv" | "xlsx" | "pdf" | "xfdf") {
     error = null;
     message = null;
     if (rows.length === 0) return;
     const dest = await saveDialog({
       title: "Export mark-ups list",
       defaultPath: `markups.${ext}`,
-      filters: [{ name: ext === "xlsx" ? "Excel workbook" : ext === "pdf" ? "PDF summary" : "CSV", extensions: [ext] }],
+      filters: [{ name: ext === "xlsx" ? "Excel workbook" : ext === "pdf" ? "PDF summary" : ext === "xfdf" ? "XFDF comments" : "CSV", extensions: [ext] }],
     });
     if (!dest) return;
     try {
       await store.flush();
-      const n = ext === "pdf"
+      const n = ext === "xfdf"
+        ? await exportMarkupsXfdf(docId, dest)
+        : ext === "pdf"
         ? await exportMarkupsSummaryPdf(docId, dest, viewIds, cols)
         : await exportMarkupsView(docId, dest, exportFormatFromPath(dest), viewIds, cols);
       message = exportDoneMessage(dest, n);
@@ -346,6 +348,7 @@
     <button class="ml-btn" disabled={rows.length === 0} onclick={() => doExport("csv")}>Export CSV</button>
     <button class="ml-btn" disabled={rows.length === 0} onclick={() => doExport("xlsx")}>Export XLSX</button>
     <button class="ml-btn" disabled={rows.length === 0} onclick={() => doExport("pdf")}>Export PDF</button>
+    <button class="ml-btn" disabled={rows.length === 0} onclick={() => doExport("xfdf")}>Export XFDF</button>
     <span class="ml-count" aria-live="polite">{rows.length === allRows.length ? `${allRows.length} mark-ups` : `${rows.length} of ${allRows.length}`}</span>
   </div>
 
