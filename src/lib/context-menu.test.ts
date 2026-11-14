@@ -13,7 +13,7 @@ describe("markupMenuItems", () => {
     expect(ids).toEqual([
       "status:Accepted", "status:Rejected", "status:Cancelled", "status:Completed", "status:None",
       "properties", "save-as-tool", "copy", "cut", "duplicate", "copy-format", "paste-format", "use-as-default",
-      "bring-to-front", "send-to-back", "delete",
+      "bring-to-front", "send-to-back", "hide", "delete",
     ]);
   });
   it("greys out edits on a locked markup but leaves copy and properties", () => {

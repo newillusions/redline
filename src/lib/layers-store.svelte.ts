@@ -7,6 +7,7 @@
  * never read it. One store per open document, found by id (`layerStoreFor`), so the panel,
  * the viewer and the properties panel share state without threading a prop through App.
  */
+import { hideMarkups, isMarkupHidden, showMarkups } from "./markup-visibility";
 import {
   addLayerToFile, defaultOff, isMarkupShown, isolate, readLayers, sameSet, saveLayersDefault,
   setLayerView, showAll, toggleLayer, setGroups, type LayerModel,
@@ -67,9 +68,16 @@ export class LayerStore {
     return !!this.model && this.model.view_supported;
   }
 
-  /** Whether a mark-up is drawn in the current view. */
-  isShown(m: { optional_content?: unknown }): boolean {
-    return isMarkupShown(this.model, this.off, m);
+  /** Ids of mark-ups the user hid (Hide / Show markups). Display-only, session-only; replaced, never mutated. */
+  hiddenMarkups = $state<ReadonlySet<string>>(new Set());
+
+  hideMarkupIds(ids: Iterable<string>): void { this.hiddenMarkups = hideMarkups(this.hiddenMarkups, ids); }
+  showMarkupIds(ids: Iterable<string>): void { this.hiddenMarkups = showMarkups(this.hiddenMarkups, ids); }
+  showAllMarkups(): void { this.hiddenMarkups = new Set(); }
+
+  /** Whether a mark-up is drawn in the current view (neither on a hidden layer nor hidden by the user). */
+  isShown(m: { optional_content?: unknown; id?: string }): boolean {
+    return !isMarkupHidden(this.hiddenMarkups, m) && isMarkupShown(this.model, this.off, m);
   }
 
   // --- loading ------------------------------------------------------------

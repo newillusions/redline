@@ -12,6 +12,8 @@
   import type { Markup, MarkupStatus, UserRef } from "$lib/ipc";
   import { exportMarkupsView, exportMarkupsSummaryPdf, exportMarkupsXfdf, getUserIdentity, isMarkupContentsLocked, isMarkupLocked } from "$lib/ipc";
   import type { MarkupStore } from "$lib/markup-store.svelte";
+  import { layerStoreFor } from "$lib/layers-store.svelte";
+  import { hiddenCount, withoutHidden } from "$lib/markup-visibility";
   import { boundsOf } from "$lib/markup-select";
   import { expandCountSelection } from "$lib/count-groups";
   import { patchMarked, patchStatus } from "$lib/markup-properties";
@@ -106,6 +108,23 @@
     26 + cols.reduce((n, k) => n + (COLUMN_DEFS.find((c) => c.key === k)?.width ?? 110), 0),
   );
   const selectedCount = $derived(store.selectedIds.size);
+
+  // Hide / Show: display-only (the markups stay listed and exported), see `markup-visibility.ts`.
+  const view = $derived(layerStoreFor(docId));
+  const hiddenTotal = $derived(hiddenCount(view.hiddenMarkups, store.markups.map((m) => m.id)));
+  const selectionHidden = $derived(selectedCount > 0 && [...store.selectedIds].every((id) => view.hiddenMarkups.has(id)));
+  function toggleHideSelected() {
+    const ids = [...store.selectedIds];
+    if (selectionHidden) view.showMarkupIds(ids);
+    else {
+      view.hideMarkupIds(ids);
+      store.selectedIds = withoutHidden(store.selectedIds, view.hiddenMarkups);
+    }
+  }
+  function hideAll() {
+    view.hideMarkupIds(store.markups.map((m) => m.id));
+    store.selectedIds = new Set();
+  }
 
   function setConfig(c: ColumnConfig) {
     config = c;
@@ -371,6 +390,9 @@
     </select>
     <button class="ml-btn" data-action="check-all" disabled={allRows.length === 0 || markedTotal === store.markups.length} onclick={() => setMarked(store.markups, true)}>Check all</button>
     <button class="ml-btn" data-action="clear-all" disabled={markedTotal === 0} onclick={() => setMarked(store.markups, false)}>Clear all{markedTotal ? ` (${markedTotal})` : ""}</button>
+    <button class="ml-btn" data-action="hide-selected" disabled={selectedCount === 0} onclick={toggleHideSelected}>{selectionHidden ? "Show" : "Hide"}</button>
+    <button class="ml-btn" data-action="hide-all" disabled={allRows.length === 0} onclick={hideAll}>Hide all</button>
+    <button class="ml-btn" data-action="show-all" disabled={hiddenTotal === 0} onclick={() => view.showAllMarkups()}>Show all{hiddenTotal ? ` (${hiddenTotal})` : ""}</button>
     <button class="ml-btn" disabled={rows.length === 0} onclick={() => doExport("csv")}>Export CSV</button>
     <button class="ml-btn" disabled={rows.length === 0} onclick={() => doExport("xlsx")}>Export XLSX</button>
     <button class="ml-btn" disabled={rows.length === 0} onclick={() => doExport("pdf")}>Export PDF</button>
@@ -435,6 +457,9 @@
                     aria-expanded={expanded.has(it.row.id)}
                     onclick={(e) => { e.stopPropagation(); toggleExpanded(it.row.id); }}
                   >{expanded.has(it.row.id) ? "▾" : "▸"}</button>
+                {/if}
+                {#if view.hiddenMarkups.has(it.row.id)}
+                  <svg class="ml-hidden-icon" data-testid="ml-hidden-icon" role="img" aria-label="Hidden from view" viewBox="0 0 16 16" width="12" height="12"><title>Hidden from view</title><path d="M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8z" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M2.5 13.5l11-11" stroke="currentColor" stroke-width="1.3"/></svg>
                 {/if}
               </span>
               {#each cols as k (k)}
@@ -515,6 +540,7 @@
 
 <style>
   .markups-list { display: flex; flex-direction: column; height: 100%; min-height: 0; font-size: var(--font-size-sm); }
+  .ml-hidden-icon { color: var(--color-text-muted); vertical-align: middle; }
   .ml-toolbar { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--color-border); background: var(--color-bg-toolbar); }
   .ml-search { width: 220px; }
   .ml-pages { width: 110px; }

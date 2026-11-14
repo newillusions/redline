@@ -65,12 +65,15 @@ export function markupMenuItems(s: MarkupMenuState): MenuItem[] {
     SEP,
     item("bring-to-front", "Bring to Front", { disabled: edit }),
     item("send-to-back", "Send to Back", { disabled: edit }),
+    item("hide", "Hide"),
     SEP,
     item("delete", "Delete", { shortcut: "Del", disabled: edit, danger: true }),
   ];
 }
 
 export interface CanvasMenuState {
+  /** At least one markup is hidden: Show All Markups is offered enabled. */
+  hasHidden?: boolean;
   canPaste: boolean;
   hasMarkups: boolean;
   canBack: boolean;
@@ -81,6 +84,8 @@ export function canvasMenuItems(s: CanvasMenuState): MenuItem[] {
   return [
     item("paste", "Paste", { shortcut: "Ctrl+V", disabled: !s.canPaste }),
     item("select-all", "Select All on Page", { disabled: !s.hasMarkups }),
+    item("hide-all", "Hide All Markups", { disabled: !s.hasMarkups }),
+    item("show-all", "Show All Markups", { disabled: !s.hasHidden }),
     SEP,
     item("fit-width", "Fit Width", { shortcut: "Ctrl+0" }),
     item("fit-height", "Fit Height", { shortcut: "Ctrl+9" }),

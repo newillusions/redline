@@ -100,6 +100,7 @@
   } from "$lib/markup-tools";
   import { patchGroup } from "$lib/markup-properties";
   import { layerStoreFor } from "$lib/layers-store.svelte";
+  import { hiddenCount } from "$lib/markup-visibility";
   import { TakeoffStore } from "$lib/takeoff-store.svelte";
   import { measureLength, measureArea, measurePerimeter, measureAngleDegrees, formatAngleLabel } from "$lib/measurement-tools";
   import { polylengthPayload, recomputeAll, MAX_POLYLENGTH_VERTICES } from "$lib/polylength";
@@ -665,6 +666,8 @@
   // Layers: mark-ups on a layer the view hides are not drawn or hit-tested. The view is
   // display-only - lists, legends, counts and exports read store.markups, never this.
   const layerView = $derived(layerStoreFor(docInfo.doc_id));
+  /** Markups the user hid that still exist (the on-canvas "N hidden" indicator). */
+  const hiddenMarkupCount = $derived(hiddenCount(layerView.hiddenMarkups, store.markups.map((m) => m.id)));
   /** The mark-ups of the current page that the layer view shows. */
   function shownOnPage(): Markup[] {
     return store.onPage(pageIndex).filter((m) => layerView.isShown(m));
@@ -1494,6 +1497,7 @@
     return canvasMenuItems({
       canPaste: markupClipboard.size > 0,
       hasMarkups: store.onPage(pageIndex).length > 0,
+      hasHidden: layerView.hiddenMarkups.size > 0,
       canBack: viewNav.back,
       canForward: viewNav.forward,
     });
@@ -1574,6 +1578,21 @@
         showArrangeNotice(selectAllOnPage(arrangeCtx(), shownOnPage().map((m) => m.id)));
         return;
       }
+      case "hide": {
+        // Display-only: the selection leaves with the markups it hides.
+        const ids = store.selectedMarkups.map((m) => m.id);
+        layerView.hideMarkupIds(ids);
+        store.selectedIds = new Set([...store.selectedIds].filter((id) => !ids.includes(id)));
+        showArrangeNotice({ ok: true, message: `Hid ${ids.length} markup${ids.length === 1 ? "" : "s"}` });
+        return;
+      }
+      case "hide-all": {
+        layerView.hideMarkupIds(store.markups.map((m) => m.id));
+        store.selectedIds = new Set();
+        showArrangeNotice({ ok: true, message: "Hid all markups" });
+        return;
+      }
+      case "show-all": layerView.showAllMarkups(); showArrangeNotice({ ok: true, message: "Showing all markups" }); return;
       case "fit-width": fitWidth(); return;
       case "fit-height": fitHeight(); return;
       case "actual-size": actualSize(); return;
@@ -4567,6 +4586,11 @@
     />
   {/if}
 
+  {#if hiddenMarkupCount > 0 && (!slot || slot.active)}
+    <button type="button" class="hidden-indicator" data-testid="hidden-indicator" title="Show all hidden markups"
+      onclick={() => layerView.showAllMarkups()}>{hiddenMarkupCount} hidden</button>
+  {/if}
+
   <!-- Copy / paste / Multiply / align / order (docs/arrange.md). Select tool only, and only
        when there is something to act on. -->
   {#if isSelectTool() && (store.selectedIds.size > 0 || markupClipboard.size > 0) && (!slot || slot.active)}
@@ -4845,6 +4869,11 @@
   /* --- Zoom-snap preset toolbar: position lives on the corner-anchored wrapper (see
        corner-* below), not on .zoom-controls itself, so the collapsed .toolbar-reopen
        tab renders at the same anchored spot as the full bar. --- */
+  .hidden-indicator {
+    position: absolute; left: 50%; transform: translateX(-50%); bottom: var(--space-4); z-index: 6;
+    padding: var(--space-1) var(--space-2); border: 1px solid var(--color-border); border-radius: var(--radius-sm);
+    background: var(--color-bg-toolbar); color: var(--color-text); font-size: var(--font-size-sm); cursor: pointer;
+  }
   .zoom-controls-wrap {
     position: absolute;
   }

@@ -169,6 +169,34 @@ describe("Viewport honours the layer view", () => {
     await waitFor(() => expect(rects(container)).toBe(3));
   });
 
+  it("a user-hidden mark-up vanishes from the viewport and cannot be clicked; Show all restores it, with no edit made", async () => {
+    const { container, overlay } = await mountViewport(store);
+    await waitFor(() => expect(layerStoreFor("d1").status).toBe("loaded"));
+    await waitFor(() => expect(rects(container)).toBe(3));
+    layerStoreFor("d1").hideMarkupIds(["a", "b"]);
+    await waitFor(() => expect(rects(container)).toBe(1));
+    store.activeTool = "select";
+    await tick();
+    ptr(overlay, "pointerdown", 100, 100); // B's centre: hidden
+    ptr(overlay, "pointerup", 100, 100);
+    await tick();
+    expect(store.selectedIds.has("b")).toBe(false);
+    expect(store.dirty).toBe(false);
+    layerStoreFor("d1").showAllMarkups();
+    await waitFor(() => expect(rects(container)).toBe(3));
+  });
+
+  it("shows an 'N hidden' indicator while markups are hidden; clicking it shows them all", async () => {
+    const { container } = await mountViewport(store);
+    await waitFor(() => expect(rects(container)).toBe(3));
+    expect(container.querySelector("[data-testid='hidden-indicator']")).toBeNull();
+    layerStoreFor("d1").hideMarkupIds(["a", "b"]);
+    await waitFor(() => expect(container.querySelector("[data-testid='hidden-indicator']")?.textContent?.trim()).toBe("2 hidden"));
+    await fireEvent.click(container.querySelector("[data-testid='hidden-indicator']")!);
+    await waitFor(() => expect(container.querySelector("[data-testid='hidden-indicator']")).toBeNull());
+    expect(rects(container)).toBe(3);
+  });
+
   it("a mark-up on a layer the file hides by default is not drawn at open", async () => {
     layerIpc.readLayers.mockResolvedValue({
       status: "Loaded",
