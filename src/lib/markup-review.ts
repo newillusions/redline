@@ -27,6 +27,25 @@ export function latestReviewChange(history: StatusChange[] | undefined): StatusC
   return null;
 }
 
+/** The standard checkmark state model (`/StateModel /Marked`, states Marked / Unmarked). */
+export const MARKED_MODEL = "Marked";
+
+function isMarkedEntry(c: StatusChange): boolean {
+  return c.model === MARKED_MODEL && !c.on_reply;
+}
+
+/** Latest markup-level Marked-model entry of a history (oldest-first array), or null. */
+export function latestMarkedChange(history: StatusChange[] | undefined): StatusChange | null {
+  const h = history ?? [];
+  for (let i = h.length - 1; i >= 0; i--) if (isMarkedEntry(h[i])) return h[i];
+  return null;
+}
+
+/** True when the markup's checkmark is ticked. Mirrors Rust `Workflow::is_marked`. */
+export function isMarked(m: Pick<Markup, "workflow">): boolean {
+  return latestMarkedChange(m.workflow.status_history)?.state === "Marked";
+}
+
 /** Replies depth-first under their parent, siblings oldest first (Revu's indented rows). */
 export function threadRows(thread: MarkupReply[]): { reply: MarkupReply; depth: number }[] {
   const ids = new Set(thread.map((r) => r.id));

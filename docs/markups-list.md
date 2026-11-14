@@ -59,6 +59,7 @@ Nothing here comes from decompiling or instrumenting Bluebeam software.
 |---|---|---|
 | Set via right-click > Status, or double-click the Status cell | V G-i9S5o-BDw@118-128, c16Kk8Cffcc@376-380 | Double-click the Status cell for an inline picker; a "Set status" menu acts on the selection. The list has no right-click menu (its contents are U) |
 | Shift+1 .. Shift+9 shortcuts, "in the order statuses are displayed" | V IfYMI1gVsvo@42-50 | With focus in the list: Shift+1 Accepted, 2 Rejected, 3 Cancelled, 4 Completed, 5 None; 6-9 unused. The order is Revu's default model order (V c16Kk8Cffcc@184-192); that Shift+N follows that exact order is **I** |
+| Per-comment checkmark | V (ISO 32000-1 table 172, Marked state model) | "Checkmark" column with a checkbox per row, plus Check all and Clear all (one undo step each). Ticking appends a hidden `/StateModel /Marked` state annotation (`/State /Marked`, or `/Unmarked` on untick); the history is kept and the Review status is untouched. Locked mark-ups are skipped. Exported as "Yes" / blank |
 | Status is stamped with who and when | V c16Kk8Cffcc@199-205, IfYMI1gVsvo@72-78 | "Status set by" and "Status set at" columns, from the latest markup-level Review entry of the status history |
 | A status change on a reply is not the mark-up's status | I (PDF model) | A history entry with `on_reply` never drives the shown status or "Status set by/at" |
 | Changing status does not create a reply row | V IfYMI1gVsvo@72-78 | It appends a history entry only (existing `patchStatus`) |

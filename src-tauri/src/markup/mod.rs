@@ -351,6 +351,9 @@ pub struct StatusChange {
 
 /// The `/StateModel` name of the standard review model.
 pub const REVIEW_MODEL: &str = "Review";
+/// The `/StateModel` name of the standard checkmark model (`/State` Marked / Unmarked,
+/// ISO 32000-1 table 172): what Acrobat's and Revu's per-comment checkmark writes.
+pub const MARKED_MODEL: &str = "Marked";
 
 impl MarkupStatus {
     /// The ISO 32000-1 `/State` string for this status in the Review model.
@@ -418,6 +421,47 @@ impl Workflow {
     /// Number of replies in the thread (all nesting levels) - for a Markups List column.
     pub fn reply_count(&self) -> usize {
         self.thread.len()
+    }
+
+    /// True when the latest markup-level `Marked`-model entry says `Marked` (the comment's
+    /// checkmark is ticked). No entry, or a latest `Unmarked`, is unticked. Entries on a reply
+    /// and other models never count.
+    pub fn is_marked(&self) -> bool {
+        self.status_history
+            .iter()
+            .rev()
+            .find(|c| c.on_reply.is_none() && c.model == MARKED_MODEL)
+            .is_some_and(|c| c.state == "Marked")
+    }
+
+    /// Tick or untick the checkmark by appending a standard `Marked`-model state entry (every
+    /// change is its own state annotation, so the history stays; see `replies.rs`). A no-op
+    /// when the checkmark already has that value. Returns whether an entry was added.
+    /// The entry's date is pushed past the previous Marked entry when needed (see below).
+    pub fn set_marked(&mut self, marked: bool, by: UserRef, at: DateTime<Utc>) -> bool {
+        if self.is_marked() == marked {
+            return false;
+        }
+        // PDF dates have one-second resolution and the reader orders entries by date, so a
+        // tick and an untick within one second would swap on reload. Keep Marked-model entries
+        // strictly one second apart (the later one always reads back later).
+        let at = self
+            .status_history
+            .iter()
+            .rev()
+            .find(|c| c.on_reply.is_none() && c.model == MARKED_MODEL)
+            .map_or(at, |last| at.max(last.at + chrono::Duration::seconds(1)));
+        self.status_history.push(StatusChange {
+            id: Uuid::new_v4(),
+            author: by,
+            at,
+            model: MARKED_MODEL.to_string(),
+            state: if marked { "Marked" } else { "Unmarked" }.to_string(),
+            on_reply: None,
+            nm: None,
+            extras: None,
+        });
+        true
     }
 
     /// The most recent Review-model status entry (who/when set the current status).

@@ -6,6 +6,7 @@
 import type { Markup, Appearance, UserRef, MarkupWorkflow, MarkupReply, StatusChange } from "./ipc";
 import { bumpAudit, DEFAULT_TEXT_FONT } from "./markup-tools";
 import { refitBox, setAutosize } from "./callout";
+import { isMarked, latestMarkedChange, MARKED_MODEL } from "./markup-review";
 
 /** Base-14 font families offered by the picker (reliable cross-viewer /DA rendering). */
 export const FONT_FAMILIES: readonly string[] = ["Helvetica", "Times", "Courier"];
@@ -101,6 +102,31 @@ export function patchStatus(
     by,
     now,
   );
+}
+
+/**
+ * Return a clone of `m` with the checkmark ticked or unticked: a new standard `Marked`-model
+ * state entry (`Marked` / `Unmarked`) appended to `status_history`, the Review status untouched.
+ * `m` is returned unchanged when the checkmark already has that value. The entry is dated at
+ * least one second after the previous Marked entry, because PDF dates have one-second resolution
+ * and the reader orders entries by date (mirrors Rust `Workflow::set_marked`). Pure.
+ */
+export function patchMarked(
+  m: Markup,
+  marked: boolean,
+  by: UserRef,
+  now: string,
+  id: string = newId(),
+): Markup {
+  if (isMarked(m) === marked) return m;
+  const last = latestMarkedChange(m.workflow.status_history);
+  const lastMs = last ? Date.parse(last.at) : NaN;
+  const nowMs = Date.parse(now);
+  const atMs = Number.isFinite(lastMs) && !(nowMs >= lastMs + 1000) ? lastMs + 1000 : nowMs;
+  const at = Number.isFinite(atMs) ? new Date(atMs).toISOString() : now;
+  const change: StatusChange = { id, author: by, at, model: MARKED_MODEL, state: marked ? "Marked" : "Unmarked" };
+  const history = m.workflow.status_history ?? [];
+  return bumpAudit({ ...m, workflow: { ...m.workflow, status_history: [...history, change] } }, by, now);
 }
 
 /**

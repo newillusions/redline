@@ -258,7 +258,7 @@ describe("MarkupsListPanel", () => {
     expect(args[1]).toBe("/tmp/out.csv");
     expect(args[2]).toBe("Csv");
     expect(args[3]).toEqual(["b", "a"]);
-    expect(args[4]).toEqual(["subject", "page", "comment", "author", "date", "status", "replies", "layer"]);
+    expect(args[4]).toEqual(["subject", "page", "comment", "author", "date", "checkmark", "status", "replies", "layer"]);
   });
 
   it("Export PDF sends the same filtered, sorted ids and visible columns to the PDF summary", async () => {

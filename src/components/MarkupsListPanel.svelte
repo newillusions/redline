@@ -14,7 +14,8 @@
   import type { MarkupStore } from "$lib/markup-store.svelte";
   import { boundsOf } from "$lib/markup-select";
   import { expandCountSelection } from "$lib/count-groups";
-  import { patchStatus } from "$lib/markup-properties";
+  import { patchMarked, patchStatus } from "$lib/markup-properties";
+  import { isMarked } from "$lib/markup-review";
   import { exportDoneMessage, exportFormatFromPath } from "$lib/doc-op-flow";
   import {
     STATUS_ORDER, applyRowClick, buildRows, cellText, columnLabel, columnKind, COLUMN_DEFS,
@@ -198,6 +199,29 @@
     );
   }
 
+  // ---- checkmark ----------------------------------------------------------------------
+
+  const markedTotal = $derived(store.markups.reduce((n, m) => n + (isMarked(m) ? 1 : 0), 0));
+
+  /** Tick or untick `list` as ONE undo step (standard `Marked` state model). Skips locked mark-ups. */
+  function setMarked(list: readonly Markup[], marked: boolean) {
+    const now = new Date().toISOString();
+    const pairs = list
+      .filter((m) => isMarked(m) !== marked)
+      .map((m) => ({ before: m, after: patchMarked(m, marked, identity ?? m.audit.modified_by, now) }));
+    if (pairs.length === 0) return;
+    error = null;
+    const locked = pairs.filter((p) => isMarkupLocked(p.before) || isMarkupContentsLocked(p.before)).length;
+    if (locked > 0) error = `${locked} locked mark-up${locked === 1 ? "" : "s"} skipped.`;
+    store.applyBatch(pairs);
+  }
+
+  function onCheckToggle(e: Event, id: string) {
+    e.stopPropagation();
+    const m = store.getById(id);
+    if (m) setMarked([m], !isMarked(m));
+  }
+
   function onStatusPick(e: Event, id: string) {
     const v = (e.currentTarget as HTMLSelectElement).value as MarkupStatus;
     editingStatusId = null;
@@ -345,6 +369,8 @@
         <option value={s}>{s} (Shift+{i + 1})</option>
       {/each}
     </select>
+    <button class="ml-btn" data-action="check-all" disabled={allRows.length === 0 || markedTotal === store.markups.length} onclick={() => setMarked(store.markups, true)}>Check all</button>
+    <button class="ml-btn" data-action="clear-all" disabled={markedTotal === 0} onclick={() => setMarked(store.markups, false)}>Clear all{markedTotal ? ` (${markedTotal})` : ""}</button>
     <button class="ml-btn" disabled={rows.length === 0} onclick={() => doExport("csv")}>Export CSV</button>
     <button class="ml-btn" disabled={rows.length === 0} onclick={() => doExport("xlsx")}>Export XLSX</button>
     <button class="ml-btn" disabled={rows.length === 0} onclick={() => doExport("pdf")}>Export PDF</button>
@@ -428,6 +454,18 @@
                       {#each STATUS_ORDER as s (s)}<option value={s}>{s}</option>{/each}
                     </select>
                   </span>
+                {:else if k === "checkmark"}
+                  <span class="ml-cell ml-check" role="gridcell">
+                    <input
+                      type="checkbox"
+                      aria-label="Checkmark"
+                      data-testid="ml-checkmark"
+                      checked={it.row.marked}
+                      onclick={(e) => e.stopPropagation()}
+                      ondblclick={(e) => e.stopPropagation()}
+                      onchange={(e) => onCheckToggle(e, it.row.id)}
+                    />
+                  </span>
                 {:else if k === "status"}
                   <span
                     class="ml-cell status-{it.row.status}"
@@ -505,6 +543,7 @@
   .ml-cell { padding: 0 var(--space-2); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   .ml-cell.num { text-align: right; font-variant-numeric: tabular-nums; }
   .ml-twist { padding: 0; text-align: center; }
+  .ml-check { display: flex; align-items: center; justify-content: center; }
   .ml-cell-select { width: 100%; font-size: var(--font-size-sm); }
   .ml-swatch { display: inline-block; width: 10px; height: 10px; margin-right: 4px; border: 1px solid var(--color-border); }
   .status-Accepted { color: var(--color-status-accepted); }

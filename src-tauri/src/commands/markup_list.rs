@@ -43,6 +43,8 @@ pub enum ListColumn {
     Measurement,
     StatusBy,
     StatusAt,
+    /// The per-comment checkmark (`Marked` state model): "Yes" when ticked, else empty.
+    Checkmark,
     Custom(String),
 }
 
@@ -65,6 +67,7 @@ impl ListColumn {
             "measurement" => Self::Measurement,
             "status_by" => Self::StatusBy,
             "status_at" => Self::StatusAt,
+            "checkmark" => Self::Checkmark,
             other => match other.strip_prefix("custom:") {
                 Some(name)
                     if !name.is_empty()
@@ -96,6 +99,7 @@ impl ListColumn {
             Self::Measurement => "Measurement".into(),
             Self::StatusBy => "Status set by".into(),
             Self::StatusAt => "Status set at".into(),
+            Self::Checkmark => "Checkmark".into(),
             Self::Custom(name) => name.clone(),
         }
     }
@@ -173,6 +177,13 @@ fn cell(m: &Markup, number: usize, col: &ListColumn, labels: &[String]) -> Strin
             .latest_review_change()
             .map(|c| stamp(&c.at))
             .unwrap_or_default(),
+        ListColumn::Checkmark => {
+            if m.workflow.is_marked() {
+                "Yes".to_string()
+            } else {
+                String::new()
+            }
+        }
         ListColumn::Custom(name) => m
             .measurement
             .as_ref()
@@ -736,6 +747,25 @@ mod tests {
             "no formula cells: {sheet}"
         );
         assert!(sheet.contains("t=\"s\""), "cells are shared-string typed");
+    }
+
+    #[test]
+    fn checkmark_column_says_yes_only_for_a_ticked_markup() {
+        let mut ticked = mk(0, "a", "Ann");
+        ticked.workflow.set_marked(
+            true,
+            UserRef {
+                user_id: Uuid::new_v4(),
+                display_name: "Rev".into(),
+            },
+            chrono::Utc::now(),
+        );
+        let plain = mk(0, "b", "Bob");
+        let ids = vec![ticked.id().to_string(), plain.id().to_string()];
+        let (headers, rows, _) =
+            view_table(&[ticked, plain], &[], &ids, &["checkmark".to_string()], &[]).unwrap();
+        assert_eq!(headers, vec!["Checkmark".to_string()]);
+        assert_eq!(rows, vec![vec!["Yes".to_string()], vec![String::new()]]);
     }
 
     #[test]

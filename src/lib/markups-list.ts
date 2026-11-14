@@ -8,7 +8,7 @@
  */
 import { markupOcRef } from "./layers";
 import type { Markup, MarkupStatus } from "./ipc";
-import { latestReviewChange, threadRows } from "./markup-review";
+import { isMarked, latestReviewChange, threadRows } from "./markup-review";
 
 /** Revu's default Review-model order (c16Kk8Cffcc@184-192); drives the status menu and Shift+N. */
 export const STATUS_ORDER: readonly MarkupStatus[] = [
@@ -44,6 +44,7 @@ export const COLUMN_DEFS: readonly ColumnDef[] = [
   { key: "author", label: "Author", kind: "text", defaultVisible: true, width: 110 },
   { key: "date", label: "Date", kind: "text", defaultVisible: true, width: 135 },
   { key: "modified", label: "Modified", kind: "text", defaultVisible: false, width: 120 },
+  { key: "checkmark", label: "Checkmark", kind: "text", defaultVisible: true, width: 84 },
   { key: "status", label: "Status", kind: "text", defaultVisible: true, width: 90 },
   { key: "replies", label: "Replies", kind: "number", defaultVisible: true, width: 64 },
   { key: "colour", label: "Colour", kind: "text", defaultVisible: false, width: 80 },
@@ -83,6 +84,8 @@ export interface ListRow {
   layerKey: string;
   measurement: string;
   measurementValue: number | null;
+  /** The checkmark is ticked (`Marked` state model). */
+  marked: boolean;
   statusBy: string;
   statusAt: string;
   custom: Record<string, string>;
@@ -144,6 +147,7 @@ export function buildRow(m: Markup, index: number, pageLabels: readonly string[]
     layerKey: markupOcRef(m) !== null ? `oc:${markupOcRef(m)}` : `name:${layer}`,
     measurement: text,
     measurementValue: value,
+    marked: isMarked(m),
     statusBy: clip(change?.author.display_name),
     statusAt: formatStamp(change?.at),
     custom,
@@ -206,6 +210,7 @@ export function cellText(r: ListRow, key: string): string {
     case "date": return r.date;
     case "modified": return r.modified;
     case "status": return r.status;
+    case "checkmark": return r.marked ? "Yes" : "";
     case "replies": return r.replies > 0 ? String(r.replies) : "";
     case "colour": return r.colour;
     case "layer": return r.layer;
