@@ -944,6 +944,17 @@ impl Markup {
     pub fn is_contents_locked(&self) -> bool {
         self.annot_flags & 0x200 != 0
     }
+
+    /// Set or clear the `Locked` bit (`0x80`) in `annot_flags`, leaving every other /F bit
+    /// (Print, Hidden, `LockedContents`, ...) as it was. The one write path for the user-facing
+    /// Lock / Unlock toggle; ordinary edits never touch the lock bits.
+    pub fn set_locked(&mut self, locked: bool) {
+        if locked {
+            self.annot_flags |= 0x80;
+        } else {
+            self.annot_flags &= !0x80;
+        }
+    }
 }
 
 /// Structured refusal for a locked-markup mutation attempt (MCP server design §4 item

@@ -28,6 +28,7 @@ export type MirrorOp =
   | { kind: "update"; markup: Markup }
   | { kind: "delete"; id: string }
   | { kind: "reorder"; ids: string[] }
+  | { kind: "lock"; id: string; locked: boolean }
   | { kind: "scale"; id: string; record: ScaleRecord | null };
 
 export interface Command {
@@ -64,6 +65,27 @@ export class ScaleCmd implements Command {
   private get id(): string { return (this.after ?? this.before)!.id; }
   apply(sink: MarkupSink): MirrorOp { sink.putScale?.(this.id, this.after); return { kind: "scale", id: this.id, record: this.after }; }
   invert(sink: MarkupSink): MirrorOp { sink.putScale?.(this.id, this.before); return { kind: "scale", id: this.id, record: this.before }; }
+}
+
+/**
+ * Lock / Unlock toggle on one markup. `before` / `after` are the same markup with only the
+ * `Locked` /F bit (0x80) differing. It replays through the backend's `set_markup_locked`, NOT
+ * `update_markup`: the update guard refuses every edit of a locked markup, and so would refuse
+ * the unlock (and the undo of a lock).
+ */
+export class LockCmd implements Command {
+  constructor(private readonly before: Markup, private readonly after: Markup) {}
+  apply(sink: MarkupSink): MirrorOp { sink.replace(this.after); return { kind: "lock", id: this.after.id, locked: hasLockBit(this.after) }; }
+  invert(sink: MarkupSink): MirrorOp { sink.replace(this.before); return { kind: "lock", id: this.before.id, locked: hasLockBit(this.before) }; }
+}
+
+/** The standard `Locked` annotation flag (ISO 32000-1 table 165 bit 8). */
+export const LOCKED_FLAG = 0x80;
+export const hasLockBit = (m: Pick<Markup, "annot_flags">): boolean => ((m.annot_flags ?? 0) & LOCKED_FLAG) !== 0;
+/** `m` with only the `Locked` bit set or cleared; every other /F bit is kept. */
+export function withLockBit(m: Markup, locked: boolean): Markup {
+  const flags = m.annot_flags ?? 4;
+  return { ...m, annot_flags: locked ? flags | LOCKED_FLAG : flags & ~LOCKED_FLAG };
 }
 
 /**

@@ -240,6 +240,19 @@ pub async fn update_markup(
     state.markups.update(&doc_id, markup)
 }
 
+/// Lock or unlock one markup (sets or clears the standard `Locked` annotation flag). Unlike
+/// `update_markup` this is allowed on a locked markup, since unlocking must be possible.
+#[tauri::command]
+pub async fn set_markup_locked(
+    state: State<'_, AppState>,
+    doc_id: String,
+    markup_id: String,
+    locked: bool,
+) -> Result<(), String> {
+    let id = uuid::Uuid::parse_str(&markup_id).map_err(|e| format!("bad markup id: {e}"))?;
+    state.markups.set_locked(&doc_id, id, locked)
+}
+
 /// Delete a markup by id (string UUID from the frontend).
 #[tauri::command]
 pub async fn delete_markup(

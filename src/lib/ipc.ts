@@ -481,6 +481,11 @@ export async function updateMarkup(doc_id: string, markup: Markup): Promise<void
   return invoke<void>("update_markup", { docId: doc_id, markup });
 }
 
+/** Lock or unlock one markup (sets or clears the standard `Locked` flag); allowed on a locked markup. */
+export async function setMarkupLocked(doc_id: string, markup_id: string, locked: boolean): Promise<void> {
+  return invoke<void>("set_markup_locked", { docId: doc_id, markupId: markup_id, locked });
+}
+
 export async function deleteMarkup(doc_id: string, markup_id: string): Promise<void> {
   return invoke<void>("delete_markup", { docId: doc_id, markupId: markup_id });
 }

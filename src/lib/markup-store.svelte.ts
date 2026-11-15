@@ -5,7 +5,7 @@
  * injected IPC. flush() awaits a full drain — App.svelte calls it before save_document.
  */
 import { isMarkupContentsLocked, isMarkupLocked, type Markup, type Appearance, type CountSet, type CountSymbol, type ScaleRecord, type Tool } from "./ipc";
-import { History, CreateCmd, UpdateCmd, DeleteCmd, ReorderCmd, ScaleCmd, refillOrder, type Command, type MarkupSink, type MirrorOp } from "./markup-commands";
+import { History, CreateCmd, UpdateCmd, DeleteCmd, ReorderCmd, ScaleCmd, LockCmd, hasLockBit, withLockBit, refillOrder, type Command, type MarkupSink, type MirrorOp } from "./markup-commands";
 import type { CountRun } from "./count-groups";
 import { fitLegendGeometry } from "./legend";
 import { onNewMarkup } from "./layers-store.svelte";
@@ -74,6 +74,8 @@ export interface MarkupIpc {
   reorder?(doc_id: string, ids: string[]): Promise<void>;
   /** Scale put/remove replayed by undo/redo of viewport changes (`ScaleCmd`). */
   putScale?(doc_id: string, id: string, record: ScaleRecord | null): Promise<void>;
+  /** Lock / Unlock toggle (`set_markup_locked`); the only mirror op allowed on a locked markup. */
+  setLocked?(doc_id: string, id: string, locked: boolean): Promise<void>;
 }
 
 export type ToolKind =
@@ -309,6 +311,21 @@ export class MarkupStore implements MarkupSink {
     this.historyVersion++;
   }
 
+  /**
+   * Lock (`locked` true) or unlock the markups `ids` as ONE undo step. Only the standard
+   * `Locked` /F bit changes; markups already in that state are left alone. Returns how many
+   * changed. This is the one mutation that works on a locked markup (see `LockCmd`).
+   */
+  setLocked(ids: readonly string[], locked: boolean): number {
+    const targets = ids.map((id) => this.getById(id)).filter((m): m is Markup => !!m && hasLockBit(m) !== locked);
+    if (targets.length === 0) return 0;
+    this.dirty = true;
+    const ops = this.history.pushBatch(targets.map((m) => new LockCmd(m, withLockBit(m, locked))));
+    ops.forEach((op) => this.enqueue(op));
+    this.historyVersion++;
+    return targets.length;
+  }
+
   /** Undo the last frame (which may be 1 or N commands). Each op is enqueued in order. */
   undo() { const ops = this.history.undo(); if (ops) { this.dirty = true; ops.forEach((op) => this.enqueue(op)); this.historyVersion++; } }
   /** Redo the last undone frame. Each op is enqueued in order. */
@@ -511,6 +528,7 @@ export class MarkupStore implements MarkupSink {
         else if (op.kind === "update") await this.ipc.update(this.docId, op.markup);
         else if (op.kind === "reorder") await this.ipc.reorder?.(this.docId, op.ids);
         else if (op.kind === "scale") await this.ipc.putScale?.(this.docId, op.id, op.record);
+        else if (op.kind === "lock") await this.ipc.setLocked?.(this.docId, op.id, op.locked);
         else await this.ipc.remove(this.docId, op.id);
       } catch (e) {
         const text = e instanceof Error ? e.message : String(e);

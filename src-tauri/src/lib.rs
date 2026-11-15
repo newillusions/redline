@@ -398,6 +398,7 @@ pub fn run() {
             commands::document::can_rebuild_from_original,
             commands::document::reload_keeping_markups,
             commands::document::update_markup,
+            commands::document::set_markup_locked,
             commands::document::delete_markup,
             commands::document::reorder_markups,
             commands::document::get_user_identity,

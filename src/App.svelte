@@ -40,7 +40,7 @@
   import { dropLayerStore, layerStoreFor } from "$lib/layers-store.svelte";
   import ToolbarMenu from "./components/ToolbarMenu.svelte";
   import type { ToolbarMenuItem } from "./components/ToolbarMenu.svelte";
-  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listMarkups, listScales, saveDocument, saveDocumentAs, saveDocumentAsRebuild, canRebuildFromOriginal, reloadKeepingMarkups, isDiskChangedError, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, deleteMarkup, reorderMarkups, flattenDocument, optimizeDocument, redactDocument, snapshotVersion, exportMarkupList, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity, getPageCount, putScale, type ScaleRecord } from "$lib/ipc";
+  import { openDocument, closeDocument, setActiveDocument, loadMarkups, listMarkups, listScales, saveDocument, saveDocumentAs, saveDocumentAsRebuild, canRebuildFromOriginal, reloadKeepingMarkups, isDiskChangedError, saveUnprotectedCopy, rememberPassword, addMarkup, updateMarkup, setMarkupLocked, deleteMarkup, reorderMarkups, flattenDocument, optimizeDocument, redactDocument, snapshotVersion, exportMarkupList, documentNeedsOcr, runOcrDocument, ERR_PASSWORD_REQUIRED, ERR_WRONG_PASSWORD, searchDocument, searchFolder, searchPaths, openFolderIndex, getFolderIndexStatus, getUserIdentity, getPageCount, putScale, type ScaleRecord } from "$lib/ipc";
   import { normaliseMeasurements } from "$lib/polylength";
   import type { IndexStatus, OcrProgressEvent } from "$lib/ipc";
   import { listen } from "@tauri-apps/api/event";
@@ -893,6 +893,7 @@
         remove: deleteMarkup,
         reorder: reorderMarkups,
         putScale,
+        setLocked: setMarkupLocked,
       });
       const ts = new TakeoffStore();
       // Undo/redo of measurement-viewport changes replays onto this tab's scales.

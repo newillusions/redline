@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import type { MarkupStore } from "$lib/markup-store.svelte";
   import type { UserRef } from "$lib/ipc";
-  import { getUserIdentity } from "$lib/ipc";
+  import { getUserIdentity, isMarkupLocked } from "$lib/ipc";
   import {
     patchAppearance,
     patchFields,
@@ -36,6 +36,11 @@
   });
 
   const selected = $derived(store.selectedMarkups);
+  // Lock / Unlock: Unlock only when every selected markup is locked, else Lock (locks the rest).
+  const allLocked = $derived(selected.length > 0 && selected.every((m) => isMarkupLocked(m)));
+  function toggleLock() {
+    store.setLocked(selected.map((m) => m.id), !allLocked);
+  }
   const mode = $derived(selected.length === 0 ? "draft" : "selection");
 
   // True only when every relevant markup is a Text or Callout - the ONLY types with a
@@ -394,6 +399,20 @@
     <CountControls {store} {identity} />
     <PolylengthControls {store} {takeoffStore} {identity} />
     <LegendControls {store} {identity} {currentPage} />
+  {/if}
+
+  {#if mode === "selection"}
+    <section class="prop-group">
+      <h3 class="prop-group-title">Lock</h3>
+      <div class="prop-row">
+        <button type="button" class="prop-button" data-action="toggle-lock" onclick={toggleLock}>
+          {allLocked ? "Unlock" : "Lock"}
+        </button>
+        <span class="prop-value muted" data-field="lock-state">
+          {allLocked ? "Locked: cannot be moved, resized or edited" : "Unlocked"}
+        </span>
+      </div>
+    </section>
   {/if}
 
   <!-- Appearance group -->

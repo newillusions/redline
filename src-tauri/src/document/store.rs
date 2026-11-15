@@ -765,6 +765,32 @@ impl MarkupStore {
         Ok(())
     }
 
+    /// Lock or unlock a markup (the Lock / Unlock toggle). The ONE mutation that is allowed on
+    /// a locked markup, because it only flips the `Locked` /F bit and unlocking has to be
+    /// possible; every content edit still goes through [`Self::update`] and its guard. Errors on unknown doc or markup id,
+    /// or while a save holds the document. A no-op (not an error) when already in that state.
+    pub fn set_locked(&self, doc_id: &str, id: Uuid, locked: bool) -> Result<(), String> {
+        let mut g = self.docs.lock().unwrap();
+        let e = g
+            .get_mut(doc_id)
+            .ok_or_else(|| format!("unknown doc_id {doc_id}"))?;
+        if e.saving {
+            return Err(BUSY.to_string());
+        }
+        let slot = e
+            .markups
+            .iter_mut()
+            .find(|x| x.id() == id)
+            .ok_or_else(|| format!("unknown markup id {id}"))?;
+        if slot.is_locked() == locked {
+            return Ok(());
+        }
+        slot.set_locked(locked);
+        e.dirty = true;
+        e.revision += 1;
+        Ok(())
+    }
+
     /// Remove a markup by id. Errors on unknown doc or absent id, or if the markup is
     /// locked (MCP server design §4 - see the doc comment on [`Self::update`], the same
     /// guard applies here).

@@ -796,3 +796,29 @@ describe("Layer field when the document has layers", () => {
     expect(sel.selectedOptions[0].textContent).toBe("Mixed");
   });
 });
+
+describe("Lock / Unlock toggle (selection mode)", () => {
+  it("shows Lock for an unlocked markup and toggles the Locked flag, undoably", async () => {
+    const store = makeStore();
+    store.seed([makeMarkup("m1")]);
+    store.selectedIds = new Set(["m1"]);
+    const { container } = await mountPanel(store);
+    const btn = container.querySelector("button[data-action='toggle-lock']") as HTMLButtonElement;
+    expect(btn.textContent?.trim()).toBe("Lock");
+    fireEvent.click(btn);
+    await tick();
+    expect((store.markups[0].annot_flags ?? 0) & 0x80).toBe(0x80);
+    expect(btn.textContent?.trim()).toBe("Unlock");
+    fireEvent.click(btn);
+    await tick();
+    expect((store.markups[0].annot_flags ?? 0) & 0x80).toBe(0);
+    store.undo();
+    await tick();
+    expect((store.markups[0].annot_flags ?? 0) & 0x80).toBe(0x80);
+  });
+
+  it("is absent in draft mode (nothing selected)", async () => {
+    const { container } = await mountPanel(makeStore());
+    expect(container.querySelector("button[data-action='toggle-lock']")).toBeNull();
+  });
+});

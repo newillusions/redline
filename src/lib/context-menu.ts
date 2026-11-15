@@ -39,6 +39,8 @@ export interface MarkupMenuState {
   anyLocked: boolean;
   /** The one status all selected markups share, when they share one. */
   commonStatus?: MarkupStatus;
+  /** Every selected markup has the Locked flag set: the menu then offers Unlock, else Lock. */
+  allLocked?: boolean;
   /** A format has been copied (format painter), so Paste Format has something to paste. */
   canPasteFormat?: boolean;
 }
@@ -54,6 +56,7 @@ export function markupMenuItems(s: MarkupMenuState): MenuItem[] {
     SEP,
     item("properties", "Properties", {}),
     item("save-as-tool", "Save as Tool...", { disabled: many }),
+    item(s.allLocked ? "unlock" : "lock", s.allLocked ? "Unlock" : "Lock"),
     SEP,
     item("copy", "Copy", { shortcut: "Ctrl+C" }),
     item("cut", "Cut", { shortcut: "Ctrl+X", disabled: edit }),

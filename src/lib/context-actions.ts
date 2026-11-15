@@ -25,6 +25,16 @@ export function setSelectionStatus(c: ArrangeCtx, status: MarkupStatus): ActionR
   return { ok: n > 0, message: locked > 0 ? `${base}; ${locked} locked skipped` : base };
 }
 
+/** Lock or unlock the selected markups as ONE undo step; markups already in that state are skipped. */
+export function setSelectionLocked(c: ArrangeCtx, locked: boolean): ActionResult {
+  const targets = c.store.selectedMarkups;
+  if (targets.length === 0) return { ok: false, message: "Select a markup first." };
+  const n = c.store.setLocked(targets.map((m) => m.id), locked);
+  const verb = locked ? "Locked" : "Unlocked";
+  if (n === 0) return { ok: false, message: `Already ${locked ? "locked" : "unlocked"}` };
+  return { ok: true, message: `${verb} ${n} markup${n === 1 ? "" : "s"}` };
+}
+
 /** Select every markup shown on the current page (Select tool must already be active). */
 export function selectAllOnPage(c: ArrangeCtx, shownIds: readonly string[]): ActionResult {
   if (shownIds.length === 0) return { ok: false, message: "No markups on this page." };
@@ -40,6 +50,8 @@ export function runMarkupCommand(id: string, c: ArrangeCtx): ActionResult | null
   const status = statusFromId(id);
   if (status) return setSelectionStatus(c, status);
   switch (id) {
+    case "lock": return setSelectionLocked(c, true);
+    case "unlock": return setSelectionLocked(c, false);
     case "copy": return copySelection(c);
     case "cut": return cutSelection(c);
     case "duplicate": return duplicateSelection(c);

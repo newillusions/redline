@@ -12,7 +12,7 @@ describe("markupMenuItems", () => {
     const ids = actions(markupMenuItems({ count: 1, anyLocked: false })).map((i) => i.id);
     expect(ids).toEqual([
       "status:Accepted", "status:Rejected", "status:Cancelled", "status:Completed", "status:None",
-      "properties", "save-as-tool", "copy", "cut", "duplicate", "copy-format", "paste-format", "use-as-default",
+      "properties", "save-as-tool", "lock", "copy", "cut", "duplicate", "copy-format", "paste-format", "use-as-default",
       "bring-to-front", "send-to-back", "hide", "delete",
     ]);
   });

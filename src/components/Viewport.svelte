@@ -1490,6 +1490,7 @@
       return markupMenuItems({
         count: sel.length,
         anyLocked: sel.some((m) => isMarkupLocked(m) || isMarkupContentsLocked(m)),
+        allLocked: sel.every((m) => isMarkupLocked(m)),
         commonStatus: statuses.size === 1 ? [...statuses][0] : undefined,
         canPasteFormat: formatClipboard.format !== null,
       });
