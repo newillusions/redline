@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { writeFileSync } from "node:fs";
 import process from "node:process";
 import { runTwoPass, closeAndVerify, parseProcessList, procKey } from "../../tools/crossviewer/two-pass.mjs";
 
@@ -331,21 +333,32 @@ describe.skipIf(!hasPwsh)("PowerShell process matching (pwsh)", () => {
   it("CloseAcrobat.ps1 matches on name + pid + start: wrong start is untouched, right start is a target", async () => {
     const child = spawn("sleep", ["30"], { stdio: "ignore" });
     try {
-      const ticks = pw(`(Get-Process -Id ${child.pid}).StartTime.ToUniversalTime().Ticks`).stdout.trim();
-      expect(ticks).toMatch(/^\d+$/);
-      const run = (start) => {
+      const execP = promisify(execFile);
+      const run = async (start) => {
         const f = path.join(process.env.TMPDIR || "/tmp", `cp-${child.pid}-${start.length}.json`);
-        spawnSync("pwsh", ["-NoProfile", "-Command", `Set-Content -LiteralPath '${f}' -Value '[{"pid":"${child.pid}","start":"${start}"}]'`]);
-        return spawnSync("pwsh", ["-NoProfile", "-File", path.join(WIN, "CloseAcrobat.ps1"), "-PidFile", f, "-ImageName", "sleep", "-GracefulWaitSec", "1"], { encoding: "utf8" });
+        writeFileSync(f, `[{"pid":"${child.pid}","start":"${start}"}]`); // fs, not a pwsh cold start per case
+        try {
+          const r = await execP("pwsh", ["-NoProfile", "-File", path.join(WIN, "CloseAcrobat.ps1"), "-PidFile", f, "-ImageName", "sleep", "-GracefulWaitSec", "1"], { encoding: "utf8" });
+          return { status: 0, stdout: r.stdout };
+        } catch (e) { return { status: e.code, stdout: e.stdout }; }
       };
-      const wrong = run("1");
+      // The wrong-start case needs no real start time, so it runs concurrently with the ticks lookup:
+      // each pwsh cold start is seconds on a loaded runner, and they were serial (past the 5 s limit).
+      const [wrong, ticksOut] = await Promise.all([
+        run("1"),
+        execP("pwsh", ["-NoProfile", "-Command", `(Get-Process -Id ${child.pid}).StartTime.ToUniversalTime().Ticks`], { encoding: "utf8" }),
+      ]);
+      const ticks = ticksOut.stdout.trim();
+      expect(ticks).toMatch(/^\d+$/);
       expect(wrong.status).toBe(0); // not matched: nothing to close
-      const right = run(ticks);
+      const right = await run(ticks);
       expect(right.status).toBe(3); // matched (and, being `sleep`, did not close)
       expect(right.stdout).toContain(String(child.pid));
       expect(process.kill(child.pid, 0)).toBe(true); // never killed
     } finally {
       child.kill();
     }
-  });
+    // Real processes: 3 pwsh spawns plus CloseAcrobat's deliberate 1 s graceful wait. Measured 2.9-3.9 s
+    // idle (vitest default is 5 s), well over it on a loaded CI runner. Timeout scoped to this test only.
+  }, 30_000);
 });
