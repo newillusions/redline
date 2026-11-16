@@ -241,6 +241,22 @@ fn write_markup(out: &mut String, m: &Markup) {
         }
         _ => {}
     }
+    // The padded `rect` and the standard attributes cannot give back a rectangle, a point or a
+    // free polyline exactly, so those carry their geometry in a private attribute.
+    let exact_elsewhere = match &m.geometry {
+        MarkupGeometry::Polyline(v) => match tag {
+            "polygon" | "polyline" => true,
+            "line" => v.len() == 2,
+            _ => false,
+        },
+        MarkupGeometry::Ink(_) | MarkupGeometry::Quads(_) => true,
+        _ => false,
+    };
+    if !exact_elsewhere {
+        if let Ok(j) = serde_json::to_string(&m.geometry) {
+            let _ = write!(extra, " rlgeom=\"{}\"", esc(&j));
+        }
+    }
     let rltype = format!("{:?}", m.markup_type);
     let h = Head {
         flags: xfdf_flags(m.annot_flags),
@@ -369,6 +385,21 @@ pub struct XfdfAnnot {
     pub gestures: Vec<Vec<PdfPoint>>,
     /// Flat quad coordinates (`coords`).
     pub coords: Vec<f64>,
+    /// The raw `flags` attribute (comma separated names: `print,locked,...`).
+    pub flags: Option<String>,
+    /// `creationdate`, a PDF date string.
+    pub created: Option<String>,
+    /// Stroke `width`.
+    pub width: Option<f64>,
+    /// Stroke `opacity`.
+    pub opacity: Option<f64>,
+    /// First point of a `line` (`start`).
+    pub start: Option<PdfPoint>,
+    /// Last point of a `line` (`end`).
+    pub end: Option<PdfPoint>,
+    /// Private `rlgeom`: the exact [`MarkupGeometry`] as JSON, written where `rect` (padded)
+    /// and the standard attributes cannot give it back (rectangles, points, free polylines).
+    pub rlgeom: Option<String>,
 }
 
 fn floats(s: &str) -> Result<Vec<f64>, String> {
@@ -389,59 +420,101 @@ fn points(s: &str) -> Result<Vec<PdfPoint>, String> {
     Ok(v.chunks(2).map(|c| PdfPoint { x: c[0], y: c[1] }).collect())
 }
 
-/// Parse an XFDF document back into its annotations, in file order.
-pub fn parse_xfdf(xml: &str) -> Result<Vec<XfdfAnnot>, String> {
-    let doc = roxmltree::Document::parse(xml).map_err(|e| format!("not valid XFDF: {e}"))?;
+/// One `<annots>` child as an [`XfdfAnnot`]; `Err` names what is wrong with just this one.
+fn parse_annot(n: roxmltree::Node) -> Result<XfdfAnnot, String> {
+    let at = |k: &str| n.attribute(k);
+    let rect = floats(at("rect").ok_or("annotation without rect")?)?;
+    let rect: [f64; 4] = rect.try_into().map_err(|_| "rect is not 4 numbers")?;
+    let child = |tag: &str| {
+        n.children()
+            .find(|c| c.is_element() && c.tag_name().name() == tag)
+    };
+    let mut gestures = Vec::new();
+    if let Some(il) = child("inklist") {
+        for g in il.children().filter(|c| c.is_element()) {
+            gestures.push(points(g.text().unwrap_or(""))?);
+        }
+    }
+    Ok(XfdfAnnot {
+        element: n.tag_name().name().to_string(),
+        markup_type: at("rltype").and_then(type_from_name),
+        page: at("page")
+            .and_then(|p| p.parse().ok())
+            .ok_or("annotation without page")?,
+        rect,
+        color: at("color").map(str::to_string),
+        interior_color: at("interior-color").map(str::to_string),
+        contents: child("contents")
+            .and_then(|c| c.text())
+            .unwrap_or("")
+            .to_string(),
+        subject: at("subject").map(str::to_string),
+        author: at("title").unwrap_or("").to_string(),
+        date: at("date").unwrap_or("").to_string(),
+        name: at("name").unwrap_or("").to_string(),
+        irt: at("inreplyto").map(str::to_string),
+        state_model: at("statemodel").map(str::to_string),
+        state: at("state").map(str::to_string),
+        vertices: match child("vertices") {
+            Some(v) => points(v.text().unwrap_or(""))?,
+            None => Vec::new(),
+        },
+        gestures,
+        coords: floats(at("coords").unwrap_or(""))?,
+        flags: at("flags").map(str::to_string),
+        created: at("creationdate").map(str::to_string),
+        width: at("width").and_then(|v| v.parse().ok()),
+        opacity: at("opacity").and_then(|v| v.parse().ok()),
+        start: at("start")
+            .map(points)
+            .transpose()?
+            .and_then(|v| v.first().copied()),
+        end: at("end")
+            .map(points)
+            .transpose()?
+            .and_then(|v| v.first().copied()),
+        rlgeom: at("rlgeom").map(str::to_string),
+    })
+}
+
+fn annots_of<'a, 'input>(
+    doc: &'a roxmltree::Document<'input>,
+) -> Result<roxmltree::Node<'a, 'input>, String> {
     let root = doc.root_element();
     if root.tag_name().name() != "xfdf" {
         return Err("root element is not <xfdf>".into());
     }
-    let annots = root
-        .children()
+    root.children()
         .find(|n| n.is_element() && n.tag_name().name() == "annots")
-        .ok_or("no <annots> element")?;
-    let mut out = Vec::new();
-    for n in annots.children().filter(|n| n.is_element()) {
-        let at = |k: &str| n.attribute(k);
-        let rect = floats(at("rect").ok_or("annotation without rect")?)?;
-        let rect: [f64; 4] = rect.try_into().map_err(|_| "rect is not 4 numbers")?;
-        let child = |tag: &str| {
-            n.children()
-                .find(|c| c.is_element() && c.tag_name().name() == tag)
-        };
-        let mut gestures = Vec::new();
-        if let Some(il) = child("inklist") {
-            for g in il.children().filter(|c| c.is_element()) {
-                gestures.push(points(g.text().unwrap_or(""))?);
-            }
+        .ok_or_else(|| "no <annots> element".to_string())
+}
+
+/// Parse an XFDF document back into its annotations, in file order. Strict: the first
+/// malformed annotation fails the whole file.
+pub fn parse_xfdf(xml: &str) -> Result<Vec<XfdfAnnot>, String> {
+    let doc = roxmltree::Document::parse(xml).map_err(|e| format!("not valid XFDF: {e}"))?;
+    annots_of(&doc)?
+        .children()
+        .filter(|n| n.is_element())
+        .map(parse_annot)
+        .collect()
+}
+
+/// [`parse_xfdf`] for import: a malformed annotation (no page, no rect, bad numbers) is skipped
+/// and reported as a warning ("annotation N: ...", 1-based among the elements) instead of
+/// failing the file. Only a file that is not XFDF at all is an error.
+pub fn parse_xfdf_lenient(xml: &str) -> Result<(Vec<XfdfAnnot>, Vec<String>), String> {
+    let doc = roxmltree::Document::parse(xml).map_err(|e| format!("not valid XFDF: {e}"))?;
+    let (mut out, mut warnings) = (Vec::new(), Vec::new());
+    for (i, n) in annots_of(&doc)?
+        .children()
+        .filter(|n| n.is_element())
+        .enumerate()
+    {
+        match parse_annot(n) {
+            Ok(a) => out.push(a),
+            Err(e) => warnings.push(format!("annotation {}: {e}", i + 1)),
         }
-        out.push(XfdfAnnot {
-            element: n.tag_name().name().to_string(),
-            markup_type: at("rltype").and_then(type_from_name),
-            page: at("page")
-                .and_then(|p| p.parse().ok())
-                .ok_or("annotation without page")?,
-            rect,
-            color: at("color").map(str::to_string),
-            interior_color: at("interior-color").map(str::to_string),
-            contents: child("contents")
-                .and_then(|c| c.text())
-                .unwrap_or("")
-                .to_string(),
-            subject: at("subject").map(str::to_string),
-            author: at("title").unwrap_or("").to_string(),
-            date: at("date").unwrap_or("").to_string(),
-            name: at("name").unwrap_or("").to_string(),
-            irt: at("inreplyto").map(str::to_string),
-            state_model: at("statemodel").map(str::to_string),
-            state: at("state").map(str::to_string),
-            vertices: match child("vertices") {
-                Some(v) => points(v.text().unwrap_or(""))?,
-                None => Vec::new(),
-            },
-            gestures,
-            coords: floats(at("coords").unwrap_or(""))?,
-        });
     }
-    Ok(out)
+    Ok((out, warnings))
 }

@@ -428,6 +428,7 @@ pub fn run() {
             commands::markup_list::export_markups_view,
             commands::markup_list::export_markups_summary_pdf,
             commands::markup_list::export_markups_xfdf,
+            commands::markup_list::import_markups_xfdf,
             // Takeoff commands (M4 S1 — preset picker + /Measure write)
             commands::takeoff::list_applicable_scales,
             commands::takeoff::write_page_measure,

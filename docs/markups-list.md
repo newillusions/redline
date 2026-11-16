@@ -95,6 +95,31 @@ The older fixed-column whole-document export (`export_markup_list`, also used by
   to 2,000 characters, the search to 200, page-filter tokens to 50, custom columns to 32.
   Cyclic or dangling reply parents cannot hang the reply expansion (`threadRows` visits each reply once).
 
+## XFDF import and export (as of 2026-11-16)
+
+Export XFDF writes every mark-up (not the filtered view) with replies and statuses. Import XFDF
+reads an `.xfdf` file and adds its mark-ups as ONE undo step (`MarkupStore.createMany`); the backend
+(`markup/xfdf_import.rs`, command `import_markups_xfdf`) only builds them.
+
+- A file redline exported comes back as it was: type from `rltype`, exact geometry from the private
+  `rlgeom` (rectangles, points, free polylines) or `vertices` / `inklist` / `coords` / `start` / `end`,
+  and the same mark-up id.
+- A Revu or Acrobat file is mapped by element (`square`, `circle`, `line`, `polyline`, `polygon`,
+  `highlight`, `underline`, `strikeout`, `squiggly`, `ink`, `freetext`, `text`, `stamp`); `rect` is then
+  the shape's box. Other elements are counted as "not imported", never guessed.
+- A mark-up whose `name` is already in the document (as its id or a PDF `/NM`) is skipped, so a second
+  import of the same file adds nothing. A non-UUID name maps to a stable derived id.
+- Measurements, legends and dynamic stamps come in as their plain shape (a file cannot carry their
+  scale, table or artwork); the summary says how many.
+- Pages outside the document, non-finite numbers, files over 64 MB and non-`#rrggbb` colours are
+  refused or defaulted. Replies and statuses join their mark-up; those whose mark-up was skipped are
+  not imported.
+- An annotation with no `name` gets an id derived from its content (element, page, rect, date, author,
+  text) plus how many identical ones came before it, so two nameless annotations stay two markups and a
+  re-import skips both. A malformed annotation (no page, no rect, bad numbers) is skipped with a warning
+  ("annotation N: ...") and the rest of the file imports; only a file that is not XFDF is refused.
+- Not built: FDF (`par-fdf-io`), importing from a PDF copy, custom columns.
+
 ## Not built in this change (follow-ups)
 
 Right-click menu, column resize and drag-reorder, subject grouping, custom status models and

@@ -449,6 +449,47 @@ pub async fn export_markups_xfdf(
     Ok(all.len())
 }
 
+/// Largest XFDF file `import_markups_xfdf` will read (the file is untrusted).
+const MAX_XFDF_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read an XFDF file and build the markups it would add to `doc_id`: those whose name is not
+/// already in the document, on pages that exist (`page_count`). Nothing is added here; the
+/// frontend adds the result as one undo step. See `markup::xfdf_import`.
+#[tauri::command]
+pub async fn import_markups_xfdf(
+    state: State<'_, AppState>,
+    doc_id: String,
+    path: String,
+    page_count: u32,
+) -> Result<crate::markup::xfdf_import::XfdfImport, String> {
+    let len = std::fs::metadata(&path)
+        .map_err(|e| format!("could not read {path}: {e}"))?
+        .len();
+    if len > MAX_XFDF_BYTES {
+        return Err(format!(
+            "{path} is {} MB; XFDF files over {} MB are refused",
+            len / (1024 * 1024),
+            MAX_XFDF_BYTES / (1024 * 1024)
+        ));
+    }
+    let xml = std::fs::read_to_string(&path).map_err(|e| format!("could not read {path}: {e}"))?;
+    let (annots, warnings) = crate::markup::xfdf::parse_xfdf_lenient(&xml)?;
+    let mut existing = std::collections::HashSet::new();
+    for m in state.markups.list(&doc_id)? {
+        existing.insert(m.id().to_string());
+        if let Some(nm) = &m.source_nm {
+            existing.insert(nm.clone());
+        }
+    }
+    let mut result = crate::markup::xfdf_import::import_annots(&annots, &existing, page_count);
+    result.ignored += warnings.len();
+    result.warnings = warnings
+        .into_iter()
+        .take(crate::markup::xfdf_import::MAX_WARNINGS)
+        .collect();
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

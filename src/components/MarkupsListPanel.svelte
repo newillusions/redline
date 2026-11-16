@@ -10,7 +10,7 @@
   import { onMount } from "svelte";
   import { save as saveDialog } from "@tauri-apps/plugin-dialog";
   import type { Markup, MarkupStatus, UserRef } from "$lib/ipc";
-  import { exportMarkupsView, exportMarkupsSummaryPdf, exportMarkupsXfdf, getUserIdentity, isMarkupContentsLocked, isMarkupLocked } from "$lib/ipc";
+  import { exportMarkupsView, exportMarkupsSummaryPdf, exportMarkupsXfdf, getPageCount, getUserIdentity, isMarkupContentsLocked, isMarkupLocked } from "$lib/ipc";
   import type { MarkupStore } from "$lib/markup-store.svelte";
   import { layerStoreFor } from "$lib/layers-store.svelte";
   import { hiddenCount, withoutHidden } from "$lib/markup-visibility";
@@ -19,6 +19,7 @@
   import { patchMarked, patchStatus } from "$lib/markup-properties";
   import { isMarked } from "$lib/markup-review";
   import { exportDoneMessage, exportFormatFromPath } from "$lib/doc-op-flow";
+  import { importMarkupsXfdf, importSummary, pickXfdfFile } from "$lib/xfdf-import";
   import {
     STATUS_ORDER, applyRowClick, buildRows, cellText, columnLabel, columnKind, COLUMN_DEFS,
     customColumnNames, defaultColumnConfig, displayItems, emptyFilter, filterRows,
@@ -293,6 +294,22 @@
     }
   }
 
+  /** Import an XFDF file as ONE undo step; markups already in the document are skipped. */
+  async function doImportXfdf() {
+    error = null;
+    message = null;
+    const path = await pickXfdfFile();
+    if (!path) return;
+    try {
+      await store.flush();
+      const result = await importMarkupsXfdf(docId, path, await getPageCount(docId));
+      store.createMany(result.markups);
+      message = importSummary(result);
+    } catch (e) {
+      error = `Import failed: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  }
+
   function onScroll(e: Event) {
     scrollTop = (e.currentTarget as HTMLElement).scrollTop;
   }
@@ -405,6 +422,7 @@
     <button class="ml-btn" disabled={rows.length === 0} onclick={() => doExport("xlsx")}>Export XLSX</button>
     <button class="ml-btn" disabled={rows.length === 0} onclick={() => doExport("pdf")}>Export PDF</button>
     <button class="ml-btn" disabled={rows.length === 0} onclick={() => doExport("xfdf")}>Export XFDF</button>
+    <button class="ml-btn" data-action="import-xfdf" onclick={doImportXfdf}>Import XFDF</button>
     <span class="ml-count" aria-live="polite">{rows.length === allRows.length ? `${allRows.length} mark-ups` : `${rows.length} of ${allRows.length}`}</span>
   </div>
 
