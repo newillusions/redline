@@ -35,6 +35,11 @@ Limits:
   Measured (release, synthetic pages of 400k to 1.6M sub-paths): build 135-145 ms for lines,
   36 ms for cubics; the 5M-point single sub-path builds in 105 ms. IPC at the cap is about
   15 MB of targets plus 2.3 MB of segments (lines; fewer segments for curves).
+- A sub-path longer than the point limit (3 x cap + 1 points) is read only up to the limit
+  and reported in `cap`, but the sub-paths after it are still indexed while budget remains.
+- A cubic whose control points lie on its chord (a straight edge some producers write as a
+  Bezier) is treated as a straight segment, so Perpendicular, Nearest and Intersection work on
+  it.
 - Perpendicular and Nearest use straight segments only (curve pieces excluded).
 - Polar/extension tracking is not implemented.
 

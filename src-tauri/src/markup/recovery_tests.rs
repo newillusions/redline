@@ -297,6 +297,47 @@ fn unsaved_work_is_classified_against_the_file_as_loaded() {
 }
 
 #[test]
+fn a_lock_only_change_on_a_foreign_markup_is_unsaved_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("a.pdf");
+    write_pdf(&p, 0, &["CLOUDREVU0000001"]);
+    let s = loaded_store(&p);
+    let id = s.list("d").unwrap()[0].id();
+    s.set_locked("d", id, true).unwrap();
+    let (u, _, _) = s.begin_reload("d").unwrap().into_parts();
+    assert_eq!(u.modified.len(), 1, "a lock change is unsaved work: {u:?}");
+    // The save path still keeps the original dictionary for that locked markup, and the
+    // baseline then moves on.
+    let out = dir.path().join("out.pdf");
+    save_with_markups_removing(&p, &out, &s.list("d").unwrap(), &s.removed_sources("d")).unwrap();
+    let d = &page_dicts(&out)[0];
+    assert_eq!(d.get(b"F").unwrap().as_i64().unwrap(), 4 | 0x80);
+    assert!(d.has(b"BE"), "original /BE kept on a locked foreign markup");
+    s.rebaseline_after_write("d");
+    let (u, _, _) = s.begin_reload("d").unwrap().into_parts();
+    assert!(u.modified.is_empty());
+}
+
+#[test]
+fn an_unsaved_lock_on_a_foreign_markup_survives_an_external_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("a.pdf");
+    write_pdf(&p, 0, &["CLOUDREVU0000001"]);
+    let s = loaded_store(&p);
+    let id = s.list("d").unwrap()[0].id();
+    s.set_locked("d", id, true).unwrap();
+    // The file changes on disk (same markup, shifted object ids).
+    write_pdf(&p, 4, &["CLOUDREVU0000001"]);
+    set_mtime(&p, 30);
+    let txn = s.begin_reload("d").unwrap();
+    let loaded = load_markups_from(&p, None).unwrap();
+    s.commit_reload("d", txn, loaded, 1).unwrap();
+    let after = s.list("d").unwrap();
+    assert_eq!(after.len(), 1);
+    assert!(after[0].is_locked(), "the unsaved lock was not overwritten");
+}
+
+#[test]
 fn reload_keeps_unsaved_edits_where_their_targets_still_exist_and_reports_the_rest() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("a.pdf");

@@ -220,25 +220,33 @@
 
   // ---- checkmark ----------------------------------------------------------------------
 
-  const markedTotal = $derived(store.markups.reduce((n, m) => n + (isMarked(m) ? 1 : 0), 0));
+  const isLockedAny = (m: Markup) => isMarkupLocked(m) || isMarkupContentsLocked(m);
+  /** Marked mark-ups Clear all can actually untick: locked ones refuse, so they are not counted. */
+  const clearableTotal = $derived(store.markups.reduce((n, m) => n + (isMarked(m) && !isLockedAny(m) ? 1 : 0), 0));
+  /** Unmarked mark-ups Check all can actually tick. */
+  const checkableTotal = $derived(store.markups.reduce((n, m) => n + (!isMarked(m) && !isLockedAny(m) ? 1 : 0), 0));
 
-  /** Tick or untick `list` as ONE undo step (standard `Marked` state model). Skips locked mark-ups. */
+  /** Tick or untick `list` as ONE undo step (standard `Marked` state model). Locked mark-ups are skipped and counted. */
   function setMarked(list: readonly Markup[], marked: boolean) {
     const now = new Date().toISOString();
-    const pairs = list
-      .filter((m) => isMarked(m) !== marked)
-      .map((m) => ({ before: m, after: patchMarked(m, marked, identity ?? m.audit.modified_by, now) }));
-    if (pairs.length === 0) return;
+    const todo = list.filter((m) => isMarked(m) !== marked);
+    if (todo.length === 0) return;
     error = null;
-    const locked = pairs.filter((p) => isMarkupLocked(p.before) || isMarkupContentsLocked(p.before)).length;
+    const pairs = todo
+      .filter((m) => !isLockedAny(m))
+      .map((m) => ({ before: m, after: patchMarked(m, marked, identity ?? m.audit.modified_by, now) }));
+    const locked = todo.length - pairs.length;
     if (locked > 0) error = `${locked} locked mark-up${locked === 1 ? "" : "s"} skipped.`;
-    store.applyBatch(pairs);
+    if (pairs.length > 0) store.applyBatch(pairs);
   }
 
   function onCheckToggle(e: Event, id: string) {
     e.stopPropagation();
     const m = store.getById(id);
-    if (m) setMarked([m], !isMarked(m));
+    if (!m) return;
+    setMarked([m], !isMarked(m));
+    // A refused (locked) toggle leaves the model unchanged, so put the native checkbox back.
+    (e.currentTarget as HTMLInputElement).checked = isMarked(store.getById(id) ?? m);
   }
 
   function onStatusPick(e: Event, id: string) {
@@ -388,8 +396,8 @@
         <option value={s}>{s} (Shift+{i + 1})</option>
       {/each}
     </select>
-    <button class="ml-btn" data-action="check-all" disabled={allRows.length === 0 || markedTotal === store.markups.length} onclick={() => setMarked(store.markups, true)}>Check all</button>
-    <button class="ml-btn" data-action="clear-all" disabled={markedTotal === 0} onclick={() => setMarked(store.markups, false)}>Clear all{markedTotal ? ` (${markedTotal})` : ""}</button>
+    <button class="ml-btn" data-action="check-all" disabled={allRows.length === 0 || checkableTotal === 0} onclick={() => setMarked(store.markups, true)}>Check all</button>
+    <button class="ml-btn" data-action="clear-all" disabled={clearableTotal === 0} onclick={() => setMarked(store.markups, false)}>Clear all{clearableTotal ? ` (${clearableTotal})` : ""}</button>
     <button class="ml-btn" data-action="hide-selected" disabled={selectedCount === 0} onclick={toggleHideSelected}>{selectionHidden ? "Show" : "Hide"}</button>
     <button class="ml-btn" data-action="hide-all" disabled={allRows.length === 0} onclick={hideAll}>Hide all</button>
     <button class="ml-btn" data-action="show-all" disabled={hiddenTotal === 0} onclick={() => view.showAllMarkups()}>Show all{hiddenTotal ? ` (${hiddenTotal})` : ""}</button>

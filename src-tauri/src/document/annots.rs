@@ -721,7 +721,7 @@ fn drop_dangling_oc(doc: &Document, d: &mut Dictionary) {
 /// markup: its original, re-sanitized here (the write boundary) and marked so the next save
 /// still manages the rewritten object. `None` = rebuild from the model.
 fn preserved_original(doc: &Document, m: &Markup, page_id: ObjectId) -> Option<Dictionary> {
-    if !m.is_unedited() {
+    if !m.is_unedited_apart_from_flags() {
         return None;
     }
     let mut d = crate::markup::foreign::sanitized_original(
@@ -737,6 +737,13 @@ fn preserved_original(doc: &Document, m: &Markup, page_id: ObjectId) -> Option<D
         d.set("P", Object::Reference(page_id));
     }
     drop_dangling_oc(doc, &mut d);
+    // The Lock / Unlock toggle changes only the model's flags, not what makes a markup "edited":
+    // carry the current bit field into the original's /F so a locked foreign markup keeps every
+    // other original key. Untouched when it already matches (an original with no /F reads as 4).
+    let original_flags = d.get(b"F").ok().and_then(|o| o.as_i64().ok()).unwrap_or(4);
+    if i64::from(m.annot_flags) != original_flags {
+        d.set("F", Object::Integer(i64::from(m.annot_flags)));
+    }
     d.set(
         crate::markup::foreign::PRESERVED_MARKER,
         Object::Boolean(true),

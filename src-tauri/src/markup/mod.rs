@@ -884,6 +884,24 @@ impl Markup {
         Some(h.finish())
     }
 
+    /// [`Markup::is_unedited`] ignoring `annot_flags`: true when the only change since load is
+    /// the `/F` bit field (the Lock / Unlock toggle). The save path uses it to keep a locked or
+    /// unlocked foreign markup's original dictionary and write the current flags into its `/F`
+    /// (`document::annots::preserved_original`). Everything else (dirty tracking, reload merge,
+    /// recovery) keeps using the full [`Markup::edit_fingerprint`], so a lock change still
+    /// counts as an unsaved edit there.
+    pub fn is_unedited_apart_from_flags(&self) -> bool {
+        let original_flags = self
+            .source_dict
+            .as_ref()
+            .and_then(|d| d.get(b"F").ok())
+            .and_then(|o| o.as_i64().ok())
+            .map_or(default_annot_flags(), |f| f as i32);
+        let mut probe = self.clone();
+        probe.annot_flags = original_flags;
+        probe.is_unedited()
+    }
+
     /// True while this foreign markup is exactly as the reader produced it: a save then
     /// writes its original dictionary back rather than rebuilding it. False for anything
     /// authored by redline, anything edited since load, and anything the reader could not

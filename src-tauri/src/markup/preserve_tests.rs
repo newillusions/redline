@@ -159,6 +159,38 @@ fn intensity(d: &Dictionary) -> f32 {
 // --- 1. unedited foreign cloud ---------------------------------------------------------
 
 #[test]
+fn locking_and_unlocking_a_revu_cloud_keeps_its_original_dictionary_over_three_cycles() {
+    let (mut doc, page) = one_page_doc();
+    let c = revu_cloud(&mut doc, "CLOUDREVU0000002", 1);
+    set_annots(&mut doc, page, vec![c.into()]);
+    // Lock: only the /F bit changes, every other original key (AP bytes, BE, column data) stays.
+    cycle(&mut doc, |ms| ms[0].set_locked(true));
+    for n in 1..=2 {
+        cycle(&mut doc, |_| {});
+        let d = only(&doc, "Polygon");
+        assert_eq!(
+            d.get(b"F").unwrap().as_i64().unwrap(),
+            4 | 0x80,
+            "cycle {n}: Locked bit in /F, Print kept"
+        );
+        assert_eq!(
+            ap_bytes(&doc, &d),
+            ORIGINAL_AP,
+            "cycle {n}: original /AP byte-for-byte"
+        );
+        assert_eq!(intensity(&d), 1.0, "cycle {n}");
+        assert!(d.has(b"BSIColumnData"), "cycle {n}");
+        assert!(!d.has(b"RLType"), "cycle {n}: still foreign, not rebuilt");
+    }
+    // Unlock: the bit goes, the original still stands.
+    cycle(&mut doc, |ms| ms[0].set_locked(false));
+    let d = only(&doc, "Polygon");
+    assert_eq!(d.get(b"F").unwrap().as_i64().unwrap(), 4);
+    assert_eq!(ap_bytes(&doc, &d), ORIGINAL_AP);
+    assert!(d.has(b"BSIColumnData"));
+}
+
+#[test]
 fn unedited_revu_cloud_keeps_its_intensity_and_original_appearance_over_three_cycles() {
     let (mut doc, page) = one_page_doc();
     let c = revu_cloud(&mut doc, "CLOUDREVU0000001", 1);

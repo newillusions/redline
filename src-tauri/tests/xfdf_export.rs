@@ -208,3 +208,33 @@ fn empty_document_exports_an_empty_annots_list() {
     let xml = export_xfdf(&[], "x.pdf");
     assert!(parse_xfdf(&xml).unwrap().is_empty());
 }
+
+#[test]
+fn export_writes_the_markups_own_flags_including_locked() {
+    let mut locked = markup(
+        MarkupType::Rectangle,
+        0,
+        rect(0.0, 0.0, 10.0, 10.0),
+        "#ff0000",
+        "Ada",
+    );
+    locked.set_locked(true);
+    locked.annot_flags |= 0x200; // LockedContents too
+    let plain = markup(
+        MarkupType::Rectangle,
+        0,
+        rect(20.0, 20.0, 30.0, 30.0),
+        "#00ff00",
+        "Ada",
+    );
+    let xml = export_xfdf(&[locked, plain], "a.pdf");
+    assert!(
+        xml.contains("flags=\"print,locked,lockedcontents\""),
+        "locked markup keeps its flags:\n{xml}"
+    );
+    assert_eq!(
+        xml.matches("flags=\"print\"").count(),
+        1,
+        "the unlocked markup is still plain print:\n{xml}"
+    );
+}

@@ -280,6 +280,14 @@ fn flatten(sub: &Subpath, max_points: usize) -> Flat {
     let mut i = 1;
     while i < p.len() {
         if sub.is_curve(i) && i + 2 < p.len() && sub.is_curve(i + 1) && sub.is_curve(i + 2) {
+            // Producers often write a straight edge as a cubic whose control points lie on it:
+            // that is a line for snapping (segment, perpendicular, intersections), not an arc.
+            if cubic_is_straight(p[i - 1], p[i], p[i + 1], p[i + 2]) {
+                segs.push(Seg::Line);
+                pts.push(p[i + 2]);
+                i += 3;
+                continue;
+            }
             segs.push(Seg::Cubic(p[i], p[i + 1]));
             pts.push(p[i + 2]);
             i += 3;
@@ -292,6 +300,24 @@ fn flatten(sub: &Subpath, max_points: usize) -> Flat {
         }
     }
     Flat { pts, segs }
+}
+
+/// True when the cubic `a, c1, c2, b` is a straight line: both control points lie on the chord
+/// `a`-`b` (within a relative 1e-6) and between its ends, so the curve traces the chord and
+/// nothing else. A zero-length chord is not straight (it may be a loop).
+fn cubic_is_straight(a: PdfPoint, c1: PdfPoint, c2: PdfPoint, b: PdfPoint) -> bool {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let len2 = dx * dx + dy * dy;
+    if len2 <= 0.0 {
+        return false;
+    }
+    let len = len2.sqrt();
+    [c1, c2].iter().all(|c| {
+        let (ex, ey) = (c.x - a.x, c.y - a.y);
+        let t = (ex * dx + ey * dy) / len2;
+        let off = (ex * dy - ey * dx).abs() / len;
+        (0.0..=1.0).contains(&t) && off <= 1e-6 * len.max(1.0)
+    })
 }
 
 /// Point at parameter `t` on the cubic `a, c1, c2, b`.
@@ -402,6 +428,9 @@ fn build_snap_index_capped(
     // (off-page junk is free: it is discarded anyway).
     let mut used = 0usize;
     let mut cut_at: Option<usize> = None;
+    // Sub-paths whose unread tail the point limit dropped while budget remained: they are
+    // reported, but the sub-paths after them are still indexed.
+    let mut partial = 0usize;
 
     'paths: for (n, sub) in subpaths.iter().enumerate() {
         if sub.points.is_empty() || !sub.points.iter().all(sane) {
@@ -458,11 +487,14 @@ fn build_snap_index_capped(
             }
         }
 
-        if cut_at.is_none() && sub.points.len() > point_limit {
-            // `flatten` read only a prefix; the unread tail is dropped, so report the cap.
-            cut_at = Some(n);
+        // `flatten` read only a prefix of a giant sub-path: the unread tail is dropped (so no
+        // closing edge either) and the cap is reported, but later sub-paths are not lost with
+        // it, since the point limit says nothing about how much budget is left.
+        let tail_unread = sub.points.len() > point_limit;
+        if tail_unread && cut_at.is_none() {
+            partial += 1;
         }
-        if cut_at.is_none() {
+        if cut_at.is_none() && !tail_unread {
             // Closing segment (last point back to first), only when PDFium marked the
             // sub-path closed and it isn't already degenerate (single point, or the
             // last point already coincides with the first - no distinct closing edge).
@@ -503,10 +535,10 @@ fn build_snap_index_capped(
         }
     }
 
-    let cap = cut_at.map(|n| SegmentCap {
+    let cap = (cut_at.is_some() || partial > 0).then(|| SegmentCap {
         max_segments,
         segments_kept: used,
-        subpaths_dropped: subpaths.len() - n,
+        subpaths_dropped: partial + cut_at.map_or(0, |n| subpaths.len() - n),
         subpaths_total: subpaths.len(),
     });
     if let Some(c) = &cap {
@@ -1462,6 +1494,96 @@ mod tests {
         };
         let g = build_snap_index_capped(0, &[sub], Some(b), 100);
         assert!(g.cap.is_some(), "dropped tail must flag the cap");
+    }
+
+    fn cubic_sub(pts: [(f64, f64); 4]) -> Subpath {
+        Subpath {
+            points: pts.iter().map(|p| pt(p.0, p.1)).collect(),
+            closed: false,
+            curve: vec![false, true, true, true],
+        }
+    }
+
+    #[test]
+    fn a_cubic_whose_controls_lie_on_its_chord_snaps_as_a_line() {
+        let g = build_snap_index(
+            0,
+            &[cubic_sub([
+                (0.0, 0.0),
+                (10.0, 0.0),
+                (20.0, 0.0),
+                (30.0, 0.0),
+            ])],
+        );
+        assert_eq!(g.segments, vec![[0.0, 0.0, 30.0, 0.0]]);
+    }
+
+    #[test]
+    fn a_curved_cubic_is_still_not_a_line() {
+        let g = build_snap_index(
+            0,
+            &[cubic_sub([
+                (0.0, 0.0),
+                (10.0, 10.0),
+                (20.0, 10.0),
+                (30.0, 0.0),
+            ])],
+        );
+        assert!(
+            g.segments.is_empty(),
+            "a real curve adds no straight segment"
+        );
+    }
+
+    #[test]
+    fn a_cubic_with_a_control_point_past_its_end_is_not_a_line() {
+        // Collinear but overshooting: the curve doubles back, so it is not the chord alone.
+        let g = build_snap_index(
+            0,
+            &[cubic_sub([
+                (0.0, 0.0),
+                (40.0, 0.0),
+                (20.0, 0.0),
+                (30.0, 0.0),
+            ])],
+        );
+        assert!(g.segments.is_empty());
+    }
+
+    #[test]
+    fn a_point_limit_cut_does_not_drop_the_sub_paths_after_it() {
+        let b = SnapBounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 100.0,
+            max_y: 100.0,
+        };
+        // 400 free off-page points, then on-page ones: the point limit (301) reads only the
+        // off-page prefix, so the budget is untouched when the sub-path is cut.
+        let giant = Subpath {
+            points: (0..1_000)
+                .map(|i| {
+                    if i < 400 {
+                        pt(1e5 + i as f64, 1e5)
+                    } else {
+                        pt((i % 90) as f64, 5.0)
+                    }
+                })
+                .collect(),
+            closed: false,
+            curve: Vec::new(),
+        };
+        let later = line((50.0, 10.0), (50.0, 90.0));
+        let g = build_snap_index_capped(0, &[giant, later], Some(b), 100);
+        let cap = g.cap.expect("the cut sub-path is reported");
+        assert_eq!(
+            cap.subpaths_dropped, 1,
+            "only the cut sub-path counts as dropped"
+        );
+        assert!(
+            g.segments.iter().any(|s| s[0] == 50.0 && s[2] == 50.0),
+            "the later sub-path is still indexed"
+        );
     }
 
     #[test]

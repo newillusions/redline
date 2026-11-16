@@ -116,8 +116,33 @@ fn pts(v: &[PdfPoint]) -> String {
     v.iter().map(pt).collect::<Vec<_>>().join(";")
 }
 
+/// The XFDF `flags` attribute for a PDF `/F` bit field (ISO 32000-1 table 165; XFDF 3.0 names,
+/// comma separated, in bit order). Empty for no bits set: [`open`] then leaves the attribute
+/// out rather than writing an empty `flags=""`.
+pub(crate) fn xfdf_flags(f: i32) -> String {
+    const NAMES: [(i32, &str); 10] = [
+        (0x1, "invisible"),
+        (0x2, "hidden"),
+        (0x4, "print"),
+        (0x8, "nozoom"),
+        (0x10, "norotate"),
+        (0x20, "noview"),
+        (0x40, "readonly"),
+        (0x80, "locked"),
+        (0x100, "togglenoview"),
+        (0x200, "lockedcontents"),
+    ];
+    NAMES
+        .iter()
+        .filter(|(bit, _)| f & bit != 0)
+        .map(|(_, n)| *n)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Common attributes of one annotation element.
 struct Head<'a> {
+    flags: String,
     tag: &'a str,
     rltype: Option<&'a str>,
     page: u32,
@@ -131,10 +156,20 @@ struct Head<'a> {
 fn open(out: &mut String, h: &Head) {
     let _ = write!(
         out,
-        "    <{} page=\"{}\" rect=\"{},{},{},{}\" name=\"{}\" title=\"{}\" date=\"{}\" flags=\"print\"",
-        h.tag, h.page, h.rect[0], h.rect[1], h.rect[2], h.rect[3], esc(&h.name), esc(h.title),
+        "    <{} page=\"{}\" rect=\"{},{},{},{}\" name=\"{}\" title=\"{}\" date=\"{}\"",
+        h.tag,
+        h.page,
+        h.rect[0],
+        h.rect[1],
+        h.rect[2],
+        h.rect[3],
+        esc(&h.name),
+        esc(h.title),
         h.date
     );
+    if !h.flags.is_empty() {
+        let _ = write!(out, " flags=\"{}\"", h.flags);
+    }
     if let Some(t) = h.rltype {
         let _ = write!(out, " rltype=\"{t}\"");
     }
@@ -208,6 +243,7 @@ fn write_markup(out: &mut String, m: &Markup) {
     }
     let rltype = format!("{:?}", m.markup_type);
     let h = Head {
+        flags: xfdf_flags(m.annot_flags),
         tag,
         rltype: Some(&rltype),
         page: m.page,
@@ -253,6 +289,7 @@ fn write_workflow(out: &mut String, m: &Markup) {
             .map(|p| p.to_string())
             .unwrap_or_else(|| id.clone());
         let h = Head {
+            flags: "print".to_string(),
             tag: "text",
             rltype: Some("Reply"),
             page: m.page,
@@ -287,6 +324,7 @@ fn write_workflow(out: &mut String, m: &Markup) {
             .map(|p| p.to_string())
             .unwrap_or_else(|| id.clone());
         let h = Head {
+            flags: "print".to_string(),
             tag: "text",
             rltype: Some("Status"),
             page: m.page,

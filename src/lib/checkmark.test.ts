@@ -121,4 +121,36 @@ describe("Markups List checkmark", () => {
     expect((document.querySelector("[data-action='check-all']") as HTMLButtonElement).disabled).toBe(true);
     expect((document.querySelector("[data-action='clear-all']") as HTMLButtonElement).disabled).toBe(false);
   });
+  it("a locked markup keeps its box unticked on click and is left out of the Clear all count", async () => {
+    const { s, ipc } = make();
+    const locked = { ...mk("l", { contents: "locked" }), annot_flags: 4 | 0x80 };
+    s.seed([mk("a", { contents: "one" }), locked]);
+    render(MarkupsListPanel, { store: s, docId: "doc1" });
+    const boxes = screen.getAllByTestId("ml-checkmark") as HTMLInputElement[];
+    // Click the locked row's box: the model refuses, so the native box must not stay ticked.
+    await fireEvent.click(boxes[1]);
+    await tick();
+    expect(isMarked(s.getById("l")!)).toBe(false);
+    expect(boxes[1].checked).toBe(false);
+    expect(ipc.update).not.toHaveBeenCalled();
+    // Tick the unlocked one: Clear all counts only what it can clear.
+    await fireEvent.click(boxes[0]);
+    await tick();
+    const clear = document.querySelector("[data-action='clear-all']") as HTMLButtonElement;
+    expect(clear.textContent).toContain("(1)");
+  });
+
+  it("Clear all stays disabled when only a locked markup is marked, and Check all leaves the locked mark in place", async () => {
+    const { s } = make();
+    const lockedMarked = patchMarked({ ...mk("l", { contents: "locked" }), annot_flags: 4 | 0x80 }, true, BY, T0);
+    s.seed([mk("a", { contents: "one" }), lockedMarked]);
+    render(MarkupsListPanel, { store: s, docId: "doc1" });
+    expect((document.querySelector("[data-action='clear-all']") as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.click(document.querySelector("[data-action='check-all']")!);
+    await tick();
+    expect(isMarked(s.getById("a")!)).toBe(true);
+    expect(isMarked(s.getById("l")!)).toBe(true);
+    // The locked mark stays and cannot be cleared.
+    expect((document.querySelector("[data-action='clear-all']") as HTMLButtonElement).textContent).toContain("(1)");
+  });
 });
