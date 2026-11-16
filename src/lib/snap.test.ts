@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   getPageSnapTargets,
   getPageSnapSegments,
+  getPageSnapCap,
   invalidateSnapCache,
   findNearestSnap,
   findBestSnap,
@@ -14,6 +15,32 @@ import type { SnapTarget } from "./snap";
 import type { PdfPoint } from "./ipc";
 
 const mockInvoke = vi.mocked(invoke);
+
+describe("getPageSnapTargets cap info", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it("unwraps the { targets, cap } response and exposes the cap per page", async () => {
+    const cap = { maxSegments: 100000, segmentsKept: 100000, subpathsDropped: 7, subpathsTotal: 90 };
+    mockInvoke.mockResolvedValue({ targets: [{ point: { x: 1, y: 2 }, kind: "Endpoint" }], cap } as never);
+    const t = await getPageSnapTargets("docCap", 3);
+    expect(t).toEqual([{ point: { x: 1, y: 2 }, kind: "Endpoint" }]);
+    expect(getPageSnapCap("docCap", 3)).toEqual(cap);
+    expect(getPageSnapCap("docCap", 4)).toBeNull();
+  });
+
+  it("a page without a cap reports null, and invalidation clears a stored cap", async () => {
+    mockInvoke.mockResolvedValue({ targets: [], cap: null } as never);
+    await getPageSnapTargets("docNoCap", 0);
+    expect(getPageSnapCap("docNoCap", 0)).toBeNull();
+    mockInvoke.mockResolvedValue({ targets: [], cap: { maxSegments: 1, segmentsKept: 1, subpathsDropped: 1, subpathsTotal: 2 } } as never);
+    await getPageSnapTargets("docInv", 0);
+    expect(getPageSnapCap("docInv", 0)).not.toBeNull();
+    invalidateSnapCache("docInv");
+    expect(getPageSnapCap("docInv", 0)).toBeNull();
+  });
+});
 
 describe("getPageSnapTargets", () => {
   beforeEach(() => {

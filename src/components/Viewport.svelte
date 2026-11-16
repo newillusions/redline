@@ -107,7 +107,7 @@
   import { nextRun } from "$lib/count-groups";
   import { addScale, addViewport, updateViewport, type BBox, type CalloutProps, type MeasurementPayload, type SearchHit } from "$lib/ipc";
   import { pdfUserSpaceToScreen } from "$lib/viewport";
-  import { getPageSnapTargets, getPageSnapSegments, findBestSnap, type SnapSegment, type SnapTarget } from "$lib/snap";
+  import { getPageSnapTargets, getPageSnapSegments, getPageSnapCap, findBestSnap, type SnapSegment, type SnapTarget } from "$lib/snap";
   import CalibrationDialog from "./CalibrationDialog.svelte";
   import ViewportDialog from "./ViewportDialog.svelte";
   import { commitViewportChange, drainScaleNotices, reportRotateError, reportViewportError, viewportDragOutcome, VIEWPORT_VANISHED_MESSAGE } from "$lib/viewport-actions";
@@ -582,12 +582,16 @@
   let snapTargets: SnapTarget[] = $state([]);
   /** Straight segments of the current page (perpendicular / nearest-on-segment snaps). */
   let snapSegments: SnapSegment[] = $state.raw([]);
+  /** True when the current page was too dense to index in full (snapping reduced). */
+  let snapReduced = $state(false);
   /** The target actually snapped to on the last clientToPdf call - screen-space
    *  indicator only, cleared whenever a call doesn't snap. */
   let activeSnapHit: SnapTarget | null = $state(null);
 
   $effect(() => {
     const tool = store.activeTool;
+    // Clear first so the notice never outlives a page change or a failed fetch.
+    snapReduced = false;
     if (!docInfo || !SNAP_ELIGIBLE_TOOLS.has(tool)) {
       snapTargets = [];
       snapSegments = [];
@@ -601,6 +605,7 @@
         // Guard against a stale response landing after the doc/page/tool moved on.
         if (docInfo?.doc_id === docId && pageIndex === pg && SNAP_ELIGIBLE_TOOLS.has(store.activeTool)) {
           snapTargets = targets;
+          snapReduced = getPageSnapCap(docId, pg) !== null;
         }
       })
       .catch(() => {
@@ -4408,6 +4413,9 @@
   {/if}
 
   <!-- Identity-load failure: a creation tool is selected but authoring can't proceed. -->
+  {#if snapReduced && SNAP_ELIGIBLE_TOOLS.has(store.activeTool) && (!slot || slot.active)}
+    <div class="snap-reduced" role="status" aria-live="polite">Snapping reduced on this page: very dense drawing</div>
+  {/if}
   {#if identityError && isCreateTool() && (!slot || slot.active)}
     <div class="draw-unavailable">
       Markup authoring unavailable — user identity failed to load.
@@ -4787,6 +4795,21 @@
     resize: both;
     outline: none;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  }
+
+  /* Snap-cap notice (shown while a snap-eligible tool is active on a very dense page). */
+  .snap-reduced {
+    position: absolute;
+    top: var(--space-3);
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--color-bg-panel);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    font-size: var(--font-size-sm);
+    padding: var(--space-1) var(--space-3);
+    border-radius: var(--radius-sm);
+    pointer-events: none;
   }
 
   /* Identity-load failure notice (shown while a draw tool is active). */

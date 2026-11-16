@@ -1641,7 +1641,7 @@ pub enum RenderCmd {
     PageSnapIndex {
         doc_id: String,
         page_index: u32,
-        reply: oneshot::Sender<Result<Vec<crate::geometry::SnapTarget>>>,
+        reply: oneshot::Sender<Result<crate::geometry::PageSnapTargets>>,
     },
     /// A page's flat vector line segments for Symbol Search. See `RenderEngine::page_segments`.
     PageSegments {
@@ -1811,9 +1811,12 @@ impl RenderHandle {
                             page_index,
                             reply,
                         } => {
-                            let result = engine
-                                .page_snap_index(&doc_id, page_index)
-                                .map(|geom| geom.snap_index.iter().cloned().collect::<Vec<_>>());
+                            let result = engine.page_snap_index(&doc_id, page_index).map(|geom| {
+                                crate::geometry::PageSnapTargets {
+                                    targets: geom.snap_index.iter().cloned().collect(),
+                                    cap: geom.cap,
+                                }
+                            });
                             let _ = reply.send(result);
                         }
                         RenderCmd::PageSnapSegments {
@@ -2077,7 +2080,7 @@ impl RenderHandle {
         &self,
         doc_id: String,
         page_index: u32,
-    ) -> Result<Vec<crate::geometry::SnapTarget>> {
+    ) -> Result<crate::geometry::PageSnapTargets> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(RenderCmd::PageSnapIndex {

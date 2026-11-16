@@ -7,7 +7,7 @@
 
 use tauri::State;
 
-use crate::geometry::SnapTarget;
+use crate::geometry::PageSnapTargets;
 use crate::AppState;
 
 /// Return the full snap-target index for a page (spec §5, v1 — `Endpoint` and
@@ -17,6 +17,9 @@ use crate::AppState;
 /// nearest-target lookup client-side against a local cache while dragging,
 /// without an IPC round-trip on every pointer-move.
 ///
+/// The response also carries `cap` (`SegmentCap`) when the page was too dense to index in
+/// full, so the viewer can say snapping is reduced.
+///
 /// Built once per (document, page) on first call and cached on the render
 /// thread until the document closes (see `RenderEngine::page_snap_index`).
 #[tauri::command]
@@ -24,7 +27,7 @@ pub async fn get_page_snap_targets(
     state: State<'_, AppState>,
     doc_id: String,
     page_index: u32,
-) -> Result<Vec<SnapTarget>, String> {
+) -> Result<PageSnapTargets, String> {
     state
         .render
         .page_snap_index(doc_id, page_index)

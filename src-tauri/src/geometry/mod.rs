@@ -192,6 +192,31 @@ pub struct PageGeometry {
     /// Straight segments `[x1, y1, x2, y2]` (PDF user space) for client-side
     /// perpendicular / nearest-on-segment snapping. Curve pieces are excluded.
     pub segments: Vec<[f64; 4]>,
+    /// Set when the page exceeded [`MAX_SEGMENTS`] and part of its geometry was dropped, so
+    /// snapping on this page is reduced. `None` for pages within the cap.
+    pub cap: Option<SegmentCap>,
+}
+
+/// What the per-page segment cap dropped. See [`MAX_SEGMENTS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentCap {
+    /// The cap that applied.
+    pub max_segments: usize,
+    /// Segments kept (every kind, in-bounds only).
+    pub segments_kept: usize,
+    /// Sub-paths cut part-way or skipped whole once the cap was reached.
+    pub subpaths_dropped: usize,
+    /// Sub-paths offered to the builder.
+    pub subpaths_total: usize,
+}
+
+/// Response of `get_page_snap_targets`: the page's targets plus, when the page hit the
+/// segment cap, what was dropped (so the viewer can say snapping is reduced).
+#[derive(Debug, Clone, Serialize)]
+pub struct PageSnapTargets {
+    pub targets: Vec<SnapTarget>,
+    pub cap: Option<SegmentCap>,
 }
 
 impl PageGeometry {
@@ -246,8 +271,10 @@ struct Flat {
     segs: Vec<Seg>,
 }
 
-fn flatten(sub: &Subpath) -> Flat {
-    let p = &sub.points;
+/// `max_points` bounds how many of the sub-path's points are read, so a single giant
+/// sub-path cannot cost more than the page budget before the cap cuts it.
+fn flatten(sub: &Subpath, max_points: usize) -> Flat {
+    let p = &sub.points[..sub.points.len().min(max_points)];
     let mut pts = vec![p[0]];
     let mut segs = Vec::new();
     let mut i = 1;
@@ -357,52 +384,139 @@ pub fn build_snap_index_bounded(
     subpaths: &[Subpath],
     bounds: Option<SnapBounds>,
 ) -> PageGeometry {
+    build_snap_index_capped(page_index, subpaths, bounds, MAX_SEGMENTS)
+}
+
+fn build_snap_index_capped(
+    page_index: u32,
+    subpaths: &[Subpath],
+    bounds: Option<SnapBounds>,
+    max_segments: usize,
+) -> PageGeometry {
+    let in_bounds = |p: PdfPoint| bounds.as_ref().map_or(true, |b| b.contains(p));
     let mut targets = Vec::new();
     let mut segments: Vec<[f64; 4]> = Vec::new();
+    // Budget: every segment kept on the page (straight, cubic or closing edge). It is what
+    // drives the r-tree size and the IPC payload (two targets per segment), so it is
+    // checked per segment, inside the sub-path, and only in-bounds segments spend it
+    // (off-page junk is free: it is discarded anyway).
+    let mut used = 0usize;
+    let mut cut_at: Option<usize> = None;
 
-    for sub in subpaths {
+    'paths: for (n, sub) in subpaths.iter().enumerate() {
         if sub.points.is_empty() || !sub.points.iter().all(sane) {
             continue;
         }
-        let flat = flatten(sub);
+        let point_limit = max_segments.saturating_mul(3).saturating_add(1);
+        let flat = flatten(sub, point_limit);
         let pts = &flat.pts;
+        // Number of segments of this sub-path actually processed (all of them unless the
+        // budget runs out part-way); arcs are fitted on that prefix only.
+        let mut done = flat.segs.len();
 
-        for p in pts {
+        let start_pushed = in_bounds(pts[0]);
+        if start_pushed {
             targets.push(SnapTarget {
-                point: *p,
+                point: pts[0],
                 kind: SnapKind::Endpoint,
             });
         }
-
         for (i, seg) in flat.segs.iter().enumerate() {
-            targets.push(SnapTarget {
-                point: seg_midpoint(&flat, i),
-                kind: SnapKind::Midpoint,
-            });
-            if matches!(seg, Seg::Line) {
-                segments.push([pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y]);
+            let (a, b) = (pts[i], pts[i + 1]);
+            let mid = seg_midpoint(&flat, i);
+            let kept_line = match (seg, &bounds) {
+                (Seg::Line, Some(bb)) => clip_segment([a.x, a.y, b.x, b.y], bb),
+                (Seg::Line, None) => Some([a.x, a.y, b.x, b.y]),
+                _ => None,
+            };
+            let counts = kept_line.is_some() || in_bounds(a) || in_bounds(b) || in_bounds(mid);
+            if counts && used >= max_segments {
+                cut_at = Some(n);
+                done = i;
+                if i == 0 && start_pushed {
+                    targets.pop(); // nothing of this sub-path was kept: no orphan start point
+                }
+                break;
+            }
+            if counts {
+                used += 1;
+            }
+            if in_bounds(b) {
+                targets.push(SnapTarget {
+                    point: b,
+                    kind: SnapKind::Endpoint,
+                });
+            }
+            if in_bounds(mid) {
+                targets.push(SnapTarget {
+                    point: mid,
+                    kind: SnapKind::Midpoint,
+                });
+            }
+            if let Some(l) = kept_line {
+                segments.push(l);
             }
         }
 
-        // Closing segment (last point back to first), only when PDFium marked the
-        // sub-path closed and it isn't already degenerate (single point, or the
-        // last point already coincides with the first — no distinct closing edge).
-        let first = pts[0];
-        let last = *pts.last().unwrap();
-        if sub.closed && pts.len() > 1 && first != last {
-            targets.push(midpoint_target(last, first));
-            segments.push([last.x, last.y, first.x, first.y]);
+        if cut_at.is_none() && sub.points.len() > point_limit {
+            // `flatten` read only a prefix; the unread tail is dropped, so report the cap.
+            cut_at = Some(n);
+        }
+        if cut_at.is_none() {
+            // Closing segment (last point back to first), only when PDFium marked the
+            // sub-path closed and it isn't already degenerate (single point, or the
+            // last point already coincides with the first - no distinct closing edge).
+            let first = pts[0];
+            let last = *pts.last().unwrap();
+            if sub.closed && pts.len() > 1 && first != last {
+                let seg = [last.x, last.y, first.x, first.y];
+                let kept = match &bounds {
+                    Some(bb) => clip_segment(seg, bb),
+                    None => Some(seg),
+                };
+                let mid = midpoint_target(last, first);
+                if kept.is_some() || in_bounds(mid.point) {
+                    if used >= max_segments {
+                        cut_at = Some(n);
+                    } else {
+                        used += 1;
+                        if in_bounds(mid.point) {
+                            targets.push(mid);
+                        }
+                        segments.extend(kept);
+                    }
+                }
+            }
         }
 
-        fit_arcs(&flat, &mut targets);
+        // Arc fits on the processed prefix only, so no target outlives its segment.
+        let prefix = Flat {
+            pts: flat.pts[..=done].to_vec(),
+            segs: flat.segs[..done].to_vec(),
+        };
+        let mut arcs = Vec::new();
+        fit_arcs(&prefix, &mut arcs);
+        targets.extend(arcs.into_iter().filter(|t| in_bounds(t.point)));
+
+        if cut_at.is_some() {
+            break 'paths;
+        }
     }
 
-    if let Some(b) = bounds {
-        targets.retain(|t| b.contains(t.point));
-        segments = segments
-            .into_iter()
-            .filter_map(|s| clip_segment(s, &b))
-            .collect();
+    let cap = cut_at.map(|n| SegmentCap {
+        max_segments,
+        segments_kept: used,
+        subpaths_dropped: subpaths.len() - n,
+        subpaths_total: subpaths.len(),
+    });
+    if let Some(c) = &cap {
+        log::warn!(
+            "snap index: page {page_index} capped at {} segments ({} of {} sub-paths cut or \
+             dropped); snapping is reduced on this page",
+            c.max_segments,
+            c.subpaths_dropped,
+            c.subpaths_total
+        );
     }
     add_intersections(&segments, &mut targets);
 
@@ -410,9 +524,15 @@ pub fn build_snap_index_bounded(
         page_index,
         snap_index: RTree::bulk_load(targets),
         segments,
+        cap,
     }
 }
 
+/// Cap on segments of every kind (straight, cubic, closing edge) kept per page, applied
+/// per segment before the r-tree build and the IPC payload so a dense page cannot stall the
+/// first snap. Segments past it, and the rest of the page's sub-paths, are dropped together
+/// with their targets. Segments outside the clip bounds do not count.
+const MAX_SEGMENTS: usize = 100_000;
 /// Cap on candidate segment pairs tested per page.
 const MAX_PAIR_TESTS: usize = 4_000_000;
 /// Cap on intersection targets emitted per page.
@@ -773,6 +893,7 @@ mod tests {
             page_index: 0,
             snap_index: RTree::bulk_load(targets),
             segments: Vec::new(),
+            cap: None,
         };
         // Cursor within 5pt tolerance of first point.
         let result = geom.nearest_snap(PdfPoint { x: 11.0, y: 21.0 }, 5.0);
@@ -790,6 +911,7 @@ mod tests {
             page_index: 0,
             snap_index: RTree::bulk_load(targets),
             segments: Vec::new(),
+            cap: None,
         };
         // Cursor 100pt away — outside any tolerance.
         let result = geom.nearest_snap(PdfPoint { x: 110.0, y: 120.0 }, 5.0);
@@ -802,6 +924,7 @@ mod tests {
             page_index: 0,
             snap_index: RTree::new(),
             segments: Vec::new(),
+            cap: None,
         };
         let result = geom.nearest_snap(PdfPoint { x: 0.0, y: 0.0 }, 10.0);
         assert!(result.is_none());
@@ -1194,6 +1317,222 @@ mod tests {
             .collect();
         let g = build_snap_index(0, &subs);
         assert!(of_kind(&g, SnapKind::Intersection).len() <= MAX_INTERSECTIONS);
+    }
+
+    #[test]
+    fn page_above_cap_is_capped_and_flagged() {
+        let n = MAX_SEGMENTS + 5_000;
+        let subs: Vec<Subpath> = (0..n)
+            .map(|i| line((i as f64 * 3.0, 0.0), (i as f64 * 3.0, 1.0)))
+            .collect();
+        let g = build_snap_index(0, &subs);
+        assert_eq!(g.segments.len(), MAX_SEGMENTS);
+        let cap = g.cap.expect("cap flag set");
+        assert_eq!(cap.max_segments, MAX_SEGMENTS);
+        assert_eq!(cap.segments_kept, MAX_SEGMENTS);
+        assert_eq!(cap.subpaths_total, n);
+        assert_eq!(cap.subpaths_dropped, 5_000);
+    }
+
+    #[test]
+    fn page_below_cap_is_untouched() {
+        let n = 1_000;
+        let subs: Vec<Subpath> = (0..n)
+            .map(|i| line((i as f64 * 3.0, 0.0), (i as f64 * 3.0, 1.0)))
+            .collect();
+        let g = build_snap_index(0, &subs);
+        assert_eq!(g.segments.len(), n);
+        assert!(g.cap.is_none());
+    }
+
+    fn bezier_sub(x: f64, y: f64) -> Subpath {
+        Subpath {
+            points: vec![
+                pt(x, y),
+                pt(x + 1.0, y + 2.0),
+                pt(x + 2.0, y + 2.0),
+                pt(x + 3.0, y),
+            ],
+            closed: false,
+            curve: vec![false, true, true, true],
+        }
+    }
+
+    fn count(g: &PageGeometry, k: SnapKind) -> usize {
+        g.snap_index.iter().filter(|t| t.kind == k).count()
+    }
+
+    #[test]
+    fn curve_only_page_is_capped_too() {
+        let subs: Vec<Subpath> = (0..2_000)
+            .map(|i| bezier_sub(i as f64 * 5.0, 0.0))
+            .collect();
+        let g = build_snap_index_capped(0, &subs, None, 1_000);
+        assert!(g.segments.is_empty(), "curves are not straight segments");
+        let cap = g.cap.expect("curve-only page must trip the cap");
+        assert_eq!(cap.segments_kept, 1_000);
+        assert_eq!(cap.subpaths_dropped, 1_000);
+        // One cubic per sub-path: 2 endpoints + 1 midpoint each, for the 1,000 kept only.
+        assert_eq!(count(&g, SnapKind::Midpoint), 1_000);
+        assert_eq!(count(&g, SnapKind::Endpoint), 2_000);
+    }
+
+    #[test]
+    fn single_giant_subpath_is_cut_inside_the_subpath() {
+        let n = 50_000;
+        let giant = Subpath {
+            points: (0..n).map(|i| pt(i as f64, (i % 2) as f64)).collect(),
+            closed: true,
+            curve: Vec::new(),
+        };
+        let g = build_snap_index_capped(0, &[giant], None, 1_000);
+        assert_eq!(g.segments.len(), 1_000);
+        let cap = g.cap.expect("flagged");
+        assert_eq!(
+            (cap.segments_kept, cap.subpaths_dropped, cap.subpaths_total),
+            (1_000, 1, 1)
+        );
+        // No orphan targets: endpoints = kept segments + 1, midpoints = kept segments
+        // (the closing edge is dropped with the cut).
+        assert_eq!(count(&g, SnapKind::Midpoint), 1_000);
+        assert_eq!(count(&g, SnapKind::Endpoint), 1_001);
+    }
+
+    #[test]
+    fn off_page_junk_first_does_not_spend_the_budget() {
+        let b = SnapBounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 100.0,
+            max_y: 100.0,
+        };
+        let mut subs: Vec<Subpath> = (0..5_000)
+            .map(|i| line((1e5 + i as f64, 1e5), (1e5 + i as f64, 1e5 + 1.0)))
+            .collect();
+        subs.extend((0..100).map(|i| line((i as f64, 1.0), (i as f64, 2.0))));
+        let g = build_snap_index_capped(0, &subs, Some(b), 1_000);
+        assert!(g.cap.is_none());
+        assert_eq!(g.segments.len(), 100);
+        assert_eq!(count(&g, SnapKind::Midpoint), 100);
+    }
+
+    #[test]
+    fn curve_only_subpath_above_the_point_limit_reports_the_cap() {
+        // cap 100 -> point limit 301; 103 cubics = 310 points, so the tail is unread.
+        let mut points = vec![pt(0.0, 0.0)];
+        let mut curve = vec![false];
+        for i in 0..103 {
+            let x = i as f64 * 3.0;
+            points.extend([pt(x + 1.0, 2.0), pt(x + 2.0, 2.0), pt(x + 3.0, 0.0)]);
+            curve.extend([true, true, true]);
+        }
+        let sub = Subpath {
+            points,
+            closed: false,
+            curve,
+        };
+        let g = build_snap_index_capped(0, &[sub], None, 100);
+        let cap = g.cap.expect("silent truncation must be reported");
+        assert_eq!(cap.subpaths_dropped, 1);
+        assert!(cap.segments_kept <= 100);
+    }
+
+    #[test]
+    fn giant_polyline_with_off_page_prefix_reports_the_cap() {
+        let b = SnapBounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 100.0,
+            max_y: 100.0,
+        };
+        // 400 off-page points (free), then on-page points; limit 301 reads only off-page ones.
+        let points: Vec<PdfPoint> = (0..1_000)
+            .map(|i| {
+                if i < 400 {
+                    pt(1e5 + i as f64, 1e5)
+                } else {
+                    pt((i % 90) as f64, 5.0)
+                }
+            })
+            .collect();
+        let sub = Subpath {
+            points,
+            closed: false,
+            curve: Vec::new(),
+        };
+        let g = build_snap_index_capped(0, &[sub], Some(b), 100);
+        assert!(g.cap.is_some(), "dropped tail must flag the cap");
+    }
+
+    #[test]
+    fn invalid_tail_subpaths_do_not_flag_a_cap() {
+        let mut subs: Vec<Subpath> = (0..10)
+            .map(|i| line((i as f64, 0.0), (i as f64, 1.0)))
+            .collect();
+        subs.push(Subpath::default());
+        subs.push(line((f64::NAN, 0.0), (1.0, 1.0)));
+        let g = build_snap_index_capped(0, &subs, None, 10);
+        assert!(g.cap.is_none());
+        assert_eq!(g.segments.len(), 10);
+    }
+
+    #[test]
+    fn segment_cap_serialises_camel_case_for_the_frontend() {
+        let c = SegmentCap {
+            max_segments: 5,
+            segments_kept: 5,
+            subpaths_dropped: 2,
+            subpaths_total: 9,
+        };
+        assert_eq!(
+            serde_json::to_value(c).unwrap(),
+            serde_json::json!({"maxSegments":5,"segmentsKept":5,"subpathsDropped":2,"subpathsTotal":9})
+        );
+    }
+
+    #[test]
+    #[ignore = "measurement: cargo test --release measure_cap -- --ignored --nocapture"]
+    fn measure_cap() {
+        let run = |label: &str, subs: Vec<Subpath>| {
+            let t = std::time::Instant::now();
+            let g = build_snap_index_bounded(0, &subs, None);
+            let build = t.elapsed();
+            let tj = serde_json::to_vec(&g.snap_index.iter().collect::<Vec<_>>())
+                .unwrap()
+                .len();
+            let sj = serde_json::to_vec(&g.segments).unwrap().len();
+            eprintln!(
+                "{label}: build_ms={} targets={} targets_json_mb={:.1} segments={} segments_json_mb={:.1} capped={}",
+                build.as_millis(), g.snap_index.size(), tj as f64 / 1e6, g.segments.len(), sj as f64 / 1e6, g.cap.is_some()
+            );
+        };
+        for n in [50_000usize, 100_000, 400_000, 1_600_000] {
+            run(
+                &format!("lines n={n}"),
+                (0..n)
+                    .map(|i| {
+                        let (x, y) = ((i % 2000) as f64 * 0.5, (i / 2000) as f64 * 0.5);
+                        line((x, y), (x + 0.7, y + if i % 2 == 0 { 0.7 } else { -0.7 }))
+                    })
+                    .collect(),
+            );
+            run(
+                &format!("curves n={n}"),
+                (0..n)
+                    .map(|i| bezier_sub((i % 2000) as f64 * 4.0, (i / 2000) as f64 * 4.0))
+                    .collect(),
+            );
+        }
+        run(
+            "giant subpath 5M pts",
+            vec![Subpath {
+                points: (0..5_000_000)
+                    .map(|i| pt(i as f64 * 0.01, (i % 2) as f64))
+                    .collect(),
+                closed: false,
+                curve: Vec::new(),
+            }],
+        );
     }
 
     // --- hostile / broken content ---

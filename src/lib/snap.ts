@@ -31,10 +31,26 @@ export interface SnapTarget {
   kind: SnapKind;
 }
 
+/** Set when a page was too dense to index in full (Rust `geometry::SegmentCap`). */
+export interface SnapCap {
+  maxSegments: number;
+  segmentsKept: number;
+  subpathsDropped: number;
+  subpathsTotal: number;
+}
+
+/** Shape of the `get_page_snap_targets` response. */
+interface PageSnapTargetsResponse {
+  targets: SnapTarget[];
+  cap: SnapCap | null;
+}
+
 /** A straight page segment `[x1, y1, x2, y2]` in PDF user space. */
 export type SnapSegment = readonly [number, number, number, number];
 
 const cache = new Map<string, Promise<SnapTarget[]>>();
+/** Cap info per page key, filled when the targets response arrives. */
+const capCache = new Map<string, SnapCap>();
 const segmentCache = new Map<string, Promise<SnapSegment[]>>();
 
 function cacheKey(docId: string, pageIndex: number): string {
@@ -55,8 +71,13 @@ export function getPageSnapTargets(docId: string, pageIndex: number): Promise<Sn
   // synchronously (no implementation configured for that call), and Promise.
   // resolve(undefined) is a valid resolved promise while undefined.catch(...)
   // throws. `?? []` guards the same case on the resolved side.
-  const req = Promise.resolve(invoke<SnapTarget[]>("get_page_snap_targets", { docId, pageIndex }))
-    .then((result) => result ?? [])
+  const req = Promise.resolve(invoke<PageSnapTargetsResponse | SnapTarget[]>("get_page_snap_targets", { docId, pageIndex }))
+    .then((result) => {
+      if (Array.isArray(result)) return result;
+      if (result?.cap) capCache.set(key, result.cap);
+      else capCache.delete(key);
+      return result?.targets ?? [];
+    })
     .catch((err) => {
       // Don't poison the cache with a failed request - a transient error (e.g. the
       // doc closed mid-flight) should let the next attempt retry, not snap-lock the
@@ -66,6 +87,12 @@ export function getPageSnapTargets(docId: string, pageIndex: number): Promise<Sn
     });
   cache.set(key, req);
   return req;
+}
+
+/** The cap info for a page whose targets have been fetched, or `null` when snapping is
+ *  complete on it (or the page has not been fetched). Call after `getPageSnapTargets` resolves. */
+export function getPageSnapCap(docId: string, pageIndex: number): SnapCap | null {
+  return capCache.get(cacheKey(docId, pageIndex)) ?? null;
 }
 
 /**
@@ -80,6 +107,9 @@ export function invalidateSnapCache(docId: string): void {
   const prefix = `${docId}#`;
   for (const key of Array.from(cache.keys())) {
     if (key.startsWith(prefix)) cache.delete(key);
+  }
+  for (const key of Array.from(capCache.keys())) {
+    if (key.startsWith(prefix)) capCache.delete(key);
   }
   for (const key of Array.from(segmentCache.keys())) {
     if (key.startsWith(prefix)) segmentCache.delete(key);
