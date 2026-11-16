@@ -17,7 +17,7 @@
 //!   cargo test -p pdf-diff -- --nocapture
 
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb};
-use pdf_diff::{pixel_diff, CharDelta};
+use pdf_diff::{change_regions, change_regions_user_space, pixel_diff, CharDelta, PageGeometry};
 
 // ---------------------------------------------------------------------------
 // Pure-Rust helpers (run without PDFium)
@@ -167,6 +167,82 @@ macro_rules! require_pdfium {
             return;
         }
     };
+}
+
+// ---------------------------------------------------------------------------
+// change_regions (no PDFium needed)
+// ---------------------------------------------------------------------------
+
+fn with_blocks(base: &DynamicImage, blocks: &[(u32, u32, u32, u32)]) -> DynamicImage {
+    let mut img = base.to_rgb8();
+    for &(x0, y0, x1, y1) in blocks {
+        for y in y0..y1 {
+            for x in x0..x1 {
+                img.put_pixel(x, y, Rgb([0, 0, 0]));
+            }
+        }
+    }
+    DynamicImage::ImageRgb8(img)
+}
+
+#[test]
+fn change_regions_three_edits_yield_three_regions() {
+    let a = solid_rgb(255, 255, 255, 400, 300);
+    // Three well separated edits.
+    let b = with_blocks(
+        &a,
+        &[(20, 20, 40, 30), (200, 100, 230, 140), (50, 250, 60, 260)],
+    );
+    let r = change_regions(&a, &b, 5, 8, 72.0).unwrap();
+    assert_eq!(r.len(), 3, "{r:?}");
+    // Ordered top-to-bottom: first is the block at y=20..30 (PDF y 270..280 at 72 DPI).
+    assert_eq!((r[0].x0, r[0].x1), (20.0, 40.0));
+    assert_eq!((r[0].y0, r[0].y1), (270.0, 280.0));
+    assert_eq!(r[0].changed_pixels, 200);
+    assert_eq!(
+        (r[1].x0, r[1].y0, r[1].x1, r[1].y1),
+        (200.0, 160.0, 230.0, 200.0)
+    );
+}
+
+#[test]
+fn change_regions_merges_nearby_pixels_and_proximity_controls_count() {
+    let a = solid_rgb(255, 255, 255, 200, 100);
+    // Two blocks 10 px apart horizontally.
+    let b = with_blocks(&a, &[(10, 10, 20, 20), (30, 10, 40, 20)]);
+    assert_eq!(change_regions(&a, &b, 5, 2, 72.0).unwrap().len(), 2);
+    let merged = change_regions(&a, &b, 5, 12, 72.0).unwrap();
+    assert_eq!(merged.len(), 1);
+    assert_eq!((merged[0].x0, merged[0].x1), (10.0, 40.0));
+}
+
+#[test]
+fn change_regions_scales_to_pdf_points_by_dpi() {
+    let a = solid_rgb(255, 255, 255, 300, 300);
+    let b = with_blocks(&a, &[(150, 150, 300, 300)]);
+    let r = change_regions(&a, &b, 5, 4, 144.0).unwrap();
+    assert_eq!(r.len(), 1);
+    // 2 px per point: pixels 150..300 -> points 75..150; bottom of image -> y 0.
+    assert_eq!(
+        (r[0].x0, r[0].y0, r[0].x1, r[0].y1),
+        (75.0, 0.0, 150.0, 75.0)
+    );
+}
+
+#[test]
+fn change_regions_identical_is_empty_and_mismatch_errors() {
+    let a = solid_rgb(10, 20, 30, 50, 50);
+    assert!(change_regions(&a, &a, 0, 4, 72.0).unwrap().is_empty());
+    let b = solid_rgb(10, 20, 30, 40, 50);
+    assert!(change_regions(&a, &b, 0, 4, 72.0).is_err());
+    assert!(change_regions(&a, &a, 0, 4, 0.0).is_err());
+}
+
+#[test]
+fn change_regions_ignores_changes_within_tolerance() {
+    let a = solid_rgb(100, 100, 100, 40, 40);
+    let b = solid_rgb(103, 100, 100, 40, 40);
+    assert!(change_regions(&a, &b, 5, 4, 72.0).unwrap().is_empty());
 }
 
 /// Skip if a specific fixture env var isn't set.
@@ -353,4 +429,87 @@ fn engine_is_headless_no_tauri_required() {
     // Its existence proves that the test binary compiles and links
     // without any Tauri framework dependency.
     let _ = std::env::var("PDFIUM_DYNAMIC_LIB_PATH");
+}
+
+// ---------------------------------------------------------------------------
+// display space -> PDF user space (rotation and non-zero box origin)
+// ---------------------------------------------------------------------------
+
+/// Page box 100 x 50 (landscape) at origin (10, 20). An edit at unrotated
+/// box offset u 10..30, v 5..15 (a block near the lower-left).
+fn user_rect() -> (f32, f32, f32, f32) {
+    (20.0, 25.0, 40.0, 35.0)
+}
+
+fn geom(rot: i32) -> PageGeometry {
+    PageGeometry {
+        rotation_deg: rot,
+        x0: 10.0,
+        y0: 20.0,
+        x1: 110.0,
+        y1: 70.0,
+    }
+}
+
+/// Build the display-space image for `rot` containing the edit, then check the
+/// recovered user-space rect equals `user_rect()`.
+fn check_rotation(rot: i32, disp_w: u32, disp_h: u32, block: (u32, u32, u32, u32)) {
+    let a = solid_rgb(255, 255, 255, disp_w, disp_h);
+    let b = with_blocks(&a, &[block]);
+    let r = change_regions_user_space(&a, &b, 5, 4, 72.0, &geom(rot)).unwrap();
+    assert_eq!(r.len(), 1, "rot {rot}: {r:?}");
+    let (x0, y0, x1, y1) = user_rect();
+    assert_eq!(
+        (r[0].x0, r[0].y0, r[0].x1, r[0].y1),
+        (x0, y0, x1, y1),
+        "rot {rot}"
+    );
+}
+
+#[test]
+fn change_regions_user_space_rotation_0_with_box_origin() {
+    // Display 100x50; edit u 10..30, v 5..15 -> pixel x 10..30, y (50-15)..(50-5).
+    check_rotation(0, 100, 50, (10, 35, 30, 45));
+}
+
+#[test]
+fn change_regions_user_space_rotation_90() {
+    // Display 50x100. (u,v)->(dx,dy)=(v, w-u): dx 5..15, dy 70..90 -> pixel y 10..30.
+    check_rotation(90, 50, 100, (5, 10, 15, 30));
+}
+
+#[test]
+fn change_regions_user_space_rotation_180() {
+    // Display 100x50. (dx,dy)=(w-u, h-v): dx 70..90, dy 35..45 -> pixel y 5..15.
+    check_rotation(180, 100, 50, (70, 5, 90, 15));
+}
+
+#[test]
+fn change_regions_user_space_rotation_270() {
+    // Display 50x100. (dx,dy)=(h-v, u): dx 35..45, dy 10..30 -> pixel y 70..90.
+    check_rotation(270, 50, 100, (35, 70, 45, 90));
+}
+
+#[test]
+fn page_geometry_rejects_non_right_angle_rotation() {
+    let g = PageGeometry {
+        rotation_deg: 45,
+        ..geom(0)
+    };
+    assert!(g.display_to_user(1.0, 1.0).is_err());
+    // Negative multiples normalise: -90 == 270.
+    let a = geom(-90).display_to_user(5.0, 10.0).unwrap();
+    assert_eq!(a, geom(270).display_to_user(5.0, 10.0).unwrap());
+}
+
+#[test]
+fn change_regions_tiny_proximity_uses_bounded_cells() {
+    // proximity 0 and 1 are clamped to the minimum cell: still correct, and
+    // gaps of 2 px merge (cell 4) while the result stays one region.
+    let a = solid_rgb(255, 255, 255, 64, 64);
+    let b = with_blocks(&a, &[(10, 10, 14, 14), (16, 10, 20, 14)]);
+    for p in [0, 1] {
+        let r = change_regions(&a, &b, 5, p, 72.0).unwrap();
+        assert_eq!(r.len(), 1, "proximity {p}: {r:?}");
+    }
 }

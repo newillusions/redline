@@ -362,6 +362,47 @@ impl<'p> PdfDiffEngine<'p> {
         Ok(bitmap.as_image())
     }
 
+    /// Geometry linking this page's display space (what [`render_page_full`]
+    /// renders and [`change_regions`] reports) to PDF user space: the page's
+    /// clockwise `/Rotate` and its visible box (crop box when present, else the
+    /// media box).
+    ///
+    /// [`render_page_full`]: PdfDiffEngine::render_page_full
+    pub fn page_geometry(&mut self, doc: &DocId, page_idx: u32) -> Result<PageGeometry> {
+        let open_doc = self
+            .docs
+            .get_mut(&doc.0)
+            .with_context(|| format!("unknown doc id: {}", doc.0))?;
+        let page = open_doc
+            .document
+            .pages()
+            .get(page_idx as u16)
+            .with_context(|| format!("page {} not found", page_idx))?;
+        let rotation_deg = match page.rotation().context("page rotation unreadable")? {
+            PdfPageRenderRotation::None => 0,
+            PdfPageRenderRotation::Degrees90 => 90,
+            PdfPageRenderRotation::Degrees180 => 180,
+            PdfPageRenderRotation::Degrees270 => 270,
+        };
+        let boundaries = page.boundaries();
+        let bounds = match boundaries.crop() {
+            Ok(b) => b.bounds,
+            Err(_) => {
+                boundaries
+                    .media()
+                    .context("page has neither crop nor media box")?
+                    .bounds
+            }
+        };
+        Ok(PageGeometry {
+            rotation_deg,
+            x0: bounds.left().value,
+            y0: bounds.bottom().value,
+            x1: bounds.right().value,
+            y1: bounds.top().value,
+        })
+    }
+
     /// Extract all characters with their center positions from a page.
     ///
     /// Skips control characters and characters with no Unicode representation.
@@ -537,9 +578,220 @@ pub fn pixel_diff(
     })
 }
 
+/// A rectangular area where two page renders differ, in DISPLAY space.
+///
+/// Display space is the space of the image produced by
+/// [`PdfDiffEngine::render_page_full`]: points (1/72 in), y-up, origin at the
+/// bottom-left of the page AS DISPLAYED, i.e. after the page's `/Rotate` and its
+/// crop box have been applied. For an unrotated page whose box starts at (0, 0)
+/// this equals PDF user space, but in general it does not. Convert with
+/// [`ChangeRegion::to_user_space`] (using [`PdfDiffEngine::page_geometry`])
+/// before using the rect as annotation geometry. `x0 <= x1`, `y0 <= y1`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeRegion {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+    /// Number of changed pixels inside the region.
+    pub changed_pixels: u64,
+}
+
+/// How a page's display space relates to its PDF user space.
+///
+/// `rotation_deg` is the page's clockwise display rotation (`/Rotate`), a
+/// multiple of 90 (other values, including negatives, are normalised modulo 360
+/// and must still be multiples of 90). `x0,y0,x1,y1` is the visible page box in
+/// user space (the crop box, else the media box; lower-left and upper-right).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PageGeometry {
+    pub rotation_deg: i32,
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+}
+
+impl PageGeometry {
+    /// Unrotated page whose box is `0,0 .. width,height`.
+    pub fn unrotated(width: f32, height: f32) -> Self {
+        Self {
+            rotation_deg: 0,
+            x0: 0.0,
+            y0: 0.0,
+            x1: width,
+            y1: height,
+        }
+    }
+
+    /// Map a display-space point to PDF user space.
+    pub fn display_to_user(&self, dx: f32, dy: f32) -> Result<(f32, f32)> {
+        let w = self.x1 - self.x0;
+        let h = self.y1 - self.y0;
+        // (u, v) = offset from the box's lower-left in unrotated page space.
+        let (u, v) = match self.rotation_deg.rem_euclid(360) {
+            0 => (dx, dy),
+            90 => (w - dy, dx),
+            180 => (w - dx, h - dy),
+            270 => (dy, h - dx),
+            r => anyhow::bail!("page rotation {} is not a multiple of 90", r),
+        };
+        Ok((self.x0 + u, self.y0 + v))
+    }
+}
+
+impl ChangeRegion {
+    /// Convert this display-space rect to PDF user space for `geom`.
+    /// The result is normalised so `x0 <= x1` and `y0 <= y1`.
+    pub fn to_user_space(&self, geom: &PageGeometry) -> Result<ChangeRegion> {
+        let (ax, ay) = geom.display_to_user(self.x0, self.y0)?;
+        let (bx, by) = geom.display_to_user(self.x1, self.y1)?;
+        Ok(ChangeRegion {
+            x0: ax.min(bx),
+            y0: ay.min(by),
+            x1: ax.max(bx),
+            y1: ay.max(by),
+            changed_pixels: self.changed_pixels,
+        })
+    }
+}
+
+/// [`change_regions`] followed by [`ChangeRegion::to_user_space`]: regions in
+/// true PDF user space for a page with the given geometry.
+pub fn change_regions_user_space(
+    img_a: &DynamicImage,
+    img_b: &DynamicImage,
+    tolerance: u8,
+    proximity_px: u32,
+    dpi: f32,
+    geom: &PageGeometry,
+) -> Result<Vec<ChangeRegion>> {
+    change_regions(img_a, img_b, tolerance, proximity_px, dpi)?
+        .iter()
+        .map(|r| r.to_user_space(geom))
+        .collect()
+}
+
+/// Group the changed pixels of two same-size page renders into change regions.
+///
+/// A pixel is changed when its max channel delta exceeds `tolerance` (same rule
+/// as [`pixel_diff`]). Changed pixels closer than about `proximity_px` pixels
+/// are merged into one region (grid-cell connectivity, so the effective merge
+/// distance lies between the effective proximity and twice it). The effective
+/// proximity is `max(proximity_px, MIN_CELL_PX)`: a tiny radius would otherwise
+/// allocate about one grid cell per pixel. Each region is the tight bounding box
+/// of its changed pixels in DISPLAY space (see [`ChangeRegion`]) using `dpi`
+/// (the DPI both images were rendered at); use [`change_regions_user_space`] or
+/// [`ChangeRegion::to_user_space`] for PDF user space. Regions are ordered
+/// top-to-bottom, then left-to-right. Identical images yield an empty list.
+///
+/// Returns `Err` when image dimensions differ or `dpi` is not positive.
+pub fn change_regions(
+    img_a: &DynamicImage,
+    img_b: &DynamicImage,
+    tolerance: u8,
+    proximity_px: u32,
+    dpi: f32,
+) -> Result<Vec<ChangeRegion>> {
+    let (w, h) = img_a.dimensions();
+    let (wb, hb) = img_b.dimensions();
+    anyhow::ensure!(
+        w == wb && h == hb,
+        "image dimensions mismatch: {}x{} vs {}x{} - render both pages at the same DPI",
+        w,
+        h,
+        wb,
+        hb
+    );
+    anyhow::ensure!(dpi > 0.0, "dpi must be positive, got {}", dpi);
+    if w == 0 || h == 0 {
+        return Ok(Vec::new());
+    }
+
+    let cell = proximity_px.max(MIN_CELL_PX);
+    let gw = w.div_ceil(cell) as u64;
+    let gh = h.div_ceil(cell) as u64;
+    // Per grid cell: bbox (min_x, min_y, max_x, max_y) and count of changed pixels.
+    let mut cells: Vec<Option<CellBox>> = vec![None; (gw * gh) as usize];
+
+    let rgb_a = img_a.to_rgb8();
+    let rgb_b = img_b.to_rgb8();
+    for y in 0..h {
+        for x in 0..w {
+            let pa = rgb_a.get_pixel(x, y);
+            let pb = rgb_b.get_pixel(x, y);
+            let d =
+                pa.0.iter()
+                    .zip(pb.0.iter())
+                    .map(|(&a, &b)| a.abs_diff(b))
+                    .max()
+                    .unwrap_or(0);
+            if d > tolerance {
+                let idx = ((y / cell) as u64 * gw + (x / cell) as u64) as usize;
+                cells[idx] = Some(match cells[idx] {
+                    None => (x, y, x, y, 1),
+                    Some((x0, y0, x1, y1, n)) => {
+                        (x0.min(x), y0.min(y), x1.max(x), y1.max(y), n + 1)
+                    }
+                });
+            }
+        }
+    }
+
+    // 8-connected components over occupied cells (iterative flood fill).
+    let mut seen = vec![false; cells.len()];
+    let scale = dpi / 72.0;
+    let mut out: Vec<(u32, u32, ChangeRegion)> = Vec::new();
+    for start in 0..cells.len() {
+        if cells[start].is_none() || seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut stack = vec![start];
+        let (mut bx0, mut by0, mut bx1, mut by1, mut count) =
+            (u32::MAX, u32::MAX, 0u32, 0u32, 0u64);
+        while let Some(i) = stack.pop() {
+            let (x0, y0, x1, y1, n) = cells[i].expect("occupied");
+            bx0 = bx0.min(x0);
+            by0 = by0.min(y0);
+            bx1 = bx1.max(x1);
+            by1 = by1.max(y1);
+            count += n;
+            let (cx, cy) = (i as u64 % gw, i as u64 / gw);
+            for ny in cy.saturating_sub(1)..=(cy + 1).min(gh - 1) {
+                for nx in cx.saturating_sub(1)..=(cx + 1).min(gw - 1) {
+                    let j = (ny * gw + nx) as usize;
+                    if cells[j].is_some() && !seen[j] {
+                        seen[j] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+        }
+        // Pixel box [bx0..=bx1] x [by0..=by1] -> PDF space (y flipped, pixel edges).
+        let region = ChangeRegion {
+            x0: bx0 as f32 / scale,
+            y0: (h - (by1 + 1)) as f32 / scale,
+            x1: (bx1 + 1) as f32 / scale,
+            y1: (h - by0) as f32 / scale,
+            changed_pixels: count,
+        };
+        out.push((by0, bx0, region));
+    }
+    out.sort_by_key(|(y, x, _)| (*y, *x));
+    Ok(out.into_iter().map(|(_, _, r)| r).collect())
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+/// Pixel bbox `(min_x, min_y, max_x, max_y, changed_count)` of one grid cell.
+type CellBox = (u32, u32, u32, u32, u64);
+
+/// Smallest grid cell edge used by [`change_regions`], bounding its memory to
+/// about one cell per 16 pixels.
+const MIN_CELL_PX: u32 = 4;
 
 /// Files at or above this size use mmap + FPDF_LoadMemDocument64 (64-bit clean)
 /// instead of the streaming path (which has a signed 32-bit internal offset cap).
